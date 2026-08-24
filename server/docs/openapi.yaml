@@ -186,6 +186,10 @@ paths:
         play when capable, else remux with AAC audio); "original" forces
         direct play; "1080p"/"720p"/"480p" force a video re-encode at that
         level. Starting playback replaces any existing session for the item.
+        Music tracks always answer direct play (browsers decode
+        flac/mp3/aac/ogg/opus natively); capabilities/quality are ignored for
+        them. The music hierarchy (artist -> album -> ordered tracks) is
+        served by the same /libraries/{id}/items and /items/{id} endpoints.
       operationId: playItem
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
