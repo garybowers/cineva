@@ -13,9 +13,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// Session is one HLS playback session: a temp dir of segments plus the
-// transcode goroutine currently filling it. Seeking past produced segments
-// cancels the goroutine and restarts it at the requested offset.
 // Quality selects the video treatment for a session. Zero value = copy the
 // video stream (remux). Height > 0 = re-encode at that height/bitrate.
 type Quality struct {
@@ -24,6 +21,9 @@ type Quality struct {
 	BitrateKbps int    `json:"bitrateKbps,omitempty"`
 }
 
+// Session is one HLS playback session: a temp dir of segments plus the
+// transcode goroutine currently filling it. Seeking past produced segments
+// cancels the goroutine and restarts it at the requested offset.
 type Session struct {
 	ID          string  `json:"id"`
 	ItemID      string  `json:"itemId"`
@@ -283,7 +283,7 @@ func (s *Session) Init(ctx context.Context) ([]byte, error) {
 			// Sessions preserve source timestamps (segment N carries pts
 			// ~N*segmentSecs, matching the playlist), so the muxer's edit
 			// list — an "empty edit" spanning the whole start offset — is
-			// wrong for us. Firefox honors edit lists in MSE and shifts the
+			// wrong for us. Firefox honours edit lists in MSE and shifts the
 			// buffered range far past the playhead (silent stall); Chrome
 			// ignores them. Strip edts so both agree with the playlist.
 			data = stripEdts(data)

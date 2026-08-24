@@ -30,7 +30,7 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 ### Books — ebooks & comics (stage 3)
 - **Ebooks**: EPUB + PDF. Built-in web reader for EPUB with position sync (reading position is per-user state like everything else); PDF served to the browser's native viewer. Metadata from embedded EPUB/OPF data, enriched via Open Library.
 - **Comics/manga**: CBZ + CBR archives with a page-based web reader.
-- **OPDS catalog feed** so external reader apps (KOReader, Calibre, Kobo-style clients) can browse and download natively.
+- **OPDS catalogue feed** so external reader apps (KOReader, Calibre, Kobo-style clients) can browse and download natively.
 
 ### Federation (designed now, built post-v1)
 Two or more Cineva servers (e.g. one at home, one at a relative's house) link as peers so remote libraries appear alongside local ones — to the user it's just another library in the list.
@@ -74,7 +74,7 @@ Native mobile/laptop apps (planned, will live in `clients/`) need true offline m
 - **Migrations**: versioned SQL files embedded with `go:embed`, applied at startup.
 - **Transcoding**: ffmpeg via [ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo) (statically linked ffmpeg, no system dependency; CGO). Media inspection uses the same bindings (`internal/media.Probe`). The package is vendored as a git submodule at `third_party/ffmpeg-statigo` with a `replace` directive in go.mod — after cloning run `git submodule update --init && (cd third_party/ffmpeg-statigo && go run ./cmd/download-lib)` once to fetch the static libraries before building.
 - **Streaming**: HLS (fMP4 segments) for video transcodes; HTTP range requests for direct play and audio; Opus/AAC for audio transcodes.
-- **Book handling**: EPUB/OPF parsed natively in Go; CBZ via `archive/zip`, CBR via a pure-Go RAR reader (e.g. `nwaples/rardecode`); OPDS 1.2 for the catalog feed.
+- **Book handling**: EPUB/OPF parsed natively in Go; CBZ via `archive/zip`, CBR via a pure-Go RAR reader (e.g. `nwaples/rardecode`); OPDS 1.2 for the catalogue feed.
 - **API**: REST, JSON, spec-first. The OpenAPI 3.1 spec lives at `server/docs/openapi.yaml` and is the contract — update the spec in the same change as the handlers. Third-party clients generate SDKs from it.
 - **Web client & admin UI**: Svelte + Vite. Built to static assets and embedded in the Go binary with `go:embed`. EPUB rendering via epub.js (or foliate-js); audio playback via the Media Session API for lock-screen controls.
 - **Metadata providers**: one interface per domain — TMDB (video), MusicBrainz + Cover Art Archive (music), Open Library (books/audiobooks), RSS (podcasts) — so alternatives can be added.
@@ -111,12 +111,13 @@ Rules:
 
 ## Conventions
 
+- **British English everywhere prose appears**: UI copy, documentation, code comments, commit messages, API descriptions (colour, catalogue, honours, -ise endings, licence as noun). Exceptions only where syntax or an external API dictates American spellings — CSS properties (`color:`), DOM/web APIs (`behavior: 'smooth'`), library identifiers (`Maximize` icon imports), and established wire-format field names.
 - Standard Go style: `gofmt`, `go vet`, and `golangci-lint` must pass. Errors are wrapped with `fmt.Errorf("...: %w", err)` and handled, never discarded.
 - Table-driven tests alongside the code (`_test.go`); the store gets tested against a real temp SQLite file, not mocks.
 - API routes are versioned under `/api/v1/`. Breaking the API means a new version, not a changed response shape.
 - Database schema changes always come as a new migration file — never edit an applied migration.
 - Frontend: TypeScript, Svelte 5 runes, no component library lock-in yet; keep the API client in one generated/typed module. Build mobile-first: new screens are designed at phone width and scale up, not the reverse.
-- Theming: all UI colors come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--ok`, `--err`) — never hardcode a color in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change.
+- Theming: all UI colours come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--ok`, `--err`) — never hardcode a colour in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change.
 
 ## Milestones
 
