@@ -71,10 +71,10 @@
   const gridFilter = (lib: Library) => (i: Item) =>
     lib.mediaType === 'music' ? i.kind === 'album' : i.kind === 'movie' || i.kind === 'series'
 
-  // ---- iTunes-style column browser state for music libraries ----
+  // ---- Music view: artist rail + album shelves ----
   let musicAll: Item[] = $state([])
   let selArtist = $state('ALL') // artist item id | 'ALL' | 'COMP'
-  let selAlbum = $state('ALL') // album item id | 'ALL'
+  let selAlbumId: string | null = $state(null) // expanded album panel
 
   const mArtists = $derived(
     musicAll.filter((i) => i.kind === 'artist').toSorted((a, b) => a.title.localeCompare(b.title)),
@@ -99,40 +99,33 @@
     }
     return ids
   })
-  const visAlbums = $derived.by(() => {
-    let list = mAlbums
-    if (selArtist === 'COMP') list = list.filter((a) => compAlbumIds.has(a.id))
-    else if (selArtist !== 'ALL') list = list.filter((a) => a.parentId === selArtist)
-    return list.toSorted(
-      (a, b) =>
-        (a.artist ?? '').localeCompare(b.artist ?? '') ||
-        (a.year ?? 0) - (b.year ?? 0) ||
-        a.title.localeCompare(b.title),
-    )
-  })
-  const visTracks = $derived.by(() => {
-    let list: Item[]
-    if (selAlbum !== 'ALL') {
-      list = mTracks.filter((t) => t.parentId === selAlbum)
-    } else {
-      const ids = new Set(visAlbums.map((a) => a.id))
-      list = mTracks.filter((t) => t.parentId && ids.has(t.parentId))
+  const byYear = (a: Item, b: Item) => (a.year ?? 0) - (b.year ?? 0) || a.title.localeCompare(b.title)
+
+  // Shelf groups: one per artist for "All", a single group otherwise.
+  const shelfGroups = $derived.by(() => {
+    if (selArtist === 'COMP') {
+      return [{ id: 'COMP', title: 'Compilations', albums: mAlbums.filter((a) => compAlbumIds.has(a.id)).toSorted(byYear) }]
     }
-    return list.toSorted((x, y) => {
-      const ax = albumById.get(x.parentId ?? '')
-      const ay = albumById.get(y.parentId ?? '')
-      return (
-        (ax?.artist ?? '').localeCompare(ay?.artist ?? '') ||
-        (ax?.title ?? '').localeCompare(ay?.title ?? '') ||
-        (x.discNum ?? 0) - (y.discNum ?? 0) ||
-        (x.trackNum ?? 0) - (y.trackNum ?? 0)
-      )
-    })
+    if (selArtist !== 'ALL') {
+      const a = mArtists.find((x) => x.id === selArtist)
+      return [{ id: selArtist, title: a?.title ?? '', albums: mAlbums.filter((al) => al.parentId === selArtist).toSorted(byYear) }]
+    }
+    return mArtists
+      .map((a) => ({ id: a.id, title: a.title, albums: mAlbums.filter((al) => al.parentId === a.id).toSorted(byYear) }))
+      .filter((g) => g.albums.length > 0)
   })
+  const shelfAlbumCount = $derived(shelfGroups.reduce((n, g) => n + g.albums.length, 0))
+
+  const tracksOf = (albumId: string) =>
+    mTracks
+      .filter((t) => t.parentId === albumId)
+      .toSorted((x, y) => (x.discNum ?? 0) - (y.discNum ?? 0) || (x.trackNum ?? 0) - (y.trackNum ?? 0))
+
+  const shelfQueue = () => shelfGroups.flatMap((g) => g.albums.flatMap((a) => tracksOf(a.id)))
 
   function selectArtist(id: string) {
     selArtist = id
-    selAlbum = 'ALL'
+    selAlbumId = null
   }
 
   const trackTime = (secs?: number) =>
@@ -560,49 +553,91 @@
         {#if musicAll.length === 0}
           <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
         {:else}
-          <div class="browser">
-            <div class="col">
-              <div class="col-h">Artist</div>
-              <button class="brow" class:sel={selArtist === 'ALL'} onclick={() => selectArtist('ALL')}>
-                All ({mArtists.length} artists)
+          <div class="music">
+            <aside class="mrail">
+              <button class="rail-item" class:sel={selArtist === 'ALL'} onclick={() => selectArtist('ALL')}>
+                All Artists <span class="rail-n">{mArtists.length}</span>
               </button>
               {#if compAlbumIds.size > 0}
-                <button class="brow" class:sel={selArtist === 'COMP'} onclick={() => selectArtist('COMP')}>Compilations</button>
-              {/if}
-              {#each mArtists as a (a.id)}
-                <button class="brow" class:sel={selArtist === a.id} onclick={() => selectArtist(a.id)}>{a.title}</button>
-              {/each}
-            </div>
-            <div class="col">
-              <div class="col-h">Album</div>
-              <button class="brow" class:sel={selAlbum === 'ALL'} onclick={() => (selAlbum = 'ALL')}>
-                All ({visAlbums.length} albums)
-              </button>
-              {#each visAlbums as a (a.id)}
-                <button class="brow" class:sel={selAlbum === a.id} onclick={() => (selAlbum = a.id)}>
-                  {a.title}
-                  {#if a.year}<span class="muted"> ({a.year})</span>{/if}
+                <button class="rail-item" class:sel={selArtist === 'COMP'} onclick={() => selectArtist('COMP')}>
+                  Compilations <span class="rail-n">{compAlbumIds.size}</span>
                 </button>
+              {/if}
+              <div class="rail-div"></div>
+              {#each mArtists as a (a.id)}
+                <button class="rail-item" class:sel={selArtist === a.id} onclick={() => selectArtist(a.id)}>{a.title}</button>
               {/each}
-            </div>
-          </div>
-          <div class="songs">
-            <table>
-              <thead>
-                <tr><th class="tnum">#</th><th>Name</th><th class="ttime">Time</th><th>Artist</th><th>Album</th></tr>
-              </thead>
-              <tbody>
-                {#each visTracks as t, i (t.id)}
-                  <tr onclick={() => startMusic(visTracks, i)} title="Play">
-                    <td class="tnum muted">{t.trackNum || ''}</td>
-                    <td>{t.title}</td>
-                    <td class="ttime muted">{trackTime(t.runtimeSecs)}</td>
-                    <td class="muted">{t.artist}</td>
-                    <td class="muted">{albumById.get(t.parentId ?? '')?.title ?? ''}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
+            </aside>
+
+            <section class="mcontent">
+              <header class="mhead">
+                <div>
+                  <h2 class="mtitle">
+                    {selArtist === 'ALL' ? 'All Artists' : selArtist === 'COMP' ? 'Compilations' : shelfGroups[0]?.title}
+                  </h2>
+                  <span class="muted">{shelfAlbumCount} albums</span>
+                </div>
+                <div class="mactions">
+                  <button class="play" onclick={() => startMusic(shelfQueue(), 0)}>▶ Play</button>
+                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}>🔀 Shuffle</button>
+                </div>
+              </header>
+
+              {#each shelfGroups as group (group.id)}
+                {#if selArtist === 'ALL'}
+                  <button class="shelf-h" onclick={() => selectArtist(group.id)}>{group.title} <span class="muted">· {group.albums.length} albums</span></button>
+                {/if}
+                <div class="shelf">
+                  {#each group.albums as album (album.id)}
+                    <button class="acard" class:sel={selAlbumId === album.id} onclick={() => (selAlbumId = selAlbumId === album.id ? null : album.id)}>
+                      {#if album.poster}
+                        <img class="acover" src={album.poster} alt={album.title} loading="lazy" />
+                      {:else}
+                        <span class="acover ph">♪</span>
+                      {/if}
+                      <span class="aname">{album.title}</span>
+                      <span class="asub">{album.year || ''}</span>
+                    </button>
+                  {/each}
+                </div>
+                {#if selAlbumId && group.albums.some((a) => a.id === selAlbumId)}
+                  {@const album = albumById.get(selAlbumId)}
+                  {@const tracks = tracksOf(selAlbumId)}
+                  {#if album}
+                    <div class="apanel">
+                      {#if album.poster}
+                        <img class="apanel-cover" src={album.poster} alt="" />
+                      {:else}
+                        <span class="apanel-cover ph">♪</span>
+                      {/if}
+                      <div class="apanel-body">
+                        <div class="apanel-head">
+                          <div>
+                            <strong>{album.title}</strong>
+                            <span class="muted"> — {album.artist}{album.year ? ` · ${album.year}` : ''} · {tracks.length} tracks</span>
+                          </div>
+                          <div class="mactions">
+                            <button class="play" onclick={() => startMusic(tracks, 0)}>▶ Play</button>
+                            <button class="dl" onclick={() => startMusic(tracks, 0, true)}>🔀</button>
+                          </div>
+                        </div>
+                        <ul class="tlist">
+                          {#each tracks as t, ti (t.id)}
+                            <li>
+                              <button onclick={() => startMusic(tracks, ti)}>
+                                <span class="tno">{t.trackNum || ti + 1}</span>
+                                <span class="tname">{t.title}{#if t.artist && t.artist !== album.artist}<span class="muted"> — {t.artist}</span>{/if}</span>
+                                <span class="muted ttm">{trackTime(t.runtimeSecs)}</span>
+                              </button>
+                            </li>
+                          {/each}
+                        </ul>
+                      </div>
+                    </div>
+                  {/if}
+                {/if}
+              {/each}
+            </section>
           </div>
         {/if}
       {:else if currentLib}
@@ -898,68 +933,141 @@
   }
   .poster.square { aspect-ratio: 1 / 1; }
 
-  /* ---- iTunes-style column browser ---- */
-  .browser {
-    display: grid;
-    grid-template-columns: 1fr 1.4fr;
-    gap: 1px;
-    background: var(--border);
-    border: 1px solid var(--border);
-    border-radius: 12px 12px 0 0;
-    overflow: hidden;
-    height: 15rem;
-  }
-  .col { background: var(--panel); overflow-y: auto; }
-  .col-h {
-    position: sticky;
-    top: 0;
+  /* ---- Music view: artist rail + album shelves ---- */
+  .music { display: flex; gap: 1.25rem; align-items: flex-start; }
+  .mrail {
+    flex: none;
+    width: 12.5rem;
     background: var(--panel);
-    color: var(--muted);
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    padding: 0.5rem 0.85rem 0.35rem;
-    border-bottom: 1px solid var(--border);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.5rem;
+    position: sticky;
+    top: calc(var(--topbar-h, 3.4rem) + 1rem);
+    max-height: calc(100vh - var(--topbar-h, 3.4rem) - 2rem);
+    overflow-y: auto;
   }
-  .brow {
-    display: block;
+  .rail-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
     width: 100%;
     text-align: left;
-    padding: 0.32rem 0.85rem;
-    font-size: 0.88rem;
+    padding: 0.45rem 0.7rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
     color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
-  .brow:hover { background: var(--bg); }
-  .brow.sel { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent-2); }
+  .rail-item:hover { background: var(--bg); }
+  .rail-item.sel { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent-2); font-weight: 600; }
+  .rail-n { color: var(--muted); font-size: 0.75rem; font-weight: 400; }
+  .rail-div { height: 1px; background: var(--border); margin: 0.4rem 0.3rem; }
 
-  .songs {
+  .mcontent { flex: 1; min-width: 0; }
+  .mhead {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .mtitle { font-size: 1.6rem; margin: 0; }
+  .mactions { display: flex; gap: 0.5rem; align-items: center; }
+
+  .shelf-h {
+    display: block;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text);
+    padding: 0;
+    margin: 1.4rem 0 0.6rem;
+  }
+  .shelf-h:hover { color: var(--accent-2); }
+  .shelf {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+    gap: 0.9rem;
+    margin-bottom: 0.75rem;
+  }
+  .acard { display: flex; flex-direction: column; gap: 0.3rem; text-align: left; border-radius: 10px; }
+  .acover {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    transition: transform 0.12s ease;
+  }
+  .acover.ph { display: grid; place-items: center; font-size: 2rem; color: var(--muted); }
+  .acard:hover .acover { transform: scale(1.03); border-color: var(--accent); }
+  .acard.sel .acover { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .aname { font-size: 0.85rem; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .asub { font-size: 0.75rem; color: var(--muted); }
+
+  .apanel {
+    display: flex;
+    gap: 1.1rem;
     background: var(--panel);
     border: 1px solid var(--border);
-    border-top: none;
-    border-radius: 0 0 12px 12px;
-    overflow-x: auto;
+    border-radius: 12px;
+    padding: 1.1rem;
+    margin: 0.25rem 0 1.25rem;
   }
-  .songs table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-  .songs th {
+  .apanel-cover {
+    width: 11rem;
+    height: 11rem;
+    border-radius: 10px;
+    object-fit: cover;
+    flex: none;
+    border: 1px solid var(--border);
+  }
+  .apanel-cover.ph { display: grid; place-items: center; font-size: 3rem; color: var(--muted); background: var(--bg); }
+  .apanel-body { flex: 1; min-width: 0; }
+  .apanel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .tlist { list-style: none; columns: 2; column-gap: 2rem; }
+  .tlist li { break-inside: avoid; }
+  .tlist button {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    width: 100%;
     text-align: left;
-    color: var(--muted);
-    font-weight: 500;
-    font-size: 0.76rem;
-    padding: 0.5rem 0.85rem;
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    background: var(--panel);
+    padding: 0.32rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.88rem;
   }
-  .songs td { padding: 0.4rem 0.85rem; border-bottom: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 18rem; }
-  .songs tbody tr { cursor: pointer; }
-  .songs tbody tr:hover { background: var(--bg); }
-  .songs tbody tr:last-child td { border-bottom: none; }
-  .tnum { width: 2.2rem; }
-  .ttime { width: 3.6rem; }
+  .tlist button:hover { background: var(--bg); color: var(--accent-2); }
+  .tno { color: var(--muted); font-size: 0.78rem; width: 1.3rem; flex: none; font-variant-numeric: tabular-nums; }
+  .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ttm { flex: none; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 767px) {
+    .music { flex-direction: column; }
+    .mrail {
+      position: static;
+      width: 100%;
+      max-height: none;
+      display: flex;
+      overflow-x: auto;
+      gap: 0.25rem;
+      padding: 0.4rem;
+    }
+    .rail-item { width: auto; white-space: nowrap; }
+    .rail-div { display: none; }
+    .tlist { columns: 1; }
+    .apanel { flex-direction: column; }
+    .apanel-cover { width: 8rem; height: 8rem; }
+  }
   .cell:hover .poster { border-color: var(--accent); }
   .cell-title { font-size: 0.86rem; line-height: 1.25; }
   .cell-sub { font-size: 0.75rem; color: var(--muted); }
