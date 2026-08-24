@@ -24,6 +24,7 @@ type AudioInfo struct {
 	TrackNum    int
 	DiscNum     int
 	Year        int
+	Compilation bool
 }
 
 // parseNum handles "3" and "3/12" style track/disc tags.
@@ -50,6 +51,10 @@ func ProbeAudio(path string) (AudioInfo, error) {
 		Album:       dictValue(meta, "album"),
 		TrackNum:    parseNum(dictValue(meta, "track")),
 		DiscNum:     parseNum(dictValue(meta, "disc")),
+	}
+	switch strings.ToLower(dictValue(meta, "compilation")) {
+	case "1", "true", "yes":
+		info.Compilation = true
 	}
 	if d := in.Raw().Duration(); d > 0 {
 		info.RuntimeSecs = int(d / ffmpeg.AVTimeBase)

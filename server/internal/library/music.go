@@ -70,6 +70,9 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 		if artistName == "" {
 			artistName = filepath.Base(artistDir)
 		}
+		if info.Compilation {
+			artistName = "Various Artists"
+		}
 
 		albumName := info.Album
 		albumYear := info.Year
