@@ -149,6 +149,64 @@
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
 
+  // ---- Download manager: dispatches each file as its own browser download ----
+  type DownloadEntry = { id: string; title: string; status: 'queued' | 'sent' }
+  let downloads: DownloadEntry[] = $state([])
+  let showDownloads = $state(false)
+  let dispatching = false
+
+  function queueDownloads(items: Item[]) {
+    const fresh = items
+      .filter((i) => !downloads.some((d) => d.id === i.id))
+      .map((i) => ({
+        id: i.id,
+        title: i.kind === 'episode' ? `S${String(i.seasonNum).padStart(2, '0')}E${String(i.episodeNum).padStart(2, '0')} ${i.title}` : i.title,
+        status: 'queued' as const,
+      }))
+    downloads = [...downloads, ...fresh]
+    showDownloads = true
+    void dispatchQueue()
+  }
+
+  async function dispatchQueue() {
+    if (dispatching) return
+    dispatching = true
+    try {
+      for (;;) {
+        const next = downloads.find((d) => d.status === 'queued')
+        if (!next) break
+        const a = document.createElement('a')
+        a.href = downloadURL(next.id)
+        a.download = ''
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        downloads = downloads.map((d) => (d.id === next.id ? { ...d, status: 'sent' } : d))
+        await new Promise((r) => setTimeout(r, 900)) // stagger so browsers accept the batch
+      }
+    } finally {
+      dispatching = false
+    }
+  }
+
+  // All playable descendants of a season or series, in order.
+  async function collectEpisodes(root: Item): Promise<Item[]> {
+    if (!detail) return []
+    if (root.kind === 'season') return detail.children.filter((c) => c.kind === 'episode')
+    if (root.kind === 'series' && currentLib) {
+      const items = await libraryItems(currentLib.id)
+      const seasonIds = new Set(items.filter((i) => i.parentId === root.id).map((i) => i.id))
+      return items
+        .filter((i) => i.kind === 'episode' && i.parentId && seasonIds.has(i.parentId))
+        .toSorted((a, b) => (a.seasonNum ?? 0) - (b.seasonNum ?? 0) || (a.episodeNum ?? 0) - (b.episodeNum ?? 0))
+    }
+    return []
+  }
+
+  async function downloadAll(root: Item) {
+    queueDownloads(await collectEpisodes(root))
+  }
+
   // Video and music playback are mutually exclusive.
   function startMusic(tracks: Item[], startIndex: number, shuffleAll = false) {
     playing = null
@@ -550,6 +608,29 @@
         </div>
       {/if}
     </div>
+    {#if downloads.length > 0}
+      <div class="dlwrap">
+        <button class="topbtn" class:active={showDownloads} onclick={() => (showDownloads = !showDownloads)} title="Downloads">
+          <Download size={16} />
+          <span class="dlbadge">{downloads.length}</span>
+        </button>
+        {#if showDownloads}
+          <div class="dlpanel">
+            <div class="dlhead">
+              <span>Downloads</span>
+              <button class="dlclear" onclick={() => { downloads = []; showDownloads = false }}>Clear</button>
+            </div>
+            <p class="dlnote muted">Files are handed to your browser — see its download list for progress.</p>
+            {#each downloads as d (d.id)}
+              <div class="dlrow">
+                <span class="dltitle">{d.title}</span>
+                <span class="muted">{d.status === 'sent' ? 'sent to browser' : 'queued…'}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
     <button class="topbtn" class:active={tab === 'settings'} onclick={() => setTab('settings')} title="Settings"><SettingsIcon size={17} /></button>
     <button class="avatar" title="Local user — accounts arrive with milestone 4"><User size={17} /></button>
@@ -670,9 +751,9 @@
             </h1>
             {#if detail.item.kind === 'season' || detail.item.kind === 'series'}
               <div class="actions">
-                <a class="dl" href={downloadURL(detail.item.id)} download>
+                <button class="dl" onclick={() => detail && downloadAll(detail.item)}>
                   <Download size={14} /> Download {detail.item.kind === 'season' ? 'season' : 'show'}
-                </a>
+                </button>
               </div>
             {/if}
             {#if detail.item.kind === 'album'}
@@ -1059,7 +1140,44 @@
   .sr-text { display: flex; flex-direction: column; min-width: 0; }
   .sr-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sr-sub { font-size: 0.76rem; color: var(--muted); }
+  .dlwrap { position: relative; margin-left: auto; }
+  .dlwrap + .status { margin-left: 0; }
+  .dlbadge {
+    position: absolute;
+    top: -0.3rem;
+    right: -0.3rem;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 999px;
+    font-size: 0.62rem;
+    min-width: 1rem;
+    height: 1rem;
+    display: grid;
+    place-items: center;
+    padding: 0 0.2rem;
+  }
+  .dlpanel {
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    right: 0;
+    width: 21rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    padding: 0.6rem 0.8rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    z-index: 60;
+  }
+  .dlhead { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 0.9rem; }
+  .dlclear { color: var(--accent-2); font-size: 0.8rem; }
+  .dlnote { font-size: 0.75rem; margin: 0.25rem 0 0.5rem; }
+  .dlrow { display: flex; justify-content: space-between; gap: 0.8rem; padding: 0.3rem 0; font-size: 0.85rem; border-top: 1px solid var(--border); }
+  .dltitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
   .avatar, .topbtn {
+    position: relative;
     width: 2.1rem;
     height: 2.1rem;
     border-radius: 50%;
