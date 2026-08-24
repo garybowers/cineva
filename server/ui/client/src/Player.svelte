@@ -1,18 +1,25 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import Hls from 'hls.js'
-  import { nextUp, postProgress, stopSession, type Item, type PlayInfo } from './lib/api'
+  import {
+    nextUp, postProgress, stopSession, QUALITIES,
+    type Item, type PlayInfo, type PlayQuality,
+  } from './lib/api'
 
   let {
     item,
     info,
+    quality,
     onclose,
     onnext,
+    onquality,
   }: {
     item: Item
     info: PlayInfo
+    quality: PlayQuality
     onclose: () => void
     onnext: (next: Item) => void
+    onquality: (q: PlayQuality) => void
   } = $props()
 
   // v1 credits window heuristic — replaced by credits *detection* later.
@@ -94,6 +101,15 @@
     else box.requestFullscreen?.().catch(() => {})
   }
 
+  function changeQuality(e: Event) {
+    const q = (e.target as HTMLSelectElement).value as PlayQuality
+    reportProgress(true) // so the new session resumes at the same spot
+    onquality(q)
+  }
+
+  const modeLabel = () =>
+    info.mode === 'direct' ? 'Direct Play' : `Transcoding${info.reason ? ` — ${info.reason}` : ''}`
+
   const epCode = (i: Item) => `S${String(i.seasonNum).padStart(2, '0')}E${String(i.episodeNum).padStart(2, '0')}`
 </script>
 
@@ -102,7 +118,13 @@
     <span class="bartitle">
       {item.title}
       {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
+      <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
     </span>
+    <select class="quality" value={quality} onchange={changeQuality} title="Playback quality">
+      {#each QUALITIES as q (q.id)}
+        <option value={q.id}>{q.label}</option>
+      {/each}
+    </select>
     <button class="ctl" onclick={toggleFullscreen} title="Fullscreen">⛶</button>
     <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
   </div>
@@ -166,6 +188,26 @@
     text-overflow: ellipsis;
   }
   .sub { color: var(--muted); font-weight: 400; margin-left: 0.4rem; }
+  .mode {
+    color: var(--muted);
+    font-weight: 400;
+    font-size: 0.78rem;
+    margin-left: 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.1rem 0.55rem;
+  }
+  .quality {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.25rem 0.4rem;
+    margin-right: 0.35rem;
+  }
+  .nowplaying:fullscreen .quality { background: rgba(0, 0, 0, 0.5); color: #fff; }
   .ctl {
     color: var(--muted);
     font-size: 0.95rem;

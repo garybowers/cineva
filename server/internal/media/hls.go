@@ -11,15 +11,25 @@ import (
 	"github.com/linuxmatters/ffmpeg-statigo/av"
 )
 
-// HLSJob remuxes a file into HLS fMP4 segments: the h264 video stream is
-// copied untouched; audio is transcoded to AAC (the one thing browsers can't
-// handle in typical media files is ac3/eac3 audio). Restart-at-offset seeking
-// is done by running a new job with StartSegment > 0.
+// HLSJob transcodes a file into HLS fMP4 segments. Audio is always
+// transcoded to AAC (browsers can't decode the ac3/eac3 common in media
+// files). Video is copied untouched by default; when VideoHeight > 0 it is
+// re-encoded to h264 at that height with VideoBitrateKbps (the Plex-style
+// quality levels). Restart-at-offset seeking runs a new job with
+// StartSegment > 0.
 type HLSJob struct {
 	InputPath    string
 	OutDir       string
 	SegmentSecs  int
 	StartSegment int
+
+	VideoHeight      int // 0 = copy the video stream
+	VideoBitrateKbps int
+
+	// Throttle, when set, is called with the current output position; it may
+	// block to keep the transcoder from racing arbitrarily far ahead of the
+	// playhead (and filling the disk with segments nobody may ever watch).
+	Throttle func(ctx context.Context, posSecs int64) error
 }
 
 const (
@@ -72,10 +82,12 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	}
 	defer aenc.Close()
 
-	// asetnsamples chunks frames to the AAC frame size; aresample smooths
-	// timestamp gaps after seeks. Output layout borrows the encoder's.
+	// asetnsamples chunks frames to the AAC frame size; format/rate/layout
+	// conversion is auto-inserted by the graph. No aresample=async here:
+	// sessions start mid-file after seeks/resume, and async compensation
+	// pads the whole start offset with silence (the no-audio-on-resume bug).
 	filter, err := av.NewAudioFilterGraphFromContext(adec.Raw(),
-		"aresample=async=1:first_pts=0,asetnsamples=n=1024:p=0",
+		"asetnsamples=n=1024:p=0",
 		ffmpeg.AVSampleFmtFltp, aacSampleRate, aenc.Raw().ChLayout())
 	if err != nil {
 		return fmt.Errorf("hls audio filter: %w", err)
@@ -88,15 +100,68 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	}
 	defer out.Close()
 
-	// Stream 0: copied video. Raw AVStream with codec parameters cloned.
-	vOut := ffmpeg.AVFormatNewStream(out.Raw(), nil)
-	if vOut == nil {
-		return errors.New("hls: cannot add video stream")
+	// Stream 0: video — copied untouched, or decoded/scaled/re-encoded when a
+	// quality level was requested.
+	var vdec *av.Decoder
+	var vfilter *av.FilterGraph
+	var venc *av.Encoder
+	var vOut *ffmpeg.AVStream
+
+	if job.VideoHeight > 0 {
+		vdec, err = av.NewDecoder(vStream)
+		if err != nil {
+			return fmt.Errorf("hls video decoder: %w", err)
+		}
+		defer vdec.Close()
+
+		srcW, srcH := vStream.Codecpar().Width(), vStream.Codecpar().Height()
+		outH := job.VideoHeight
+		if outH > srcH {
+			outH = srcH // never upscale
+		}
+		outW := srcW * outH / srcH / 2 * 2 // keep aspect, force even
+
+		vfilter, err = av.NewVideoFilterGraphFromContext(vdec.Raw(),
+			fmt.Sprintf("scale=%d:%d", outW, outH), ffmpeg.AVPixFmtYuv420P)
+		if err != nil {
+			return fmt.Errorf("hls video filter: %w", err)
+		}
+		defer vfilter.Close()
+
+		// Keyframe every segment so the HLS muxer can cut clean boundaries.
+		fps := 25
+		if fr := vStream.AvgFrameRate(); fr != nil && fr.Den() > 0 && fr.Num() > 0 {
+			fps = (fr.Num() + fr.Den() - 1) / fr.Den()
+		}
+		venc, err = av.NewEncoderByID(ffmpeg.AVCodecIdH264, func(cc *ffmpeg.AVCodecContext) {
+			cc.SetWidth(outW)
+			cc.SetHeight(outH)
+			cc.SetPixFmt(ffmpeg.AVPixFmtYuv420P)
+			cc.SetTimeBase(vStream.TimeBase())
+			cc.SetBitRate(int64(job.VideoBitrateKbps) * 1000)
+			cc.SetGopSize(fps * job.SegmentSecs)
+			cc.SetMaxBFrames(2)
+			cc.SetFlags(cc.Flags() | ffmpeg.AVCodecFlagGlobalHeader)
+		})
+		if err != nil {
+			return fmt.Errorf("hls h264 encoder: %w", err)
+		}
+		defer venc.Close()
+
+		vOut, err = out.AddStream(venc)
+		if err != nil {
+			return fmt.Errorf("hls add video stream: %w", err)
+		}
+	} else {
+		vOut = ffmpeg.AVFormatNewStream(out.Raw(), nil)
+		if vOut == nil {
+			return errors.New("hls: cannot add video stream")
+		}
+		if _, err := ffmpeg.AVCodecParametersCopy(vOut.Codecpar(), vStream.Codecpar()); err != nil {
+			return fmt.Errorf("hls copy video params: %w", err)
+		}
+		vOut.SetTimeBase(vStream.TimeBase())
 	}
-	if _, err := ffmpeg.AVCodecParametersCopy(vOut.Codecpar(), vStream.Codecpar()); err != nil {
-		return fmt.Errorf("hls copy video params: %w", err)
-	}
-	vOut.SetTimeBase(vStream.TimeBase())
 
 	// Stream 1: encoded AAC audio.
 	aOut, err := out.AddStream(aenc)
@@ -138,9 +203,20 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	encodeFrame := func(frame *ffmpeg.AVFrame) error {
 		return aenc.Encode(frame, writeAudioPacket)
 	}
+	writeVideoPacket := func(pkt *ffmpeg.AVPacket) error {
+		ffmpeg.AVPacketRescaleTs(pkt, venc.Raw().TimeBase(), vOut.TimeBase())
+		pkt.SetStreamIndex(vOut.Index())
+		return out.WritePacket(pkt)
+	}
+	encodeVideoFrame := func(frame *ffmpeg.AVFrame) error {
+		frame.SetPictType(ffmpeg.AVPictureTypeNone) // let the encoder decide
+		return venc.Encode(frame, writeVideoPacket)
+	}
 
 	pkt := ffmpeg.AVPacketAlloc()
 	defer ffmpeg.AVPacketFree(&pkt)
+
+	oneSecond := ffmpeg.AVMakeQ(1, 1)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -156,11 +232,30 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 
 		switch pkt.StreamIndex() {
 		case vStream.Index():
-			ffmpeg.AVPacketRescaleTs(pkt, vStream.TimeBase(), vOut.TimeBase())
-			pkt.SetStreamIndex(vOut.Index())
-			pkt.SetPos(-1)
-			if err := out.WritePacket(pkt); err != nil {
-				return fmt.Errorf("hls write video: %w", err)
+			if job.Throttle != nil && pkt.Pts() != ffmpeg.AVNoptsValue {
+				pos := ffmpeg.AVRescaleQ(pkt.Pts(), vStream.TimeBase(), oneSecond)
+				if err := job.Throttle(ctx, pos); err != nil {
+					return err
+				}
+			}
+			if venc != nil {
+				err = vdec.Decode(pkt, func(frame *ffmpeg.AVFrame) error {
+					frame.SetPts(frame.BestEffortTimestamp())
+					if err := vfilter.Push(frame); err != nil {
+						return err
+					}
+					return vfilter.Pull(encodeVideoFrame)
+				})
+				if err != nil {
+					return fmt.Errorf("hls video: %w", err)
+				}
+			} else {
+				ffmpeg.AVPacketRescaleTs(pkt, vStream.TimeBase(), vOut.TimeBase())
+				pkt.SetStreamIndex(vOut.Index())
+				pkt.SetPos(-1)
+				if err := out.WritePacket(pkt); err != nil {
+					return fmt.Errorf("hls write video: %w", err)
+				}
 			}
 		case aStream.Index():
 			err := adec.Decode(pkt, func(frame *ffmpeg.AVFrame) error {
@@ -177,7 +272,24 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		ffmpeg.AVPacketUnref(pkt)
 	}
 
-	// Drain: decoder -> filter -> encoder -> muxer.
+	// Drain: decoders -> filters -> encoders -> muxer.
+	if venc != nil {
+		if err := vdec.Flush(func(frame *ffmpeg.AVFrame) error {
+			frame.SetPts(frame.BestEffortTimestamp())
+			if err := vfilter.Push(frame); err != nil {
+				return err
+			}
+			return vfilter.Pull(encodeVideoFrame)
+		}); err != nil {
+			return fmt.Errorf("hls flush video decoder: %w", err)
+		}
+		if err := vfilter.Push(nil); err == nil {
+			_ = vfilter.Pull(encodeVideoFrame)
+		}
+		if err := venc.Flush(writeVideoPacket); err != nil {
+			return fmt.Errorf("hls flush video encoder: %w", err)
+		}
+	}
 	if err := adec.Flush(func(frame *ffmpeg.AVFrame) error {
 		frame.SetPts(frame.BestEffortTimestamp())
 		if err := filter.Push(frame); err != nil {

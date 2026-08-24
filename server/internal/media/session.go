@@ -16,18 +16,28 @@ import (
 // Session is one HLS playback session: a temp dir of segments plus the
 // transcode goroutine currently filling it. Seeking past produced segments
 // cancels the goroutine and restarts it at the requested offset.
+// Quality selects the video treatment for a session. Zero value = copy the
+// video stream (remux). Height > 0 = re-encode at that height/bitrate.
+type Quality struct {
+	Label       string `json:"label"` // "auto" (remux) or "1080p"/"720p"/...
+	Height      int    `json:"height,omitempty"`
+	BitrateKbps int    `json:"bitrateKbps,omitempty"`
+}
+
 type Session struct {
-	ID          string `json:"id"`
-	ItemID      string `json:"itemId"`
-	Title       string `json:"title"`
-	InputPath   string `json:"-"`
-	Dir         string `json:"-"`
-	SegmentSecs int    `json:"segmentSecs"`
-	NumSegments int    `json:"numSegments"`
+	ID          string  `json:"id"`
+	ItemID      string  `json:"itemId"`
+	Title       string  `json:"title"`
+	InputPath   string  `json:"-"`
+	Dir         string  `json:"-"`
+	SegmentSecs int     `json:"segmentSecs"`
+	NumSegments int     `json:"numSegments"`
+	Quality     Quality `json:"quality"`
 
 	mu           sync.Mutex
 	cancel       context.CancelFunc
 	startSegment int
+	lastReq      int // highest segment index a client asked for
 	lastAccess   time.Time
 }
 
@@ -55,7 +65,22 @@ func NewSessionManager(root string, segmentSecs int) *SessionManager {
 }
 
 // Start creates a session and begins transcoding from the given position.
-func (sm *SessionManager) Start(itemID, title, inputPath string, runtimeSecs, startSecs int) (*Session, error) {
+// Any existing session for the same item is stopped first — replaying or
+// changing quality must not stack transcoders (single-user until milestone 4).
+func (sm *SessionManager) Start(itemID, title, inputPath string, runtimeSecs, startSecs int, q Quality) (*Session, error) {
+	sm.mu.Lock()
+	var stale []*Session
+	for id, existing := range sm.sessions {
+		if existing.ItemID == itemID {
+			delete(sm.sessions, id)
+			stale = append(stale, existing)
+		}
+	}
+	sm.mu.Unlock()
+	for _, s := range stale {
+		s.shutdown()
+	}
+
 	numSeg := (runtimeSecs + sm.SegmentSecs - 1) / sm.SegmentSecs
 	if numSeg < 1 {
 		numSeg = 1
@@ -68,6 +93,7 @@ func (sm *SessionManager) Start(itemID, title, inputPath string, runtimeSecs, st
 	s := &Session{
 		ID: id, ItemID: itemID, Title: title, InputPath: inputPath,
 		Dir: dir, SegmentSecs: sm.SegmentSecs, NumSegments: numSeg,
+		Quality:    q,
 		lastAccess: time.Now(),
 	}
 	s.restartLocked(sm.baseCtx, startSecs/sm.SegmentSecs)
@@ -153,6 +179,11 @@ func (s *Session) touch() {
 	s.mu.Unlock()
 }
 
+// throttleAheadSecs: how far past the playhead the transcoder may run before
+// pausing. Bounds disk usage — a full episode no longer lands on disk unless
+// it is actually watched.
+const throttleAheadSecs = 120
+
 // restartLocked (re)launches the transcode goroutine at the given segment.
 func (s *Session) restartLocked(base context.Context, startSegment int) {
 	if s.cancel != nil {
@@ -161,9 +192,26 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 	ctx, cancel := context.WithCancel(base)
 	s.cancel = cancel
 	s.startSegment = startSegment
+	s.lastReq = startSegment
 	job := HLSJob{
 		InputPath: s.InputPath, OutDir: s.Dir,
 		SegmentSecs: s.SegmentSecs, StartSegment: startSegment,
+		VideoHeight: s.Quality.Height, VideoBitrateKbps: s.Quality.BitrateKbps,
+		Throttle: func(ctx context.Context, posSecs int64) error {
+			for {
+				s.mu.Lock()
+				allowed := int64(s.lastReq*s.SegmentSecs + throttleAheadSecs)
+				s.mu.Unlock()
+				if posSecs <= allowed {
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		},
 	}
 	go func() {
 		if err := RunHLS(ctx, job); err != nil && ctx.Err() == nil {
@@ -216,6 +264,11 @@ func (s *Session) EnsureFile(ctx context.Context, name string) (string, error) {
 	}
 
 	if segIdx >= 0 {
+		s.mu.Lock()
+		if segIdx > s.lastReq {
+			s.lastReq = segIdx // advances the throttle window
+		}
+		s.mu.Unlock()
 		s.maybeRestart(segIdx)
 	}
 

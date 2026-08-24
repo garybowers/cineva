@@ -165,9 +165,28 @@ paths:
   /items/{id}/play:
     post:
       summary: Start playback — decides direct play vs HLS transcode
+      description: >
+        The body optionally carries the device's decode capabilities (detected
+        client-side) and a quality choice. quality "auto" negotiates (direct
+        play when capable, else remux with AAC audio); "original" forces
+        direct play; "1080p"/"720p"/"480p" force a video re-encode at that
+        level. Starting playback replaces any existing session for the item.
       operationId: playItem
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                containers: { type: array, items: { type: string } }
+                videoCodecs: { type: array, items: { type: string } }
+                audioCodecs: { type: array, items: { type: string } }
+                quality:
+                  type: string
+                  enum: [auto, original, 1080p, 720p, 480p]
       responses:
         "200":
           description: How to play the item, including the resume position
@@ -359,6 +378,7 @@ components:
         sessionId: { type: string }
         durationSecs: { type: integer }
         positionSecs: { type: integer, description: Resume point }
+        reason: { type: string, description: Why transcoding was chosen }
 
     PlayState:
       type: object

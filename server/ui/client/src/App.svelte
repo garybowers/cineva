@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, libraryItems, itemDetail, playItem, continueWatching, downloadURL,
-    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem,
+    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import Player from './Player.svelte'
@@ -27,8 +27,17 @@
   let detail: ItemDetail | null = $state(null)
   let stack: string[] = $state([]) // item-id trail for Back
   let resume: ResumeItem[] = $state([])
-  let playing: { item: Item; info: PlayInfo } | null = $state(null)
+  let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
+  let playGen = 0 // bumps on quality change so the player remounts
+
+  function readQuality(): PlayQuality {
+    try {
+      return (localStorage.getItem('cineva-quality') as PlayQuality) || 'auto'
+    } catch {
+      return 'auto'
+    }
+  }
 
   function readAutoplay(): boolean {
     try {
@@ -64,10 +73,10 @@
     }
   }
 
-  async function startPlay(item: Item) {
+  async function startPlay(item: Item, quality: PlayQuality = readQuality()) {
     try {
-      const info = await playItem(item.id)
-      playing = { item, info }
+      const info = await playItem(item.id, quality)
+      playing = { item, info, quality, gen: ++playGen }
     } catch (e) {
       console.error('play failed', e)
     }
@@ -81,6 +90,15 @@
   function playNext(next: Item) {
     playing = null
     startPlay(next)
+  }
+
+  function changeQuality(q: PlayQuality) {
+    try {
+      localStorage.setItem('cineva-quality', q)
+    } catch {
+      /* private browsing */
+    }
+    if (playing) startPlay(playing.item, q)
   }
 
   async function openLibrary(lib: Library) {
@@ -139,8 +157,15 @@
 
   <main>
     {#if playing}
-      {#key playing.item.id}
-        <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
+      {#key playing.gen}
+        <Player
+          item={playing.item}
+          info={playing.info}
+          quality={playing.quality}
+          onclose={closePlayer}
+          onnext={playNext}
+          onquality={changeQuality}
+        />
       {/key}
     {/if}
     {#if tab === 'home'}
