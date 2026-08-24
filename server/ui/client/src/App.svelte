@@ -10,7 +10,7 @@
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
-    RotateCcw,
+    RotateCcw, AudioLines,
   } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
@@ -147,6 +147,7 @@
   let music: { queue: Item[]; startIndex: number; shuffle: boolean; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
   let playGen = 0 // bumps on quality change so the player remounts
+  let playingPos = $state(0) // live playhead seconds, reported by the Player
 
   // Video and music playback are mutually exclusive.
   function startMusic(tracks: Item[], startIndex: number, shuffleAll = false) {
@@ -357,6 +358,7 @@
     try {
       const info = await playItem(item.id, quality, fromStart)
       music = null // video and music are mutually exclusive
+      playingPos = info.positionSecs || 0
       playing = { item, info, quality, gen: ++playGen }
       const inContext = detail && (detail.item.id === item.id || detail.item.id === item.parentId)
       if (!inContext) showItem(item) // full player lives on the item's (or its season's) page
@@ -619,6 +621,7 @@
           onnext={playNext}
           onquality={changeQuality}
           onexpand={() => playing && showItem(playing.item)}
+          ontime={(t) => (playingPos = t)}
         />
       {/key}
     {/if}
@@ -718,7 +721,7 @@
             <ul class="eplist">
               {#each detail.children as child (child.id)}
                 <li>
-                  <button class="eprow" class:sel={epDetail?.item.id === child.id} onclick={() => selectEpisode(child)}>
+                  <button class="eprow" class:sel={epDetail?.item.id === child.id} class:nowplaying={playing?.item.id === child.id} onclick={() => selectEpisode(child)}>
                     {#if child.poster}
                       <img class="epthumb" src={child.poster} alt="" loading="lazy" />
                     {:else}
@@ -727,7 +730,13 @@
                     <span class="epmain">
                       <span><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
                     </span>
+                    {#if playing?.item.id === child.id}
+                      <span class="ep-live" title="Now playing"><AudioLines size={16} /></span>
+                    {/if}
                     <span class="muted">{runtime(child.runtimeSecs)}</span>
+                    {#if playing?.item.id === child.id && child.runtimeSecs}
+                      <span class="ep-progress"><span style="width: {Math.min(100, (playingPos / child.runtimeSecs) * 100)}%"></span></span>
+                    {/if}
                   </button>
                   {#if epDetail && epDetail.item.id === child.id}
                     <div class="eppanel">
@@ -1425,6 +1434,7 @@
   .eplist li { border-bottom: 1px solid var(--border); }
   .eplist li:last-child { border-bottom: none; }
   .eprow {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 0.9rem;
@@ -1445,6 +1455,19 @@
   }
   .epthumb.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); }
   .epmain { flex: 1; min-width: 0; }
+  .eprow.nowplaying .epmain { color: var(--accent-2); }
+  .ep-live { color: var(--accent-2); flex: none; display: grid; place-items: center; }
+  .ep-progress {
+    position: absolute;
+    left: 0.4rem;
+    right: 0.4rem;
+    bottom: 0;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .ep-progress span { display: block; height: 100%; background: var(--accent); }
   .eppanel {
     background: var(--panel);
     border: 1px solid var(--border);

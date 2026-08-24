@@ -19,6 +19,7 @@
     onnext,
     onquality,
     onexpand,
+    ontime,
   }: {
     item: Item
     info: PlayInfo
@@ -28,6 +29,7 @@
     onnext: (next: Item) => void
     onquality: (q: PlayQuality) => void
     onexpand: () => void
+    ontime?: (secs: number) => void
   } = $props()
 
   // v1 credits window heuristic — replaced by credits *detection* later.
@@ -114,6 +116,7 @@
 
   function onTimeUpdate() {
     if (!seeking) current = video.currentTime
+    ontime?.(video.currentTime)
     if (video.duration && isFinite(video.duration)) duration = video.duration
     if (video.buffered.length > 0) bufferedEnd = video.buffered.end(video.buffered.length - 1)
     reportProgress()
