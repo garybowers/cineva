@@ -2,7 +2,8 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    type Health, type Library, type Scan,
+    listSessions, stopSession,
+    type Health, type Library, type Scan, type PlaySession,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
@@ -23,6 +24,7 @@
   let theme = $state(currentTheme())
   let libraries: Library[] = $state([])
   let scans: Scan[] = $state([])
+  let sessions: PlaySession[] = $state([])
   let error = $state('')
 
   // Add-library form
@@ -43,6 +45,7 @@
       offline = false
       libraries = await listLibraries()
       scans = await listScans()
+      sessions = await listSessions()
     } catch {
       offline = true
     }
@@ -126,9 +129,9 @@
           <div class="sub">{libraries.reduce((n, l) => n + l.itemCount, 0)} playable items</div>
         </div>
         <div class="card">
-          <div class="k">Active scans</div>
-          <div class="v">{scans.filter((s) => s.status === 'running').length}</div>
-          <div class="sub">streams arrive in milestone 3</div>
+          <div class="k">Active streams</div>
+          <div class="v">{sessions.length}</div>
+          <div class="sub">{scans.filter((s) => s.status === 'running').length} scans running</div>
         </div>
       </div>
     {:else if page === 'libraries'}
@@ -177,8 +180,28 @@
       <div class="empty">User management arrives in milestone 4. Until then, use the <code>cineva user add</code> CLI.</div>
     {:else if page === 'activity'}
       <h1>Activity</h1>
+      <h2>Streams</h2>
+      {#if sessions.length === 0}
+        <div class="empty slim">No active playback sessions.</div>
+      {:else}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Title</th><th>Session</th><th></th></tr></thead>
+            <tbody>
+              {#each sessions as s (s.id)}
+                <tr>
+                  <td>{s.title}</td>
+                  <td class="muted">{s.id.slice(0, 8)} · {s.numSegments} segments</td>
+                  <td class="actions"><button class="danger" onclick={() => stopSession(s.id).then(refresh)}>Stop</button></td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+      <h2>Scans</h2>
       {#if scans.length === 0}
-        <div class="empty">No scans yet — trigger one from the Libraries page.</div>
+        <div class="empty slim">No scans yet — trigger one from the Libraries page.</div>
       {:else}
         <div class="tablewrap">
           <table>
@@ -255,6 +278,8 @@
 
   main { flex: 1; padding: 1.25rem; max-width: 70rem; width: 100%; margin: 0 auto; }
   h1 { font-size: 1.35rem; margin-bottom: 1rem; }
+  h2 { font-size: 0.95rem; color: var(--muted); margin: 1.25rem 0 0.6rem; }
+  .empty.slim { padding: 1rem 1.25rem; }
 
   .error {
     background: color-mix(in srgb, var(--err) 15%, transparent);

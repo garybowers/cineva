@@ -25,6 +25,14 @@ libraries:
   # (CINEVA_LIBRARIES_ARTWORK_DIR)
   artwork_dir: artwork
 
+transcode:
+  # Working directory for HLS transcode sessions (segments are temp files,
+  # cleaned up when a session ends). Default: <system tmp>/cineva-transcode.
+  # (CINEVA_TRANSCODE_DIR)
+  # dir: /tmp/cineva-transcode
+  # Target HLS segment length in seconds. (CINEVA_TRANSCODE_SEGMENT_SECS)
+  segment_secs: 6
+
 metadata:
   tmdb:
     # TMDB API key for movie/TV metadata + posters. Free at
@@ -35,6 +43,5 @@ metadata:
 # --- Sections arriving with later milestones (do not uncomment until the
 # --- feature exists; config validate will show them once real):
 #
-# transcode:       milestone 3   — temp/cache directory, session limits
 # auth:            milestone 4   — session lifetime
 # federation:      milestone 10  — federation port, identity key location

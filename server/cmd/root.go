@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -36,6 +37,8 @@ func initConfig() {
 	viper.SetDefault("database.path", "cineva.db")
 	viper.SetDefault("libraries.artwork_dir", "artwork")
 	viper.SetDefault("metadata.tmdb.api_key", "")
+	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
+	viper.SetDefault("transcode.segment_secs", 6)
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

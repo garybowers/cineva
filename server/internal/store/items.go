@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -52,9 +53,25 @@ type ItemRepo interface {
 
 var _ ItemRepo = (*Store)(nil)
 
-const itemCols = `id, library_id, kind, COALESCE(parent_id, ''), title, year, season_num,
-	episode_num, path, size_bytes, runtime_secs, container, video_codec, audio_codec,
-	width, height, tmdb_id, overview, poster, added_at, updated_at`
+// itemColumns returns the item SELECT column list, optionally alias-qualified.
+func itemColumns(alias string) string {
+	p := func(c string) string {
+		if alias == "" {
+			return c
+		}
+		return alias + "." + c
+	}
+	cols := []string{
+		p("id"), p("library_id"), p("kind"), "COALESCE(" + p("parent_id") + ", '')",
+		p("title"), p("year"), p("season_num"), p("episode_num"), p("path"),
+		p("size_bytes"), p("runtime_secs"), p("container"), p("video_codec"),
+		p("audio_codec"), p("width"), p("height"), p("tmdb_id"), p("overview"),
+		p("poster"), p("added_at"), p("updated_at"),
+	}
+	return strings.Join(cols, ", ")
+}
+
+var itemCols = itemColumns("")
 
 func scanItem(row interface{ Scan(...any) error }) (Item, error) {
 	var it Item

@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    getHealth, listLibraries, libraryItems, itemDetail,
-    type Health, type Library, type Item, type ItemDetail,
+    getHealth, listLibraries, libraryItems, itemDetail, playItem, continueWatching, downloadURL,
+    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+  import Player from './Player.svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
   const tabs: { id: Tab; label: string; icon: string }[] = [
@@ -25,6 +26,26 @@
   let gridItems: Item[] = $state([])
   let detail: ItemDetail | null = $state(null)
   let stack: string[] = $state([]) // item-id trail for Back
+  let resume: ResumeItem[] = $state([])
+  let playing: { item: Item; info: PlayInfo } | null = $state(null)
+  let autoplay = $state(readAutoplay())
+
+  function readAutoplay(): boolean {
+    try {
+      return localStorage.getItem('cineva-autoplay') !== 'off'
+    } catch {
+      return true
+    }
+  }
+
+  function setAutoplay(on: boolean) {
+    autoplay = on
+    try {
+      localStorage.setItem('cineva-autoplay', on ? 'on' : 'off')
+    } catch {
+      /* private browsing */
+    }
+  }
 
   function setTheme(id: string) {
     theme = id
@@ -36,10 +57,30 @@
       health = await getHealth()
       offline = false
       libraries = await listLibraries()
+      resume = await continueWatching()
     } catch {
       health = null
       offline = true
     }
+  }
+
+  async function startPlay(item: Item) {
+    try {
+      const info = await playItem(item.id)
+      playing = { item, info }
+    } catch (e) {
+      console.error('play failed', e)
+    }
+  }
+
+  function closePlayer() {
+    playing = null
+    poll() // refresh continue-watching
+  }
+
+  function playNext(next: Item) {
+    playing = null
+    startPlay(next)
   }
 
   async function openLibrary(lib: Library) {
@@ -101,7 +142,20 @@
       <h1>Home</h1>
       <section>
         <h2>Continue Watching</h2>
-        <div class="empty">Nothing in progress yet — playback arrives in a later milestone.</div>
+        {#if resume.length === 0}
+          <div class="empty">Nothing in progress — start something from your libraries.</div>
+        {:else}
+          <div class="grid">
+            {#each resume as r (r.id)}
+              <button class="cell" onclick={() => startPlay(r)}>
+                {@render poster(r)}
+                <div class="progress"><div class="progress-fill" style="width: {Math.min(100, (r.positionSecs / (r.runtimeSecs || 1)) * 100)}%"></div></div>
+                <span class="cell-title">{r.title}</span>
+                {#if r.kind === 'episode'}<span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')}</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
       </section>
       <section>
         <h2>Libraries</h2>
@@ -135,7 +189,10 @@
             </p>
             {#if detail.item.overview}<p class="overview">{detail.item.overview}</p>{/if}
             {#if detail.item.kind === 'movie' || detail.item.kind === 'episode'}
-              <button class="play" disabled title="Playback arrives in milestone 3">▶ Play</button>
+              <div class="actions">
+                <button class="play" onclick={() => detail && startPlay(detail.item)}>▶ Play</button>
+                <a class="dl" href={downloadURL(detail.item.id)} download>↓ Download</a>
+              </div>
             {/if}
           </div>
         </div>
@@ -205,7 +262,10 @@
         </div>
         <div class="row">
           <span>Next-episode autoplay</span>
-          <span class="muted">arrives with playback</span>
+          <div class="theme-picker">
+            <button class="chip" class:sel={autoplay} onclick={() => setAutoplay(true)}>On</button>
+            <button class="chip" class:sel={!autoplay} onclick={() => setAutoplay(false)}>Off</button>
+          </div>
         </div>
       </section>
     {/if}
@@ -220,6 +280,10 @@
     {/each}
   </nav>
 </div>
+
+{#if playing}
+  <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
+{/if}
 
 <style>
   .shell { min-height: 100vh; display: flex; flex-direction: column; }
@@ -312,6 +376,7 @@
   .detail-body { flex: 1; min-width: 0; }
   .meta { color: var(--muted); font-size: 0.88rem; margin: 0.4rem 0 0.8rem; }
   .overview { font-size: 0.95rem; line-height: 1.5; margin-bottom: 1rem; }
+  .actions { display: flex; gap: 0.6rem; align-items: center; }
   .play {
     background: var(--accent);
     color: white;
@@ -319,7 +384,22 @@
     border-radius: 8px;
     font-weight: 600;
   }
-  .play:disabled { opacity: 0.45; cursor: not-allowed; }
+  .dl {
+    color: var(--accent-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.55rem 1rem;
+    text-decoration: none;
+    font-size: 0.9rem;
+  }
+  .progress {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: -0.1rem;
+  }
+  .progress-fill { height: 100%; background: var(--accent); }
 
   .children { list-style: none; margin-top: 1.25rem; }
   .children li { border-bottom: 1px solid var(--border); }

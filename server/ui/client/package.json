@@ -13,5 +13,8 @@
     "svelte": "^5.16.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
+  },
+  "dependencies": {
+    "hls.js": "^1.7.1"
   }
 }

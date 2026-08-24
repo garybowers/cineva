@@ -16,6 +16,7 @@ var adminFS embed.FS
 
 // themes/<name>/theme.css + theme.json — one folder per theme, shared by both
 // UIs (they are built against the same design-token contract).
+//
 //go:embed all:themes
 var themesFS embed.FS
 

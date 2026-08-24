@@ -33,9 +33,11 @@ var serveCmd = &cobra.Command{
 
 		artworkDir := viper.GetString("libraries.artwork_dir")
 		return api.Serve(api.Config{
-			Host:       viper.GetString("server.host"),
-			Port:       viper.GetInt("server.port"),
-			ArtworkDir: artworkDir,
+			Host:         viper.GetString("server.host"),
+			Port:         viper.GetInt("server.port"),
+			ArtworkDir:   artworkDir,
+			TranscodeDir: viper.GetString("transcode.dir"),
+			SegmentSecs:  viper.GetInt("transcode.segment_secs"),
 		}, st, newManager(st, artworkDir))
 	},
 }

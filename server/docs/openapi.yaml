@@ -162,6 +162,143 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Scan" }
 
+  /items/{id}/play:
+    post:
+      summary: Start playback — decides direct play vs HLS transcode
+      operationId: playItem
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: How to play the item, including the resume position
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlayInfo" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/stream:
+    get:
+      summary: Direct play the original file (supports HTTP range requests)
+      operationId: streamItem
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The media file }
+        "206": { description: Partial content (range request) }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/download:
+    get:
+      summary: Download the original file as an attachment
+      operationId: downloadItem
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The media file with Content-Disposition attachment }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/progress:
+    post:
+      summary: Report playback position (crossing ~90% marks the item watched)
+      operationId: postProgress
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [positionSecs]
+              properties:
+                positionSecs: { type: integer }
+      responses:
+        "200":
+          description: Updated play state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlayState" }
+
+  /items/{id}/next:
+    get:
+      summary: Server-side next-up decision — the episode after this one
+      operationId: nextUp
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The next episode
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Item" }
+        "204": { description: No next episode (end of series, or not an episode) }
+
+  /continue-watching:
+    get:
+      summary: In-progress items for the home screen, most recent first
+      operationId: continueWatching
+      responses:
+        "200":
+          description: Items with resume positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - { $ref: "#/components/schemas/Item" }
+                    - type: object
+                      properties:
+                        positionSecs: { type: integer }
+
+  /play/sessions:
+    get:
+      summary: List active HLS playback sessions
+      operationId: listSessions
+      responses:
+        "200":
+          description: Active sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PlaySession" }
+
+  /play/{sid}/index.m3u8:
+    get:
+      summary: HLS VOD playlist for a session
+      operationId: hlsPlaylist
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The playlist
+          content:
+            application/vnd.apple.mpegurl: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /play/{sid}/{file}:
+    get:
+      summary: HLS session asset (init.mp4 or segNNNNN.m4s); blocks until produced, seeking restarts the transcoder
+      operationId: hlsFile
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+        - { name: file, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The segment }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "504": { description: Segment not produced in time }
+
+  /play/{sid}:
+    delete:
+      summary: Stop a playback session and delete its temp files
+      operationId: stopSession
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Stopped }
+
 components:
   schemas:
     MediaType:
@@ -213,6 +350,32 @@ components:
         poster: { type: string, description: Server-relative artwork URL (/artwork/...) }
         addedAt: { type: string }
         updatedAt: { type: string }
+
+    PlayInfo:
+      type: object
+      properties:
+        mode: { type: string, enum: [direct, hls] }
+        url: { type: string }
+        sessionId: { type: string }
+        durationSecs: { type: integer }
+        positionSecs: { type: integer, description: Resume point }
+
+    PlayState:
+      type: object
+      properties:
+        itemId: { type: string }
+        positionSecs: { type: integer }
+        watched: { type: boolean }
+        updatedAt: { type: string }
+
+    PlaySession:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        itemId: { type: string, format: uuid }
+        title: { type: string }
+        segmentSecs: { type: integer }
+        numSegments: { type: integer }
 
     Scan:
       type: object
