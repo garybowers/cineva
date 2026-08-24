@@ -171,11 +171,27 @@
   }
 
   // fromChild: opened via the current detail's children list (drill-down);
-  // otherwise opened from the grid (fresh trail).
+  // otherwise the trail is rebuilt by walking the parent chain, so direct
+  // jumps (resume, search) still show the full path.
   async function openItem(id: string, fromChild = false) {
     const parent = fromChild && detail ? detail.item : null
     detail = await itemDetail(id)
-    trail = parent ? [...trail, parent] : []
+    if (parent) {
+      trail = [...trail, parent]
+    } else {
+      const ancestors: Item[] = []
+      let parentId = detail.item.parentId
+      while (parentId && ancestors.length < 4) {
+        try {
+          const p = (await itemDetail(parentId)).item
+          ancestors.unshift(p)
+          parentId = p.parentId
+        } catch {
+          break
+        }
+      }
+      trail = ancestors
+    }
     detailSubs = []
     if (detail.item.kind === 'movie' || detail.item.kind === 'episode') {
       itemSubtitles(id).then((s) => (detailSubs = s)).catch(() => {})
@@ -500,6 +516,7 @@
     border-bottom: 1px solid var(--border);
   }
   .topbar .logo { flex: none; }
+  .topbar .status { margin-left: auto; } /* pushes status + profile to the right edge */
   .search { position: relative; flex: 1; max-width: 30rem; }
   .search input {
     width: 100%;
