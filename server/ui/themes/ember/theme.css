@@ -1,0 +1,12 @@
+/* Cineva theme: Ember (warm dark). */
+:root {
+  --bg: #151010;
+  --panel: #1f1715;
+  --border: #342823;
+  --text: #f0e8e4;
+  --muted: #a3928a;
+  --accent: #ff8a3d;
+  --accent-2: #ffb454;
+  --ok: #3ecf8e;
+  --err: #ff6b6b;
+}

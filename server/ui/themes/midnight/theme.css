@@ -1,0 +1,14 @@
+/* Cineva theme: Midnight (default dark).
+   Every theme must define this full token set — it is the contract
+   both the client and admin UIs are built against. */
+:root {
+  --bg: #0e1116;
+  --panel: #161b23;
+  --border: #232a35;
+  --text: #e8ebf0;
+  --muted: #8a93a3;
+  --accent: #7c5cff;
+  --accent-2: #4dc3ff;
+  --ok: #3ecf8e;
+  --err: #ff6b6b;
+}

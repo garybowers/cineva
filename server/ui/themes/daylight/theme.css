@@ -1,0 +1,12 @@
+/* Cineva theme: Daylight (light). */
+:root {
+  --bg: #f4f5f8;
+  --panel: #ffffff;
+  --border: #dee3ea;
+  --text: #1a2029;
+  --muted: #5b6472;
+  --accent: #6a48ff;
+  --accent-2: #0b78c2;
+  --ok: #178f5f;
+  --err: #d64545;
+}

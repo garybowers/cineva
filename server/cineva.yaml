@@ -1,0 +1,29 @@
+# Cineva server configuration.
+#
+# This file is optional — every key can instead be set with a CINEVA_* env var
+# (dots become underscores, uppercased): server.port -> CINEVA_SERVER_PORT.
+# Precedence: CLI flags > env vars > this file > built-in defaults.
+#
+# The server looks for cineva.yaml in the working directory, then /etc/cineva.
+# This copy is for local development; grow it as features land (one section
+# per subsystem, added in the same change as the feature that reads it).
+
+server:
+  # Address to bind. 0.0.0.0 listens on all interfaces; use 127.0.0.1 to
+  # keep the server local-only. (CINEVA_SERVER_HOST)
+  host: 0.0.0.0
+  # HTTP port for the API, web client, and admin UI. (CINEVA_SERVER_PORT)
+  port: 4747
+
+database:
+  # SQLite database file; created on first run, migrations auto-apply at
+  # startup. (CINEVA_DATABASE_PATH)
+  path: cineva.db
+
+# --- Sections arriving with later milestones (do not uncomment until the
+# --- feature exists; config validate will show them once real):
+#
+# libraries:       milestone 2   — scan intervals, artwork cache location
+# transcode:       milestone 3   — temp/cache directory, session limits
+# auth:            milestone 4   — session lifetime
+# federation:      milestone 10  — federation port, identity key location

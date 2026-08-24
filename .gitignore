@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Runtime artifacts — the SQLite database and WAL files
+cineva.db
+cineva.db-*
+
+# Local binaries and logs
+/server/cineva
+*.log
+
+# Note: server/ui/*/dist IS committed for now so a fresh clone can
+# `go build` (go:embed needs the built assets). Revisit once CI builds them.
