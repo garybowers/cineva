@@ -122,6 +122,11 @@ Rules:
 
 v1 = milestones 1–6 (video end-to-end). Later stages are ordered but can flex.
 
+Deferred items and enhancement ideas are tracked per-milestone in
+[BACKLOG.md](BACKLOG.md) — when punting something during a milestone, add a
+backlog entry in the same change. A milestone can be called done with open
+backlog entries; it cannot be called done with undocumented gaps.
+
 1. **Skeleton**: go.mod, Cobra root + `serve`/`version`/`config validate` commands, Viper YAML config, Echo server with health endpoint, SQLite store with migrations, embedded placeholder UI. `go run . serve` (from `server/`) serves something. Schema bakes in the server identity keypair, typed media domains, and a library-source abstraction (local path vs federated peer) from day one.
 2. **Library & scan**: library CRUD, scanner framework, video scanner with ffprobe extraction, TMDB matching, artwork caching, `scan` CLI command.
 3. **Video playback**: direct play with range requests, HLS transcode sessions with seeking, WebVTT extraction + burn-in fallback, watch-state tracking, server-side next-up endpoint, item download (original + portable transcode).
