@@ -22,10 +22,12 @@ var (
 	episodeRe = regexp.MustCompile(`(?i)\bS(\d{1,2})\s*E(\d{1,3})\b`)
 	// "Heat (1995).mkv" / "Heat (1995) Remastered"
 	movieYearRe = regexp.MustCompile(`^(.*?)\s*\((\d{4})\)`)
+	// "10 Cloverfield Lane 2016 Remux-2160p" — bare year token
+	bareYearRe = regexp.MustCompile(`^(.*?)[\s._]+((?:19|20)\d{2})(?:[\s._)\]]|$)`)
 	// "Season 04" directory
 	seasonDirRe = regexp.MustCompile(`(?i)^season\s*(\d{1,3})$`)
-	// Trailing quality tags worth stripping from episode titles
-	qualityRe = regexp.MustCompile(`(?i)\s*\b(HDTV|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|\d{3,4}p)\b.*$`)
+	// Trailing quality/release tags worth stripping from titles
+	qualityRe = regexp.MustCompile(`(?i)[\s.-]*\b(HDTV|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|Remux|x26[45]|h26[45]|HEVC|\d{3,4}p)\b.*$`)
 )
 
 type EpisodeInfo struct {
@@ -77,16 +79,28 @@ type MovieInfo struct {
 	Year  int
 }
 
-// ParseMovie extracts title/year from "Title (Year)" in the filename, falling
-// back to the parent directory, then the bare filename.
+func cleanTitle(t string) string {
+	t = qualityRe.ReplaceAllString(t, "")
+	return strings.Trim(t, " -._")
+}
+
+// ParseMovie extracts title/year from the filename ("Title (Year)" or
+// "Title YYYY Quality..."), falling back to the parent directory, then the
+// bare filename with release tags stripped.
 func ParseMovie(path string) MovieInfo {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	for _, candidate := range []string{base, filepath.Base(filepath.Dir(path))} {
+	candidates := []string{base, filepath.Base(filepath.Dir(path))}
+	for _, candidate := range candidates {
 		if m := movieYearRe.FindStringSubmatch(candidate); m != nil {
 			year, _ := strconv.Atoi(m[2])
-			return MovieInfo{Title: strings.TrimSpace(m[1]), Year: year}
+			return MovieInfo{Title: cleanTitle(m[1]), Year: year}
 		}
 	}
-	title := strings.TrimSpace(qualityRe.ReplaceAllString(base, ""))
-	return MovieInfo{Title: title}
+	for _, candidate := range candidates {
+		if m := bareYearRe.FindStringSubmatch(candidate); m != nil {
+			year, _ := strconv.Atoi(m[2])
+			return MovieInfo{Title: cleanTitle(m[1]), Year: year}
+		}
+	}
+	return MovieInfo{Title: cleanTitle(base)}
 }

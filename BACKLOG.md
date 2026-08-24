@@ -16,6 +16,9 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Scan cancellation (context plumbing exists, no abort endpoint/UI).
 - [ ] Scheduled rescans and/or filesystem watch (`libraries.scan_interval` config).
 - [ ] Fuzzy/multi-field search: search matches title substring only — add year, cast, person search when credits exist.
+- [ ] Multi-version grouping: 40 movie folders hold two files of the same film (m4v + mkv); each becomes a separate item. Plex groups them as versions of one movie with a version picker at play time.
+- [ ] Extras/trailers filtering: subfolders like Featurettes/ or -trailer suffixed files should attach to the movie, not appear as movies (none in the current library, but standard layouts have them).
+- [ ] Cast/crew from embedded iTunMOVI plists (the mp4s carry full cast/directors/writers) + TMDB credits — needs the people/credits schema decision.
 
 ## Milestone 3 — Playback
 - [ ] **PGS/VobSub burn-in**: image-based subtitle tracks are cataloged and listed without a URL (API returns 422 with an explanation). Burn-in needs the video re-encode path plus a multi-input overlay filter graph. Nothing in the current library requires it.

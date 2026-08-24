@@ -163,21 +163,38 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 	return len(files), created, nil
 }
 
+// cacheArtwork writes an image into the artwork cache under a stable name
+// derived from (prefix, key) and returns its serve path ("" on failure or
+// when no artwork dir is configured). Existing files are reused.
+func (m *Manager) cacheArtwork(prefix, key string, img []byte) string {
+	if m.ArtworkDir == "" || len(img) == 0 {
+		return ""
+	}
+	sum := sha1.Sum([]byte(key))
+	name := prefix + "-" + hex.EncodeToString(sum[:8]) + ".jpg"
+	dest := filepath.Join(m.ArtworkDir, name)
+	if _, err := os.Stat(dest); err == nil {
+		return "/artwork/" + name
+	}
+	if err := os.MkdirAll(m.ArtworkDir, 0o755); err != nil {
+		return ""
+	}
+	if err := os.WriteFile(dest, img, 0o644); err != nil {
+		log.Printf("cache artwork %s: %v", key, err)
+		return ""
+	}
+	return "/artwork/" + name
+}
+
 // albumArtwork caches the album's cover image (embedded art from a track, or
 // a cover/folder image file in the album dir) and returns its serve path.
 func (m *Manager) albumArtwork(ctx context.Context, trackPath, albumDir string, done map[string]bool) string {
 	if m.ArtworkDir == "" {
 		return ""
 	}
-	sum := sha1.Sum([]byte(albumDir))
-	name := "album-" + hex.EncodeToString(sum[:8]) + ".jpg"
-	dest := filepath.Join(m.ArtworkDir, name)
 	if done[albumDir] {
-		return "/artwork/" + name
-	}
-	if _, err := os.Stat(dest); err == nil {
-		done[albumDir] = true
-		return "/artwork/" + name
+		sum := sha1.Sum([]byte(albumDir))
+		return "/artwork/album-" + hex.EncodeToString(sum[:8]) + ".jpg"
 	}
 
 	var img []byte
@@ -190,16 +207,9 @@ func (m *Manager) albumArtwork(ctx context.Context, trackPath, albumDir string, 
 	if img == nil {
 		img = media.ExtractCoverArt(trackPath)
 	}
-	if img == nil {
-		return ""
+	p := m.cacheArtwork("album", albumDir, img)
+	if p != "" {
+		done[albumDir] = true
 	}
-	if err := os.MkdirAll(m.ArtworkDir, 0o755); err != nil {
-		return ""
-	}
-	if err := os.WriteFile(dest, img, 0o644); err != nil {
-		log.Printf("album art %s: %v", albumDir, err)
-		return ""
-	}
-	done[albumDir] = true
-	return "/artwork/" + name
+	return p
 }

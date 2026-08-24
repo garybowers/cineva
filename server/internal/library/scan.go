@@ -236,6 +236,9 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 	return len(files), created, nil
 }
 
+// fillFileInfo probes technical info plus embedded metadata: tags override
+// filename parsing (they carry correct punctuation, years, and synopses in
+// iTunes-style files), and attached cover art becomes the item's poster.
 func (m *Manager) fillFileInfo(item *store.Item, path string) {
 	if st, err := os.Stat(path); err == nil {
 		item.SizeBytes = st.Size()
@@ -251,6 +254,30 @@ func (m *Manager) fillFileInfo(item *store.Item, path string) {
 	item.AudioCodec = info.AudioCodec
 	item.Width = info.Width
 	item.Height = info.Height
+
+	t := info.Tags
+	if t.Title != "" {
+		item.Title = t.Title
+	}
+	if t.Year != 0 && item.Year == 0 {
+		item.Year = t.Year
+	}
+	if t.Overview != "" && item.Overview == "" {
+		item.Overview = t.Overview
+	}
+	if t.SeasonNum != 0 && item.Kind == store.KindEpisode {
+		item.SeasonNum = t.SeasonNum
+	}
+	if t.EpisodeNum != 0 && item.Kind == store.KindEpisode {
+		item.EpisodeNum = t.EpisodeNum
+	}
+	if info.HasCoverArt && item.Poster == "" {
+		if img := media.ExtractCoverArt(path); img != nil {
+			if p := m.cacheArtwork("embed", path, img); p != "" {
+				item.Poster = p
+			}
+		}
+	}
 }
 
 // syncSubtitles records an item's subtitle tracks: embedded streams plus

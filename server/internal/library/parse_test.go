@@ -43,6 +43,11 @@ func TestParseMovie(t *testing.T) {
 		{"/movies/Heat (1995)/Heat (1995) Remastered BluRay-1080p.mkv", "Heat", 1995},
 		{"/movies/Alien (1979)/movie.mkv", "Alien", 1979},
 		{"/movies/Unknown Film.mkv", "Unknown Film", 0},
+		{"/movies/10 Cloverfield Lane/10 Cloverfield Lane 2016 Remux-2160p.mkv", "10 Cloverfield Lane", 2016},
+		{"/movies/Project Hail Mary (2026)/Project Hail Mary 2026 WEBDL-2160p.mkv", "Project Hail Mary", 2026},
+		{"/movies/Batteries Not Included/-batteries not included 1987 Bluray-1080p.mkv", "batteries not included", 1987},
+		{"/movies/13 Hours/13 Hours The Secret Soldiers of Benghazi 2016.mkv", "13 Hours The Secret Soldiers of Benghazi", 2016},
+		{"/movies/007_ Moonraker/007_ Moonraker.m4v", "007_ Moonraker", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
