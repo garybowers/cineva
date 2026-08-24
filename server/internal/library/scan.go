@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
@@ -138,6 +139,10 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	var filesSeen, itemsCreated int
 	var scanErr error
 
+	// Everything upserted this scan gets updated_at >= cutoff; whatever is
+	// older afterwards belongs to files that vanished and is pruned.
+	cutoff := time.Now().UTC().Add(-time.Second).Format("2006-01-02 15:04:05")
+
 	switch lib.MediaType {
 	case store.MediaMovies:
 		filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib)
@@ -147,6 +152,14 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		filesSeen, itemsCreated, scanErr = m.scanMusic(ctx, lib)
 	default:
 		scanErr = fmt.Errorf("scanner for %s libraries arrives in a later milestone", lib.MediaType)
+	}
+
+	if scanErr == nil && filesSeen > 0 {
+		if pruned, err := m.Store.PruneUnseen(context.WithoutCancel(ctx), lib.ID, cutoff); err != nil {
+			log.Printf("prune %s: %v", lib.Name, err)
+		} else if pruned > 0 {
+			log.Printf("scan %s: pruned %d stale item(s)", lib.Name, pruned)
+		}
 	}
 
 	status, errMsg := "completed", ""

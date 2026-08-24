@@ -82,6 +82,14 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 		}
 		if artistName == "" {
 			artistName = filepath.Base(artistDir)
+			// Album folders directly under a library root have no artist
+			// folder — don't invent an artist named after the root dir.
+			for _, root := range lib.Paths {
+				if artistDir == filepath.Clean(root) {
+					artistName = "Unknown Artist"
+					break
+				}
+			}
 		}
 		if info.Compilation {
 			artistName = "Various Artists"

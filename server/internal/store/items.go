@@ -189,6 +189,20 @@ func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, e
 		 LIMIT ?`, q, q, limit)
 }
 
+// PruneUnseen deletes a library's items not touched since the given cutoff
+// (UTC, sqlite datetime format). Every scan upserts all current items, so
+// anything older belongs to files no longer on disk. Cascades to subtitles
+// and play state.
+func (s *Store) PruneUnseen(ctx context.Context, libraryID, cutoff string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM items WHERE library_id = ? AND updated_at < ?`, libraryID, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("prune library %s: %w", libraryID, err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (s *Store) queryItems(ctx context.Context, query string, args ...any) ([]Item, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

@@ -9,7 +9,7 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Hoist shared frontend code (design tokens in `app.css`, `theme.ts`, API client patterns) into a shared package — currently duplicated between `ui/client` and `ui/admin`; do it when a third surface appears.
 
 ## Milestone 2 — Library & scan
-- [ ] **Prune deleted files**: rescans upsert but never remove items whose files vanished from disk. Needs mark-and-sweep per scan.
+- [x] **Prune deleted files**: successful scans sweep items not touched by the scan (updated_at cutoff), cascading to subtitles/play state.
 - [x] Episode-level TMDB metadata: titles/overviews/stills via the season endpoint (tags and filenames still take precedence where present).
 - [x] Season posters / overviews via the TMDB season endpoint.
 - [ ] Worker pool for probing (scan is sequential; fine at hundreds of files, slow at tens of thousands).

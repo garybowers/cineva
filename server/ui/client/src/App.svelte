@@ -360,6 +360,13 @@
     musicFilter = ''
   }
 
+  // Artist rail filter (name narrowing for very large libraries).
+  let railFilter = $state('')
+  const railArtists = $derived.by(() => {
+    const q = railFilter.trim().toLowerCase()
+    return q ? mArtists.filter((a) => a.title.toLowerCase().includes(q)) : mArtists
+  })
+
   // Filter within the current artist/album scope: albums by title or by
   // containing a matching song; matching songs listed for direct play.
   let musicFilter = $state('')
@@ -907,7 +914,7 @@
                 <button class="play" onclick={() => detail && startSession(detail.children, 0)}><Play size={15} /> Listen</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0)}>Queue</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
-                <button class="dl" onclick={() => detail && queueDownloads(detail.children)} title="Download album"><Download size={14} /> Download</button>
+                <a class="dl" href={downloadURL(detail.item.id)} download title="Download album (ZIP)"><Download size={14} /> Download</a>
               </div>
             {/if}
             <p class="meta">
@@ -1033,18 +1040,30 @@
         {:else}
           <div class="music">
             <aside class="mrail">
-              <button class="rail-item" class:sel={selArtist === 'ALL'} onclick={() => selectArtist('ALL')}>
-                All Artists <span class="rail-n">{mArtists.length}</span>
-              </button>
-              {#if compAlbumIds.size > 0}
-                <button class="rail-item" class:sel={selArtist === 'COMP'} onclick={() => selectArtist('COMP')}>
-                  Compilations <span class="rail-n">{compAlbumIds.size}</span>
+              <div class="rail-top">
+                <input
+                  class="rail-filter"
+                  type="search"
+                  placeholder="Filter artists…"
+                  bind:value={railFilter}
+                  onkeydown={(e) => e.key === 'Escape' && (railFilter = '')}
+                />
+                <button class="rail-item" class:sel={selArtist === 'ALL'} onclick={() => selectArtist('ALL')}>
+                  All Artists <span class="rail-n">{mArtists.length}</span>
                 </button>
-              {/if}
-              <div class="rail-div"></div>
-              {#each mArtists as a (a.id)}
+                {#if compAlbumIds.size > 0}
+                  <button class="rail-item" class:sel={selArtist === 'COMP'} onclick={() => selectArtist('COMP')}>
+                    Compilations <span class="rail-n">{compAlbumIds.size}</span>
+                  </button>
+                {/if}
+                <div class="rail-div"></div>
+              </div>
+              {#each railArtists as a (a.id)}
                 <button class="rail-item" class:sel={selArtist === a.id} onclick={() => selectArtist(a.id)}>{a.title}</button>
               {/each}
+              {#if railArtists.length === 0}
+                <div class="rail-empty muted">No artists match</div>
+              {/if}
             </aside>
 
             <section class="mcontent">
@@ -1066,7 +1085,11 @@
                   <button class="play" onclick={() => startSession(shelfQueue(), 0)}><Play size={15} /> Listen</button>
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0)}>Queue</button>
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}><Shuffle size={14} /> Shuffle</button>
-                  <button class="dl" onclick={() => queueDownloads(shelfQueue())} title="Download all shown"><Download size={14} /></button>
+                  {#if selArtist !== 'ALL' && selArtist !== 'COMP'}
+                    <a class="dl" href={downloadURL(selArtist)} download title="Download artist (ZIP)"><Download size={14} /></a>
+                  {:else}
+                    <button class="dl" onclick={() => queueDownloads(shelfQueue())} title="Download all shown"><Download size={14} /></button>
+                  {/if}
                 </div>
               </header>
 
@@ -1122,7 +1145,7 @@
                             <button class="play" onclick={() => startSession(tracks, 0)}><Play size={15} /> Listen</button>
                             <button class="dl" onclick={() => startMusic(tracks, 0)}>Queue</button>
                             <button class="dl" onclick={() => startMusic(tracks, 0, true)}><Shuffle size={14} /></button>
-                            <button class="dl" onclick={() => queueDownloads(tracks)} title="Download album"><Download size={14} /></button>
+                            <a class="dl" href={downloadURL(selAlbumId ?? '')} download title="Download album (ZIP)"><Download size={14} /></a>
                           </div>
                         </div>
                         <ul class="tlist">
@@ -1558,6 +1581,27 @@
     max-height: calc(100vh - var(--topbar-h, 3.4rem) - 2rem);
     overflow-y: auto;
   }
+  .rail-top {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+    padding-bottom: 0.15rem;
+    margin-bottom: 0.15rem;
+  }
+  .rail-filter {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.35rem 0.8rem;
+    margin-bottom: 0.4rem;
+  }
+  .rail-filter:focus { outline: none; border-color: var(--accent); }
+  .rail-empty { padding: 0.5rem 0.7rem; font-size: 0.85rem; }
   .rail-item {
     display: flex;
     justify-content: space-between;
