@@ -282,7 +282,9 @@
 </div>
 
 {#if playing}
-  <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
+  {#key playing.item.id}
+    <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
+  {/key}
 {/if}
 
 <style>
