@@ -3,7 +3,7 @@
   import { postProgress, type Item } from './lib/api'
   import {
     Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
-    Volume2, VolumeX, X, Music as MusicIcon,
+    Volume2, VolumeX, X, Music as MusicIcon, Disc3, Download,
   } from '@lucide/svelte'
 
   let {
@@ -12,12 +12,18 @@
     startShuffle = false,
     onclose,
     onlocate,
+    onexpand,
+    onchange,
+    ontime,
   }: {
     queue: Item[]
     startIndex?: number
     startShuffle?: boolean
     onclose: () => void
     onlocate: (track: Item) => void
+    onexpand?: () => void
+    onchange?: (track: Item, index: number) => void
+    ontime?: (secs: number) => void
   } = $props()
 
   let audio: HTMLAudioElement
@@ -47,6 +53,12 @@
     duration = queue[index].runtimeSecs ?? 0
     audio.src = `/api/v1/items/${queue[index].id}/stream`
     if (autoplay) audio.play().catch(() => {})
+    onchange?.(queue[index], index)
+  }
+
+  // Jump to a queue position (used by the listening-session view).
+  export function jumpTo(i: number) {
+    load(i)
   }
 
   onMount(() => {
@@ -136,7 +148,7 @@
 
 <audio
   bind:this={audio}
-  ontimeupdate={() => { if (!seeking) current = audio.currentTime; if (isFinite(audio.duration)) duration = audio.duration }}
+  ontimeupdate={() => { if (!seeking) current = audio.currentTime; if (isFinite(audio.duration)) duration = audio.duration; ontime?.(audio.currentTime) }}
   onplay={() => (paused = false)}
   onpause={() => (paused = true)}
   onended={onEnded}
@@ -175,6 +187,10 @@
 
     <span class="qpos">{index + 1}/{queue.length}</span>
     <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolume} aria-label="Volume" />
+    <a class="ctl dl-a" href={`/api/v1/items/${track.id}/download`} download title="Download track"><Download size={16} /></a>
+    {#if onexpand}
+      <button class="ctl" onclick={onexpand} title="Listening session"><Disc3 size={17} /></button>
+    {/if}
     <button class="ctl" onclick={onclose} title="Stop"><X size={17} /></button>
   </div>
 {/if}
@@ -245,6 +261,7 @@
     border-radius: 6px;
   }
   .ctl:hover { background: var(--bg); color: var(--text); }
+  .dl-a { display: grid; place-items: center; }
   .ctl.on { color: var(--accent-2); }
   .ctl.big { font-size: 1.3rem; }
 

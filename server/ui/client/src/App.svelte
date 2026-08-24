@@ -27,6 +27,7 @@
 
   // ---- URL routing: /libraries/<Library>/<Title>/... (names, not ids) ----
   function buildPath(): string {
+    if (listening && music) return '/listening'
     if (tab === 'home') return '/'
     if (tab === 'settings') return '/settings'
     let p = '/libraries'
@@ -46,6 +47,7 @@
 
   function setTab(t: Tab) {
     tab = t
+    listening = false
     syncURL()
   }
 
@@ -59,6 +61,11 @@
       }
       if (parts[0] === 'settings') {
         tab = 'settings'
+        return
+      }
+      if (parts[0] === 'listening') {
+        listening = !!music
+        if (!music) tab = 'home'
         return
       }
       if (parts[0] !== 'libraries') {
@@ -160,7 +167,12 @@
       .filter((i) => !downloads.some((d) => d.id === i.id))
       .map((i) => ({
         id: i.id,
-        title: i.kind === 'episode' ? `S${String(i.seasonNum).padStart(2, '0')}E${String(i.episodeNum).padStart(2, '0')} ${i.title}` : i.title,
+        title:
+          i.kind === 'episode'
+            ? `S${String(i.seasonNum).padStart(2, '0')}E${String(i.episodeNum).padStart(2, '0')} ${i.title}`
+            : i.kind === 'track' && i.artist
+              ? `${i.artist} — ${i.title}`
+              : i.title,
         status: 'queued' as const,
       }))
     downloads = [...downloads, ...fresh]
@@ -211,6 +223,40 @@
   function startMusic(tracks: Item[], startIndex: number, shuffleAll = false) {
     playing = null
     music = { queue: tracks, startIndex, shuffle: shuffleAll, gen: ++playGen }
+  }
+
+  // ---- Listening session: full-page album view over the playing queue ----
+  let listening = $state(false)
+  let musicNow: { track: Item; index: number } | null = $state(null)
+  let musicPos = $state(0)
+  let sessionAlbums: Map<string, Item> = $state(new Map())
+  let mpRef: { jumpTo: (i: number) => void } | undefined = $state()
+
+  function onTrackChange(track: Item, index: number) {
+    musicNow = { track, index }
+    musicPos = 0
+    const albumId = track.parentId
+    if (albumId && !sessionAlbums.has(albumId)) {
+      itemDetail(albumId)
+        .then((d) => (sessionAlbums = new Map(sessionAlbums).set(albumId, d.item)))
+        .catch(() => {})
+    }
+  }
+
+  function openListening() {
+    listening = true
+    syncURL()
+  }
+
+  function closeListening() {
+    listening = false
+    syncURL()
+  }
+
+  // "Pop the CD in": start the queue and open the session view.
+  function startSession(tracks: Item[], startIndex = 0, shuffleAll = false) {
+    startMusic(tracks, startIndex, shuffleAll)
+    openListening()
   }
 
   // Open the album containing a track (from the music bar or search).
@@ -275,10 +321,22 @@
   })
   const shelfAlbumCount = $derived(shelfGroups.reduce((n, g) => n + g.albums.length, 0))
 
-  const tracksOf = (albumId: string) =>
-    mTracks
-      .filter((t) => t.parentId === albumId)
-      .toSorted((x, y) => (x.discNum ?? 0) - (y.discNum ?? 0) || (x.trackNum ?? 0) - (y.trackNum ?? 0))
+  // Tracks grouped by album, computed once per library load — the filter
+  // and shelf code call this per album, so it must be O(1), not a scan.
+  const tracksByAlbum = $derived.by(() => {
+    const m = new Map<string, Item[]>()
+    for (const t of mTracks) {
+      if (!t.parentId) continue
+      const arr = m.get(t.parentId)
+      if (arr) arr.push(t)
+      else m.set(t.parentId, [t])
+    }
+    for (const arr of m.values()) {
+      arr.sort((x, y) => (x.discNum ?? 0) - (y.discNum ?? 0) || (x.trackNum ?? 0) - (y.trackNum ?? 0))
+    }
+    return m
+  })
+  const tracksOf = (albumId: string) => tracksByAlbum.get(albumId) ?? []
 
   const shelfQueue = () => shelfGroups.flatMap((g) => g.albums.flatMap((a) => tracksOf(a.id)))
 
@@ -291,6 +349,12 @@
   // Filter within the current artist/album scope: albums by title or by
   // containing a matching song; matching songs listed for direct play.
   let musicFilter = $state('')
+  let mfTimer: ReturnType<typeof setTimeout> | undefined
+  function onMusicFilterInput(e: Event) {
+    const v = (e.target as HTMLInputElement).value
+    clearTimeout(mfTimer)
+    mfTimer = setTimeout(() => (musicFilter = v), 200)
+  }
   const filterQ = $derived(musicFilter.trim().toLowerCase())
   const filteredShelfGroups = $derived.by(() => {
     if (!filterQ) return shelfGroups
@@ -308,15 +372,18 @@
   const matchedSongs = $derived.by(() => {
     if (!filterQ) return []
     const out: { t: Item; album: Item; idx: number; tracks: Item[] }[] = []
-    for (const g of shelfGroups) {
+    outer: for (const g of shelfGroups) {
       for (const a of g.albums) {
         const ts = tracksOf(a.id)
-        ts.forEach((t, i) => {
-          if (t.title.toLowerCase().includes(filterQ)) out.push({ t, album: a, idx: i, tracks: ts })
-        })
+        for (let i = 0; i < ts.length; i++) {
+          if (ts[i].title.toLowerCase().includes(filterQ)) {
+            out.push({ t: ts[i], album: a, idx: i, tracks: ts })
+            if (out.length >= 60) break outer
+          }
+        }
       }
     }
-    return out.slice(0, 60)
+    return out
   })
 
   const trackTime = (secs?: number) =>
@@ -683,11 +750,15 @@
     {#if music}
       {#key music.gen}
         <MusicPlayer
+          bind:this={mpRef}
           queue={music.queue}
           startIndex={music.startIndex}
           startShuffle={music.shuffle}
-          onclose={() => (music = null)}
+          onclose={() => { music = null; musicNow = null; if (listening) closeListening() }}
           onlocate={openAlbumOf}
+          onexpand={openListening}
+          onchange={onTrackChange}
+          ontime={(t) => (musicPos = t)}
         />
       {/key}
     {/if}
@@ -706,7 +777,53 @@
         />
       {/key}
     {/if}
-    {#if tab === 'home'}
+    {#if listening && music && musicNow}
+      {@const albumId = musicNow.track.parentId ?? ''}
+      {@const albumTracks = music.queue.filter((t) => t.parentId === albumId)}
+      {@const album = sessionAlbums.get(albumId)}
+      {@const queueAlbums = [...new Map(music.queue.map((t) => [t.parentId ?? '', t])).values()]}
+      <section class="session">
+        <div class="session-body">
+          <div class="session-side">
+            {#if musicNow.track.poster}
+              <img class="session-cover" src={musicNow.track.poster} alt="" />
+            {:else}
+              <div class="session-cover ph"><MusicIcon size={64} /></div>
+            {/if}
+            <h2 class="session-album">{album?.title ?? ''}</h2>
+            <p class="muted">{musicNow.track.artist}{album?.year ? ` · ${album.year}` : ''}</p>
+            {#if queueAlbums.length > 1}
+              <p class="muted small">Album {queueAlbums.findIndex((t) => (t.parentId ?? '') === albumId) + 1} of {queueAlbums.length} in this session</p>
+            {/if}
+          </div>
+          <ul class="session-tracks">
+            {#each albumTracks as t (t.id)}
+              {@const qi = music.queue.findIndex((q) => q.id === t.id)}
+              <li>
+                <button class="strack" class:current={t.id === musicNow.track.id} onclick={() => mpRef?.jumpTo(qi)}>
+                  <span class="tno">{t.trackNum || ''}</span>
+                  <span class="tname">{t.title}</span>
+                  <span class="ttm muted">{trackTime(t.runtimeSecs)}</span>
+                  {#if t.id === musicNow.track.id && t.runtimeSecs}
+                    <span class="strack-progress"><span style="width: {Math.min(100, (musicPos / t.runtimeSecs) * 100)}%"></span></span>
+                  {/if}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        </div>
+        {#if queueAlbums.length > 1}
+          <div class="session-shelf">
+            {#each queueAlbums as qa (qa.parentId ?? qa.id)}
+              {@const firstIdx = music.queue.findIndex((q) => q.parentId === qa.parentId)}
+              <button class="session-disc" class:cur={(qa.parentId ?? '') === albumId} onclick={() => mpRef?.jumpTo(firstIdx)} title={sessionAlbums.get(qa.parentId ?? '')?.title ?? ''}>
+                {#if qa.poster}<img src={qa.poster} alt="" />{:else}<span class="ph"><MusicIcon size={20} /></span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </section>
+    {:else if tab === 'home'}
       <h1>Home</h1>
       <section>
         <h2>Continue Watching</h2>
@@ -759,8 +876,10 @@
             {#if detail.item.kind === 'album'}
               <p class="meta">{detail.item.artist} · {detail.children.length} tracks</p>
               <div class="actions">
-                <button class="play" onclick={() => detail && startMusic(detail.children, 0)}><Play size={15} /> Play</button>
+                <button class="play" onclick={() => detail && startSession(detail.children, 0)}><Play size={15} /> Listen</button>
+                <button class="dl" onclick={() => detail && startMusic(detail.children, 0)}>Queue</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
+                <button class="dl" onclick={() => detail && queueDownloads(detail.children)} title="Download album"><Download size={14} /> Download</button>
               </div>
             {/if}
             <p class="meta">
@@ -913,11 +1032,13 @@
                     class="mfilter"
                     type="search"
                     placeholder="Filter songs & albums…"
-                    bind:value={musicFilter}
-                    onkeydown={(e) => e.key === 'Escape' && (musicFilter = '')}
+                    oninput={onMusicFilterInput}
+                    onkeydown={(e) => { if (e.key === 'Escape') { musicFilter = ''; (e.target as HTMLInputElement).value = '' } }}
                   />
-                  <button class="play" onclick={() => startMusic(shelfQueue(), 0)}><Play size={15} /> Play</button>
+                  <button class="play" onclick={() => startSession(shelfQueue(), 0)}><Play size={15} /> Listen</button>
+                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0)}>Queue</button>
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}><Shuffle size={14} /> Shuffle</button>
+                  <button class="dl" onclick={() => queueDownloads(shelfQueue())} title="Download all shown"><Download size={14} /></button>
                 </div>
               </header>
 
@@ -970,8 +1091,10 @@
                             <span class="muted"> — {album.artist}{album.year ? ` · ${album.year}` : ''} · {tracks.length} tracks</span>
                           </div>
                           <div class="mactions">
-                            <button class="play" onclick={() => startMusic(tracks, 0)}><Play size={15} /> Play</button>
+                            <button class="play" onclick={() => startSession(tracks, 0)}><Play size={15} /> Listen</button>
+                            <button class="dl" onclick={() => startMusic(tracks, 0)}>Queue</button>
                             <button class="dl" onclick={() => startMusic(tracks, 0, true)}><Shuffle size={14} /></button>
+                            <button class="dl" onclick={() => queueDownloads(tracks)} title="Download album"><Download size={14} /></button>
                           </div>
                         </div>
                         <ul class="tlist">
