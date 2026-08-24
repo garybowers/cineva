@@ -138,6 +138,11 @@
   </header>
 
   <main>
+    {#if playing}
+      {#key playing.item.id}
+        <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
+      {/key}
+    {/if}
     {#if tab === 'home'}
       <h1>Home</h1>
       <section>
@@ -281,11 +286,6 @@
   </nav>
 </div>
 
-{#if playing}
-  {#key playing.item.id}
-    <Player item={playing.item} info={playing.info} onclose={closePlayer} onnext={playNext} />
-  {/key}
-{/if}
 
 <style>
   .shell { min-height: 100vh; display: flex; flex-direction: column; }
