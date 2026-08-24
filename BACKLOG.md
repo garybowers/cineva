@@ -10,8 +10,8 @@ record it here in the same change — this file is how we find our way back.
 
 ## Milestone 2 — Library & scan
 - [ ] **Prune deleted files**: rescans upsert but never remove items whose files vanished from disk. Needs mark-and-sweep per scan.
-- [ ] Episode-level TMDB metadata: episode titles/overviews/still images (currently parsed from filenames; series get TMDB data, episodes don't).
-- [ ] Season posters / artwork.
+- [x] Episode-level TMDB metadata: titles/overviews/stills via the season endpoint (tags and filenames still take precedence where present).
+- [x] Season posters / overviews via the TMDB season endpoint.
 - [ ] Worker pool for probing (scan is sequential; fine at hundreds of files, slow at tens of thousands).
 - [ ] Scan cancellation (context plumbing exists, no abort endpoint/UI).
 - [ ] Scheduled rescans and/or filesystem watch (`libraries.scan_interval` config).

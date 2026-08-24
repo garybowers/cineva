@@ -177,8 +177,10 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 		return 0, 0, err
 	}
 	created := 0
-	seriesIDs := map[string]string{} // show dir -> item id
-	seasonIDs := map[string]string{} // season dir -> item id
+	seriesIDs := map[string]string{}                 // show dir -> item id
+	seriesTmdb := map[string]int{}                   // show dir -> tmdb id
+	seasonIDs := map[string]string{}                 // season dir -> item id
+	seasonData := map[string]metadata.SeasonResult{} // season dir -> tmdb season
 
 	for _, path := range files {
 		ep, ok := ParseEpisode(path)
@@ -204,15 +206,31 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 				return len(files), created, err
 			}
 			seriesID, seriesIDs[showDir] = saved.ID, saved.ID
+			seriesTmdb[showDir] = saved.TmdbID
 			created++
 		}
 
 		seasonID, ok := seasonIDs[seasonDir]
 		if !ok {
-			saved, err := m.Store.UpsertItem(ctx, store.Item{
+			season := store.Item{
 				LibraryID: lib.ID, Kind: store.KindSeason, ParentID: seriesID,
 				Title: "Season " + strconv.Itoa(ep.Season), SeasonNum: ep.Season, Path: seasonDir,
-			})
+			}
+			// Season-level TMDB data: poster + overview for the season item,
+			// plus per-episode titles/overviews/stills applied below.
+			if m.Video != nil && seriesTmdb[showDir] != 0 {
+				if sr, err := m.Video.TVSeason(ctx, seriesTmdb[showDir], ep.Season); err == nil {
+					seasonData[seasonDir] = sr
+					season.Overview = sr.Overview
+					if sr.PosterURL != "" && m.ArtworkDir != "" {
+						name := fmt.Sprintf("tmdb-s%d-season%d", seriesTmdb[showDir], ep.Season)
+						if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, sr.PosterURL, m.ArtworkDir, name); err == nil {
+							season.Poster = "/artwork/" + file
+						}
+					}
+				}
+			}
+			saved, err := m.Store.UpsertItem(ctx, season)
 			if err != nil {
 				return len(files), created, err
 			}
@@ -228,6 +246,27 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 			item.Title = fmt.Sprintf("Episode %d", ep.Episode)
 		}
 		m.fillFileInfo(&item, path)
+		// TMDB episode data fills whatever tags and filenames didn't provide.
+		if sr, ok := seasonData[seasonDir]; ok {
+			for _, te := range sr.Episodes {
+				if te.Num != ep.Episode {
+					continue
+				}
+				if item.Overview == "" {
+					item.Overview = te.Overview
+				}
+				if item.Title == fmt.Sprintf("Episode %d", ep.Episode) && te.Title != "" {
+					item.Title = te.Title
+				}
+				if item.Poster == "" && te.StillURL != "" && m.ArtworkDir != "" {
+					name := fmt.Sprintf("tmdb-s%d-e%dx%d", seriesTmdb[showDir], ep.Season, ep.Episode)
+					if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, te.StillURL, m.ArtworkDir, name); err == nil {
+						item.Poster = "/artwork/" + file
+					}
+				}
+				break
+			}
+		}
 		saved, err := m.Store.UpsertItem(ctx, item)
 		if err != nil {
 			return len(files), created, err

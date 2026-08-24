@@ -24,10 +24,26 @@ type VideoResult struct {
 	PosterURL string
 }
 
+// EpisodeResult is one episode's metadata within a season.
+type EpisodeResult struct {
+	Num      int
+	Title    string
+	Overview string
+	StillURL string
+}
+
+// SeasonResult is a TV season's metadata including its episode list.
+type SeasonResult struct {
+	Overview  string
+	PosterURL string
+	Episodes  []EpisodeResult
+}
+
 // VideoProvider is the video-domain metadata interface (see CLAUDE.md).
 type VideoProvider interface {
 	SearchMovie(ctx context.Context, title string, year int) (VideoResult, error)
 	SearchTV(ctx context.Context, name string) (VideoResult, error)
+	TVSeason(ctx context.Context, tvID, season int) (SeasonResult, error)
 }
 
 var ErrNotFound = fmt.Errorf("no metadata match")
@@ -102,6 +118,54 @@ func (t *TMDB) search(ctx context.Context, kind string, params url.Values) (Vide
 			out.Year, _ = strconv.Atoi(d[:4])
 			break
 		}
+	}
+	return out, nil
+}
+
+type tmdbSeasonResponse struct {
+	Overview   string `json:"overview"`
+	PosterPath string `json:"poster_path"`
+	Episodes   []struct {
+		EpisodeNumber int    `json:"episode_number"`
+		Name          string `json:"name"`
+		Overview      string `json:"overview"`
+		StillPath     string `json:"still_path"`
+	} `json:"episodes"`
+}
+
+// TVSeason fetches a season's metadata: overview, poster, and the episode
+// list with titles, overviews, and still frames.
+func (t *TMDB) TVSeason(ctx context.Context, tvID, season int) (SeasonResult, error) {
+	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%d/season/%d?api_key=%s", tvID, season, url.QueryEscape(t.APIKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return SeasonResult{}, err
+	}
+	res, err := t.Client.Do(req)
+	if err != nil {
+		return SeasonResult{}, fmt.Errorf("tmdb season: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		return SeasonResult{}, ErrNotFound
+	}
+	if res.StatusCode != http.StatusOK {
+		return SeasonResult{}, fmt.Errorf("tmdb season: status %d", res.StatusCode)
+	}
+	var body tmdbSeasonResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return SeasonResult{}, fmt.Errorf("tmdb season: %w", err)
+	}
+	out := SeasonResult{Overview: body.Overview}
+	if body.PosterPath != "" {
+		out.PosterURL = tmdbImageBase + body.PosterPath
+	}
+	for _, e := range body.Episodes {
+		ep := EpisodeResult{Num: e.EpisodeNumber, Title: e.Name, Overview: e.Overview}
+		if e.StillPath != "" {
+			ep.StillURL = tmdbImageBase + e.StillPath
+		}
+		out.Episodes = append(out.Episodes, ep)
 	}
 	return out, nil
 }
