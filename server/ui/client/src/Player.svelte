@@ -29,6 +29,18 @@
   let video: HTMLVideoElement
   let hls: Hls | null = null
   let next: Item | null = $state(null)
+  let subtitle = $state('off') // selected track id, or 'off'
+
+  const textSubs = info.subtitles?.filter((t) => t.url) ?? []
+  const subLabel = (t: (typeof textSubs)[number]) =>
+    t.title || t.language?.toUpperCase() || t.codec
+
+  function selectSubtitle(e: Event) {
+    subtitle = (e.target as HTMLSelectElement).value
+    for (const track of video.textTracks) {
+      track.mode = track.id === subtitle ? 'showing' : 'hidden'
+    }
+  }
   let showNext = $state(false)
   let remaining = $state(0)
   let dismissed = false
@@ -54,6 +66,7 @@
       video.src = info.url // direct play, or Safari's native HLS
       if (info.positionSecs > 0) video.currentTime = info.positionSecs
     }
+    for (const track of video.textTracks) track.mode = 'hidden' // off until picked
     video.play().catch(() => {})
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     if (item.kind === 'episode') {
@@ -123,6 +136,14 @@
       {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
       <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
     </span>
+    {#if textSubs.length > 0}
+      <select class="quality" value={subtitle} onchange={selectSubtitle} title="Subtitles">
+        <option value="off">CC Off</option>
+        {#each textSubs as t (t.id)}
+          <option value={t.id}>{subLabel(t)}</option>
+        {/each}
+      </select>
+    {/if}
     <select class="quality" value={quality} onchange={changeQuality} title="Playback quality">
       {#each QUALITIES as q (q.id)}
         <option value={q.id}>{q.label}</option>
@@ -132,8 +153,11 @@
     <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
   </div>
   <div class="stage">
-    <!-- svelte-ignore a11y_media_has_caption -->
-    <video bind:this={video} controls playsinline ontimeupdate={onTimeUpdate} onended={onEnded}></video>
+    <video bind:this={video} controls playsinline crossorigin="anonymous" ontimeupdate={onTimeUpdate} onended={onEnded}>
+      {#each textSubs as t (t.id)}
+        <track id={t.id} kind="subtitles" src={t.url} label={subLabel(t)} srclang={t.language || 'und'} />
+      {/each}
+    </video>
 
     {#if showNext && next}
       <div class="upnext">

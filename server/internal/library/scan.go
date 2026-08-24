@@ -157,9 +157,11 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, 
 				m.applyVideoResult(ctx, &item, r)
 			}
 		}
-		if _, err := m.Store.UpsertItem(ctx, item); err != nil {
+		saved, err := m.Store.UpsertItem(ctx, item)
+		if err != nil {
 			return len(files), created, err
 		}
+		m.syncSubtitles(ctx, saved.ID, path)
 		created++
 	}
 	return len(files), created, nil
@@ -222,9 +224,11 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 			item.Title = fmt.Sprintf("Episode %d", ep.Episode)
 		}
 		m.fillFileInfo(&item, path)
-		if _, err := m.Store.UpsertItem(ctx, item); err != nil {
+		saved, err := m.Store.UpsertItem(ctx, item)
+		if err != nil {
 			return len(files), created, err
 		}
+		m.syncSubtitles(ctx, saved.ID, path)
 		created++
 	}
 	return len(files), created, nil
@@ -245,6 +249,31 @@ func (m *Manager) fillFileInfo(item *store.Item, path string) {
 	item.AudioCodec = info.AudioCodec
 	item.Width = info.Width
 	item.Height = info.Height
+}
+
+// syncSubtitles records an item's subtitle tracks: embedded streams plus
+// sidecar files next to the media.
+func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
+	tracks := []store.SubtitleTrack{}
+	embedded, err := media.ProbeSubtitles(path)
+	if err != nil {
+		log.Printf("probe subtitles %s: %v", path, err)
+	}
+	for _, s := range embedded {
+		tracks = append(tracks, store.SubtitleTrack{
+			Source: "embedded", StreamIndex: s.Index, Codec: s.Codec,
+			Language: s.Language, Title: s.Title, Forced: s.Forced,
+		})
+	}
+	for _, s := range media.SidecarSubtitles(path) {
+		tracks = append(tracks, store.SubtitleTrack{
+			Source: "sidecar", StreamIndex: -1, Path: s.Path, Codec: s.Codec,
+			Language: s.Language, Forced: s.Forced,
+		})
+	}
+	if err := m.Store.ReplaceSubtitles(ctx, itemID, tracks); err != nil {
+		log.Printf("save subtitles for %s: %v", path, err)
+	}
 }
 
 func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r metadata.VideoResult) {

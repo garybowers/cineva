@@ -65,12 +65,13 @@ func directPlayReason(item store.Item, caps capabilities) string {
 }
 
 type playInfo struct {
-	Mode         string `json:"mode"` // "direct" | "hls"
-	URL          string `json:"url"`
-	SessionID    string `json:"sessionId,omitempty"`
-	DurationSecs int    `json:"durationSecs"`
-	PositionSecs int    `json:"positionSecs"`     // resume point
-	Reason       string `json:"reason,omitempty"` // why transcoding was chosen
+	Mode         string         `json:"mode"` // "direct" | "hls"
+	URL          string         `json:"url"`
+	SessionID    string         `json:"sessionId,omitempty"`
+	DurationSecs int            `json:"durationSecs"`
+	PositionSecs int            `json:"positionSecs"`     // resume point
+	Reason       string         `json:"reason,omitempty"` // why transcoding was chosen
+	Subtitles    []subtitleInfo `json:"subtitles"`
 }
 
 func (s *server) playableItem(c echo.Context) (store.Item, error) {
@@ -106,9 +107,16 @@ func (s *server) playItem(c echo.Context) error {
 		resume = 0
 	}
 
+	tracks, err := s.store.SubtitlesForItem(c.Request().Context(), item.ID)
+	if err != nil {
+		return err
+	}
+	subs := subtitleInfos(tracks)
+
 	direct := playInfo{
 		Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
 		DurationSecs: item.RuntimeSecs, PositionSecs: resume,
+		Subtitles: subs,
 	}
 
 	var sessionQuality media.Quality // zero value = remux (video copy)
@@ -137,7 +145,7 @@ func (s *server) playItem(c echo.Context) error {
 	return c.JSON(http.StatusOK, playInfo{
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
-		Reason: reason,
+		Reason: reason, Subtitles: subs,
 	})
 }
 

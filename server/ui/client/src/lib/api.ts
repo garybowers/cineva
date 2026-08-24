@@ -35,6 +35,15 @@ export interface ItemDetail {
   children: Item[]
 }
 
+export interface SubtitleTrack {
+  id: string
+  language?: string
+  title?: string
+  codec: string
+  forced?: boolean
+  url?: string // absent for image-based tracks (burn-in not yet available)
+}
+
 export interface PlayInfo {
   mode: 'direct' | 'hls'
   url: string
@@ -42,6 +51,7 @@ export interface PlayInfo {
   durationSecs: number
   positionSecs: number
   reason?: string
+  subtitles: SubtitleTrack[]
 }
 
 export type PlayQuality = 'auto' | 'original' | '1080p' | '720p' | '480p'

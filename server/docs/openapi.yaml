@@ -253,6 +253,35 @@ paths:
               schema: { $ref: "#/components/schemas/Item" }
         "204": { description: No next episode (end of series, or not an episode) }
 
+  /items/{id}/subtitles:
+    get:
+      summary: List an item's subtitle tracks (embedded and sidecar)
+      operationId: itemSubtitles
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Subtitle tracks; text tracks carry a WebVTT url
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SubtitleTrack" }
+
+  /subtitles/{id}.vtt:
+    get:
+      summary: A text subtitle track extracted/converted to WebVTT (cached server-side)
+      operationId: subtitleVTT
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: WebVTT content
+          content:
+            text/vtt: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { description: Image-based track — needs burn-in, not yet available }
+
   /continue-watching:
     get:
       summary: In-progress items for the home screen, most recent first
@@ -379,6 +408,19 @@ components:
         durationSecs: { type: integer }
         positionSecs: { type: integer, description: Resume point }
         reason: { type: string, description: Why transcoding was chosen }
+        subtitles:
+          type: array
+          items: { $ref: "#/components/schemas/SubtitleTrack" }
+
+    SubtitleTrack:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        language: { type: string }
+        title: { type: string }
+        codec: { type: string, description: subrip/ass/mov_text/vtt (text) or hdmv_pgs_subtitle/dvd_subtitle (image) }
+        forced: { type: boolean }
+        url: { type: string, description: WebVTT url; absent for image-based tracks }
 
     PlayState:
       type: object

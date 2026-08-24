@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -29,16 +30,18 @@ type Config struct {
 }
 
 type server struct {
-	store    *store.Store
-	manager  *library.Manager
-	sessions *media.SessionManager
+	store       *store.Store
+	manager     *library.Manager
+	sessions    *media.SessionManager
+	subtitleDir string
 }
 
 func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s := &server{
-		store:    st,
-		manager:  manager,
-		sessions: media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		store:       st,
+		manager:     manager,
+		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
 	}
 
 	e := echo.New()
@@ -63,6 +66,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/items/:id/download", s.downloadItem)
 	v1.POST("/items/:id/progress", s.postProgress)
 	v1.GET("/items/:id/next", s.nextUp)
+	v1.GET("/items/:id/subtitles", s.itemSubtitles)
+	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
 	v1.GET("/continue-watching", s.continueWatching)
 	v1.GET("/play/sessions", s.listSessions)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
