@@ -25,6 +25,7 @@
   let repeat: 'off' | 'all' | 'one' = $state('off')
   let volume = $state(readVolume())
   let muted = $state(false)
+  let seeking = $state(false) // true while the seek thumb is being dragged
 
   const track = $derived(queue[index])
 
@@ -98,8 +99,17 @@
     repeat = repeat === 'off' ? 'all' : repeat === 'all' ? 'one' : 'off'
   }
 
-  function onSeek(e: Event) {
+  // Dragging previews the position; the actual seek happens once on release.
+  // Seeking on every input event fires dozens of decoder seeks per second
+  // (audible crackle) while timeupdate fights the thumb (haywire bar).
+  function onSeekPreview(e: Event) {
+    seeking = true
+    current = Number((e.target as HTMLInputElement).value)
+  }
+
+  function onSeekCommit(e: Event) {
     audio.currentTime = Number((e.target as HTMLInputElement).value)
+    seeking = false
   }
 
   function onVolume(e: Event) {
@@ -122,7 +132,7 @@
 
 <audio
   bind:this={audio}
-  ontimeupdate={() => { current = audio.currentTime; if (isFinite(audio.duration)) duration = audio.duration }}
+  ontimeupdate={() => { if (!seeking) current = audio.currentTime; if (isFinite(audio.duration)) duration = audio.duration }}
   onplay={() => (paused = false)}
   onpause={() => (paused = true)}
   onended={onEnded}
@@ -155,7 +165,7 @@
 
     <div class="seekarea">
       <span class="time">{fmt(current)}</span>
-      <input type="range" class="seek" min="0" max={duration || 0} step="0.5" value={current} oninput={onSeek} aria-label="Seek" />
+      <input type="range" class="seek" min="0" max={duration || 0} step="0.5" value={current} oninput={onSeekPreview} onchange={onSeekCommit} aria-label="Seek" />
       <span class="time">{fmt(duration)}</span>
     </div>
 

@@ -45,6 +45,7 @@
   let muted = $state(false)
   let volume = $state(readVolume())
   let idle = $state(false)
+  let seeking = $state(false) // true while the seek thumb is being dragged
 
   let dismissed = false
   let lastPosted = -100
@@ -108,7 +109,7 @@
   }
 
   function onTimeUpdate() {
-    current = video.currentTime
+    if (!seeking) current = video.currentTime
     if (video.duration && isFinite(video.duration)) duration = video.duration
     if (video.buffered.length > 0) bufferedEnd = video.buffered.end(video.buffered.length - 1)
     reportProgress()
@@ -140,10 +141,19 @@
     video.currentTime = Math.max(0, Math.min(duration || Infinity, video.currentTime + secs))
   }
 
-  function onSeekInput(e: Event) {
+  // Preview while dragging; the real seek fires once on release. Per-tick
+  // seeks would thrash the decoder — and for HLS, every drag tick can mean
+  // a server-side transcoder restart.
+  function onSeekPreview(e: Event) {
+    seeking = true
+    current = Number((e.target as HTMLInputElement).value)
+  }
+
+  function onSeekCommit(e: Event) {
     const t = Number((e.target as HTMLInputElement).value)
     video.currentTime = t
     current = t
+    seeking = false
   }
 
   function onVolumeInput(e: Event) {
@@ -322,7 +332,8 @@
           max={duration || 0}
           step="0.5"
           value={current}
-          oninput={onSeekInput}
+          oninput={onSeekPreview}
+          onchange={onSeekCommit}
           aria-label="Seek"
         />
       </div>
