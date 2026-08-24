@@ -152,7 +152,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 			return len(files), created, err
 		}
 		// Tracks inherit their album's cover for player/list display.
-		if album, err := m.Store.Item(ctx, albumID); err == nil && album.Poster != "" && saved.Poster == "" {
+		if album, err := m.Store.Item(ctx, albumID); err == nil && album.Poster != "" && saved.Poster != album.Poster {
 			saved.Poster = album.Poster
 			if _, err := m.Store.UpsertItem(ctx, saved); err != nil {
 				log.Printf("track poster %s: %v", path, err)
@@ -169,7 +169,8 @@ func (m *Manager) albumArtwork(ctx context.Context, trackPath, albumDir string, 
 	if m.ArtworkDir == "" {
 		return ""
 	}
-	name := "album-" + hex.EncodeToString(sha1.New().Sum([]byte(albumDir)))[:16] + ".jpg"
+	sum := sha1.Sum([]byte(albumDir))
+	name := "album-" + hex.EncodeToString(sum[:8]) + ".jpg"
 	dest := filepath.Join(m.ArtworkDir, name)
 	if done[albumDir] {
 		return "/artwork/" + name

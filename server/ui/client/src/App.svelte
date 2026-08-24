@@ -126,7 +126,39 @@
   function selectArtist(id: string) {
     selArtist = id
     selAlbumId = null
+    musicFilter = ''
   }
+
+  // Filter within the current artist/album scope: albums by title or by
+  // containing a matching song; matching songs listed for direct play.
+  let musicFilter = $state('')
+  const filterQ = $derived(musicFilter.trim().toLowerCase())
+  const filteredShelfGroups = $derived.by(() => {
+    if (!filterQ) return shelfGroups
+    return shelfGroups
+      .map((g) => ({
+        ...g,
+        albums: g.albums.filter(
+          (a) =>
+            a.title.toLowerCase().includes(filterQ) ||
+            tracksOf(a.id).some((t) => t.title.toLowerCase().includes(filterQ)),
+        ),
+      }))
+      .filter((g) => g.albums.length > 0)
+  })
+  const matchedSongs = $derived.by(() => {
+    if (!filterQ) return []
+    const out: { t: Item; album: Item; idx: number; tracks: Item[] }[] = []
+    for (const g of shelfGroups) {
+      for (const a of g.albums) {
+        const ts = tracksOf(a.id)
+        ts.forEach((t, i) => {
+          if (t.title.toLowerCase().includes(filterQ)) out.push({ t, album: a, idx: i, tracks: ts })
+        })
+      }
+    }
+    return out.slice(0, 60)
+  })
 
   const trackTime = (secs?: number) =>
     secs ? `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}` : ''
@@ -578,12 +610,34 @@
                   <span class="muted">{shelfAlbumCount} albums</span>
                 </div>
                 <div class="mactions">
+                  <input
+                    class="mfilter"
+                    type="search"
+                    placeholder="Filter songs & albums…"
+                    bind:value={musicFilter}
+                    onkeydown={(e) => e.key === 'Escape' && (musicFilter = '')}
+                  />
                   <button class="play" onclick={() => startMusic(shelfQueue(), 0)}>▶ Play</button>
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}>🔀 Shuffle</button>
                 </div>
               </header>
 
-              {#each shelfGroups as group (group.id)}
+              {#if filterQ && matchedSongs.length > 0}
+                <div class="msongs">
+                  <div class="msongs-h">Songs</div>
+                  {#each matchedSongs as m (m.t.id)}
+                    <button class="msong" onclick={() => startMusic(m.tracks, m.idx)}>
+                      <span class="tname">{m.t.title}</span>
+                      <span class="muted">{m.album.artist} — {m.album.title}</span>
+                      <span class="muted ttm">{trackTime(m.t.runtimeSecs)}</span>
+                    </button>
+                  {/each}
+                </div>
+              {:else if filterQ && filteredShelfGroups.length === 0}
+                <div class="empty">No matches for “{musicFilter}”.</div>
+              {/if}
+
+              {#each filteredShelfGroups as group (group.id)}
                 {#if selArtist === 'ALL'}
                   <button class="shelf-h" onclick={() => selectArtist(group.id)}>{group.title} <span class="muted">· {group.albums.length} albums</span></button>
                 {/if}
@@ -865,11 +919,9 @@
 
   main {
     flex: 1;
-    padding: 1.25rem;
+    padding: 1.25rem 1.5rem;
     padding-bottom: 5rem;
-    max-width: 60rem;
     width: 100%;
-    margin: 0 auto;
   }
   h1 { font-size: 1.4rem; margin-bottom: 1rem; }
   h2 { font-size: 1rem; color: var(--muted); margin: 1.25rem 0 0.5rem; }
@@ -974,7 +1026,45 @@
     flex-wrap: wrap;
   }
   .mtitle { font-size: 1.6rem; margin: 0; }
-  .mactions { display: flex; gap: 0.5rem; align-items: center; }
+  .mactions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .mfilter {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.86rem;
+    padding: 0.4rem 0.9rem;
+    width: 15rem;
+  }
+  .mfilter:focus { outline: none; border-color: var(--accent); }
+
+  .msongs {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.5rem;
+    margin-bottom: 1rem;
+  }
+  .msongs-h {
+    color: var(--muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.3rem 0.6rem;
+  }
+  .msong {
+    display: flex;
+    align-items: baseline;
+    gap: 0.8rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.35rem 0.6rem;
+    border-radius: 8px;
+    font-size: 0.88rem;
+  }
+  .msong:hover { background: var(--bg); color: var(--accent-2); }
+  .msong .tname { flex: none; max-width: 40%; }
 
   .shelf-h {
     display: block;
