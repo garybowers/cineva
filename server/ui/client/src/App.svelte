@@ -25,7 +25,7 @@
   let currentLib: Library | null = $state(null)
   let gridItems: Item[] = $state([])
   let detail: ItemDetail | null = $state(null)
-  let stack: string[] = $state([]) // item-id trail for Back
+  let trail: Item[] = $state([]) // breadcrumb ancestors of the current detail
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
@@ -104,27 +104,36 @@
   async function openLibrary(lib: Library) {
     currentLib = lib
     detail = null
-    stack = []
+    trail = []
     const items = await libraryItems(lib.id)
     gridItems = items.filter((i) => i.kind === 'movie' || i.kind === 'series')
   }
 
-  async function openItem(id: string) {
-    if (detail) stack = [...stack, detail.item.id]
+  // fromChild: opened via the current detail's children list (drill-down);
+  // otherwise opened from the grid (fresh trail).
+  async function openItem(id: string, fromChild = false) {
+    const parent = fromChild && detail ? detail.item : null
     detail = await itemDetail(id)
+    trail = parent ? [...trail, parent] : []
   }
 
-  async function back() {
-    if (stack.length > 0) {
-      const prev = stack[stack.length - 1]
-      stack = stack.slice(0, -1)
-      detail = await itemDetail(prev)
-    } else if (detail) {
-      detail = null
-    } else {
-      currentLib = null
-      gridItems = []
-    }
+  function toLibraries() {
+    currentLib = null
+    detail = null
+    trail = []
+    gridItems = []
+    tab = 'libraries'
+  }
+
+  function toGrid() {
+    detail = null
+    trail = []
+  }
+
+  async function toCrumb(index: number) {
+    const target = trail[index]
+    detail = await itemDetail(target.id)
+    trail = trail.slice(0, index)
   }
 
   function runtime(secs?: number): string {
@@ -203,8 +212,24 @@
         {/if}
       </section>
     {:else if tab === 'libraries'}
+      {#if currentLib}
+        <nav class="crumbs" aria-label="Breadcrumb">
+          <button class="crumb" onclick={toLibraries}>Libraries</button>
+          <span class="sep">›</span>
+          {#if detail}
+            <button class="crumb" onclick={toGrid}>{currentLib.name}</button>
+            {#each trail as ancestor, i (ancestor.id)}
+              <span class="sep">›</span>
+              <button class="crumb" onclick={() => toCrumb(i)}>{ancestor.title}</button>
+            {/each}
+            <span class="sep">›</span>
+            <span class="crumb-current">{detail.item.title}</span>
+          {:else}
+            <span class="crumb-current">{currentLib.name}</span>
+          {/if}
+        </nav>
+      {/if}
       {#if detail}
-        <button class="backbtn" onclick={back}>← Back</button>
         <div class="detail">
           {@render poster(detail.item)}
           <div class="detail-body">
@@ -230,7 +255,7 @@
           <ul class="children">
             {#each detail.children as child (child.id)}
               <li>
-                <button onclick={() => openItem(child.id)}>
+                <button onclick={() => openItem(child.id, true)}>
                   <span>
                     {#if child.kind === 'episode'}<span class="epnum">{child.episodeNum}.</span> {/if}
                     {child.title}
@@ -242,7 +267,6 @@
           </ul>
         {/if}
       {:else if currentLib}
-        <button class="backbtn" onclick={back}>← Libraries</button>
         <h1>{currentLib.name}</h1>
         {#if gridItems.length === 0}
           <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
@@ -375,7 +399,18 @@
   .libcard span { color: var(--muted); font-size: 0.82rem; }
   .libcard:hover { border-color: var(--accent); }
 
-  .backbtn { color: var(--accent-2); margin-bottom: 0.75rem; padding: 0.25rem 0; }
+  .crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    margin-bottom: 0.9rem;
+    font-size: 0.88rem;
+  }
+  .crumb { color: var(--accent-2); padding: 0.15rem 0.1rem; }
+  .crumb:hover { text-decoration: underline; }
+  .crumb-current { color: var(--muted); padding: 0.15rem 0.1rem; }
+  .sep { color: var(--muted); user-select: none; }
 
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr)); gap: 0.9rem; }
   .cell { display: flex; flex-direction: column; gap: 0.35rem; text-align: left; }
