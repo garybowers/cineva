@@ -31,10 +31,12 @@ var serveCmd = &cobra.Command{
 		}
 		fmt.Printf("server identity: %x…\n", identity.PublicKey[:8])
 
+		artworkDir := viper.GetString("libraries.artwork_dir")
 		return api.Serve(api.Config{
-			Host: viper.GetString("server.host"),
-			Port: viper.GetInt("server.port"),
-		}, st)
+			Host:       viper.GetString("server.host"),
+			Port:       viper.GetInt("server.port"),
+			ArtworkDir: artworkDir,
+		}, st, newManager(st, artworkDir))
 	},
 }
 

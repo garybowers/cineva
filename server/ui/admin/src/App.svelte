@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { getHealth, type Health } from './lib/api'
+  import {
+    getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
+    type Health, type Library, type Scan,
+  } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
   type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'settings'
@@ -11,32 +14,84 @@
     { id: 'activity', label: 'Activity' },
     { id: 'settings', label: 'Settings' },
   ]
+  const mediaTypes = ['movies', 'tv', 'music', 'audiobooks', 'podcasts', 'books']
 
   let page: Page = $state('dashboard')
   let health: Health | null = $state(null)
   let offline = $state(false)
   let themes: ThemeInfo[] = $state([])
   let theme = $state(currentTheme())
+  let libraries: Library[] = $state([])
+  let scans: Scan[] = $state([])
+  let error = $state('')
+
+  // Add-library form
+  let showAdd = $state(false)
+  let newName = $state('')
+  let newType = $state('movies')
+  let newPath = $state('')
+  let saving = $state(false)
 
   function setTheme(id: string) {
     theme = id
     applyTheme(id)
   }
 
-  async function poll() {
+  async function refresh() {
     try {
       health = await getHealth()
       offline = false
+      libraries = await listLibraries()
+      scans = await listScans()
     } catch {
-      health = null
       offline = true
     }
   }
 
+  async function submitLibrary() {
+    saving = true
+    error = ''
+    try {
+      await createLibrary(newName, newType, [newPath])
+      showAdd = false
+      newName = newPath = ''
+      await refresh()
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    } finally {
+      saving = false
+    }
+  }
+
+  async function removeLibrary(lib: Library) {
+    if (!confirm(`Delete library "${lib.name}"? Scanned items are removed; media files on disk are untouched.`)) return
+    try {
+      await deleteLibrary(lib.id)
+      await refresh()
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  async function startScan(lib: Library) {
+    error = ''
+    try {
+      await scanLibrary(lib.id)
+      page = 'activity'
+      await refresh()
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  function libName(id: string): string {
+    return libraries.find((l) => l.id === id)?.name ?? id.slice(0, 8)
+  }
+
   onMount(() => {
-    poll()
+    refresh()
     listThemes().then((t) => (themes = t)).catch(() => {})
-    const id = setInterval(poll, 5000)
+    const id = setInterval(refresh, 5000)
     return () => clearInterval(id)
   })
 </script>
@@ -53,6 +108,10 @@
   </aside>
 
   <main>
+    {#if error}
+      <div class="error">{error} <button onclick={() => (error = '')}>✕</button></div>
+    {/if}
+
     {#if page === 'dashboard'}
       <h1>Dashboard</h1>
       <div class="cards">
@@ -62,31 +121,85 @@
           <div class="sub">{health ? `${health.service} ${health.version}` : 'no response from /api/v1/health'}</div>
         </div>
         <div class="card">
-          <div class="k">Active streams</div>
-          <div class="v">0</div>
-          <div class="sub">playback arrives in milestone 3</div>
+          <div class="k">Libraries</div>
+          <div class="v">{libraries.length}</div>
+          <div class="sub">{libraries.reduce((n, l) => n + l.itemCount, 0)} playable items</div>
         </div>
         <div class="card">
-          <div class="k">Libraries</div>
-          <div class="v">0</div>
-          <div class="sub">library management arrives in milestone 2</div>
+          <div class="k">Active scans</div>
+          <div class="v">{scans.filter((s) => s.status === 'running').length}</div>
+          <div class="sub">streams arrive in milestone 3</div>
         </div>
       </div>
     {:else if page === 'libraries'}
       <h1>Libraries</h1>
       <div class="bar">
-        <button class="primary" disabled title="Arrives with milestone 2">+ Add library</button>
+        <button class="primary" onclick={() => (showAdd = !showAdd)}>{showAdd ? 'Cancel' : '+ Add library'}</button>
       </div>
-      <div class="empty">
-        No libraries configured. Each library has exactly one media type — Movies, TV, Music,
-        Audiobooks, Podcasts, or Books — chosen at creation.
-      </div>
+      {#if showAdd}
+        <form class="panel form" onsubmit={(e) => { e.preventDefault(); submitLibrary() }}>
+          <label>Name <input bind:value={newName} placeholder="Movies" required /></label>
+          <label>Media type
+            <select bind:value={newType}>
+              {#each mediaTypes as t (t)}<option value={t}>{t}</option>{/each}
+            </select>
+          </label>
+          <label>Path <input bind:value={newPath} placeholder="/media/movies" required /></label>
+          <button class="primary" disabled={saving} type="submit">{saving ? 'Creating…' : 'Create'}</button>
+          <p class="hint">One media type per library, chosen now and immutable. Add more paths later.</p>
+        </form>
+      {/if}
+      {#if libraries.length === 0}
+        <div class="empty">No libraries yet.</div>
+      {:else}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Paths</th><th>Items</th><th></th></tr></thead>
+            <tbody>
+              {#each libraries as lib (lib.id)}
+                <tr>
+                  <td>{lib.name}</td>
+                  <td><span class="tag">{lib.mediaType}</span></td>
+                  <td class="muted">{lib.paths.join(', ')}</td>
+                  <td>{lib.itemCount}</td>
+                  <td class="actions">
+                    <button onclick={() => startScan(lib)}>Scan</button>
+                    <button class="danger" onclick={() => removeLibrary(lib)}>Delete</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     {:else if page === 'users'}
       <h1>Users</h1>
       <div class="empty">User management arrives in milestone 4. Until then, use the <code>cineva user add</code> CLI.</div>
     {:else if page === 'activity'}
       <h1>Activity</h1>
-      <div class="empty">Scan progress and active transcode sessions will appear here.</div>
+      {#if scans.length === 0}
+        <div class="empty">No scans yet — trigger one from the Libraries page.</div>
+      {:else}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Library</th><th>Status</th><th>Files</th><th>Items</th><th>Started</th></tr></thead>
+            <tbody>
+              {#each scans as s (s.id)}
+                <tr>
+                  <td>{libName(s.libraryId)}</td>
+                  <td>
+                    <span class="tag" class:ok={s.status === 'completed'} class:bad={s.status === 'failed'}>{s.status}</span>
+                    {#if s.error}<div class="muted small">{s.error}</div>{/if}
+                  </td>
+                  <td>{s.filesSeen}</td>
+                  <td>{s.itemsCreated}</td>
+                  <td class="muted">{s.startedAt}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     {:else}
       <h1>Settings</h1>
       <div class="panel">
@@ -143,6 +256,17 @@
   main { flex: 1; padding: 1.25rem; max-width: 70rem; width: 100%; margin: 0 auto; }
   h1 { font-size: 1.35rem; margin-bottom: 1rem; }
 
+  .error {
+    background: color-mix(in srgb, var(--err) 15%, transparent);
+    border: 1px solid var(--err);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    margin-bottom: 1rem;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
   .card {
     background: var(--panel);
@@ -169,15 +293,45 @@
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 0.25rem 1.25rem;
+    padding: 1rem 1.25rem;
     margin-bottom: 1rem;
   }
+  .form { display: flex; flex-direction: column; gap: 0.75rem; max-width: 28rem; }
+  .form label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.9rem; color: var(--muted); }
+  .form input, .form select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 0.5rem 0.7rem;
+    font: inherit;
+  }
+  .hint { color: var(--muted); font-size: 0.8rem; }
+
+  .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
+  tr:last-child td { border-bottom: none; }
+  .actions { display: flex; gap: 0.5rem; }
+  .actions button { color: var(--accent-2); }
+  .actions .danger { color: var(--err); }
+  .tag {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.78rem;
+  }
+  .tag.ok { color: var(--ok); border-color: var(--ok); }
+  .tag.bad { color: var(--err); border-color: var(--err); }
+  .small { font-size: 0.78rem; }
+
   .setting {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 1rem;
-    padding: 0.9rem 0;
   }
   .theme-picker { display: flex; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
   .chip {
@@ -201,8 +355,8 @@
     color: var(--muted);
   }
   code { color: var(--accent-2); }
+  .muted { color: var(--muted); }
 
-  /* Desktop: sidebar layout */
   @media (min-width: 900px) {
     .shell { flex-direction: row; }
     aside {

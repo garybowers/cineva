@@ -20,10 +20,21 @@ database:
   # startup. (CINEVA_DATABASE_PATH)
   path: cineva.db
 
+libraries:
+  # Where downloaded poster/artwork files are cached, served at /artwork.
+  # (CINEVA_LIBRARIES_ARTWORK_DIR)
+  artwork_dir: artwork
+
+metadata:
+  tmdb:
+    # TMDB API key for movie/TV metadata + posters. Free at
+    # https://www.themoviedb.org/settings/api — leave empty to scan without
+    # metadata enrichment. (CINEVA_METADATA_TMDB_API_KEY)
+    api_key: ""
+
 # --- Sections arriving with later milestones (do not uncomment until the
 # --- feature exists; config validate will show them once real):
 #
-# libraries:       milestone 2   — scan intervals, artwork cache location
 # transcode:       milestone 3   — temp/cache directory, session limits
 # auth:            milestone 4   — session lifetime
 # federation:      milestone 10  — federation port, identity key location

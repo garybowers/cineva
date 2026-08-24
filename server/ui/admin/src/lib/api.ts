@@ -6,10 +6,50 @@ export interface Health {
   version: string
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`/api/v1${path}`)
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
-  return res.json() as Promise<T>
+export interface Library {
+  id: string
+  name: string
+  mediaType: string
+  source: string
+  paths: string[]
+  itemCount: number
+  createdAt: string
 }
 
-export const getHealth = () => get<Health>('/health')
+export interface Scan {
+  id: string
+  libraryId: string
+  status: 'running' | 'completed' | 'failed'
+  filesSeen: number
+  itemsCreated: number
+  error?: string
+  startedAt: string
+  finishedAt?: string
+}
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`/api/v1${path}`, init)
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`
+    try {
+      const body = await res.json()
+      if (body.message) msg = body.message
+    } catch {
+      /* not json */
+    }
+    throw new Error(msg)
+  }
+  return res.status === 204 ? (undefined as T) : (res.json() as Promise<T>)
+}
+
+export const getHealth = () => req<Health>('/health')
+export const listLibraries = () => req<Library[]>('/libraries')
+export const createLibrary = (name: string, mediaType: string, paths: string[]) =>
+  req<Library>('/libraries', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, mediaType, paths }),
+  })
+export const deleteLibrary = (id: string) => req<void>(`/libraries/${id}`, { method: 'DELETE' })
+export const scanLibrary = (id: string) => req<Scan>(`/libraries/${id}/scan`, { method: 'POST' })
+export const listScans = () => req<Scan[]>('/scans')

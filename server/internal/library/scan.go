@@ -1,0 +1,264 @@
+package library
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+
+	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/metadata"
+	"github.com/garybowers/cineva/server/internal/store"
+)
+
+// Manager orchestrates library scans. Scans run in managed goroutines; the
+// scans table carries progress so any client can observe it.
+type Manager struct {
+	Store      *store.Store
+	Video      metadata.VideoProvider // nil when no TMDB key is configured
+	ArtworkDir string
+	Probe      func(path string) (media.Info, error)
+
+	mu      sync.Mutex
+	running map[string]bool // libraryID -> scan in progress
+}
+
+func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string) *Manager {
+	return &Manager{
+		Store:      st,
+		Video:      video,
+		ArtworkDir: artworkDir,
+		Probe:      media.Probe,
+		running:    map[string]bool{},
+	}
+}
+
+// StartScan launches a scan in the background and returns its record.
+func (m *Manager) StartScan(ctx context.Context, lib store.Library) (store.Scan, error) {
+	m.mu.Lock()
+	if m.running[lib.ID] {
+		m.mu.Unlock()
+		return store.Scan{}, fmt.Errorf("library %q is already being scanned", lib.Name)
+	}
+	m.running[lib.ID] = true
+	m.mu.Unlock()
+
+	scan, err := m.Store.CreateScan(ctx, lib.ID)
+	if err != nil {
+		m.clearRunning(lib.ID)
+		return store.Scan{}, err
+	}
+	go func() {
+		defer m.clearRunning(lib.ID)
+		// Detached from the request context: a scan outlives its HTTP request.
+		m.runScan(context.Background(), scan, lib)
+	}()
+	return scan, nil
+}
+
+// RunScanSync runs a scan in the foreground (used by the `cineva scan` CLI).
+func (m *Manager) RunScanSync(ctx context.Context, lib store.Library) (store.Scan, error) {
+	m.mu.Lock()
+	if m.running[lib.ID] {
+		m.mu.Unlock()
+		return store.Scan{}, fmt.Errorf("library %q is already being scanned", lib.Name)
+	}
+	m.running[lib.ID] = true
+	m.mu.Unlock()
+	defer m.clearRunning(lib.ID)
+
+	scan, err := m.Store.CreateScan(ctx, lib.ID)
+	if err != nil {
+		return store.Scan{}, err
+	}
+	m.runScan(ctx, scan, lib)
+	scans, err := m.Store.Scans(ctx, 50)
+	if err != nil {
+		return store.Scan{}, err
+	}
+	for _, s := range scans {
+		if s.ID == scan.ID {
+			return s, nil
+		}
+	}
+	return scan, nil
+}
+
+func (m *Manager) clearRunning(libID string) {
+	m.mu.Lock()
+	delete(m.running, libID)
+	m.mu.Unlock()
+}
+
+func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library) {
+	var filesSeen, itemsCreated int
+	var scanErr error
+
+	switch lib.MediaType {
+	case store.MediaMovies:
+		filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib)
+	case store.MediaTV:
+		filesSeen, itemsCreated, scanErr = m.scanTV(ctx, lib)
+	default:
+		scanErr = fmt.Errorf("scanner for %s libraries arrives in a later milestone", lib.MediaType)
+	}
+
+	status, errMsg := "completed", ""
+	if scanErr != nil {
+		status, errMsg = "failed", scanErr.Error()
+		log.Printf("scan %s (%s): %v", lib.Name, scan.ID, scanErr)
+	}
+	if err := m.Store.FinishScan(ctx, scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
+		log.Printf("finish scan %s: %v", scan.ID, err)
+	}
+}
+
+func (m *Manager) videoFiles(lib store.Library) ([]string, error) {
+	var files []string
+	for _, root := range lib.Paths {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && IsVideoFile(path) {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("walk %s: %w", root, err)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, error) {
+	files, err := m.videoFiles(lib)
+	if err != nil {
+		return 0, 0, err
+	}
+	created := 0
+	for _, path := range files {
+		info := ParseMovie(path)
+		item := store.Item{
+			LibraryID: lib.ID, Kind: store.KindMovie,
+			Title: info.Title, Year: info.Year, Path: path,
+		}
+		m.fillFileInfo(&item, path)
+		if m.Video != nil {
+			if r, err := m.Video.SearchMovie(ctx, info.Title, info.Year); err == nil {
+				m.applyVideoResult(ctx, &item, r)
+			}
+		}
+		if _, err := m.Store.UpsertItem(ctx, item); err != nil {
+			return len(files), created, err
+		}
+		created++
+	}
+	return len(files), created, nil
+}
+
+func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, error) {
+	files, err := m.videoFiles(lib)
+	if err != nil {
+		return 0, 0, err
+	}
+	created := 0
+	seriesIDs := map[string]string{} // show dir -> item id
+	seasonIDs := map[string]string{} // season dir -> item id
+
+	for _, path := range files {
+		ep, ok := ParseEpisode(path)
+		if !ok {
+			log.Printf("scan: no SxxEyy marker, skipping %s", path)
+			continue
+		}
+		seasonDir := filepath.Dir(path)
+		showDir := filepath.Dir(seasonDir)
+
+		seriesID, ok := seriesIDs[showDir]
+		if !ok {
+			series := store.Item{
+				LibraryID: lib.ID, Kind: store.KindSeries, Title: ep.Show, Path: showDir,
+			}
+			if m.Video != nil {
+				if r, err := m.Video.SearchTV(ctx, ep.Show); err == nil {
+					m.applyVideoResult(ctx, &series, r)
+				}
+			}
+			saved, err := m.Store.UpsertItem(ctx, series)
+			if err != nil {
+				return len(files), created, err
+			}
+			seriesID, seriesIDs[showDir] = saved.ID, saved.ID
+			created++
+		}
+
+		seasonID, ok := seasonIDs[seasonDir]
+		if !ok {
+			saved, err := m.Store.UpsertItem(ctx, store.Item{
+				LibraryID: lib.ID, Kind: store.KindSeason, ParentID: seriesID,
+				Title: "Season " + strconv.Itoa(ep.Season), SeasonNum: ep.Season, Path: seasonDir,
+			})
+			if err != nil {
+				return len(files), created, err
+			}
+			seasonID, seasonIDs[seasonDir] = saved.ID, saved.ID
+			created++
+		}
+
+		item := store.Item{
+			LibraryID: lib.ID, Kind: store.KindEpisode, ParentID: seasonID,
+			Title: ep.Title, SeasonNum: ep.Season, EpisodeNum: ep.Episode, Path: path,
+		}
+		if item.Title == "" {
+			item.Title = fmt.Sprintf("Episode %d", ep.Episode)
+		}
+		m.fillFileInfo(&item, path)
+		if _, err := m.Store.UpsertItem(ctx, item); err != nil {
+			return len(files), created, err
+		}
+		created++
+	}
+	return len(files), created, nil
+}
+
+func (m *Manager) fillFileInfo(item *store.Item, path string) {
+	if st, err := os.Stat(path); err == nil {
+		item.SizeBytes = st.Size()
+	}
+	info, err := m.Probe(path)
+	if err != nil {
+		log.Printf("probe %s: %v", path, err)
+		return
+	}
+	item.RuntimeSecs = info.RuntimeSecs
+	item.Container = info.Container
+	item.VideoCodec = info.VideoCodec
+	item.AudioCodec = info.AudioCodec
+	item.Width = info.Width
+	item.Height = info.Height
+}
+
+func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r metadata.VideoResult) {
+	item.TmdbID = r.TmdbID
+	item.Overview = r.Overview
+	if r.Year > 0 && item.Year == 0 {
+		item.Year = r.Year
+	}
+	if r.PosterURL != "" && m.ArtworkDir != "" {
+		name := "tmdb-" + strconv.Itoa(r.TmdbID)
+		if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, r.PosterURL, m.ArtworkDir, name); err == nil {
+			item.Poster = "/artwork/" + file
+		} else {
+			log.Printf("artwork for %s: %v", item.Title, err)
+		}
+	}
+}

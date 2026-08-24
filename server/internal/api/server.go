@@ -7,20 +7,26 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/store"
 	"github.com/garybowers/cineva/server/internal/version"
 	"github.com/garybowers/cineva/server/ui"
 )
 
 type Config struct {
-	Host string
-	Port int
+	Host       string
+	Port       int
+	ArtworkDir string
 }
 
-// Serve starts the HTTP server. st is kept on the server for the handlers
-// that arrive with milestone 2 (library CRUD).
-func Serve(cfg Config, st *store.Store) error {
-	_ = st
+type server struct {
+	store   *store.Store
+	manager *library.Manager
+}
+
+func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
+	s := &server{store: st, manager: manager}
+
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover(), middleware.Logger())
@@ -28,8 +34,19 @@ func Serve(cfg Config, st *store.Store) error {
 	v1 := e.Group("/api/v1")
 	v1.GET("/health", health)
 	v1.GET("/themes", listThemes)
+	v1.GET("/libraries", s.listLibraries)
+	v1.POST("/libraries", s.createLibrary)
+	v1.GET("/libraries/:id", s.getLibrary)
+	v1.DELETE("/libraries/:id", s.deleteLibrary)
+	v1.POST("/libraries/:id/scan", s.scanLibrary)
+	v1.GET("/libraries/:id/items", s.libraryItems)
+	v1.GET("/items/:id", s.getItem)
+	v1.GET("/scans", s.listScans)
 
 	e.StaticFS("/themes", ui.Themes())
+	if cfg.ArtworkDir != "" {
+		e.Static("/artwork", cfg.ArtworkDir)
+	}
 
 	// Admin UI shares the main port at /admin. Do not alias /settings here —
 	// that path belongs to the client app's own settings page.

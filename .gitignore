@@ -9,5 +9,8 @@ cineva.db-*
 /server/cineva
 *.log
 
+# Downloaded artwork cache
+artwork/
+
 # Note: server/ui/*/dist IS committed for now so a fresh clone can
 # `go build` (go:embed needs the built assets). Revisit once CI builds them.

@@ -34,6 +34,8 @@ func initConfig() {
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.port", 4747)
 	viper.SetDefault("database.path", "cineva.db")
+	viper.SetDefault("libraries.artwork_dir", "artwork")
+	viper.SetDefault("metadata.tmdb.api_key", "")
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/google/uuid v1.6.0
 	github.com/labstack/echo/v4 v4.15.4
+	github.com/linuxmatters/ffmpeg-statigo v0.0.0-20260801211208-acdb390153f6
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	modernc.org/sqlite v1.57.0
@@ -39,3 +40,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/linuxmatters/ffmpeg-statigo => ../third_party/ffmpeg-statigo
