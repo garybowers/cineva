@@ -165,6 +165,7 @@ func (s *server) hlsPlaylist(c echo.Context) error {
 	if !ok {
 		return echo.NewHTTPError(http.StatusNotFound, "session not found")
 	}
+	c.Response().Header().Set("Cache-Control", "no-store")
 	return c.Blob(http.StatusOK, "application/vnd.apple.mpegurl", []byte(session.Playlist()))
 }
 
@@ -172,6 +173,15 @@ func (s *server) hlsFile(c echo.Context) error {
 	session, ok := s.sessions.Get(c.Param("sid"))
 	if !ok {
 		return echo.NewHTTPError(http.StatusNotFound, "session not found")
+	}
+	// Session files are transient; a cached partial file poisons the player.
+	c.Response().Header().Set("Cache-Control", "no-store")
+	if c.Param("file") == "init.mp4" {
+		data, err := session.Init(c.Request().Context())
+		if err != nil {
+			return echo.NewHTTPError(http.StatusGatewayTimeout, err.Error())
+		}
+		return c.Blob(http.StatusOK, "video/mp4", data)
 	}
 	path, err := session.EnsureFile(c.Request().Context(), c.Param("file"))
 	if err != nil {

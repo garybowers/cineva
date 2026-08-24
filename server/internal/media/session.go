@@ -39,6 +39,7 @@ type Session struct {
 	startSegment int
 	lastReq      int // highest segment index a client asked for
 	lastAccess   time.Time
+	initBytes    []byte // cached init.mp4; restarts rewrite the file mid-flight
 }
 
 type SessionManager struct {
@@ -249,6 +250,58 @@ func (s *Session) Playlist() string {
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return b.String()
+}
+
+// Init returns the session's init segment. The muxer rewrites init.mp4 on
+// every seek-restart, so serving the file directly races a restart and can
+// hand the player a truncated init (which it then caches — the
+// "failed to generate initSegment" bug). Instead the first complete init is
+// cached in memory: init content depends only on stream parameters, so it is
+// identical across restarts.
+func (s *Session) Init(ctx context.Context) ([]byte, error) {
+	s.touch()
+	s.mu.Lock()
+	cached := s.initBytes
+	s.mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	// The init is guaranteed complete once the first segment of the current
+	// run exists (the muxer writes init fully before any segment completes).
+	deadline := time.Now().Add(30 * time.Second)
+	initPath := filepath.Join(s.Dir, "init.mp4")
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		first := s.segmentFile(s.startSegment)
+		s.mu.Unlock()
+		if _, err := os.Stat(first); err == nil {
+			data, err := os.ReadFile(initPath)
+			if err != nil {
+				return nil, fmt.Errorf("read init: %w", err)
+			}
+			// Sessions preserve source timestamps (segment N carries pts
+			// ~N*segmentSecs, matching the playlist), so the muxer's edit
+			// list — an "empty edit" spanning the whole start offset — is
+			// wrong for us. Firefox honors edit lists in MSE and shifts the
+			// buffered range far past the playhead (silent stall); Chrome
+			// ignores them. Strip edts so both agree with the playlist.
+			data = stripEdts(data)
+			s.mu.Lock()
+			if s.initBytes == nil {
+				s.initBytes = data
+			}
+			data = s.initBytes
+			s.mu.Unlock()
+			return data, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	return nil, fmt.Errorf("init segment not produced in time")
 }
 
 // EnsureFile blocks until the requested playlist file exists, restarting the

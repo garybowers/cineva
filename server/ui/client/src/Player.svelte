@@ -44,13 +44,16 @@
 
   onMount(() => {
     if (info.mode === 'hls' && Hls.isSupported()) {
-      hls = new Hls()
+      // startPosition (not a pre-metadata currentTime seek): a currentTime
+      // seek before the manifest loads makes hls.js first fetch segment 0,
+      // thrashing the server-side transcoder with a restart-to-zero.
+      hls = new Hls({ startPosition: info.positionSecs > 0 ? info.positionSecs : -1 })
       hls.loadSource(info.url)
       hls.attachMedia(video)
     } else {
       video.src = info.url // direct play, or Safari's native HLS
+      if (info.positionSecs > 0) video.currentTime = info.positionSecs
     }
-    if (info.positionSecs > 0) video.currentTime = info.positionSecs
     video.play().catch(() => {})
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     if (item.kind === 'episode') {
