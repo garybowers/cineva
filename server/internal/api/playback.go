@@ -1,8 +1,14 @@
 package api
 
 import (
+	"archive/zip"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 
@@ -170,13 +176,86 @@ func (s *server) streamItem(c echo.Context) error {
 	return c.File(item.Path)
 }
 
-// GET /items/:id/download — original file as attachment.
+// GET /items/:id/download — a playable item's original file as an
+// attachment; container kinds (season, series, album, artist) stream a
+// stored ZIP of every descendant file.
 func (s *server) downloadItem(c echo.Context) error {
-	item, err := s.playableItem(c)
+	ctx := c.Request().Context()
+	item, err := s.store.Item(ctx, c.Param("id"))
 	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "item not found")
+	}
+	switch item.Kind {
+	case store.KindMovie, store.KindEpisode, store.KindTrack:
+		return c.Attachment(item.Path, filepath.Base(item.Path))
+	case store.KindSeason, store.KindSeries, store.KindAlbum, store.KindArtist:
+		return s.downloadArchive(c, item)
+	}
+	return echo.NewHTTPError(http.StatusBadRequest, "item is not downloadable")
+}
+
+var zipNameSanitiser = strings.NewReplacer("/", "-", "\\", "-", "\x00", "")
+
+// downloadArchive streams a ZIP (stored, uncompressed — media is already
+// compressed) of all files beneath a container item, preserving one level
+// of folder structure per container ("Season 02/…", "Album/…").
+func (s *server) downloadArchive(c echo.Context, root store.Item) error {
+	ctx := c.Request().Context()
+	type entry struct {
+		path string
+		name string
+	}
+	var files []entry
+	var walk func(id, prefix string) error
+	walk = func(id, prefix string) error {
+		children, err := s.store.ItemsByParent(ctx, id)
+		if err != nil {
+			return err
+		}
+		for _, ch := range children {
+			switch ch.Kind {
+			case store.KindMovie, store.KindEpisode, store.KindTrack:
+				files = append(files, entry{path: ch.Path, name: prefix + filepath.Base(ch.Path)})
+			default:
+				if err := walk(ch.ID, prefix+zipNameSanitiser.Replace(ch.Title)+"/"); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(root.ID, ""); err != nil {
 		return err
 	}
-	return c.Attachment(item.Path, filepath.Base(item.Path))
+	if len(files) == 0 {
+		return echo.NewHTTPError(http.StatusNotFound, "nothing to download")
+	}
+
+	res := c.Response()
+	res.Header().Set(echo.HeaderContentType, "application/zip")
+	res.Header().Set(echo.HeaderContentDisposition,
+		fmt.Sprintf(`attachment; filename=%q`, zipNameSanitiser.Replace(root.Title)+".zip"))
+	res.WriteHeader(http.StatusOK)
+
+	zw := zip.NewWriter(res.Writer)
+	defer zw.Close()
+	for _, f := range files {
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: f.name, Method: zip.Store})
+		if err != nil {
+			return nil // client went away mid-stream
+		}
+		src, err := os.Open(f.path)
+		if err != nil {
+			log.Printf("archive %s: %v", f.path, err)
+			continue
+		}
+		_, err = io.Copy(w, src)
+		src.Close()
+		if err != nil {
+			return nil // client went away mid-stream
+		}
+	}
+	return nil
 }
 
 // GET /play/:sid/index.m3u8 | /play/:sid/:file — HLS session assets.

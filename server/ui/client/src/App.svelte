@@ -668,6 +668,13 @@
               {detail.item.title}
               {#if detail.item.year}<span class="muted">({detail.item.year})</span>{/if}
             </h1>
+            {#if detail.item.kind === 'season' || detail.item.kind === 'series'}
+              <div class="actions">
+                <a class="dl" href={downloadURL(detail.item.id)} download>
+                  <Download size={14} /> Download {detail.item.kind === 'season' ? 'season' : 'show'}
+                </a>
+              </div>
+            {/if}
             {#if detail.item.kind === 'album'}
               <p class="meta">{detail.item.artist} · {detail.children.length} tracks</p>
               <div class="actions">

@@ -231,12 +231,17 @@ paths:
 
   /items/{id}/download:
     get:
-      summary: Download the original file as an attachment
+      summary: Download an item — original file, or a streamed ZIP for containers
+      description: >
+        Playable items (movie, episode, track) download their original file.
+        Container items (season, series, album, artist) stream a stored
+        (uncompressed) ZIP of every descendant file, one folder level per
+        container ("Season 02/...").
       operationId: downloadItem
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
-        "200": { description: The media file with Content-Disposition attachment }
+        "200": { description: The media file or ZIP archive, Content-Disposition attachment }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /items/{id}/progress:
