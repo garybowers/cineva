@@ -406,6 +406,7 @@
       {/if}
     </div>
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
+    <button class="topbtn" class:active={tab === 'settings'} onclick={() => (tab = 'settings')} title="Settings">⚙</button>
     <button class="avatar" title="Local user — accounts arrive with milestone 4">👤</button>
   </div>
 
@@ -427,8 +428,7 @@
         <div class="type-label">No libraries yet</div>
       {/if}
     </div>
-    <button class="side-item side-bottom" class:active={tab === 'settings'} onclick={() => (tab = 'settings')}>⚙ Settings</button>
-    <div class="side-status">
+    <div class="side-status side-bottom">
       <span class="status" class:offline></span>
       <span>{offline ? 'offline' : health?.version ?? ''}</span>
     </div>
@@ -840,7 +840,7 @@
   .sr-text { display: flex; flex-direction: column; min-width: 0; }
   .sr-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sr-sub { font-size: 0.76rem; color: var(--muted); }
-  .avatar {
+  .avatar, .topbtn {
     width: 2.1rem;
     height: 2.1rem;
     border-radius: 50%;
@@ -850,8 +850,10 @@
     place-items: center;
     font-size: 1rem;
     flex: none;
+    color: var(--muted);
   }
-  .avatar:hover { border-color: var(--accent); }
+  .avatar:hover, .topbtn:hover { border-color: var(--accent); color: var(--text); }
+  .topbtn.active { border-color: var(--accent); color: var(--accent-2); }
 
   /* ---- Sidebar: desktop only; mobile keeps the bottom tab bar ---- */
   .side { display: none; }
