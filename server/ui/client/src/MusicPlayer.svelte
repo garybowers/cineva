@@ -1,6 +1,10 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
   import { postProgress, type Item } from './lib/api'
+  import {
+    Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
+    Volume2, VolumeX, X, Music as MusicIcon,
+  } from '@lucide/svelte'
 
   let {
     queue,
@@ -145,7 +149,7 @@
     {#if track.poster}
       <img class="cover" src={track.poster} alt="" />
     {:else}
-      <span class="cover ph">♪</span>
+      <span class="cover ph"><MusicIcon size={22} /></span>
     {/if}
 
     <div class="info">
@@ -154,12 +158,12 @@
     </div>
 
     <div class="transport">
-      <button class="ctl" class:on={shuffle} onclick={() => (shuffle = !shuffle)} title="Shuffle">🔀</button>
-      <button class="ctl" onclick={prev} title="Previous">⏮</button>
-      <button class="ctl big" onclick={togglePlay}>{paused ? '▶' : '⏸'}</button>
-      <button class="ctl" onclick={next} title="Next">⏭</button>
+      <button class="ctl" class:on={shuffle} onclick={() => (shuffle = !shuffle)} title="Shuffle"><Shuffle size={16} /></button>
+      <button class="ctl" onclick={prev} title="Previous"><SkipBack size={17} /></button>
+      <button class="ctl big" onclick={togglePlay}>{#if paused}<Play size={22} />{:else}<Pause size={22} />{/if}</button>
+      <button class="ctl" onclick={next} title="Next"><SkipForward size={17} /></button>
       <button class="ctl" class:on={repeat !== 'off'} onclick={cycleRepeat} title="Repeat: {repeat}">
-        {repeat === 'one' ? '🔂' : '🔁'}
+        {#if repeat === 'one'}<Repeat1 size={16} />{:else}<Repeat size={16} />{/if}
       </button>
     </div>
 
@@ -171,7 +175,7 @@
 
     <span class="qpos">{index + 1}/{queue.length}</span>
     <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolume} aria-label="Volume" />
-    <button class="ctl" onclick={onclose} title="Stop">✕</button>
+    <button class="ctl" onclick={onclose} title="Stop"><X size={17} /></button>
   </div>
 {/if}
 

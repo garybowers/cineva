@@ -5,6 +5,10 @@
     nextUp, postProgress, stopSession, QUALITIES,
     type Item, type PlayInfo, type PlayQuality,
   } from './lib/api'
+  import {
+    Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize,
+    Maximize2,
+  } from '@lucide/svelte'
 
   let {
     item,
@@ -263,7 +267,7 @@
           <option value={q.id}>{q.label}</option>
         {/each}
       </select>
-      <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
+      <button class="ctl" onclick={onclose} title="Stop playback"><X size={17} /></button>
     </div>
   {/if}
 
@@ -285,7 +289,7 @@
     </video>
 
     {#if paused && !compact}
-      <button class="bigplay" onclick={togglePlay} aria-label="Play">▶</button>
+      <button class="bigplay" onclick={togglePlay} aria-label="Play"><Play size={30} /></button>
     {/if}
 
     {#if showNext && next && !compact}
@@ -312,13 +316,13 @@
       <span class="time">{fmt(current)} / {fmt(duration)}</span>
     </div>
     <div class="mini-transport">
-      <button class="ctl" onclick={() => skip(-10)} title="Back 10s">↺10</button>
-      <button class="ctl playpause" onclick={togglePlay}>{paused ? '▶' : '⏸'}</button>
-      <button class="ctl" onclick={() => skip(10)} title="Forward 10s">↻10</button>
+      <button class="ctl" onclick={() => skip(-10)} title="Back 10s"><RotateCcw size={16} /></button>
+      <button class="ctl playpause" onclick={togglePlay}>{#if paused}<Play size={19} />{:else}<Pause size={19} />{/if}</button>
+      <button class="ctl" onclick={() => skip(10)} title="Forward 10s"><RotateCw size={16} /></button>
     </div>
     <div class="mini-actions">
-      <button class="ctl" onclick={onexpand} title="Expand">⤢</button>
-      <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
+      <button class="ctl" onclick={onexpand} title="Expand"><Maximize2 size={16} /></button>
+      <button class="ctl" onclick={onclose} title="Stop playback"><X size={17} /></button>
     </div>
   {:else}
     <div class="controls">
@@ -338,14 +342,14 @@
         />
       </div>
       <div class="buttons">
-        <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)">↺10</button>
-        <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{paused ? '▶' : '⏸'}</button>
-        <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)">↻10</button>
+        <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)"><RotateCcw size={16} /></button>
+        <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{#if paused}<Play size={19} />{:else}<Pause size={19} />{/if}</button>
+        <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)"><RotateCw size={16} /></button>
         <span class="time">{fmt(current)} / {fmt(duration)}</span>
         <span class="spacer"></span>
-        <button class="ctl" onclick={toggleMute} title="Mute (m)">{muted || volume === 0 ? '🔇' : '🔊'}</button>
+        <button class="ctl" onclick={toggleMute} title="Mute (m)">{#if muted || volume === 0}<VolumeX size={17} />{:else}<Volume2 size={17} />{/if}</button>
         <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolumeInput} aria-label="Volume" />
-        <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)">⛶</button>
+        <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)"><Maximize size={16} /></button>
       </div>
     </div>
   {/if}

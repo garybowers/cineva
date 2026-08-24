@@ -7,25 +7,29 @@
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import Player from './Player.svelte'
   import MusicPlayer from './MusicPlayer.svelte'
+  import {
+    House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
+    Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
+  } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
-  const tabs: { id: Tab; label: string; icon: string }[] = [
-    { id: 'home', label: 'Home', icon: '⌂' },
-    { id: 'libraries', label: 'Libraries', icon: '▤' },
-    { id: 'settings', label: 'Settings', icon: '⚙' },
+  const tabs = [
+    { id: 'home' as Tab, label: 'Home', icon: House },
+    { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
+    { id: 'settings' as Tab, label: 'Settings', icon: SettingsIcon },
   ]
 
   let tab: Tab = $state('home')
   let health: Health | null = $state(null)
   let offline = $state(false)
 
-  const typeLabels: Record<string, { label: string; icon: string }> = {
-    movies: { label: 'Movies', icon: '🎬' },
-    tv: { label: 'TV Shows', icon: '📺' },
-    music: { label: 'Music', icon: '🎵' },
-    audiobooks: { label: 'Audiobooks', icon: '🎧' },
-    podcasts: { label: 'Podcasts', icon: '📻' },
-    books: { label: 'Books', icon: '📚' },
+  const typeLabels: Record<string, { label: string; icon: typeof House }> = {
+    movies: { label: 'Movies', icon: Clapperboard },
+    tv: { label: 'TV Shows', icon: Tv },
+    music: { label: 'Music', icon: MusicIcon },
+    audiobooks: { label: 'Audiobooks', icon: Headphones },
+    podcasts: { label: 'Podcasts', icon: Podcast },
+    books: { label: 'Books', icon: BookOpen },
   }
   const libraryTree = $derived(
     Object.entries(typeLabels)
@@ -370,7 +374,7 @@
   {#if item.poster}
     <img class="poster" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'} src={item.poster} alt={item.title} loading="lazy" />
   {:else}
-    <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}><span>{item.kind === 'album' || item.kind === 'track' ? '♪' : item.title.slice(0, 1)}</span></div>
+    <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}><span>{#if item.kind === 'album' || item.kind === 'track'}<MusicIcon size={30} />{:else}{item.title.slice(0, 1)}{/if}</span></div>
   {/if}
 {/snippet}
 
@@ -406,16 +410,17 @@
       {/if}
     </div>
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
-    <button class="topbtn" class:active={tab === 'settings'} onclick={() => (tab = 'settings')} title="Settings">⚙</button>
-    <button class="avatar" title="Local user — accounts arrive with milestone 4">👤</button>
+    <button class="topbtn" class:active={tab === 'settings'} onclick={() => (tab = 'settings')} title="Settings"><SettingsIcon size={17} /></button>
+    <button class="avatar" title="Local user — accounts arrive with milestone 4"><User size={17} /></button>
   </div>
 
   <div class="body">
   <aside class="side">
-    <button class="side-item" class:active={tab === 'home'} onclick={() => (tab = 'home')}>⌂ Home</button>
+    <button class="side-item" class:active={tab === 'home'} onclick={() => (tab = 'home')}><House size={16} /> Home</button>
     <div class="tree">
       {#each libraryTree as group (group.type)}
-        <div class="type-label"><span class="type-icon">{group.icon}</span> {group.label}</div>
+        {@const TypeIcon = group.icon}
+        <div class="type-label"><TypeIcon size={15} /> {group.label}</div>
         {#each group.libs as lib (lib.id)}
           <button
             class="side-item leaf"
@@ -524,8 +529,8 @@
             {#if detail.item.kind === 'album'}
               <p class="meta">{detail.item.artist} · {detail.children.length} tracks</p>
               <div class="actions">
-                <button class="play" onclick={() => detail && startMusic(detail.children, 0)}>▶ Play</button>
-                <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}>🔀 Shuffle</button>
+                <button class="play" onclick={() => detail && startMusic(detail.children, 0)}><Play size={15} /> Play</button>
+                <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
               </div>
             {/if}
             <p class="meta">
@@ -537,10 +542,10 @@
             {#if detail.item.kind === 'movie' || detail.item.kind === 'episode'}
               <div class="actions">
                 <button class="play" onclick={() => detail && startPlay(detail.item)}>
-                  ▶ {resumable ? 'Resume' : 'Play'}
+                  <Play size={15} /> {resumable ? 'Resume' : 'Play'}
                 </button>
                 {#if resumable}<span class="muted">{minutesLeft} min left</span>{/if}
-                <a class="dl" href={downloadURL(detail.item.id)} download>↓ Download</a>
+                <a class="dl" href={downloadURL(detail.item.id)} download><Download size={14} /> Download</a>
               </div>
               <dl class="tech">
                 <div><dt>Video</dt><dd>{detail.item.height}p ({detail.item.videoCodec})</dd></div>
@@ -617,8 +622,8 @@
                     bind:value={musicFilter}
                     onkeydown={(e) => e.key === 'Escape' && (musicFilter = '')}
                   />
-                  <button class="play" onclick={() => startMusic(shelfQueue(), 0)}>▶ Play</button>
-                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}>🔀 Shuffle</button>
+                  <button class="play" onclick={() => startMusic(shelfQueue(), 0)}><Play size={15} /> Play</button>
+                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}><Shuffle size={14} /> Shuffle</button>
                 </div>
               </header>
 
@@ -647,7 +652,7 @@
                       {#if album.poster}
                         <img class="acover" src={album.poster} alt={album.title} loading="lazy" />
                       {:else}
-                        <span class="acover ph">♪</span>
+                        <span class="acover ph"><MusicIcon size={30} /></span>
                       {/if}
                       <span class="aname">{album.title}</span>
                       <span class="asub">{album.year || ''}</span>
@@ -662,7 +667,7 @@
                       {#if album.poster}
                         <img class="apanel-cover" src={album.poster} alt="" />
                       {:else}
-                        <span class="apanel-cover ph">♪</span>
+                        <span class="apanel-cover ph"><MusicIcon size={40} /></span>
                       {/if}
                       <div class="apanel-body">
                         <div class="apanel-head">
@@ -671,8 +676,8 @@
                             <span class="muted"> — {album.artist}{album.year ? ` · ${album.year}` : ''} · {tracks.length} tracks</span>
                           </div>
                           <div class="mactions">
-                            <button class="play" onclick={() => startMusic(tracks, 0)}>▶ Play</button>
-                            <button class="dl" onclick={() => startMusic(tracks, 0, true)}>🔀</button>
+                            <button class="play" onclick={() => startMusic(tracks, 0)}><Play size={15} /> Play</button>
+                            <button class="dl" onclick={() => startMusic(tracks, 0, true)}><Shuffle size={14} /></button>
                           </div>
                         </div>
                         <ul class="tlist">
@@ -757,8 +762,9 @@
 
   <nav class="tabbar">
     {#each tabs as t (t.id)}
+      {@const TabIcon = t.icon}
       <button class:active={tab === t.id} onclick={() => (tab = t.id)}>
-        <span class="icon">{t.icon}</span>
+        <TabIcon size={19} />
         <span>{t.label}</span>
       </button>
     {/each}
@@ -876,6 +882,9 @@
   }
   main.withbar { padding-bottom: 6.5rem; }
   .side-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     text-align: left;
     padding: 0.5rem 0.65rem;
     border-radius: 8px;
@@ -886,6 +895,9 @@
   .side-item.active { background: var(--bg); color: var(--accent-2); }
   .tree { display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.75rem; flex: 1; }
   .type-label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
     color: var(--muted);
     font-size: 0.72rem;
     text-transform: uppercase;
@@ -1171,6 +1183,9 @@
   .overview { font-size: 0.95rem; line-height: 1.5; margin-bottom: 1rem; }
   .actions { display: flex; gap: 0.6rem; align-items: center; }
   .play {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     background: var(--accent);
     color: white;
     padding: 0.55rem 1.4rem;
@@ -1178,6 +1193,9 @@
     font-weight: 600;
   }
   .dl {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     color: var(--accent-2);
     border: 1px solid var(--border);
     border-radius: 8px;
