@@ -32,7 +32,7 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Per-user default quality/autoplay stored server-side (after milestone 4; localStorage today).
 
 ## Milestone 5 — Web client (partially built early)
-- [ ] Real URL routing: browser back/forward, deep links, shareable URLs (breadcrumb trail maps cleanly onto routes like `/library/tv/succession/s02`).
+- [x] Real URL routing: name-based paths (/libraries/TV Shows/Succession/Season 2), browser back/forward, deep links with server-side SPA fallback.
 - [ ] Cast & Crew row + ratings on detail pages (needs TMDB key + credits fetch in the scanner; see the Plex reference screenshots).
 - [ ] Episode/backdrop imagery in lists instead of letter placeholders (TMDB stills).
 - [ ] PWA: manifest + install + icon set (the mobile-first layout is done; installability is not).

@@ -3,11 +3,14 @@ package api
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -85,6 +88,22 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	e.StaticFS("/admin", ui.Admin())
 	e.StaticFS("/", ui.Client())
 
+	// SPA fallback: the client owns URL routing (/libraries/..., /settings),
+	// so unknown extension-less GETs outside the API get index.html.
+	e.HTTPErrorHandler = func(err error, c echo.Context) {
+		he, ok := err.(*echo.HTTPError)
+		p := c.Request().URL.Path
+		if ok && he.Code == http.StatusNotFound && c.Request().Method == http.MethodGet &&
+			!strings.ContainsRune(path.Base(p), '.') &&
+			!hasAnyPrefix(p, "/api/", "/admin", "/themes/", "/artwork/") {
+			if data, ferr := fs.ReadFile(ui.Client(), "index.html"); ferr == nil {
+				_ = c.HTMLBlob(http.StatusOK, data)
+				return
+			}
+		}
+		e.DefaultHTTPErrorHandler(err, c)
+	}
+
 	// Graceful shutdown: SIGINT/SIGTERM stops HTTP, then kills transcode
 	// sessions and removes their temp dirs.
 	shutdownDone := make(chan struct{})
@@ -107,6 +126,15 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		return nil
 	}
 	return err
+}
+
+func hasAnyPrefix(s string, prefixes ...string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func health(c echo.Context) error {

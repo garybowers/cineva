@@ -22,6 +22,101 @@
   let tab: Tab = $state('home')
   let health: Health | null = $state(null)
   let offline = $state(false)
+  let routing = false // true while applyRoute drives state (suppresses pushState)
+
+  // ---- URL routing: /libraries/<Library>/<Title>/... (names, not ids) ----
+  function buildPath(): string {
+    if (tab === 'home') return '/'
+    if (tab === 'settings') return '/settings'
+    let p = '/libraries'
+    if (currentLib) p += '/' + encodeURIComponent(currentLib.name)
+    if (detail) {
+      for (const a of trail) p += '/' + encodeURIComponent(a.title)
+      p += '/' + encodeURIComponent(detail.item.title)
+    }
+    return p
+  }
+
+  function syncURL() {
+    if (routing) return
+    const p = buildPath()
+    if (p !== location.pathname) history.pushState({}, '', p)
+  }
+
+  function setTab(t: Tab) {
+    tab = t
+    syncURL()
+  }
+
+  async function applyRoute(rawPath: string) {
+    routing = true
+    try {
+      const parts = rawPath.split('/').filter(Boolean).map(decodeURIComponent)
+      if (parts.length === 0) {
+        tab = 'home'
+        return
+      }
+      if (parts[0] === 'settings') {
+        tab = 'settings'
+        return
+      }
+      if (parts[0] !== 'libraries') {
+        tab = 'home'
+        return
+      }
+      tab = 'libraries'
+      if (libraries.length === 0) {
+        try {
+          libraries = await listLibraries()
+        } catch {
+          return
+        }
+      }
+      const lib = parts[1] ? libraries.find((l) => l.name === parts[1]) : undefined
+      if (!lib) {
+        currentLib = null
+        detail = null
+        trail = []
+        return
+      }
+      await openLibrary(lib)
+      const segs = parts.slice(2)
+      if (segs.length === 0) return
+
+      // Resolve title segments against the library's item tree.
+      const items = await libraryItems(lib.id)
+      let target: Item | null = null
+      const ancestors: Item[] = []
+      for (const seg of segs) {
+        const found = items.find((i) =>
+          i.title === seg &&
+          (target ? i.parentId === target.id : !i.parentId || i.kind === 'movie' || i.kind === 'series' || i.kind === 'artist'),
+        )
+        if (!found) break
+        if (target) ancestors.push(target)
+        target = found
+      }
+      if (!target) return
+      // Seasons are the last navigation level: an episode URL resolves to
+      // its season with the episode selected in-page.
+      let selectEp: Item | null = null
+      if (target.kind === 'episode' && target.parentId) {
+        selectEp = target
+        target = items.find((i) => i.id === selectEp!.parentId) ?? target
+        ancestors.pop()
+      }
+      detail = await itemDetail(target.id)
+      trail = ancestors
+      epDetail = null
+      detailSubs = []
+      if (detail.item.kind === 'movie') {
+        itemSubtitles(target.id).then((s) => (detailSubs = s)).catch(() => {})
+      }
+      if (selectEp) selectEpisode(selectEp)
+    } finally {
+      routing = false
+    }
+  }
 
   const typeLabels: Record<string, { label: string; icon: typeof House }> = {
     movies: { label: 'Movies', icon: Clapperboard },
@@ -196,7 +291,9 @@
   // The full player shows on the playing item's own page; anywhere else it
   // collapses to the bottom now-playing bar (Plex-style).
   const playerCompact = $derived(
-    !!playing && !(tab === 'libraries' && detail?.item.id === playing.item.id),
+    !!playing &&
+      !(tab === 'libraries' && detail &&
+        (detail.item.id === playing.item.id || detail.item.id === playing.item.parentId)),
   )
 
   // Jump to an item's detail page, restoring library context.
@@ -260,7 +357,8 @@
       const info = await playItem(item.id, quality)
       music = null // video and music are mutually exclusive
       playing = { item, info, quality, gen: ++playGen }
-      if (detail?.item.id !== item.id) showItem(item) // full player lives on the item's page
+      const inContext = detail && (detail.item.id === item.id || detail.item.id === item.parentId)
+      if (!inContext) showItem(item) // full player lives on the item's (or its season's) page
     } catch (e) {
       console.error('play failed', e)
     }
@@ -293,11 +391,12 @@
     if (lib.mediaType === 'music') {
       musicAll = items
       selArtist = 'ALL'
-      selAlbum = 'ALL'
+      selAlbumId = null
       gridItems = []
     } else {
       gridItems = items.filter(gridFilter(lib))
     }
+    syncURL()
   }
 
   // fromChild: opened via the current detail's children list (drill-down);
@@ -305,11 +404,21 @@
   // jumps (resume, search) still show the full path.
   async function openItem(id: string, fromChild = false) {
     const parent = fromChild && detail ? detail.item : null
-    detail = await itemDetail(id)
-    if (parent) {
+    let d = await itemDetail(id)
+    let ancestors: Item[] | null = null
+    // Seasons are the last navigation level: opening an episode opens its
+    // season with the episode selected in-page.
+    let selectEp: Item | null = null
+    if (d.item.kind === 'episode' && d.item.parentId) {
+      selectEp = d.item
+      d = await itemDetail(d.item.parentId)
+    }
+    detail = d
+    epDetail = null
+    if (parent && !selectEp) {
       trail = [...trail, parent]
     } else {
-      const ancestors: Item[] = []
+      ancestors = []
       let parentId = detail.item.parentId
       while (parentId && ancestors.length < 4) {
         try {
@@ -323,37 +432,60 @@
       trail = ancestors
     }
     detailSubs = []
-    if (detail.item.kind === 'movie' || detail.item.kind === 'episode') {
-      itemSubtitles(id).then((s) => (detailSubs = s)).catch(() => {})
+    if (detail.item.kind === 'movie') {
+      itemSubtitles(detail.item.id).then((s) => (detailSubs = s)).catch(() => {})
     }
+    if (selectEp) selectEpisode(selectEp)
+    syncURL()
   }
 
-  const resumable = $derived(
-    !!detail?.playState && detail.playState.positionSecs > 10 && !detail.playState.watched,
-  )
-  const minutesLeft = $derived(
-    detail && detail.playState && detail.item.runtimeSecs
-      ? Math.max(1, Math.round((detail.item.runtimeSecs - detail.playState.positionSecs) / 60))
-      : 0,
-  )
+  // ---- Episode selection within a season page (accordion panel) ----
+  let epDetail: ItemDetail | null = $state(null)
+  let epSubs: SubtitleTrack[] = $state([])
+
+  async function selectEpisode(ep: Item) {
+    if (epDetail?.item.id === ep.id) {
+      epDetail = null // toggle off
+      return
+    }
+    epSubs = []
+    epDetail = await itemDetail(ep.id)
+    itemSubtitles(ep.id).then((s) => (epSubs = s)).catch(() => {})
+  }
+
+  const canResume = (d: ItemDetail | null) =>
+    !!d?.playState && d.playState.positionSecs > 10 && !d.playState.watched
+  const minsLeft = (d: ItemDetail | null) =>
+    d && d.playState && d.item.runtimeSecs
+      ? Math.max(1, Math.round((d.item.runtimeSecs - d.playState.positionSecs) / 60))
+      : 0
+
+  const resumable = $derived(canResume(detail))
+  const minutesLeft = $derived(minsLeft(detail))
 
   function toLibraries() {
     currentLib = null
     detail = null
+    epDetail = null
     trail = []
     gridItems = []
     tab = 'libraries'
+    syncURL()
   }
 
   function toGrid() {
     detail = null
+    epDetail = null
     trail = []
+    syncURL()
   }
 
   async function toCrumb(index: number) {
     const target = trail[index]
     detail = await itemDetail(target.id)
     trail = trail.slice(0, index)
+    epDetail = null
+    syncURL()
   }
 
   function runtime(secs?: number): string {
@@ -365,8 +497,14 @@
   onMount(() => {
     poll()
     listThemes().then((t) => (themes = t)).catch(() => {})
+    applyRoute(location.pathname)
+    const onPop = () => applyRoute(location.pathname)
+    window.addEventListener('popstate', onPop)
     const id = setInterval(poll, 5000)
-    return () => clearInterval(id)
+    return () => {
+      clearInterval(id)
+      window.removeEventListener('popstate', onPop)
+    }
   })
 </script>
 
@@ -380,7 +518,7 @@
 
 <div class="shell">
   <div class="topbar">
-    <button class="logo" onclick={() => (tab = 'home')}>Cineva</button>
+    <button class="logo" onclick={() => setTab('home')}>Cineva</button>
     <div class="search">
       <input
         type="search"
@@ -410,13 +548,13 @@
       {/if}
     </div>
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
-    <button class="topbtn" class:active={tab === 'settings'} onclick={() => (tab = 'settings')} title="Settings"><SettingsIcon size={17} /></button>
+    <button class="topbtn" class:active={tab === 'settings'} onclick={() => setTab('settings')} title="Settings"><SettingsIcon size={17} /></button>
     <button class="avatar" title="Local user — accounts arrive with milestone 4"><User size={17} /></button>
   </div>
 
   <div class="body">
   <aside class="side">
-    <button class="side-item" class:active={tab === 'home'} onclick={() => (tab = 'home')}><House size={16} /> Home</button>
+    <button class="side-item" class:active={tab === 'home'} onclick={() => setTab('home')}><House size={16} /> Home</button>
     <div class="tree">
       {#each libraryTree as group (group.type)}
         {@const TypeIcon = group.icon}
@@ -559,31 +697,79 @@
           </div>
         </div>
         {#if detail.children.length > 0}
-          <ul class="children">
-            {#each detail.children as child, ci (child.id)}
-              <li>
-                {#if child.kind === 'track'}
-                  <button onclick={() => detail && startMusic(detail.children, ci)}>
-                    <span>
-                      <span class="epnum">{child.trackNum || ci + 1}.</span>
-                      {child.title}
-                      {#if child.artist && child.artist !== detail.item.artist}<span class="muted"> — {child.artist}</span>{/if}
-                    </span>
-                    <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
-                  </button>
-                {:else}
-                  <button onclick={() => openItem(child.id, true)}>
-                    <span>
-                      {#if child.kind === 'episode'}<span class="epnum">{child.episodeNum}.</span> {/if}
-                      {child.title}
-                      {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
+          {#if detail.item.kind === 'series'}
+            <!-- Seasons as a poster grid -->
+            <div class="grid seasons">
+              {#each detail.children as child (child.id)}
+                <button class="cell" onclick={() => openItem(child.id, true)}>
+                  {@render poster(child)}
+                  <span class="cell-title">{child.title}</span>
+                </button>
+              {/each}
+            </div>
+          {:else if detail.item.kind === 'season'}
+            <!-- Episodes: terminal level — rows select an inline panel -->
+            <ul class="eplist">
+              {#each detail.children as child (child.id)}
+                <li>
+                  <button class="eprow" class:sel={epDetail?.item.id === child.id} onclick={() => selectEpisode(child)}>
+                    {#if child.poster}
+                      <img class="epthumb" src={child.poster} alt="" loading="lazy" />
+                    {:else}
+                      <span class="epthumb ph"><Tv size={20} /></span>
+                    {/if}
+                    <span class="epmain">
+                      <span><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
                     </span>
                     <span class="muted">{runtime(child.runtimeSecs)}</span>
                   </button>
-                {/if}
-              </li>
-            {/each}
-          </ul>
+                  {#if epDetail && epDetail.item.id === child.id}
+                    <div class="eppanel">
+                      <p class="meta">
+                        S{String(epDetail.item.seasonNum).padStart(2, '0')}E{String(epDetail.item.episodeNum).padStart(2, '0')}
+                        · {runtime(epDetail.item.runtimeSecs)}
+                        {#if epDetail.item.width}· {epDetail.item.width}x{epDetail.item.height} {epDetail.item.videoCodec}{/if}
+                        {#if epSubs.length}· CC: {epSubs.map((s) => s.language || s.codec).join(', ')}{/if}
+                      </p>
+                      {#if epDetail.item.overview}<p class="overview">{epDetail.item.overview}</p>{/if}
+                      <div class="actions">
+                        <button class="play" onclick={() => epDetail && startPlay(epDetail.item)}>
+                          <Play size={15} /> {canResume(epDetail) ? 'Resume' : 'Play'}
+                        </button>
+                        {#if canResume(epDetail)}<span class="muted">{minsLeft(epDetail)} min left</span>{/if}
+                        <a class="dl" href={downloadURL(epDetail.item.id)} download><Download size={14} /> Download</a>
+                      </div>
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <ul class="children">
+              {#each detail.children as child, ci (child.id)}
+                <li>
+                  {#if child.kind === 'track'}
+                    <button onclick={() => detail && startMusic(detail.children, ci)}>
+                      <span>
+                        <span class="epnum">{child.trackNum || ci + 1}.</span>
+                        {child.title}
+                        {#if child.artist && child.artist !== detail.item.artist}<span class="muted"> — {child.artist}</span>{/if}
+                      </span>
+                      <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
+                    </button>
+                  {:else}
+                    <button onclick={() => openItem(child.id, true)}>
+                      <span>
+                        {child.title}
+                        {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
+                      </span>
+                      <span class="muted">{runtime(child.runtimeSecs)}</span>
+                    </button>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
         {/if}
       {:else if currentLib && currentLib.mediaType === 'music'}
         <h1>{currentLib.name}</h1>
@@ -763,7 +949,7 @@
   <nav class="tabbar">
     {#each tabs as t (t.id)}
       {@const TabIcon = t.icon}
-      <button class:active={tab === t.id} onclick={() => (tab = t.id)}>
+      <button class:active={tab === t.id} onclick={() => setTab(t.id)}>
         <TabIcon size={19} />
         <span>{t.label}</span>
       </button>
@@ -1220,6 +1406,43 @@
   }
   .tech div { display: flex; gap: 0.75rem; }
   .tech dt { color: var(--muted); width: 5.5rem; flex: none; }
+
+  .grid.seasons { margin-top: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); }
+
+  /* ---- Episode list (season page, terminal level) ---- */
+  .eplist { list-style: none; margin-top: 1.25rem; }
+  .eplist li { border-bottom: 1px solid var(--border); }
+  .eplist li:last-child { border-bottom: none; }
+  .eprow {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.5rem 0.4rem;
+    border-radius: 10px;
+  }
+  .eprow:hover { background: var(--panel); }
+  .eprow.sel { background: var(--panel); }
+  .epthumb {
+    width: 7.5rem;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    flex: none;
+  }
+  .epthumb.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); }
+  .epmain { flex: 1; min-width: 0; }
+  .eppanel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    margin: 0.35rem 0 0.85rem;
+  }
+  .eppanel .overview { margin: 0.5rem 0 0.9rem; }
+  .eppanel .meta { margin: 0; }
 
   .children { list-style: none; margin-top: 1.25rem; }
   .children li { border-bottom: 1px solid var(--border); }
