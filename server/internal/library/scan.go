@@ -155,7 +155,9 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, 
 		}
 		m.fillFileInfo(&item, path)
 		if m.Video != nil {
-			if r, err := m.Video.SearchMovie(ctx, info.Title, info.Year); err == nil {
+			// Search with the tag-corrected title/year when available —
+			// embedded tags restore punctuation the filename mangles.
+			if r, err := m.Video.SearchMovie(ctx, item.Title, item.Year); err == nil {
 				m.applyVideoResult(ctx, &item, r)
 			}
 		}

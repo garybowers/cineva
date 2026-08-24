@@ -31,7 +31,33 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ./cineva.yaml, then /etc/cineva/cineva.yaml)")
 }
 
+// loadDotEnv reads KEY=VALUE lines from a git-ignored ./.env file into the
+// environment (existing variables win), so secrets like the TMDB key can
+// live outside both the repo and the yaml: CINEVA_METADATA_TMDB_API_KEY=...
+func loadDotEnv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
 func initConfig() {
+	loadDotEnv()
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.port", 4747)
 	viper.SetDefault("database.path", "cineva.db")
