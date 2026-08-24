@@ -39,7 +39,9 @@ record it here in the same change — this file is how we find our way back.
 - [ ] User menu behind the top-bar profile icon (after milestone 4).
 
 ## Milestone 7 — Audio (music shipped; audiobooks pending)
-- [ ] MusicBrainz + Cover Art Archive enrichment (metadata is tags-first only; provider interface still to build).
+- [x] MusicBrainz + Cover Art Archive enrichment: queried only for albums missing art/year/titles (1 req/s throttle, proper User-Agent); canonical track titles for untagged files matched by track number.
+- [ ] Optional local MusicBrainz mirror/dataset: MB publishes full DB dumps — a local mirror would remove the 1 req/s limit for very large untagged libraries.
+- [ ] Transcoded ZIP downloads pre-warm serially — a whole artist as MP3 transcodes each track on the fly during the download; fine for albums, slow for artists. Consider a prepare-then-fetch job when milestone 8's async infrastructure lands.
 - [ ] Gapless album playback (needs Web Audio API preloading/crossfeed; plain `<audio>` has a small gap between tracks).
 - [ ] Audio transcode fallback for browser-unsupported codecs (wma, alac in some browsers) — everything currently direct plays.
 - [ ] Artist pages (grid shows albums; an artist view listing their albums exists only via breadcrumb/parent navigation).

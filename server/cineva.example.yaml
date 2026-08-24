@@ -34,6 +34,11 @@ transcode:
   segment_secs: 6
 
 metadata:
+  # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
+  # open data, no key needed, rate-limited to 1 request/second.
+  # (CINEVA_METADATA_MUSICBRAINZ_ENABLED)
+  musicbrainz:
+    enabled: true
   tmdb:
     # TMDB API key for movie/TV metadata + posters. Free at
     # https://www.themoviedb.org/settings/api — leave empty to scan without

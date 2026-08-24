@@ -255,6 +255,8 @@ paths:
       operationId: downloadItem
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [original, mp3, ogg] }, description: Music only — transcode tracks (or every track in an album/artist ZIP) }
+        - { name: quality, in: query, required: false, schema: { type: integer, enum: [128, 192, 256, 320] }, description: Bitrate in kbps for transcoded formats (default 192) }
       responses:
         "200": { description: The media file or ZIP archive, Content-Disposition attachment }
         "404": { $ref: "#/components/responses/NotFound" }

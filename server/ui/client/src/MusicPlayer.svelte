@@ -187,7 +187,21 @@
 
     <span class="qpos">{index + 1}/{queue.length}</span>
     <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolume} aria-label="Volume" />
-    <a class="ctl dl-a" href={`/api/v1/items/${track.id}/download`} download title="Download track"><Download size={16} /></a>
+    <select class="dlsel" title="Download track" onchange={(e) => {
+      const v = (e.target as HTMLSelectElement).value
+      if (v) {
+        const [f, q] = v.split('-')
+        const u = f === 'original' ? `/api/v1/items/${track.id}/download` : `/api/v1/items/${track.id}/download?format=${f}&quality=${q}`
+        const a = document.createElement('a'); a.href = u; a.download = ''; document.body.appendChild(a); a.click(); a.remove()
+      }
+      ;(e.target as HTMLSelectElement).value = ''
+    }}>
+      <option value="">DL…</option>
+      <option value="original">Original</option>
+      <option value="mp3-320">MP3 320</option>
+      <option value="mp3-192">MP3 192</option>
+      <option value="ogg-192">OGG 192</option>
+    </select>
     {#if onexpand}
       <button class="ctl" onclick={onexpand} title="Listening session"><Disc3 size={17} /></button>
     {/if}
@@ -262,6 +276,16 @@
   }
   .ctl:hover { background: var(--bg); color: var(--text); }
   .dl-a { display: grid; place-items: center; }
+  .dlsel {
+    background: var(--bg);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.2rem 0.3rem;
+    flex: none;
+  }
   .ctl.on { color: var(--accent-2); }
   .ctl.big { font-size: 1.3rem; }
 

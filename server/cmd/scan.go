@@ -18,7 +18,11 @@ func newManager(st *store.Store, artworkDir string) *library.Manager {
 	if key := viper.GetString("metadata.tmdb.api_key"); key != "" {
 		video = metadata.NewTMDB(key)
 	}
-	return library.NewManager(st, video, artworkDir)
+	mgr := library.NewManager(st, video, artworkDir)
+	if viper.GetBool("metadata.musicbrainz.enabled") {
+		mgr.Music = metadata.NewMusicBrainz()
+	}
+	return mgr
 }
 
 var scanCmd = &cobra.Command{

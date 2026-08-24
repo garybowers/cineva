@@ -2,12 +2,14 @@ package api
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -185,13 +187,64 @@ func (s *server) downloadItem(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "item not found")
 	}
+	format := c.QueryParam("format")
+	quality, _ := strconv.Atoi(c.QueryParam("quality"))
 	switch item.Kind {
-	case store.KindMovie, store.KindEpisode, store.KindTrack:
+	case store.KindTrack:
+		if format != "" && format != "original" {
+			return s.downloadTranscoded(c, item, format, quality)
+		}
+		return c.Attachment(item.Path, filepath.Base(item.Path))
+	case store.KindMovie, store.KindEpisode:
 		return c.Attachment(item.Path, filepath.Base(item.Path))
 	case store.KindSeason, store.KindSeries, store.KindAlbum, store.KindArtist:
-		return s.downloadArchive(c, item)
+		return s.downloadArchive(c, item, format, quality)
 	}
 	return echo.NewHTTPError(http.StatusBadRequest, "item is not downloadable")
+}
+
+var allowedBitrates = map[int]bool{128: true, 192: true, 256: true, 320: true}
+
+// transcodedTrack ensures a cached transcode of a track exists and returns
+// its path plus the download filename.
+func (s *server) transcodedTrack(ctx context.Context, item store.Item, format string, quality int) (string, string, error) {
+	f, ok := media.AudioDownloadFormat(format)
+	if !ok {
+		return "", "", echo.NewHTTPError(http.StatusBadRequest, "unknown format "+format)
+	}
+	if !allowedBitrates[quality] {
+		quality = 192
+	}
+	dir := filepath.Join(s.dlCacheDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", err
+	}
+	cached := filepath.Join(dir, fmt.Sprintf("%s-%s-%d.%s", item.ID, format, quality, f.Ext))
+	// A crashed transcode can leave an empty/partial file: only trust
+	// non-empty caches, and build new ones atomically via rename.
+	if st, err := os.Stat(cached); err != nil || st.Size() == 0 {
+		part := cached + ".part." + f.Ext // keep the extension so the muxer resolves
+		if err := media.TranscodeAudio(ctx, item.Path, part, f.Encoder, quality); err != nil {
+			os.Remove(part)
+			return "", "", echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if err := os.Rename(part, cached); err != nil {
+			return "", "", err
+		}
+	}
+	nice := item.Title
+	if item.Artist != "" {
+		nice = item.Artist + " - " + item.Title
+	}
+	return cached, zipNameSanitiser.Replace(nice) + "." + f.Ext, nil
+}
+
+func (s *server) downloadTranscoded(c echo.Context, item store.Item, format string, quality int) error {
+	path, name, err := s.transcodedTrack(c.Request().Context(), item, format, quality)
+	if err != nil {
+		return err
+	}
+	return c.Attachment(path, name)
 }
 
 var zipNameSanitiser = strings.NewReplacer("/", "-", "\\", "-", "\x00", "")
@@ -199,11 +252,12 @@ var zipNameSanitiser = strings.NewReplacer("/", "-", "\\", "-", "\x00", "")
 // downloadArchive streams a ZIP (stored, uncompressed — media is already
 // compressed) of all files beneath a container item, preserving one level
 // of folder structure per container ("Season 02/…", "Album/…").
-func (s *server) downloadArchive(c echo.Context, root store.Item) error {
+func (s *server) downloadArchive(c echo.Context, root store.Item, format string, quality int) error {
 	ctx := c.Request().Context()
 	type entry struct {
-		path string
-		name string
+		path  string
+		name  string
+		track *store.Item
 	}
 	var files []entry
 	var walk func(id, prefix string) error
@@ -214,7 +268,10 @@ func (s *server) downloadArchive(c echo.Context, root store.Item) error {
 		}
 		for _, ch := range children {
 			switch ch.Kind {
-			case store.KindMovie, store.KindEpisode, store.KindTrack:
+			case store.KindTrack:
+				t := ch
+				files = append(files, entry{path: ch.Path, name: prefix + filepath.Base(ch.Path), track: &t})
+			case store.KindMovie, store.KindEpisode:
 				files = append(files, entry{path: ch.Path, name: prefix + filepath.Base(ch.Path)})
 			default:
 				if err := walk(ch.ID, prefix+zipNameSanitiser.Replace(ch.Title)+"/"); err != nil {
@@ -240,6 +297,13 @@ func (s *server) downloadArchive(c echo.Context, root store.Item) error {
 	zw := zip.NewWriter(res.Writer)
 	defer zw.Close()
 	for _, f := range files {
+		// Music archives can transcode per entry (format=mp3/ogg).
+		if format != "" && format != "original" && f.track != nil {
+			if path, name, err := s.transcodedTrack(ctx, *f.track, format, quality); err == nil {
+				f.path = path
+				f.name = f.name[:len(f.name)-len(filepath.Ext(f.name))] + filepath.Ext(name)
+			}
+		}
 		w, err := zw.CreateHeader(&zip.FileHeader{Name: f.name, Method: zip.Store})
 		if err != nil {
 			return nil // client went away mid-stream

@@ -37,6 +37,7 @@ type server struct {
 	manager     *library.Manager
 	sessions    *media.SessionManager
 	subtitleDir string
+	dlCacheDir  string
 }
 
 func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
@@ -45,6 +46,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		manager:     manager,
 		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
 		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
+		dlCacheDir:  filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
 
 	e := echo.New()

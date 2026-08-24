@@ -201,6 +201,19 @@
     }
   }
 
+  // Trigger a download in the chosen format ("original" | "mp3-320" | ...).
+  function dlNavigate(id: string, v: string) {
+    if (!v) return
+    const [format, q] = v.split('-')
+    const url = format === 'original' ? downloadURL(id) : `${downloadURL(id)}?format=${format}&quality=${q}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = ''
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
   // All playable descendants of a season or series, in order.
   async function collectEpisodes(root: Item): Promise<Item[]> {
     if (!detail) return []
@@ -914,7 +927,13 @@
                 <button class="play" onclick={() => detail && startSession(detail.children, 0)}><Play size={15} /> Listen</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0)}>Queue</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
-                <a class="dl" href={downloadURL(detail.item.id)} download title="Download album (ZIP)"><Download size={14} /> Download</a>
+                <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { detail && dlNavigate(detail.item.id, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
+                  <option value="">Download…</option>
+                  <option value="original">Original (ZIP)</option>
+                  <option value="mp3-320">MP3 320 (ZIP)</option>
+                  <option value="mp3-192">MP3 192 (ZIP)</option>
+                  <option value="ogg-192">OGG 192 (ZIP)</option>
+                </select>
               </div>
             {/if}
             <p class="meta">
@@ -1086,7 +1105,13 @@
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0)}>Queue</button>
                   <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}><Shuffle size={14} /> Shuffle</button>
                   {#if selArtist !== 'ALL' && selArtist !== 'COMP'}
-                    <a class="dl" href={downloadURL(selArtist)} download title="Download artist (ZIP)"><Download size={14} /></a>
+                    <select class="dlsel" title="Download artist (ZIP)" onchange={(e) => { dlNavigate(selArtist, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
+                      <option value="">Download…</option>
+                      <option value="original">Original (ZIP)</option>
+                      <option value="mp3-320">MP3 320 (ZIP)</option>
+                      <option value="mp3-192">MP3 192 (ZIP)</option>
+                      <option value="ogg-192">OGG 192 (ZIP)</option>
+                    </select>
                   {:else}
                     <button class="dl" onclick={() => queueDownloads(shelfQueue())} title="Download all shown"><Download size={14} /></button>
                   {/if}
@@ -1145,7 +1170,13 @@
                             <button class="play" onclick={() => startSession(tracks, 0)}><Play size={15} /> Listen</button>
                             <button class="dl" onclick={() => startMusic(tracks, 0)}>Queue</button>
                             <button class="dl" onclick={() => startMusic(tracks, 0, true)}><Shuffle size={14} /></button>
-                            <a class="dl" href={downloadURL(selAlbumId ?? '')} download title="Download album (ZIP)"><Download size={14} /></a>
+                            <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { selAlbumId && dlNavigate(selAlbumId, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
+                              <option value="">Download…</option>
+                              <option value="original">Original (ZIP)</option>
+                              <option value="mp3-320">MP3 320 (ZIP)</option>
+                              <option value="mp3-192">MP3 192 (ZIP)</option>
+                              <option value="ogg-192">OGG 192 (ZIP)</option>
+                            </select>
                           </div>
                         </div>
                         <ul class="tlist">
@@ -1641,6 +1672,18 @@
     width: 15rem;
   }
   .mfilter:focus { outline: none; border-color: var(--accent); }
+
+  .dlsel {
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.3rem 0.45rem;
+    max-width: 8rem;
+  }
+  .dlsel:hover { color: var(--text); border-color: var(--accent); }
 
   .msongs {
     background: var(--panel);

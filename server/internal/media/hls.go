@@ -87,7 +87,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	// sessions start mid-file after seeks/resume, and async compensation
 	// pads the whole start offset with silence (the no-audio-on-resume bug).
 	filter, err := av.NewAudioFilterGraphFromContext(adec.Raw(),
-		"asetnsamples=n=1024:p=0",
+		audioFilterSpec(aacSampleRate, 1024),
 		ffmpeg.AVSampleFmtFltp, aacSampleRate, aenc.Raw().ChLayout())
 	if err != nil {
 		return fmt.Errorf("hls audio filter: %w", err)

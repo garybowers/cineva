@@ -24,6 +24,7 @@ import (
 type Manager struct {
 	Store      *store.Store
 	Video      metadata.VideoProvider // nil when no TMDB key is configured
+	Music      metadata.MusicProvider // nil when MusicBrainz is disabled
 	ArtworkDir string
 	Probe      func(path string) (media.Info, error)
 

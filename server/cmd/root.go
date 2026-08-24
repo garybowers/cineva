@@ -63,6 +63,7 @@ func initConfig() {
 	viper.SetDefault("database.path", "cineva.db")
 	viper.SetDefault("libraries.artwork_dir", "artwork")
 	viper.SetDefault("metadata.tmdb.api_key", "")
+	viper.SetDefault("metadata.musicbrainz.enabled", true)
 	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
 	viper.SetDefault("transcode.segment_secs", 6)
 

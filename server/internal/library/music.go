@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -53,9 +54,10 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 	sort.Strings(files)
 
 	created := 0
-	artistIDs := map[string]string{} // artist name -> item id
-	albumIDs := map[string]string{}  // album dir -> item id
-	albumArt := map[string]bool{}    // album dirs whose artwork is done
+	artistIDs := map[string]string{}                 // artist name -> item id
+	albumIDs := map[string]string{}                  // album dir -> item id
+	albumArt := map[string]bool{}                    // album dirs whose artwork is done
+	mbData := map[string]*metadata.MusicRelease{}    // album dir -> MB release (nil = looked up, no match)
 
 	for _, path := range files {
 		if err := ctx.Err(); err != nil {
@@ -119,6 +121,8 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 			if title == "" {
 				title = mt[2]
 			}
+		} else if n, err := strconv.Atoi(base); err == nil && trackNum == 0 {
+			trackNum = n // bare "03.flac" style — number only, no title
 		}
 		if title == "" {
 			title = base
@@ -146,6 +150,26 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 				Title: albumName, Artist: artistName, Year: albumYear, Path: albumDir,
 			}
 			album.Poster = m.albumArtwork(ctx, path, albumDir, albumArt)
+			// MusicBrainz fills what tags and local art couldn't: only
+			// queried when this album is actually missing something (the
+			// 1 req/s limit makes blanket lookups unaffordable).
+			if m.Music != nil && artistName != "Unknown Artist" &&
+				(album.Poster == "" || album.Year == 0 || info.Title == "") {
+				if rel, err := m.Music.SearchRelease(ctx, artistName, albumName); err == nil {
+					mbData[albumDir] = &rel
+					if album.Year == 0 {
+						album.Year = rel.Year
+					}
+					if album.Poster == "" {
+						if img, err := m.Music.FrontCover(ctx, rel.MBID); err == nil && img != nil {
+							album.Poster = m.cacheArtwork("mb", albumDir, img)
+						}
+					}
+					log.Printf("musicbrainz: matched %q / %q -> %s", artistName, albumName, rel.MBID)
+				} else {
+					mbData[albumDir] = nil
+				}
+			}
 			saved, err := m.Store.UpsertItem(ctx, album)
 			if err != nil {
 				return len(files), created, err
@@ -157,6 +181,17 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 		displayArtist := info.Artist
 		if displayArtist == "" {
 			displayArtist = artistName
+		}
+		// Untagged files get canonical track titles from MusicBrainz.
+		if info.Title == "" && trackNum > 0 {
+			if rel := mbData[albumDir]; rel != nil {
+				for _, mt := range rel.Tracks {
+					if mt.Pos == trackNum && mt.Title != "" {
+						title = mt.Title
+						break
+					}
+				}
+			}
 		}
 		discNum := info.DiscNum
 		if discNum == 0 {
