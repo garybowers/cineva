@@ -17,6 +17,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
@@ -36,6 +37,7 @@ type server struct {
 	store       *store.Store
 	manager     *library.Manager
 	sessions    *media.SessionManager
+	events      *events.Bus
 	subtitleDir string
 	dlCacheDir  string
 }
@@ -45,9 +47,13 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		store:       st,
 		manager:     manager,
 		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		events:      events.NewBus(),
 		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:  filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
+	// Scans run by this server publish progress onto the same bus the
+	// /events stream reads from. CLI scans leave manager.Events nil.
+	manager.Events = s.events
 
 	e := echo.New()
 	e.HideBanner = true
@@ -66,6 +72,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/scans", s.listScans)
 	v1.POST("/scans/:id/cancel", s.cancelScan)
 	v1.GET("/search", s.search)
+	v1.GET("/events", s.eventStream)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)

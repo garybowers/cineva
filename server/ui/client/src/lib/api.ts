@@ -16,7 +16,10 @@ export interface Library {
 export interface Item {
   id: string
   libraryId: string
-  kind: 'movie' | 'series' | 'season' | 'episode'
+  kind: 'movie' | 'series' | 'season' | 'episode' | 'artist' | 'album' | 'track'
+  artist?: string
+  trackNum?: number
+  discNum?: number
   parentId?: string
   title: string
   year?: number
@@ -125,4 +128,27 @@ export async function nextUp(id: string): Promise<Item | null> {
   const res = await fetch(`/api/v1/items/${id}/next`)
   if (res.status === 204 || !res.ok) return null
   return res.json() as Promise<Item>
+}
+
+// Live event stream: the server pushes state changes (scan progress, library
+// changes) over SSE so the UI updates without refreshes. Events are hints —
+// handlers refetch whatever they display. EventSource reconnects on its own;
+// onState reports connectivity (true on open, false while retrying).
+export function subscribeEvents(
+  handlers: Record<string, (data: unknown) => void>,
+  onState?: (connected: boolean) => void,
+): () => void {
+  const es = new EventSource('/api/v1/events')
+  for (const [type, fn] of Object.entries(handlers)) {
+    es.addEventListener(type, (e) => {
+      try {
+        fn(JSON.parse((e as MessageEvent).data || 'null'))
+      } catch {
+        fn(null)
+      }
+    })
+  }
+  es.onopen = () => onState?.(true)
+  es.onerror = () => onState?.(false)
+  return () => es.close()
 }

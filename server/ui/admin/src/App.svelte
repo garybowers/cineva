@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    cancelScan, listSessions, stopSession,
+    cancelScan, listSessions, stopSession, subscribeEvents,
     type Health, type Library, type Scan, type PlaySession,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -91,11 +91,46 @@
     return libraries.find((l) => l.id === id)?.name ?? id.slice(0, 8)
   }
 
+  // Live scan totals arrive on the event stream only (the scanner counts its
+  // file listing up front); keyed by scan id for the progress bars below.
+  let scanTotals: Map<string, number> = $state(new Map())
+
+  function onScanEvent(data: unknown) {
+    const s = data as (Scan & { filesTotal?: number }) | null
+    if (!s?.id) return
+    if (s.filesTotal) scanTotals = new Map(scanTotals).set(s.id, s.filesTotal)
+    const i = scans.findIndex((x) => x.id === s.id)
+    if (i >= 0) scans[i] = s
+    else scans = [s, ...scans]
+    if (s.status !== 'running') {
+      // Finished scans change item counts.
+      listLibraries().then((l) => (libraries = l)).catch(() => {})
+    }
+  }
+
+  const pct = (s: Scan): number | null => {
+    const total = scanTotals.get(s.id)
+    return s.status === 'running' && total ? Math.min(100, Math.round((s.filesSeen / total) * 100)) : null
+  }
+
   onMount(() => {
     refresh()
     listThemes().then((t) => (themes = t)).catch(() => {})
-    const id = setInterval(refresh, 5000)
-    return () => clearInterval(id)
+    // Live updates over SSE; the slow poll is only a fallback for missed events.
+    const closeEvents = subscribeEvents(
+      {
+        scan: onScanEvent,
+        libraries: () => listLibraries().then((l) => (libraries = l)).catch(() => {}),
+      },
+      (connected) => {
+        if (connected && offline) refresh()
+      },
+    )
+    const id = setInterval(refresh, 30000)
+    return () => {
+      clearInterval(id)
+      closeEvents()
+    }
   })
 </script>
 
@@ -213,8 +248,11 @@
                   <td>
                     <span class="tag" class:ok={s.status === 'completed'} class:bad={s.status === 'failed'}>{s.status}</span>
                     {#if s.error}<div class="muted small">{s.error}</div>{/if}
+                    {#if pct(s) !== null}
+                      <div class="scanbar"><div class="scanbar-fill" style="width: {pct(s)}%"></div></div>
+                    {/if}
                   </td>
-                  <td>{s.filesSeen}</td>
+                  <td>{s.filesSeen}{#if s.status === 'running' && scanTotals.get(s.id)}<span class="muted"> / {scanTotals.get(s.id)}</span>{/if}</td>
                   <td>{s.itemsCreated}</td>
                   <td class="muted">{s.startedAt}</td>
                   <td class="actions">
@@ -343,7 +381,9 @@
   th, td { text-align: left; padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; font-size: 0.8rem; }
   tr:last-child td { border-bottom: none; }
-  .actions { display: flex; gap: 0.5rem; }
+  /* td stays a table cell — flex here shoves the borders outside the table */
+  .actions { white-space: nowrap; }
+  .actions button + button { margin-left: 0.5rem; }
   .actions button { color: var(--accent-2); }
   .actions .danger { color: var(--err); }
   .tag {
@@ -355,6 +395,20 @@
   }
   .tag.ok { color: var(--ok); border-color: var(--ok); }
   .tag.bad { color: var(--err); border-color: var(--err); }
+  .scanbar {
+    margin-top: 0.4rem;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--bg);
+    overflow: hidden;
+    min-width: 6rem;
+  }
+  .scanbar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width 0.6s ease;
+  }
   .small { font-size: 0.78rem; }
 
   .setting {

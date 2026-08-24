@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems,
+    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -298,6 +298,57 @@
       })
     }
     await openItem(track.parentId)
+  }
+
+  // Jump to a track's artist in the music view. Tracks hang off albums, so
+  // the artist id comes from the album's parent.
+  async function goToArtistOf(item: Item) {
+    let artistId = item.kind === 'album' ? (item.parentId ?? '') : ''
+    if (!artistId && item.parentId) {
+      try {
+        artistId = (await itemDetail(item.parentId)).item.parentId ?? ''
+      } catch {
+        /* album gone — fall through */
+      }
+    }
+    const lib = libraries.find((l) => l.id === item.libraryId)
+    if (!lib || !artistId) return
+    tab = 'libraries'
+    listening = false
+    detail = null
+    if (currentLib?.id !== lib.id || musicAll.length === 0) await openLibrary(lib)
+    selectArtist(artistId)
+    syncURL()
+  }
+
+  // A search hit on a song plays it in album context: queue the whole album
+  // starting at that track.
+  async function playTrackResult(t: Item) {
+    let queue = [t]
+    let start = 0
+    if (t.parentId) {
+      try {
+        const tracks = (await itemDetail(t.parentId)).children.filter((c) => c.kind === 'track')
+        if (tracks.length > 0) {
+          queue = tracks
+          start = Math.max(0, tracks.findIndex((c) => c.id === t.id))
+        }
+      } catch {
+        /* album gone — play the bare track */
+      }
+    }
+    startMusic(queue, start)
+  }
+
+  // "Go to song": the album page with the track picked out.
+  let hlTrackId: string | null = $state(null)
+  async function goToSong(t: Item) {
+    hlTrackId = t.id
+    await openAlbumOf(t)
+    setTimeout(() => {
+      document.querySelector('.children li.hl')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }, 50)
+    setTimeout(() => (hlTrackId = null), 5000)
   }
 
   const gridFilter = (lib: Library) => (i: Item) =>
@@ -656,15 +707,44 @@
     return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`
   }
 
+  // Refetch the open library's items in place, without disturbing the view
+  // (selected artist, expanded album, breadcrumbs stay put).
+  async function refreshLibraryItems() {
+    if (!currentLib) return
+    const items = await libraryItems(currentLib.id)
+    if (currentLib.mediaType === 'music') musicAll = items
+    else gridItems = items.filter(gridFilter(currentLib))
+  }
+
   onMount(() => {
     poll()
     listThemes().then((t) => (themes = t)).catch(() => {})
     applyRoute(location.pathname)
     const onPop = () => applyRoute(location.pathname)
     window.addEventListener('popstate', onPop)
-    const id = setInterval(poll, 5000)
+    // Live updates over SSE; the slow poll below is only the fallback for
+    // anything a dropped event missed.
+    const closeEvents = subscribeEvents(
+      {
+        libraries: () => {
+          listLibraries().then((l) => (libraries = l)).catch(() => {})
+          continueWatching().then((r) => (resume = r)).catch(() => {})
+        },
+        scan: (data) => {
+          const s = data as { libraryId?: string; status?: string } | null
+          if (s?.status === 'completed' && currentLib?.id === s.libraryId) {
+            refreshLibraryItems().catch(() => {})
+          }
+        },
+      },
+      (connected) => {
+        if (connected && offline) poll()
+      },
+    )
+    const id = setInterval(poll, 30000)
     return () => {
       clearInterval(id)
+      closeEvents()
       window.removeEventListener('popstate', onPop)
     }
   })
@@ -692,7 +772,8 @@
       {#if searchResults.length > 0}
         <div class="search-results">
           {#each searchResults as r (r.id)}
-            <button class="sr" onclick={() => { showItem(r); clearSearch() }}>
+            {@const open = () => { if (r.kind === 'track') playTrackResult(r); else showItem(r); clearSearch() }}
+            <div class="sr" role="button" tabindex="0" onclick={open} onkeydown={(e) => e.key === 'Enter' && open()}>
               {#if r.poster}
                 <img src={r.poster} alt="" />
               {:else}
@@ -701,10 +782,21 @@
               <span class="sr-text">
                 <span class="sr-title">{r.title}</span>
                 <span class="sr-sub">
-                  {r.kind}{r.year ? ` · ${r.year}` : ''}{r.kind === 'episode' ? ` · S${String(r.seasonNum).padStart(2, '0')}E${String(r.episodeNum).padStart(2, '0')}` : ''}
+                  {r.kind}{r.year ? ` · ${r.year}` : ''}{r.kind === 'episode' ? ` · S${String(r.seasonNum).padStart(2, '0')}E${String(r.episodeNum).padStart(2, '0')}` : ''}{r.kind === 'track' && r.runtimeSecs ? ` · ${trackTime(r.runtimeSecs)}` : ''}
                 </span>
               </span>
-            </button>
+              {#if r.kind === 'track'}
+                <span class="sr-actions">
+                  <button class="sr-act" onclick={(e) => { e.stopPropagation(); goToSong(r); clearSearch() }}>Song</button>
+                  <button class="sr-act" onclick={(e) => { e.stopPropagation(); openAlbumOf(r); clearSearch() }}>Album</button>
+                  <button class="sr-act" onclick={(e) => { e.stopPropagation(); goToArtistOf(r); clearSearch() }}>Artist</button>
+                </span>
+              {:else if r.kind === 'album'}
+                <span class="sr-actions">
+                  <button class="sr-act" onclick={(e) => { e.stopPropagation(); goToArtistOf(r); clearSearch() }}>Artist</button>
+                </span>
+              {/if}
+            </div>
           {/each}
         </div>
       {/if}
@@ -1028,7 +1120,7 @@
           {:else}
             <ul class="children">
               {#each detail.children as child, ci (child.id)}
-                <li>
+                <li class:hl={child.id === hlTrackId}>
                   {#if child.kind === 'track'}
                     <button onclick={() => detail && startMusic(detail.children, ci)}>
                       <span>
@@ -1326,8 +1418,19 @@
     width: 100%;
     padding: 0.5rem 0.8rem;
     text-align: left;
+    cursor: pointer;
   }
   .sr:hover { background: var(--bg); }
+  .sr-actions { margin-left: auto; display: flex; gap: 0.35rem; flex: none; }
+  .sr-act {
+    font-size: 0.72rem;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.15rem 0.55rem;
+    white-space: nowrap;
+  }
+  .sr-act:hover { color: var(--text); border-color: var(--accent); }
   .sr img, .sr-ph {
     width: 2rem;
     height: 3rem;
@@ -1907,6 +2010,10 @@
   .children { list-style: none; margin-top: 1.25rem; }
   .children li { border-bottom: 1px solid var(--border); }
   .children li:last-child { border-bottom: none; }
+  .children li.hl {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-radius: 8px;
+  }
   .children button {
     width: 100%;
     display: flex;

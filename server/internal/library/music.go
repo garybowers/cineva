@@ -35,7 +35,7 @@ var trackFileRe = regexp.MustCompile(`^(\d{1,3})\s*-\s*(.+)$`)
 
 // scanMusic builds artist -> album -> track from tags first, directory
 // layout (Artist/Year - Album/NN - Title.ext) as fallback.
-func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, error) {
+func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report reportFunc) (int, int, error) {
 	var files []string
 	for _, root := range lib.Paths {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -59,10 +59,11 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 	albumArt := map[string]bool{}                    // album dirs whose artwork is done
 	mbData := map[string]*metadata.MusicRelease{}    // album dir -> MB release (nil = looked up, no match)
 
-	for _, path := range files {
+	for i, path := range files {
 		if err := ctx.Err(); err != nil {
 			return len(files), created, err
 		}
+		report(i, created, len(files))
 		info, err := media.ProbeAudio(path)
 		if err != nil {
 			log.Printf("probe audio %s: %v", path, err)

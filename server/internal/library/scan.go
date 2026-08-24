@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
@@ -27,6 +28,7 @@ type Manager struct {
 	Music      metadata.MusicProvider // nil when MusicBrainz is disabled
 	ArtworkDir string
 	Probe      func(path string) (media.Info, error)
+	Events     *events.Bus // nil outside the server (CLI scans)
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // libraryID -> cancel for the active scan
@@ -136,21 +138,47 @@ func (m *Manager) clearRunning(libID string) {
 	m.mu.Unlock()
 }
 
+// scanEvent is the payload of "scan" events. FilesTotal comes from the
+// scanner's upfront file listing — it lives only on the event (not the
+// scans table) and is 0 until the listing completes.
+type scanEvent struct {
+	store.Scan
+	FilesTotal int `json:"filesTotal,omitempty"`
+}
+
 func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library) {
 	var filesSeen, itemsCreated int
 	var scanErr error
+
+	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: scan}})
 
 	// Everything upserted this scan gets updated_at >= cutoff; whatever is
 	// older afterwards belongs to files that vanished and is pruned.
 	cutoff := time.Now().UTC().Add(-time.Second).Format("2006-01-02 15:04:05")
 
+	// report streams progress to the scans table and the event bus, at most
+	// once a second so a fast local scan doesn't turn into a write storm.
+	var lastReport time.Time
+	report := func(seen, created, total int) {
+		if time.Since(lastReport) < time.Second {
+			return
+		}
+		lastReport = time.Now()
+		snap := scan
+		snap.FilesSeen, snap.ItemsCreated = seen, created
+		if err := m.Store.UpdateScanProgress(context.WithoutCancel(ctx), scan.ID, seen, created); err != nil {
+			log.Printf("scan progress %s: %v", lib.Name, err)
+		}
+		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: snap, FilesTotal: total}})
+	}
+
 	switch lib.MediaType {
 	case store.MediaMovies:
-		filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib)
+		filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib, report)
 	case store.MediaTV:
-		filesSeen, itemsCreated, scanErr = m.scanTV(ctx, lib)
+		filesSeen, itemsCreated, scanErr = m.scanTV(ctx, lib, report)
 	case store.MediaMusic:
-		filesSeen, itemsCreated, scanErr = m.scanMusic(ctx, lib)
+		filesSeen, itemsCreated, scanErr = m.scanMusic(ctx, lib, report)
 	default:
 		scanErr = fmt.Errorf("scanner for %s libraries arrives in a later milestone", lib.MediaType)
 	}
@@ -175,7 +203,16 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	if err := m.Store.FinishScan(context.WithoutCancel(ctx), scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
 		log.Printf("finish scan %s: %v", scan.ID, err)
 	}
+	done := scan
+	done.Status, done.Error = status, errMsg
+	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
+	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
+	m.Events.Publish(events.Event{Type: "libraries"})
 }
+
+// reportFunc receives scanner progress: files handled, items upserted, and
+// the total files found by the upfront listing.
+type reportFunc func(seen, created, total int)
 
 func (m *Manager) videoFiles(lib store.Library) ([]string, error) {
 	var files []string
@@ -197,16 +234,17 @@ func (m *Manager) videoFiles(lib store.Library) ([]string, error) {
 	return files, nil
 }
 
-func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, error) {
+func (m *Manager) scanMovies(ctx context.Context, lib store.Library, report reportFunc) (int, int, error) {
 	files, err := m.videoFiles(lib)
 	if err != nil {
 		return 0, 0, err
 	}
 	created := 0
-	for _, path := range files {
+	for i, path := range files {
 		if err := ctx.Err(); err != nil {
 			return len(files), created, err
 		}
+		report(i, created, len(files))
 		info := ParseMovie(path)
 		item := store.Item{
 			LibraryID: lib.ID, Kind: store.KindMovie,
@@ -230,7 +268,7 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, 
 	return len(files), created, nil
 }
 
-func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, error) {
+func (m *Manager) scanTV(ctx context.Context, lib store.Library, report reportFunc) (int, int, error) {
 	files, err := m.videoFiles(lib)
 	if err != nil {
 		return 0, 0, err
@@ -241,10 +279,11 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 	seasonIDs := map[string]string{}                 // season dir -> item id
 	seasonData := map[string]metadata.SeasonResult{} // season dir -> tmdb season
 
-	for _, path := range files {
+	for i, path := range files {
 		if err := ctx.Err(); err != nil {
 			return len(files), created, err
 		}
+		report(i, created, len(files))
 		ep, ok := ParseEpisode(path)
 		if !ok {
 			log.Printf("scan: no SxxEyy marker, skipping %s", path)

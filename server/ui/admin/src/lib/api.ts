@@ -65,3 +65,26 @@ export interface PlaySession {
 
 export const listSessions = () => req<PlaySession[]>('/play/sessions')
 export const stopSession = (id: string) => req<void>(`/play/${id}`, { method: 'DELETE' })
+
+// Live event stream: the server pushes state changes (scan progress, library
+// changes) over SSE so the UI updates without refreshes. Events are hints —
+// handlers refetch whatever they display. EventSource reconnects on its own;
+// onState reports connectivity (true on open, false while retrying).
+export function subscribeEvents(
+  handlers: Record<string, (data: unknown) => void>,
+  onState?: (connected: boolean) => void,
+): () => void {
+  const es = new EventSource('/api/v1/events')
+  for (const [type, fn] of Object.entries(handlers)) {
+    es.addEventListener(type, (e) => {
+      try {
+        fn(JSON.parse((e as MessageEvent).data || 'null'))
+      } catch {
+        fn(null)
+      }
+    })
+  }
+  es.onopen = () => onState?.(true)
+  es.onerror = () => onState?.(false)
+  return () => es.close()
+}

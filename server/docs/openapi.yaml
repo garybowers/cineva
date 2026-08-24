@@ -177,6 +177,23 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
 
+  /events:
+    get:
+      summary: Live server events (SSE)
+      description: >
+        A Server-Sent Events stream of state changes so clients update
+        without polling. Event types: "scan" (data: a Scan, plus filesTotal
+        while running — the scanner's upfront file count) and "libraries"
+        (no data — an invalidation hint: refetch library lists and counts).
+        Events are advisory; clients refetch what they display on receipt.
+      operationId: eventStream
+      responses:
+        "200":
+          description: SSE stream (text/event-stream)
+          content:
+            text/event-stream:
+              schema: { type: string }
+
   /scans/{id}/cancel:
     post:
       summary: Cancel a running scan

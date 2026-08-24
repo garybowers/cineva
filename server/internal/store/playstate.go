@@ -83,9 +83,11 @@ func (s *Store) ContinueWatching(ctx context.Context, userID string, limit int) 
 	defer rows.Close()
 	out := []ResumeItem{}
 	for rows.Next() {
+		// Mirrors scanItem's column order, plus the trailing position column.
 		var r ResumeItem
 		if err := rows.Scan(&r.ID, &r.LibraryID, &r.Kind, &r.ParentID, &r.Title, &r.Year,
-			&r.SeasonNum, &r.EpisodeNum, &r.Path, &r.SizeBytes, &r.RuntimeSecs,
+			&r.SeasonNum, &r.EpisodeNum, &r.DiscNum, &r.TrackNum, &r.Artist,
+			&r.Path, &r.SizeBytes, &r.RuntimeSecs,
 			&r.Container, &r.VideoCodec, &r.AudioCodec, &r.Width, &r.Height,
 			&r.TmdbID, &r.Overview, &r.Poster, &r.AddedAt, &r.UpdatedAt, &r.PositionSecs); err != nil {
 			return nil, fmt.Errorf("scan resume item: %w", err)

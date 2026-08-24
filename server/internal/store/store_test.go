@@ -104,3 +104,31 @@ func TestLibraryRoundTrip(t *testing.T) {
 		t.Fatalf("libraries after delete = %+v, want empty", libs)
 	}
 }
+
+// Guards the resume query against itemColumns/scan-list drift: adding a
+// column to the items table broke ContinueWatching silently until it was
+// queried, because its row scan is written out by hand.
+func TestContinueWatchingSurvivesSchema(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	lib, err := s.CreateLibrary(ctx, "Movies", MediaMovies, []string{"/m"})
+	if err != nil {
+		t.Fatalf("create library: %v", err)
+	}
+	item, err := s.UpsertItem(ctx, Item{
+		LibraryID: lib.ID, Kind: KindMovie, Title: "Film", Path: "/m/film.mkv", RuntimeSecs: 5400,
+	})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if _, err := s.SetProgress(ctx, LocalUser, item.ID, 600, item.RuntimeSecs); err != nil {
+		t.Fatalf("set progress: %v", err)
+	}
+	got, err := s.ContinueWatching(ctx, LocalUser, 10)
+	if err != nil {
+		t.Fatalf("continue watching: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != item.ID || got[0].PositionSecs != 600 {
+		t.Fatalf("continue watching = %+v, want the single in-progress item at 600s", got)
+	}
+}

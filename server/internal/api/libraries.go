@@ -5,6 +5,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -28,6 +29,7 @@ func (s *server) createLibrary(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
+	s.events.Publish(events.Event{Type: "libraries"})
 	return c.JSON(http.StatusCreated, libraryResponse{Library: lib})
 }
 
@@ -64,6 +66,7 @@ func (s *server) deleteLibrary(c echo.Context) error {
 	if err := s.store.DeleteLibrary(c.Request().Context(), c.Param("id")); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.events.Publish(events.Event{Type: "libraries"})
 	return c.NoContent(http.StatusNoContent)
 }
 

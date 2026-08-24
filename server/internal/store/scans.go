@@ -23,6 +23,7 @@ type Scan struct {
 type ScanRepo interface {
 	CreateScan(ctx context.Context, libraryID string) (Scan, error)
 	FinishScan(ctx context.Context, id, status, errMsg string, filesSeen, itemsCreated int) error
+	UpdateScanProgress(ctx context.Context, id string, filesSeen, itemsCreated int) error
 	Scans(ctx context.Context, limit int) ([]Scan, error)
 	ScanByID(ctx context.Context, id string) (Scan, error)
 	RunningScan(ctx context.Context, libraryID string) (Scan, bool, error)
@@ -37,7 +38,9 @@ func (s *Store) CreateScan(ctx context.Context, libraryID string) (Scan, error) 
 		`INSERT INTO scans (id, library_id) VALUES (?, ?)`, id, libraryID); err != nil {
 		return Scan{}, fmt.Errorf("create scan: %w", err)
 	}
-	return Scan{ID: id, LibraryID: libraryID, Status: "running"}, nil
+	// Read the row back so callers (and the event stream) get the DB's
+	// started_at rather than a zero value.
+	return s.ScanByID(ctx, id)
 }
 
 func (s *Store) FinishScan(ctx context.Context, id, status, errMsg string, filesSeen, itemsCreated int) error {
@@ -46,6 +49,17 @@ func (s *Store) FinishScan(ctx context.Context, id, status, errMsg string, files
 		 finished_at = datetime('now') WHERE id = ?`,
 		status, errMsg, filesSeen, itemsCreated, id); err != nil {
 		return fmt.Errorf("finish scan %s: %w", id, err)
+	}
+	return nil
+}
+
+// UpdateScanProgress records how far a running scan has got, so observers
+// (the /scans API and the event stream) can show live progress.
+func (s *Store) UpdateScanProgress(ctx context.Context, id string, filesSeen, itemsCreated int) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE scans SET files_seen = ?, items_created = ? WHERE id = ? AND status = 'running'`,
+		filesSeen, itemsCreated, id); err != nil {
+		return fmt.Errorf("scan progress %s: %w", id, err)
 	}
 	return nil
 }
