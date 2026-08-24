@@ -259,6 +259,20 @@
     openListening()
   }
 
+  async function leaveSessionToLibrary(lib: Library) {
+    listening = false
+    tab = 'libraries'
+    await openLibrary(lib)
+  }
+
+  async function leaveSessionToArtist(lib: Library, album: Item) {
+    listening = false
+    tab = 'libraries'
+    if (currentLib?.id !== lib.id || musicAll.length === 0) await openLibrary(lib)
+    if (album.parentId) selectArtist(album.parentId)
+    syncURL()
+  }
+
   // Open the album containing a track (from the music bar or search).
   async function openAlbumOf(track: Item) {
     if (!track.parentId) return
@@ -730,7 +744,7 @@
 
   <div class="content">
   <main class:withbar={(playing && playerCompact) || !!music}>
-    {#if tab === 'libraries' && currentLib}
+    {#if tab === 'libraries' && currentLib && !listening}
       <nav class="crumbs" aria-label="Breadcrumb">
         <button class="crumb" onclick={toLibraries}>Libraries</button>
         <span class="sep">›</span>
@@ -782,7 +796,21 @@
       {@const albumTracks = music.queue.filter((t) => t.parentId === albumId)}
       {@const album = sessionAlbums.get(albumId)}
       {@const queueAlbums = [...new Map(music.queue.map((t) => [t.parentId ?? '', t])).values()]}
+      {@const slib = libraries.find((l) => l.id === musicNow.track.libraryId)}
       <section class="session">
+        <nav class="crumbs" aria-label="Breadcrumb">
+          <button class="crumb" onclick={() => { listening = false; toLibraries() }}>Libraries</button>
+          {#if slib}
+            <span class="sep">›</span>
+            <button class="crumb" onclick={() => slib && leaveSessionToLibrary(slib)}>{slib.name}</button>
+          {/if}
+          {#if album?.parentId && album.artist}
+            <span class="sep">›</span>
+            <button class="crumb" onclick={() => slib && album && leaveSessionToArtist(slib, album)}>{album.artist}</button>
+          {/if}
+          <span class="sep">›</span>
+          <span class="crumb-current">{album?.title ?? musicNow.track.title}</span>
+        </nav>
         <div class="session-body">
           <div class="session-side">
             {#if musicNow.track.poster}
@@ -1455,6 +1483,7 @@
 
   /* ---- Listening session ---- */
   .session { padding-top: 0.5rem; }
+  .session .crumbs { margin-bottom: 1.4rem; }
   .session-body { display: flex; gap: 3rem; align-items: flex-start; justify-content: center; }
   .session-side { flex: none; width: min(26rem, 40vw); text-align: center; position: sticky; top: calc(var(--topbar-h, 3.4rem) + 1.5rem); }
   .session-cover {
