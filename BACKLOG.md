@@ -19,6 +19,8 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Multi-version grouping: 40 movie folders hold two files of the same film (m4v + mkv); each becomes a separate item. Plex groups them as versions of one movie with a version picker at play time.
 - [ ] Extras/trailers filtering: subfolders like Featurettes/ or -trailer suffixed files should attach to the movie, not appear as movies (none in the current library, but standard layouts have them).
 - [ ] Cast/crew from embedded iTunMOVI plists (the mp4s carry full cast/directors/writers) + TMDB credits — needs the people/credits schema decision.
+- [ ] NFO sidecar support (Kodi XML format) + local poster.jpg/fanart.jpg — the Jellyfin/Radarr/Sonarr interop layer; user's current library has none, so ecosystem value only.
+- [ ] Ship a project TMDB API key as the built-in default (Jellyfin/Kodi model — permitted for open source with attribution), keeping metadata.tmdb.api_key as the user override; add the TMDB attribution line to the client Settings page.
 
 ## Milestone 3 — Playback
 - [ ] **PGS/VobSub burn-in**: image-based subtitle tracks are cataloged and listed without a URL (API returns 422 with an explanation). Burn-in needs the video re-encode path plus a multi-input overlay filter graph. Nothing in the current library requires it.
