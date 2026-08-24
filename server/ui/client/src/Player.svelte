@@ -10,16 +10,20 @@
     item,
     info,
     quality,
+    compact = false,
     onclose,
     onnext,
     onquality,
+    onexpand,
   }: {
     item: Item
     info: PlayInfo
     quality: PlayQuality
+    compact?: boolean
     onclose: () => void
     onnext: (next: Item) => void
     onquality: (q: PlayQuality) => void
+    onexpand: () => void
   } = $props()
 
   // v1 credits window heuristic — replaced by credits *detection* later.
@@ -81,7 +85,7 @@
     for (const track of video.textTracks) track.mode = 'hidden' // off until picked
     video.volume = volume
     video.play().catch(() => {})
-    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    if (!compact) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     if (item.kind === 'episode') {
       nextUp(item.id).then((n) => (next = n)).catch(() => {})
     }
@@ -157,7 +161,6 @@
   }
 
   function toggleFullscreen() {
-    // Fullscreen the box (not the video) so our controls stay usable.
     if (document.fullscreenElement) document.exitFullscreen?.()
     else box.requestFullscreen?.().catch(() => {})
   }
@@ -225,28 +228,34 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<section class="nowplaying" class:idle bind:this={box} onmousemove={wake}>
-  <div class="bar">
-    <span class="bartitle">
-      {item.title}
-      {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
-      <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
-    </span>
-    {#if textSubs.length > 0}
-      <select class="picker" value={subtitle} onchange={selectSubtitle} title="Subtitles">
-        <option value="off">CC Off</option>
-        {#each textSubs as t (t.id)}
-          <option value={t.id}>{subLabel(t)}</option>
+<section class="nowplaying" class:idle class:compact bind:this={box} onmousemove={wake}>
+  {#if compact}
+    <div class="mini-progress"><div style="width: {pct(current)}%"></div></div>
+  {/if}
+
+  {#if !compact}
+    <div class="bar">
+      <span class="bartitle">
+        {item.title}
+        {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
+        <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
+      </span>
+      {#if textSubs.length > 0}
+        <select class="picker" value={subtitle} onchange={selectSubtitle} title="Subtitles">
+          <option value="off">CC Off</option>
+          {#each textSubs as t (t.id)}
+            <option value={t.id}>{subLabel(t)}</option>
+          {/each}
+        </select>
+      {/if}
+      <select class="picker" value={quality} onchange={changeQuality} title="Playback quality">
+        {#each QUALITIES as q (q.id)}
+          <option value={q.id}>{q.label}</option>
         {/each}
       </select>
-    {/if}
-    <select class="picker" value={quality} onchange={changeQuality} title="Playback quality">
-      {#each QUALITIES as q (q.id)}
-        <option value={q.id}>{q.label}</option>
-      {/each}
-    </select>
-    <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
-  </div>
+      <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
+    </div>
+  {/if}
 
   <div class="stage">
     <video
@@ -257,19 +266,19 @@
       onended={onEnded}
       onplay={() => { paused = false; wake() }}
       onpause={() => (paused = true)}
-      onclick={togglePlay}
-      ondblclick={toggleFullscreen}
+      onclick={() => (compact ? onexpand() : togglePlay())}
+      ondblclick={() => !compact && toggleFullscreen()}
     >
       {#each textSubs as t (t.id)}
         <track id={t.id} kind="subtitles" src={t.url} label={subLabel(t)} srclang={t.language || 'und'} />
       {/each}
     </video>
 
-    {#if paused}
+    {#if paused && !compact}
       <button class="bigplay" onclick={togglePlay} aria-label="Play">▶</button>
     {/if}
 
-    {#if showNext && next}
+    {#if showNext && next && !compact}
       <div class="upnext">
         <div class="upnext-label">Up next · starts in {remaining}s</div>
         <div class="upnext-title">
@@ -284,32 +293,51 @@
     {/if}
   </div>
 
-  <div class="controls">
-    <div class="seekwrap">
-      <div class="seek-buffered" style="width: {pct(bufferedEnd)}%"></div>
-      <div class="seek-played" style="width: {pct(current)}%"></div>
-      <input
-        class="seek"
-        type="range"
-        min="0"
-        max={duration || 0}
-        step="0.5"
-        value={current}
-        oninput={onSeekInput}
-        aria-label="Seek"
-      />
-    </div>
-    <div class="buttons">
-      <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)">↺10</button>
-      <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{paused ? '▶' : '⏸'}</button>
-      <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)">↻10</button>
+  {#if compact}
+    <div class="mini-info">
+      <button class="mini-title" onclick={onexpand} title="Go to item">
+        {item.title}
+        {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
+      </button>
       <span class="time">{fmt(current)} / {fmt(duration)}</span>
-      <span class="spacer"></span>
-      <button class="ctl" onclick={toggleMute} title="Mute (m)">{muted || volume === 0 ? '🔇' : '🔊'}</button>
-      <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolumeInput} aria-label="Volume" />
-      <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)">⛶</button>
     </div>
-  </div>
+    <div class="mini-transport">
+      <button class="ctl" onclick={() => skip(-10)} title="Back 10s">↺10</button>
+      <button class="ctl playpause" onclick={togglePlay}>{paused ? '▶' : '⏸'}</button>
+      <button class="ctl" onclick={() => skip(10)} title="Forward 10s">↻10</button>
+    </div>
+    <div class="mini-actions">
+      <button class="ctl" onclick={onexpand} title="Expand">⤢</button>
+      <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
+    </div>
+  {:else}
+    <div class="controls">
+      <div class="seekwrap">
+        <div class="seek-buffered" style="width: {pct(bufferedEnd)}%"></div>
+        <div class="seek-played" style="width: {pct(current)}%"></div>
+        <input
+          class="seek"
+          type="range"
+          min="0"
+          max={duration || 0}
+          step="0.5"
+          value={current}
+          oninput={onSeekInput}
+          aria-label="Seek"
+        />
+      </div>
+      <div class="buttons">
+        <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)">↺10</button>
+        <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{paused ? '▶' : '⏸'}</button>
+        <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)">↻10</button>
+        <span class="time">{fmt(current)} / {fmt(duration)}</span>
+        <span class="spacer"></span>
+        <button class="ctl" onclick={toggleMute} title="Mute (m)">{muted || volume === 0 ? '🔇' : '🔊'}</button>
+        <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolumeInput} aria-label="Volume" />
+        <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)">⛶</button>
+      </div>
+    </div>
+  {/if}
 </section>
 
 <style>
@@ -335,6 +363,58 @@
   .nowplaying:fullscreen.idle .controls { opacity: 0; pointer-events: none; }
   .nowplaying:fullscreen.idle { cursor: none; }
   .bar, .controls { transition: opacity 0.25s ease; }
+
+  /* ---- Compact: Plex-style bottom now-playing bar ---- */
+  .nowplaying.compact {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 45;
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    height: 4.6rem;
+    margin: 0;
+    border-radius: 0;
+    border: none;
+    border-top: 1px solid var(--border);
+    padding-right: 0.75rem;
+  }
+  @media (max-width: 767px) {
+    .nowplaying.compact { bottom: 3.35rem; } /* clear the mobile tab bar */
+  }
+  .mini-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: var(--border);
+  }
+  .mini-progress div { height: 100%; background: var(--accent); }
+  .nowplaying.compact .stage { width: 8rem; height: 100%; flex: none; }
+  .nowplaying.compact video {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    aspect-ratio: auto;
+    object-fit: cover;
+  }
+  .mini-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+  .mini-title {
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.92rem;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 0;
+  }
+  .mini-title:hover { color: var(--accent-2); }
+  .mini-transport { display: flex; align-items: center; gap: 0.2rem; }
+  .mini-actions { display: flex; align-items: center; gap: 0.2rem; }
 
   .bar {
     display: flex;
@@ -397,7 +477,6 @@
   }
   .bigplay:hover { background: var(--accent); }
 
-  /* ---- Transport controls ---- */
   .controls { padding: 0.35rem 0.9rem 0.55rem; }
   .seekwrap { position: relative; height: 14px; display: flex; align-items: center; }
   .seek-buffered, .seek-played {
@@ -456,10 +535,7 @@
   .playpause { font-size: 1.15rem; }
   .time { color: var(--muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; margin-left: 0.3rem; }
   .spacer { flex: 1; }
-  .vol {
-    width: 5.5rem;
-    accent-color: var(--accent);
-  }
+  .vol { width: 5.5rem; accent-color: var(--accent); }
 
   .upnext {
     position: absolute;

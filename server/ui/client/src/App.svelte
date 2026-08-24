@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL,
+    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -45,6 +45,51 @@
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
   let playGen = 0 // bumps on quality change so the player remounts
+
+  // Search
+  let searchQ = $state('')
+  let searchResults: Item[] = $state([])
+  let searchTimer: ReturnType<typeof setTimeout> | undefined
+
+  function onSearchInput() {
+    clearTimeout(searchTimer)
+    const q = searchQ.trim()
+    if (q.length < 2) {
+      searchResults = []
+      return
+    }
+    searchTimer = setTimeout(async () => {
+      try {
+        searchResults = await searchItems(q)
+      } catch {
+        searchResults = []
+      }
+    }, 250)
+  }
+
+  function clearSearch() {
+    searchQ = ''
+    searchResults = []
+  }
+
+  // The full player shows on the playing item's own page; anywhere else it
+  // collapses to the bottom now-playing bar (Plex-style).
+  const playerCompact = $derived(
+    !!playing && !(tab === 'libraries' && detail?.item.id === playing.item.id),
+  )
+
+  // Jump to an item's detail page, restoring library context.
+  async function showItem(target: Item) {
+    tab = 'libraries'
+    const lib = libraries.find((l) => l.id === target.libraryId)
+    if (lib && lib.id !== currentLib?.id) {
+      currentLib = lib
+      libraryItems(lib.id).then((items) => {
+        gridItems = items.filter((i) => i.kind === 'movie' || i.kind === 'series')
+      })
+    }
+    await openItem(target.id)
+  }
 
   function readQuality(): PlayQuality {
     try {
@@ -92,6 +137,7 @@
     try {
       const info = await playItem(item.id, quality)
       playing = { item, info, quality, gen: ++playGen }
+      if (detail?.item.id !== item.id) showItem(item) // full player lives on the item's page
     } catch (e) {
       console.error('play failed', e)
     }
@@ -187,8 +233,42 @@
 {/snippet}
 
 <div class="shell">
+  <div class="topbar">
+    <button class="logo" onclick={() => (tab = 'home')}>Cineva</button>
+    <div class="search">
+      <input
+        type="search"
+        placeholder="Search…"
+        bind:value={searchQ}
+        oninput={onSearchInput}
+        onkeydown={(e) => e.key === 'Escape' && clearSearch()}
+      />
+      {#if searchResults.length > 0}
+        <div class="search-results">
+          {#each searchResults as r (r.id)}
+            <button class="sr" onclick={() => { showItem(r); clearSearch() }}>
+              {#if r.poster}
+                <img src={r.poster} alt="" />
+              {:else}
+                <span class="sr-ph">{r.title.slice(0, 1)}</span>
+              {/if}
+              <span class="sr-text">
+                <span class="sr-title">{r.title}</span>
+                <span class="sr-sub">
+                  {r.kind}{r.year ? ` · ${r.year}` : ''}{r.kind === 'episode' ? ` · S${String(r.seasonNum).padStart(2, '0')}E${String(r.episodeNum).padStart(2, '0')}` : ''}
+                </span>
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+    <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
+    <button class="avatar" title="Local user — accounts arrive with milestone 4">👤</button>
+  </div>
+
+  <div class="body">
   <aside class="side">
-    <span class="logo">Cineva</span>
     <button class="side-item" class:active={tab === 'home'} onclick={() => (tab = 'home')}>⌂ Home</button>
     <div class="tree">
       {#each libraryTree as group (group.type)}
@@ -213,12 +293,7 @@
   </aside>
 
   <div class="content">
-  <header>
-    <span class="logo">Cineva</span>
-    <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
-  </header>
-
-  <main>
+  <main class:withbar={playing && playerCompact}>
     {#if tab === 'libraries' && currentLib}
       <nav class="crumbs" aria-label="Breadcrumb">
         <button class="crumb" onclick={toLibraries}>Libraries</button>
@@ -242,9 +317,11 @@
           item={playing.item}
           info={playing.info}
           quality={playing.quality}
+          compact={playerCompact}
           onclose={closePlayer}
           onnext={playNext}
           onquality={changeQuality}
+          onexpand={() => playing && showItem(playing.item)}
         />
       {/key}
     {/if}
@@ -390,7 +467,7 @@
     {/if}
   </main>
 
-  <nav>
+  <nav class="tabbar">
     {#each tabs as t (t.id)}
       <button class:active={tab === t.id} onclick={() => (tab = t.id)}>
         <span class="icon">{t.icon}</span>
@@ -399,12 +476,93 @@
     {/each}
   </nav>
   </div>
+  </div>
 </div>
 
 
 <style>
-  .shell { min-height: 100vh; display: flex; }
+  .shell { min-height: 100vh; display: flex; flex-direction: column; }
+  .body { flex: 1; display: flex; }
   .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+  /* ---- Persistent top bar: logo, universal search, profile ---- */
+  :root { --topbar-h: 3.4rem; }
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    height: var(--topbar-h);
+    padding: 0 1rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .logo { flex: none; }
+  .search { position: relative; flex: 1; max-width: 30rem; }
+  .search input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.88rem;
+    padding: 0.45rem 1rem;
+  }
+  .search input:focus { outline: none; border-color: var(--accent); }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 0.4rem);
+    left: 0;
+    right: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .sr {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    width: 100%;
+    padding: 0.5rem 0.8rem;
+    text-align: left;
+  }
+  .sr:hover { background: var(--bg); }
+  .sr img, .sr-ph {
+    width: 2rem;
+    height: 3rem;
+    border-radius: 4px;
+    object-fit: cover;
+    flex: none;
+  }
+  .sr-ph {
+    display: grid;
+    place-items: center;
+    background: var(--bg);
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .sr-text { display: flex; flex-direction: column; min-width: 0; }
+  .sr-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sr-sub { font-size: 0.76rem; color: var(--muted); }
+  .avatar {
+    width: 2.1rem;
+    height: 2.1rem;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    display: grid;
+    place-items: center;
+    font-size: 1rem;
+    flex: none;
+  }
+  .avatar:hover { border-color: var(--accent); }
 
   /* ---- Sidebar: desktop only; mobile keeps the bottom tab bar ---- */
   .side { display: none; }
@@ -415,17 +573,17 @@
       width: 15rem;
       flex: none;
       position: sticky;
-      top: 0;
-      height: 100vh;
+      top: var(--topbar-h);
+      height: calc(100vh - var(--topbar-h));
       overflow-y: auto;
       background: var(--panel);
       border-right: 1px solid var(--border);
-      padding: 1.1rem 0.8rem;
+      padding: 0.9rem 0.8rem;
       gap: 0.15rem;
     }
-    header, nav { display: none !important; }
+    .tabbar { display: none !important; }
   }
-  .side .logo { margin: 0 0.35rem 1rem; }
+  main.withbar { padding-bottom: 6.5rem; }
   .side-item {
     text-align: left;
     padding: 0.5rem 0.65rem;
@@ -443,8 +601,8 @@
     letter-spacing: 0.06em;
     padding: 0.7rem 0.65rem 0.25rem;
   }
-  .type-icon { margin-right: 0.2rem; }
-  .side-item.leaf { padding-left: 1.6rem; }
+  .type-icon { margin-right: 0.35rem; font-size: 1.15rem; vertical-align: -0.2rem; }
+  .side-item.leaf { padding-left: 1.9rem; }
   .side-bottom { margin-top: auto; }
   .side-status {
     display: flex;
@@ -453,13 +611,6 @@
     padding: 0.6rem 0.65rem 0;
     color: var(--muted);
     font-size: 0.78rem;
-  }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid var(--border);
   }
   .logo {
     font-size: 1.35rem;
@@ -630,14 +781,14 @@
     background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
 
-  nav {
+  .tabbar {
     position: fixed;
     bottom: 0; left: 0; right: 0;
     display: flex;
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
-  nav button {
+  .tabbar button {
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -647,8 +798,8 @@
     color: var(--muted);
     font-size: 0.75rem;
   }
-  nav button .icon { font-size: 1.15rem; }
-  nav button.active { color: var(--accent-2); }
+  .tabbar button .icon { font-size: 1.15rem; }
+  .tabbar button.active { color: var(--accent-2); }
 
   @media (min-width: 768px) {
     main { padding-bottom: 1.25rem; }

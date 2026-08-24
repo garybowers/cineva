@@ -112,6 +112,7 @@ export const listLibraries = () => get<Library[]>('/libraries')
 export const libraryItems = (id: string) => get<Item[]>(`/libraries/${id}/items`)
 export const itemDetail = (id: string) => get<ItemDetail>(`/items/${id}`)
 export const itemSubtitles = (id: string) => get<SubtitleTrack[]>(`/items/${id}/subtitles`)
+export const searchItems = (q: string) => get<Item[]>(`/search?q=${encodeURIComponent(q)}`)
 export const playItem = (id: string, quality: PlayQuality = 'auto') =>
   post<PlayInfo>(`/items/${id}/play`, { ...caps, quality })
 export const postProgress = (id: string, positionSecs: number) =>

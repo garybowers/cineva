@@ -164,6 +164,16 @@ func (s *Store) CountItems(ctx context.Context, libraryID string, kind ItemKind)
 	return n, nil
 }
 
+// SearchItems finds movies, series, and episodes whose title matches q
+// (case-insensitive substring). Series and movies rank above episodes.
+func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, error) {
+	return s.queryItems(ctx,
+		`SELECT `+itemCols+` FROM items
+		 WHERE kind IN ('movie', 'series', 'episode') AND title LIKE '%' || ? || '%'
+		 ORDER BY CASE kind WHEN 'episode' THEN 1 ELSE 0 END, title
+		 LIMIT ?`, q, limit)
+}
+
 func (s *Store) queryItems(ctx context.Context, query string, args ...any) ([]Item, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

@@ -59,6 +59,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/libraries/:id/items", s.libraryItems)
 	v1.GET("/items/:id", s.getItem)
 	v1.GET("/scans", s.listScans)
+	v1.GET("/search", s.search)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)

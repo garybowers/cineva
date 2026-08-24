@@ -96,6 +96,19 @@ func (s *server) libraryItems(c echo.Context) error {
 	return c.JSON(http.StatusOK, items)
 }
 
+// GET /search?q= — universal title search.
+func (s *server) search(c echo.Context) error {
+	q := c.QueryParam("q")
+	if len(q) < 2 {
+		return c.JSON(http.StatusOK, []store.Item{})
+	}
+	items, err := s.store.SearchItems(c.Request().Context(), q, 20)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, items)
+}
+
 func (s *server) getItem(c echo.Context) error {
 	ctx := c.Request().Context()
 	item, err := s.store.Item(ctx, c.Param("id"))
