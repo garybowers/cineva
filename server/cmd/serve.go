@@ -31,6 +31,13 @@ var serveCmd = &cobra.Command{
 		}
 		fmt.Printf("server identity: %x…\n", identity.PublicKey[:8])
 
+		// Any scan still 'running' at startup belonged to a dead process.
+		if n, err := st.FailOrphanedScans(ctx); err != nil {
+			return err
+		} else if n > 0 {
+			fmt.Printf("marked %d orphaned scan(s) as failed\n", n)
+		}
+
 		artworkDir := viper.GetString("libraries.artwork_dir")
 		return api.Serve(api.Config{
 			Host:         viper.GetString("server.host"),

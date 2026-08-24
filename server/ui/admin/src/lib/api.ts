@@ -53,6 +53,7 @@ export const createLibrary = (name: string, mediaType: string, paths: string[]) 
 export const deleteLibrary = (id: string) => req<void>(`/libraries/${id}`, { method: 'DELETE' })
 export const scanLibrary = (id: string) => req<Scan>(`/libraries/${id}/scan`, { method: 'POST' })
 export const listScans = () => req<Scan[]>('/scans')
+export const cancelScan = (id: string) => req<void>(`/scans/${id}/cancel`, { method: 'POST' })
 
 export interface PlaySession {
   id: string

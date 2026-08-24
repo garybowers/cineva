@@ -2,6 +2,7 @@ package library
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -26,7 +27,7 @@ type Manager struct {
 	Probe      func(path string) (media.Info, error)
 
 	mu      sync.Mutex
-	running map[string]bool // libraryID -> scan in progress
+	running map[string]context.CancelFunc // libraryID -> cancel for the active scan
 }
 
 func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string) *Manager {
@@ -35,49 +36,86 @@ func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string
 		Video:      video,
 		ArtworkDir: artworkDir,
 		Probe:      media.Probe,
-		running:    map[string]bool{},
+		running:    map[string]context.CancelFunc{},
 	}
+}
+
+// acquire takes the scan lock for a library: in-process via the running map,
+// cross-process via the scans table (CLI and server share the database).
+func (m *Manager) acquire(ctx context.Context, lib store.Library, cancel context.CancelFunc) error {
+	m.mu.Lock()
+	if _, ok := m.running[lib.ID]; ok {
+		m.mu.Unlock()
+		return fmt.Errorf("library %q is already being scanned", lib.Name)
+	}
+	m.running[lib.ID] = cancel
+	m.mu.Unlock()
+	if _, running, err := m.Store.RunningScan(ctx, lib.ID); err != nil || running {
+		m.clearRunning(lib.ID)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("library %q is already being scanned (possibly by another process)", lib.Name)
+	}
+	return nil
+}
+
+// CancelScan stops a running scan. Scans owned by this process are cancelled
+// via their context; a stale row from a dead process is marked failed.
+func (m *Manager) CancelScan(ctx context.Context, scanID string) error {
+	sc, err := m.Store.ScanByID(ctx, scanID)
+	if err != nil {
+		return err
+	}
+	if sc.Status != "running" {
+		return fmt.Errorf("scan is not running")
+	}
+	m.mu.Lock()
+	cancel, ok := m.running[sc.LibraryID]
+	m.mu.Unlock()
+	if ok {
+		cancel() // runScan records the row as cancelled
+		return nil
+	}
+	return m.Store.FinishScan(ctx, scanID, "failed", "cancelled", sc.FilesSeen, sc.ItemsCreated)
 }
 
 // StartScan launches a scan in the background and returns its record.
 func (m *Manager) StartScan(ctx context.Context, lib store.Library) (store.Scan, error) {
-	m.mu.Lock()
-	if m.running[lib.ID] {
-		m.mu.Unlock()
-		return store.Scan{}, fmt.Errorf("library %q is already being scanned", lib.Name)
+	// Detached from the request context: a scan outlives its HTTP request.
+	runCtx, cancel := context.WithCancel(context.Background())
+	if err := m.acquire(ctx, lib, cancel); err != nil {
+		cancel()
+		return store.Scan{}, err
 	}
-	m.running[lib.ID] = true
-	m.mu.Unlock()
-
 	scan, err := m.Store.CreateScan(ctx, lib.ID)
 	if err != nil {
 		m.clearRunning(lib.ID)
+		cancel()
 		return store.Scan{}, err
 	}
 	go func() {
 		defer m.clearRunning(lib.ID)
-		// Detached from the request context: a scan outlives its HTTP request.
-		m.runScan(context.Background(), scan, lib)
+		defer cancel()
+		m.runScan(runCtx, scan, lib)
 	}()
 	return scan, nil
 }
 
 // RunScanSync runs a scan in the foreground (used by the `cineva scan` CLI).
 func (m *Manager) RunScanSync(ctx context.Context, lib store.Library) (store.Scan, error) {
-	m.mu.Lock()
-	if m.running[lib.ID] {
-		m.mu.Unlock()
-		return store.Scan{}, fmt.Errorf("library %q is already being scanned", lib.Name)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := m.acquire(ctx, lib, cancel); err != nil {
+		return store.Scan{}, err
 	}
-	m.running[lib.ID] = true
-	m.mu.Unlock()
 	defer m.clearRunning(lib.ID)
 
 	scan, err := m.Store.CreateScan(ctx, lib.ID)
 	if err != nil {
 		return store.Scan{}, err
 	}
-	m.runScan(ctx, scan, lib)
+	m.runScan(runCtx, scan, lib)
 	scans, err := m.Store.Scans(ctx, 50)
 	if err != nil {
 		return store.Scan{}, err
@@ -112,11 +150,15 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	}
 
 	status, errMsg := "completed", ""
-	if scanErr != nil {
+	if errors.Is(scanErr, context.Canceled) {
+		status, errMsg = "failed", "cancelled"
+		log.Printf("scan %s (%s): cancelled", lib.Name, scan.ID)
+	} else if scanErr != nil {
 		status, errMsg = "failed", scanErr.Error()
 		log.Printf("scan %s (%s): %v", lib.Name, scan.ID, scanErr)
 	}
-	if err := m.Store.FinishScan(ctx, scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
+	// The scan's own context may be cancelled; finish the row regardless.
+	if err := m.Store.FinishScan(context.WithoutCancel(ctx), scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
 		log.Printf("finish scan %s: %v", scan.ID, err)
 	}
 }
@@ -148,6 +190,9 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library) (int, int, 
 	}
 	created := 0
 	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			return len(files), created, err
+		}
 		info := ParseMovie(path)
 		item := store.Item{
 			LibraryID: lib.ID, Kind: store.KindMovie,
@@ -183,6 +228,9 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library) (int, int, erro
 	seasonData := map[string]metadata.SeasonResult{} // season dir -> tmdb season
 
 	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			return len(files), created, err
+		}
 		ep, ok := ParseEpisode(path)
 		if !ok {
 			log.Printf("scan: no SxxEyy marker, skipping %s", path)

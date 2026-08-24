@@ -177,6 +177,21 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
 
+  /scans/{id}/cancel:
+    post:
+      summary: Cancel a running scan
+      description: >
+        Scans owned by this server process stop within one file; a stale
+        'running' row left by a dead process is marked failed. Starting a
+        scan while one is running for the same library is rejected with 409
+        (the scans table is the cross-process lock).
+      operationId: cancelScan
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Cancellation initiated (or stale row cleared) }
+        "409": { description: Scan is not running }
+
   /items/{id}/play:
     post:
       summary: Start playback — decides direct play vs HLS transcode

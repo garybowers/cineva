@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -22,6 +24,9 @@ type ScanRepo interface {
 	CreateScan(ctx context.Context, libraryID string) (Scan, error)
 	FinishScan(ctx context.Context, id, status, errMsg string, filesSeen, itemsCreated int) error
 	Scans(ctx context.Context, limit int) ([]Scan, error)
+	ScanByID(ctx context.Context, id string) (Scan, error)
+	RunningScan(ctx context.Context, libraryID string) (Scan, bool, error)
+	FailOrphanedScans(ctx context.Context) (int64, error)
 }
 
 var _ ScanRepo = (*Store)(nil)
@@ -43,6 +48,48 @@ func (s *Store) FinishScan(ctx context.Context, id, status, errMsg string, files
 		return fmt.Errorf("finish scan %s: %w", id, err)
 	}
 	return nil
+}
+
+const scanCols = `id, library_id, status, files_seen, items_created, error, started_at, COALESCE(finished_at, '')`
+
+func (s *Store) ScanByID(ctx context.Context, id string) (Scan, error) {
+	var sc Scan
+	err := s.db.QueryRowContext(ctx,
+		`SELECT `+scanCols+` FROM scans WHERE id = ?`, id).
+		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt)
+	if err != nil {
+		return Scan{}, fmt.Errorf("scan %s: %w", id, err)
+	}
+	return sc, nil
+}
+
+// RunningScan reports whether a library has a scan in progress — the
+// cross-process lock (CLI scans and server scans share the database).
+func (s *Store) RunningScan(ctx context.Context, libraryID string) (Scan, bool, error) {
+	var sc Scan
+	err := s.db.QueryRowContext(ctx,
+		`SELECT `+scanCols+` FROM scans WHERE library_id = ? AND status = 'running' LIMIT 1`, libraryID).
+		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Scan{}, false, nil
+	}
+	if err != nil {
+		return Scan{}, false, fmt.Errorf("running scan: %w", err)
+	}
+	return sc, true, nil
+}
+
+// FailOrphanedScans marks all 'running' scans as failed — called at server
+// startup, when any scan still marked running belonged to a dead process.
+func (s *Store) FailOrphanedScans(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE scans SET status = 'failed', error = 'interrupted (process exited)',
+		 finished_at = datetime('now') WHERE status = 'running'`)
+	if err != nil {
+		return 0, fmt.Errorf("fail orphaned scans: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func (s *Store) Scans(ctx context.Context, limit int) ([]Scan, error) {

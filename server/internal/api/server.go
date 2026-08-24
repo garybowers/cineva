@@ -62,6 +62,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/libraries/:id/items", s.libraryItems)
 	v1.GET("/items/:id", s.getItem)
 	v1.GET("/scans", s.listScans)
+	v1.POST("/scans/:id/cancel", s.cancelScan)
 	v1.GET("/search", s.search)
 
 	// Playback (milestone 3)

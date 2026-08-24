@@ -55,6 +55,9 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 	albumArt := map[string]bool{}    // album dirs whose artwork is done
 
 	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			return len(files), created, err
+		}
 		info, err := media.ProbeAudio(path)
 		if err != nil {
 			log.Printf("probe audio %s: %v", path, err)

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    listSessions, stopSession,
+    cancelScan, listSessions, stopSession,
     type Health, type Library, type Scan, type PlaySession,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -205,7 +205,7 @@
       {:else}
         <div class="tablewrap">
           <table>
-            <thead><tr><th>Library</th><th>Status</th><th>Files</th><th>Items</th><th>Started</th></tr></thead>
+            <thead><tr><th>Library</th><th>Status</th><th>Files</th><th>Items</th><th>Started</th><th></th></tr></thead>
             <tbody>
               {#each scans as s (s.id)}
                 <tr>
@@ -217,6 +217,11 @@
                   <td>{s.filesSeen}</td>
                   <td>{s.itemsCreated}</td>
                   <td class="muted">{s.startedAt}</td>
+                  <td class="actions">
+                    {#if s.status === 'running'}
+                      <button class="danger" onclick={() => cancelScan(s.id).then(refresh).catch((e) => (error = String(e)))}>Cancel</button>
+                    {/if}
+                  </td>
                 </tr>
               {/each}
             </tbody>

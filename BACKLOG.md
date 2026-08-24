@@ -13,7 +13,7 @@ record it here in the same change — this file is how we find our way back.
 - [x] Episode-level TMDB metadata: titles/overviews/stills via the season endpoint (tags and filenames still take precedence where present).
 - [x] Season posters / overviews via the TMDB season endpoint.
 - [ ] Worker pool for probing (scan is sequential; fine at hundreds of files, slow at tens of thousands).
-- [ ] Scan cancellation (context plumbing exists, no abort endpoint/UI).
+- [x] Scan cancellation: POST /scans/{id}/cancel + admin Cancel button; scans stop within one file.
 - [ ] Scheduled rescans and/or filesystem watch (`libraries.scan_interval` config).
 - [ ] Fuzzy/multi-field search: search matches title substring only — add year, cast, person search when credits exist.
 - [ ] Multi-version grouping: 40 movie folders hold two files of the same film (m4v + mkv); each becomes a separate item. Plex groups them as versions of one movie with a version picker at play time.
@@ -55,4 +55,4 @@ record it here in the same change — this file is how we find our way back.
 
 ## Operational
 - [ ] CI: build UIs, `go vet`/test, lint on push (no CI at all yet).
-- [ ] Stale `running` scans: a scan interrupted by server kill stays `running` in the DB forever; mark orphaned scans failed at startup.
+- [x] Stale `running` scans marked failed at server startup; the scans table doubles as the cross-process scan lock.

@@ -80,6 +80,14 @@ func (s *server) scanLibrary(c echo.Context) error {
 	return c.JSON(http.StatusAccepted, scan)
 }
 
+// POST /scans/:id/cancel — stop a running scan (or clear a stale one).
+func (s *server) cancelScan(c echo.Context) error {
+	if err := s.manager.CancelScan(c.Request().Context(), c.Param("id")); err != nil {
+		return echo.NewHTTPError(http.StatusConflict, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
 func (s *server) listScans(c echo.Context) error {
 	scans, err := s.store.Scans(c.Request().Context(), 50)
 	if err != nil {
