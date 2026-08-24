@@ -105,6 +105,8 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib)
 	case store.MediaTV:
 		filesSeen, itemsCreated, scanErr = m.scanTV(ctx, lib)
+	case store.MediaMusic:
+		filesSeen, itemsCreated, scanErr = m.scanMusic(ctx, lib)
 	default:
 		scanErr = fmt.Errorf("scanner for %s libraries arrives in a later milestone", lib.MediaType)
 	}

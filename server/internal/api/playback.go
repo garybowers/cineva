@@ -79,10 +79,11 @@ func (s *server) playableItem(c echo.Context) (store.Item, error) {
 	if err != nil {
 		return store.Item{}, echo.NewHTTPError(http.StatusNotFound, "item not found")
 	}
-	if item.Kind != store.KindMovie && item.Kind != store.KindEpisode {
-		return store.Item{}, echo.NewHTTPError(http.StatusBadRequest, "item is not playable")
+	switch item.Kind {
+	case store.KindMovie, store.KindEpisode, store.KindTrack:
+		return item, nil
 	}
-	return item, nil
+	return store.Item{}, echo.NewHTTPError(http.StatusBadRequest, "item is not playable")
 }
 
 // POST /items/:id/play — decide direct play vs HLS and start a session if
@@ -92,6 +93,15 @@ func (s *server) playItem(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
+	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)
+	if item.Kind == store.KindTrack {
+		return c.JSON(http.StatusOK, playInfo{
+			Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
+			DurationSecs: item.RuntimeSecs, Subtitles: []subtitleInfo{},
+		})
+	}
+
 	caps := defaultCaps
 	var body capabilities
 	if err := c.Bind(&body); err == nil && len(body.Containers) > 0 {

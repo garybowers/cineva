@@ -6,6 +6,7 @@
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import Player from './Player.svelte'
+  import MusicPlayer from './MusicPlayer.svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
   const tabs: { id: Tab; label: string; icon: string }[] = [
@@ -43,8 +44,32 @@
   let trail: Item[] = $state([]) // breadcrumb ancestors of the current detail
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
+  let music: { queue: Item[]; startIndex: number; shuffle: boolean; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
   let playGen = 0 // bumps on quality change so the player remounts
+
+  // Video and music playback are mutually exclusive.
+  function startMusic(tracks: Item[], startIndex: number, shuffleAll = false) {
+    playing = null
+    music = { queue: tracks, startIndex, shuffle: shuffleAll, gen: ++playGen }
+  }
+
+  // Open the album containing a track (from the music bar or search).
+  async function openAlbumOf(track: Item) {
+    if (!track.parentId) return
+    tab = 'libraries'
+    const lib = libraries.find((l) => l.id === track.libraryId)
+    if (lib && lib.id !== currentLib?.id) {
+      currentLib = lib
+      libraryItems(lib.id).then((items) => {
+        gridItems = items.filter(gridFilter(lib))
+      })
+    }
+    await openItem(track.parentId)
+  }
+
+  const gridFilter = (lib: Library) => (i: Item) =>
+    lib.mediaType === 'music' ? i.kind === 'album' : i.kind === 'movie' || i.kind === 'series'
 
   // Search
   let searchQ = $state('')
@@ -80,12 +105,13 @@
 
   // Jump to an item's detail page, restoring library context.
   async function showItem(target: Item) {
+    if (target.kind === 'track') return openAlbumOf(target)
     tab = 'libraries'
     const lib = libraries.find((l) => l.id === target.libraryId)
     if (lib && lib.id !== currentLib?.id) {
       currentLib = lib
       libraryItems(lib.id).then((items) => {
-        gridItems = items.filter((i) => i.kind === 'movie' || i.kind === 'series')
+        gridItems = items.filter(gridFilter(lib))
       })
     }
     await openItem(target.id)
@@ -136,6 +162,7 @@
   async function startPlay(item: Item, quality: PlayQuality = readQuality()) {
     try {
       const info = await playItem(item.id, quality)
+      music = null // video and music are mutually exclusive
       playing = { item, info, quality, gen: ++playGen }
       if (detail?.item.id !== item.id) showItem(item) // full player lives on the item's page
     } catch (e) {
@@ -167,7 +194,7 @@
     detail = null
     trail = []
     const items = await libraryItems(lib.id)
-    gridItems = items.filter((i) => i.kind === 'movie' || i.kind === 'series')
+    gridItems = items.filter(gridFilter(lib))
   }
 
   // fromChild: opened via the current detail's children list (drill-down);
@@ -242,9 +269,9 @@
 
 {#snippet poster(item: Item)}
   {#if item.poster}
-    <img class="poster" src={item.poster} alt={item.title} loading="lazy" />
+    <img class="poster" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'} src={item.poster} alt={item.title} loading="lazy" />
   {:else}
-    <div class="poster placeholder"><span>{item.title.slice(0, 1)}</span></div>
+    <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}><span>{item.kind === 'album' || item.kind === 'track' ? '♪' : item.title.slice(0, 1)}</span></div>
   {/if}
 {/snippet}
 
@@ -309,7 +336,7 @@
   </aside>
 
   <div class="content">
-  <main class:withbar={playing && playerCompact}>
+  <main class:withbar={(playing && playerCompact) || !!music}>
     {#if tab === 'libraries' && currentLib}
       <nav class="crumbs" aria-label="Breadcrumb">
         <button class="crumb" onclick={toLibraries}>Libraries</button>
@@ -326,6 +353,17 @@
           <span class="crumb-current">{currentLib.name}</span>
         {/if}
       </nav>
+    {/if}
+    {#if music}
+      {#key music.gen}
+        <MusicPlayer
+          queue={music.queue}
+          startIndex={music.startIndex}
+          startShuffle={music.shuffle}
+          onclose={() => (music = null)}
+          onlocate={openAlbumOf}
+        />
+      {/key}
     {/if}
     {#if playing}
       {#key playing.gen}
@@ -384,6 +422,13 @@
               {detail.item.title}
               {#if detail.item.year}<span class="muted">({detail.item.year})</span>{/if}
             </h1>
+            {#if detail.item.kind === 'album'}
+              <p class="meta">{detail.item.artist} · {detail.children.length} tracks</p>
+              <div class="actions">
+                <button class="play" onclick={() => detail && startMusic(detail.children, 0)}>▶ Play</button>
+                <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}>🔀 Shuffle</button>
+              </div>
+            {/if}
             <p class="meta">
               {#if detail.item.kind === 'episode'}S{String(detail.item.seasonNum).padStart(2, '0')}E{String(detail.item.episodeNum).padStart(2, '0')} · {/if}
               {runtime(detail.item.runtimeSecs)}
@@ -411,15 +456,27 @@
         </div>
         {#if detail.children.length > 0}
           <ul class="children">
-            {#each detail.children as child (child.id)}
+            {#each detail.children as child, ci (child.id)}
               <li>
-                <button onclick={() => openItem(child.id, true)}>
-                  <span>
-                    {#if child.kind === 'episode'}<span class="epnum">{child.episodeNum}.</span> {/if}
-                    {child.title}
-                  </span>
-                  <span class="muted">{runtime(child.runtimeSecs)}</span>
-                </button>
+                {#if child.kind === 'track'}
+                  <button onclick={() => detail && startMusic(detail.children, ci)}>
+                    <span>
+                      <span class="epnum">{child.trackNum || ci + 1}.</span>
+                      {child.title}
+                      {#if child.artist && child.artist !== detail.item.artist}<span class="muted"> — {child.artist}</span>{/if}
+                    </span>
+                    <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
+                  </button>
+                {:else}
+                  <button onclick={() => openItem(child.id, true)}>
+                    <span>
+                      {#if child.kind === 'episode'}<span class="epnum">{child.episodeNum}.</span> {/if}
+                      {child.title}
+                      {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
+                    </span>
+                    <span class="muted">{runtime(child.runtimeSecs)}</span>
+                  </button>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -434,7 +491,9 @@
               <button class="cell" onclick={() => openItem(item.id)}>
                 {@render poster(item)}
                 <span class="cell-title">{item.title}</span>
-                {#if item.year}<span class="cell-sub">{item.year}</span>{/if}
+                <span class="cell-sub">
+                  {#if item.kind === 'album'}{item.artist}{#if item.year} · {item.year}{/if}{:else if item.year}{item.year}{/if}
+                </span>
               </button>
             {/each}
           </div>
@@ -713,6 +772,7 @@
     font-weight: 700;
     color: var(--muted);
   }
+  .poster.square { aspect-ratio: 1 / 1; }
   .cell:hover .poster { border-color: var(--accent); }
   .cell-title { font-size: 0.86rem; line-height: 1.25; }
   .cell-sub { font-size: 0.75rem; color: var(--muted); }

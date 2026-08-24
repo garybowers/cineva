@@ -38,9 +38,21 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // Migrate applies embedded migrations in filename order, tracking applied
-// versions in schema_migrations. Migration files are append-only.
+// versions in schema_migrations. Migration files are append-only. Migrations
+// run on a dedicated connection with foreign keys disabled so table rebuilds
+// (SQLite's only way to change constraints) don't cascade into child tables.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("migration connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`)
+
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
 		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 	)`); err != nil {
@@ -62,7 +74,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		}
 
 		var applied int
-		if err := s.db.QueryRowContext(ctx,
+		if err := conn.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&applied); err != nil {
 			return fmt.Errorf("check migration %d: %w", version, err)
 		}
@@ -74,7 +86,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", base, err)
 		}
-		tx, err := s.db.BeginTx(ctx, nil)
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin migration %d: %w", version, err)
 		}

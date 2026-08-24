@@ -40,7 +40,7 @@ func (s *server) listLibraries(c echo.Context) error {
 	out := make([]libraryResponse, 0, len(libs))
 	for _, lib := range libs {
 		resp := libraryResponse{Library: lib}
-		for _, kind := range []store.ItemKind{store.KindMovie, store.KindEpisode} {
+		for _, kind := range []store.ItemKind{store.KindMovie, store.KindEpisode, store.KindTrack} {
 			n, err := s.store.CountItems(ctx, lib.ID, kind)
 			if err != nil {
 				return err

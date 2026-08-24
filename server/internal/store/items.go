@@ -17,6 +17,9 @@ const (
 	KindSeries  ItemKind = "series"
 	KindSeason  ItemKind = "season"
 	KindEpisode ItemKind = "episode"
+	KindArtist  ItemKind = "artist"
+	KindAlbum   ItemKind = "album"
+	KindTrack   ItemKind = "track"
 )
 
 type Item struct {
@@ -28,6 +31,9 @@ type Item struct {
 	Year        int      `json:"year,omitempty"`
 	SeasonNum   int      `json:"seasonNum,omitempty"`
 	EpisodeNum  int      `json:"episodeNum,omitempty"`
+	DiscNum     int      `json:"discNum,omitempty"`
+	TrackNum    int      `json:"trackNum,omitempty"`
+	Artist      string   `json:"artist,omitempty"`
 	Path        string   `json:"path"`
 	SizeBytes   int64    `json:"sizeBytes,omitempty"`
 	RuntimeSecs int      `json:"runtimeSecs,omitempty"`
@@ -63,7 +69,8 @@ func itemColumns(alias string) string {
 	}
 	cols := []string{
 		p("id"), p("library_id"), p("kind"), "COALESCE(" + p("parent_id") + ", '')",
-		p("title"), p("year"), p("season_num"), p("episode_num"), p("path"),
+		p("title"), p("year"), p("season_num"), p("episode_num"), p("disc_num"),
+		p("track_num"), p("artist"), p("path"),
 		p("size_bytes"), p("runtime_secs"), p("container"), p("video_codec"),
 		p("audio_codec"), p("width"), p("height"), p("tmdb_id"), p("overview"),
 		p("poster"), p("added_at"), p("updated_at"),
@@ -76,7 +83,8 @@ var itemCols = itemColumns("")
 func scanItem(row interface{ Scan(...any) error }) (Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.LibraryID, &it.Kind, &it.ParentID, &it.Title, &it.Year,
-		&it.SeasonNum, &it.EpisodeNum, &it.Path, &it.SizeBytes, &it.RuntimeSecs,
+		&it.SeasonNum, &it.EpisodeNum, &it.DiscNum, &it.TrackNum, &it.Artist,
+		&it.Path, &it.SizeBytes, &it.RuntimeSecs,
 		&it.Container, &it.VideoCodec, &it.AudioCodec, &it.Width, &it.Height,
 		&it.TmdbID, &it.Overview, &it.Poster, &it.AddedAt, &it.UpdatedAt)
 	return it, err
@@ -98,12 +106,14 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 	case errors.Is(err, sql.ErrNoRows):
 		id = uuid.NewString()
 		_, err = s.db.ExecContext(ctx, `INSERT INTO items
-			(id, library_id, kind, parent_id, title, year, season_num, episode_num, path,
+			(id, library_id, kind, parent_id, title, year, season_num, episode_num,
+			 disc_num, track_num, artist, path,
 			 size_bytes, runtime_secs, container, video_codec, audio_codec, width, height,
 			 tmdb_id, overview, poster)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, item.LibraryID, string(item.Kind), parent, item.Title, item.Year,
-			item.SeasonNum, item.EpisodeNum, item.Path, item.SizeBytes, item.RuntimeSecs,
+			item.SeasonNum, item.EpisodeNum, item.DiscNum, item.TrackNum, item.Artist,
+			item.Path, item.SizeBytes, item.RuntimeSecs,
 			item.Container, item.VideoCodec, item.AudioCodec, item.Width, item.Height,
 			item.TmdbID, item.Overview, item.Poster)
 		if err != nil {
@@ -114,6 +124,7 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 	default:
 		_, err = s.db.ExecContext(ctx, `UPDATE items SET
 			kind = ?, parent_id = ?, title = ?, year = ?, season_num = ?, episode_num = ?,
+			disc_num = ?, track_num = ?, artist = ?,
 			size_bytes = ?, runtime_secs = ?, container = ?, video_codec = ?, audio_codec = ?,
 			width = ?, height = ?,
 			tmdb_id = CASE WHEN ? != 0 THEN ? ELSE tmdb_id END,
@@ -122,6 +133,7 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			updated_at = datetime('now')
 			WHERE id = ?`,
 			string(item.Kind), parent, item.Title, item.Year, item.SeasonNum, item.EpisodeNum,
+			item.DiscNum, item.TrackNum, item.Artist,
 			item.SizeBytes, item.RuntimeSecs, item.Container, item.VideoCodec, item.AudioCodec,
 			item.Width, item.Height,
 			item.TmdbID, item.TmdbID, item.Overview, item.Overview, item.Poster, item.Poster,
@@ -150,7 +162,8 @@ func (s *Store) ItemsByLibrary(ctx context.Context, libraryID string) ([]Item, e
 
 func (s *Store) ItemsByParent(ctx context.Context, parentID string) ([]Item, error) {
 	return s.queryItems(ctx,
-		`SELECT `+itemCols+` FROM items WHERE parent_id = ? ORDER BY season_num, episode_num, title`,
+		`SELECT `+itemCols+` FROM items WHERE parent_id = ?
+		 ORDER BY disc_num, track_num, season_num, episode_num, year, title`,
 		parentID)
 }
 
@@ -164,14 +177,16 @@ func (s *Store) CountItems(ctx context.Context, libraryID string, kind ItemKind)
 	return n, nil
 }
 
-// SearchItems finds movies, series, and episodes whose title matches q
-// (case-insensitive substring). Series and movies rank above episodes.
+// SearchItems finds items whose title (or artist) matches q, case-insensitive
+// substring. Top-level entries (movies, series, artists, albums) rank above
+// episodes and tracks.
 func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, error) {
 	return s.queryItems(ctx,
 		`SELECT `+itemCols+` FROM items
-		 WHERE kind IN ('movie', 'series', 'episode') AND title LIKE '%' || ? || '%'
-		 ORDER BY CASE kind WHEN 'episode' THEN 1 ELSE 0 END, title
-		 LIMIT ?`, q, limit)
+		 WHERE kind IN ('movie', 'series', 'episode', 'artist', 'album', 'track')
+		   AND (title LIKE '%' || ? || '%' OR artist LIKE '%' || ? || '%')
+		 ORDER BY CASE kind WHEN 'episode' THEN 1 WHEN 'track' THEN 1 ELSE 0 END, title
+		 LIMIT ?`, q, q, limit)
 }
 
 func (s *Store) queryItems(ctx context.Context, query string, args ...any) ([]Item, error) {

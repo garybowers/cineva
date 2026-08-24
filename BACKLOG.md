@@ -33,6 +33,16 @@ record it here in the same change — this file is how we find our way back.
 - [ ] PWA: manifest + install + icon set (the mobile-first layout is done; installability is not).
 - [ ] User menu behind the top-bar profile icon (after milestone 4).
 
+## Milestone 7 — Audio (music shipped; audiobooks pending)
+- [ ] MusicBrainz + Cover Art Archive enrichment (metadata is tags-first only; provider interface still to build).
+- [ ] Gapless album playback (needs Web Audio API preloading/crossfeed; plain `<audio>` has a small gap between tracks).
+- [ ] Audio transcode fallback for browser-unsupported codecs (wma, alac in some browsers) — everything currently direct plays.
+- [ ] Artist pages (grid shows albums; an artist view listing their albums exists only via breadcrumb/parent navigation).
+- [ ] Playlists (manual + smart), play counts / recently-played rows from the listen history already being recorded.
+- [ ] Media Session API on the music bar (lock-screen / hardware-key controls).
+- [ ] Audiobooks: M4B chapters, playback speed, precise resume (milestone item, not started).
+- [ ] Podcasts (milestone 8 in the roadmap numbering): RSS subscriptions, polling, retention.
+
 ## Milestone 6 — Admin UI
 - [ ] Multiple paths per library in the add form (API supports it; form takes one).
 - [ ] Edit library paths after creation.
