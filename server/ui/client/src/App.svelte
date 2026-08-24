@@ -10,6 +10,7 @@
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
+    RotateCcw,
   } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
@@ -352,9 +353,9 @@
     }
   }
 
-  async function startPlay(item: Item, quality: PlayQuality = readQuality()) {
+  async function startPlay(item: Item, quality: PlayQuality = readQuality(), fromStart = false) {
     try {
-      const info = await playItem(item.id, quality)
+      const info = await playItem(item.id, quality, fromStart)
       music = null // video and music are mutually exclusive
       playing = { item, info, quality, gen: ++playGen }
       const inContext = detail && (detail.item.id === item.id || detail.item.id === item.parentId)
@@ -682,7 +683,12 @@
                 <button class="play" onclick={() => detail && startPlay(detail.item)}>
                   <Play size={15} /> {resumable ? 'Resume' : 'Play'}
                 </button>
-                {#if resumable}<span class="muted">{minutesLeft} min left</span>{/if}
+                {#if resumable}
+                  <span class="muted">{minutesLeft} min left</span>
+                  <button class="dl" onclick={() => detail && startPlay(detail.item, undefined, true)}>
+                    <RotateCcw size={14} /> Start over
+                  </button>
+                {/if}
                 <a class="dl" href={downloadURL(detail.item.id)} download><Download size={14} /> Download</a>
               </div>
               <dl class="tech">
@@ -736,7 +742,12 @@
                         <button class="play" onclick={() => epDetail && startPlay(epDetail.item)}>
                           <Play size={15} /> {canResume(epDetail) ? 'Resume' : 'Play'}
                         </button>
-                        {#if canResume(epDetail)}<span class="muted">{minsLeft(epDetail)} min left</span>{/if}
+                        {#if canResume(epDetail)}
+                          <span class="muted">{minsLeft(epDetail)} min left</span>
+                          <button class="dl" onclick={() => epDetail && startPlay(epDetail.item, undefined, true)}>
+                            <RotateCcw size={14} /> Start over
+                          </button>
+                        {/if}
                         <a class="dl" href={downloadURL(epDetail.item.id)} download><Download size={14} /> Download</a>
                       </div>
                     </div>

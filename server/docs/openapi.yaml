@@ -206,6 +206,9 @@ paths:
                 quality:
                   type: string
                   enum: [auto, original, 1080p, 720p, 480p]
+                fromStart:
+                  type: boolean
+                  description: Ignore the stored resume position and play from 00:00
       responses:
         "200":
           description: How to play the item, including the resume position

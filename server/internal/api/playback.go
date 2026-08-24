@@ -23,6 +23,8 @@ type capabilities struct {
 	// "original"   — force direct play of the untouched file
 	// "1080p", "720p", "480p" — force a video transcode at that level
 	Quality string `json:"quality"`
+	// FromStart ignores the stored resume position and plays from 00:00.
+	FromStart bool `json:"fromStart"`
 }
 
 // qualityLevels maps the selectable transcode levels to encode parameters.
@@ -113,7 +115,7 @@ func (s *server) playItem(c echo.Context) error {
 		return err
 	}
 	resume := ps.PositionSecs
-	if ps.Watched {
+	if ps.Watched || body.FromStart {
 		resume = 0
 	}
 
