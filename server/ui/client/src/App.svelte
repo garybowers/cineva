@@ -1453,6 +1453,68 @@
   }
   .poster.square { aspect-ratio: 1 / 1; }
 
+  /* ---- Listening session ---- */
+  .session { padding-top: 0.5rem; }
+  .session-body { display: flex; gap: 3rem; align-items: flex-start; justify-content: center; }
+  .session-side { flex: none; width: min(26rem, 40vw); text-align: center; position: sticky; top: calc(var(--topbar-h, 3.4rem) + 1.5rem); }
+  .session-cover {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: 18px;
+    border: 1px solid var(--border);
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+    margin-bottom: 1.2rem;
+  }
+  .session-cover.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); }
+  .session-album { font-size: 1.5rem; margin: 0 0 0.3rem; line-height: 1.2; }
+  .small { font-size: 0.8rem; }
+  .session-tracks { list-style: none; flex: 1; min-width: 0; max-width: 36rem; padding-top: 0.5rem; }
+  .strack {
+    position: relative;
+    display: flex;
+    align-items: baseline;
+    gap: 0.9rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.6rem 0.9rem;
+    border-radius: 10px;
+    font-size: 0.96rem;
+  }
+  .strack:hover { background: var(--panel); color: var(--accent-2); }
+  .strack.current { background: var(--panel); color: var(--accent-2); font-weight: 600; }
+  .strack .tno { width: 1.6rem; }
+  .strack-progress {
+    position: absolute;
+    left: 0.9rem;
+    right: 0.9rem;
+    bottom: 3px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .strack-progress span { display: block; height: 100%; background: var(--accent); }
+  .session-shelf { display: flex; gap: 0.6rem; margin-top: 2.2rem; flex-wrap: wrap; justify-content: center; }
+  .session-disc { border-radius: 8px; opacity: 0.5; transition: opacity 0.15s, transform 0.15s; padding: 0; }
+  .session-disc img, .session-disc .ph {
+    width: 4.4rem;
+    height: 4.4rem;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    background: var(--panel);
+  }
+  .session-disc:hover { opacity: 1; transform: translateY(-2px); }
+  .session-disc.cur { opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (max-width: 767px) {
+    .session-body { flex-direction: column; align-items: stretch; }
+    .session-side { width: 100%; position: static; }
+  }
+
   /* ---- Music view: artist rail + album shelves ---- */
   .music { display: flex; gap: 1.25rem; align-items: flex-start; }
   .mrail {

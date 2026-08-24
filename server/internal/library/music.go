@@ -26,6 +26,9 @@ var audioExts = map[string]bool{
 // "1995 - Album Name" directory pattern.
 var albumDirRe = regexp.MustCompile(`^(\d{4})\s*-\s*(.+)$`)
 
+// "CD1" / "Disc 2" / "disk3" subdirectory inside a multi-disc album.
+var discDirRe = regexp.MustCompile(`(?i)^(?:cd|disc|disk)\s*(\d{1,2})$`)
+
 // "03 - Title.flac" filename pattern.
 var trackFileRe = regexp.MustCompile(`^(\d{1,3})\s*-\s*(.+)$`)
 
@@ -64,6 +67,13 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 			continue
 		}
 		albumDir := filepath.Dir(path)
+		// Multi-disc layout: Artist/Album/CD1/track — the disc folder is
+		// part of the album, not an album itself.
+		discFromDir := 0
+		if md := discDirRe.FindStringSubmatch(filepath.Base(albumDir)); md != nil {
+			discFromDir, _ = strconv.Atoi(md[1])
+			albumDir = filepath.Dir(albumDir)
+		}
 		artistDir := filepath.Dir(albumDir)
 
 		artistName := info.AlbumArtist
@@ -140,10 +150,14 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library) (int, int, e
 		if displayArtist == "" {
 			displayArtist = artistName
 		}
+		discNum := info.DiscNum
+		if discNum == 0 {
+			discNum = discFromDir
+		}
 		track := store.Item{
 			LibraryID: lib.ID, Kind: store.KindTrack, ParentID: albumID,
 			Title: title, Artist: displayArtist, Year: albumYear,
-			TrackNum: trackNum, DiscNum: info.DiscNum, Path: path,
+			TrackNum: trackNum, DiscNum: discNum, Path: path,
 			RuntimeSecs: info.RuntimeSecs, Container: info.Container,
 			AudioCodec: info.Codec,
 		}
