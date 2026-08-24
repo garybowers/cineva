@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    getHealth, listLibraries, libraryItems, itemDetail, playItem, continueWatching, downloadURL,
-    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality,
+    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL,
+    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import Player from './Player.svelte'
@@ -17,6 +17,20 @@
   let tab: Tab = $state('home')
   let health: Health | null = $state(null)
   let offline = $state(false)
+
+  const typeLabels: Record<string, { label: string; icon: string }> = {
+    movies: { label: 'Movies', icon: '🎬' },
+    tv: { label: 'TV Shows', icon: '📺' },
+    music: { label: 'Music', icon: '🎵' },
+    audiobooks: { label: 'Audiobooks', icon: '🎧' },
+    podcasts: { label: 'Podcasts', icon: '📻' },
+    books: { label: 'Books', icon: '📚' },
+  }
+  const libraryTree = $derived(
+    Object.entries(typeLabels)
+      .map(([type, meta]) => ({ type, ...meta, libs: libraries.filter((l) => l.mediaType === type) }))
+      .filter((g) => g.libs.length > 0),
+  )
   let themes: ThemeInfo[] = $state([])
   let theme = $state(currentTheme())
 
@@ -25,6 +39,7 @@
   let currentLib: Library | null = $state(null)
   let gridItems: Item[] = $state([])
   let detail: ItemDetail | null = $state(null)
+  let detailSubs: SubtitleTrack[] = $state([])
   let trail: Item[] = $state([]) // breadcrumb ancestors of the current detail
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
@@ -115,7 +130,20 @@
     const parent = fromChild && detail ? detail.item : null
     detail = await itemDetail(id)
     trail = parent ? [...trail, parent] : []
+    detailSubs = []
+    if (detail.item.kind === 'movie' || detail.item.kind === 'episode') {
+      itemSubtitles(id).then((s) => (detailSubs = s)).catch(() => {})
+    }
   }
+
+  const resumable = $derived(
+    !!detail?.playState && detail.playState.positionSecs > 10 && !detail.playState.watched,
+  )
+  const minutesLeft = $derived(
+    detail && detail.playState && detail.item.runtimeSecs
+      ? Math.max(1, Math.round((detail.item.runtimeSecs - detail.playState.positionSecs) / 60))
+      : 0,
+  )
 
   function toLibraries() {
     currentLib = null
@@ -159,12 +187,55 @@
 {/snippet}
 
 <div class="shell">
+  <aside class="side">
+    <span class="logo">Cineva</span>
+    <button class="side-item" class:active={tab === 'home'} onclick={() => (tab = 'home')}>⌂ Home</button>
+    <div class="tree">
+      {#each libraryTree as group (group.type)}
+        <div class="type-label"><span class="type-icon">{group.icon}</span> {group.label}</div>
+        {#each group.libs as lib (lib.id)}
+          <button
+            class="side-item leaf"
+            class:active={tab === 'libraries' && currentLib?.id === lib.id}
+            onclick={() => { tab = 'libraries'; openLibrary(lib) }}
+          >{lib.name}</button>
+        {/each}
+      {/each}
+      {#if libraries.length === 0}
+        <div class="type-label">No libraries yet</div>
+      {/if}
+    </div>
+    <button class="side-item side-bottom" class:active={tab === 'settings'} onclick={() => (tab = 'settings')}>⚙ Settings</button>
+    <div class="side-status">
+      <span class="status" class:offline></span>
+      <span>{offline ? 'offline' : health?.version ?? ''}</span>
+    </div>
+  </aside>
+
+  <div class="content">
   <header>
     <span class="logo">Cineva</span>
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
   </header>
 
   <main>
+    {#if tab === 'libraries' && currentLib}
+      <nav class="crumbs" aria-label="Breadcrumb">
+        <button class="crumb" onclick={toLibraries}>Libraries</button>
+        <span class="sep">›</span>
+        {#if detail}
+          <button class="crumb" onclick={toGrid}>{currentLib.name}</button>
+          {#each trail as ancestor, i (ancestor.id)}
+            <span class="sep">›</span>
+            <button class="crumb" onclick={() => toCrumb(i)}>{ancestor.title}</button>
+          {/each}
+          <span class="sep">›</span>
+          <span class="crumb-current">{detail.item.title}</span>
+        {:else}
+          <span class="crumb-current">{currentLib.name}</span>
+        {/if}
+      </nav>
+    {/if}
     {#if playing}
       {#key playing.gen}
         <Player
@@ -212,23 +283,6 @@
         {/if}
       </section>
     {:else if tab === 'libraries'}
-      {#if currentLib}
-        <nav class="crumbs" aria-label="Breadcrumb">
-          <button class="crumb" onclick={toLibraries}>Libraries</button>
-          <span class="sep">›</span>
-          {#if detail}
-            <button class="crumb" onclick={toGrid}>{currentLib.name}</button>
-            {#each trail as ancestor, i (ancestor.id)}
-              <span class="sep">›</span>
-              <button class="crumb" onclick={() => toCrumb(i)}>{ancestor.title}</button>
-            {/each}
-            <span class="sep">›</span>
-            <span class="crumb-current">{detail.item.title}</span>
-          {:else}
-            <span class="crumb-current">{currentLib.name}</span>
-          {/if}
-        </nav>
-      {/if}
       {#if detail}
         <div class="detail">
           {@render poster(detail.item)}
@@ -245,9 +299,20 @@
             {#if detail.item.overview}<p class="overview">{detail.item.overview}</p>{/if}
             {#if detail.item.kind === 'movie' || detail.item.kind === 'episode'}
               <div class="actions">
-                <button class="play" onclick={() => detail && startPlay(detail.item)}>▶ Play</button>
+                <button class="play" onclick={() => detail && startPlay(detail.item)}>
+                  ▶ {resumable ? 'Resume' : 'Play'}
+                </button>
+                {#if resumable}<span class="muted">{minutesLeft} min left</span>{/if}
                 <a class="dl" href={downloadURL(detail.item.id)} download>↓ Download</a>
               </div>
+              <dl class="tech">
+                <div><dt>Video</dt><dd>{detail.item.height}p ({detail.item.videoCodec})</dd></div>
+                <div><dt>Audio</dt><dd>{(detail.item.audioCodec ?? '').toUpperCase()}</dd></div>
+                <div>
+                  <dt>Subtitles</dt>
+                  <dd>{detailSubs.length ? detailSubs.map((s) => s.title || s.language || s.codec).join(' · ') : 'None'}</dd>
+                </div>
+              </dl>
             {/if}
           </div>
         </div>
@@ -333,11 +398,62 @@
       </button>
     {/each}
   </nav>
+  </div>
 </div>
 
 
 <style>
-  .shell { min-height: 100vh; display: flex; flex-direction: column; }
+  .shell { min-height: 100vh; display: flex; }
+  .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+  /* ---- Sidebar: desktop only; mobile keeps the bottom tab bar ---- */
+  .side { display: none; }
+  @media (min-width: 768px) {
+    .side {
+      display: flex;
+      flex-direction: column;
+      width: 15rem;
+      flex: none;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      padding: 1.1rem 0.8rem;
+      gap: 0.15rem;
+    }
+    header, nav { display: none !important; }
+  }
+  .side .logo { margin: 0 0.35rem 1rem; }
+  .side-item {
+    text-align: left;
+    padding: 0.5rem 0.65rem;
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+  .side-item:hover { background: var(--bg); color: var(--text); }
+  .side-item.active { background: var(--bg); color: var(--accent-2); }
+  .tree { display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.75rem; flex: 1; }
+  .type-label {
+    color: var(--muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.7rem 0.65rem 0.25rem;
+  }
+  .type-icon { margin-right: 0.2rem; }
+  .side-item.leaf { padding-left: 1.6rem; }
+  .side-bottom { margin-top: auto; }
+  .side-status {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.6rem 0.65rem 0;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
   header {
     display: flex;
     align-items: center;
@@ -462,6 +578,15 @@
     margin-top: -0.1rem;
   }
   .progress-fill { height: 100%; background: var(--accent); }
+  .tech {
+    margin-top: 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.88rem;
+  }
+  .tech div { display: flex; gap: 0.75rem; }
+  .tech dt { color: var(--muted); width: 5.5rem; flex: none; }
 
   .children { list-style: none; margin-top: 1.25rem; }
   .children li { border-bottom: 1px solid var(--border); }
@@ -526,24 +651,6 @@
   nav button.active { color: var(--accent-2); }
 
   @media (min-width: 768px) {
-    nav {
-      position: sticky;
-      top: 0;
-      bottom: auto;
-      order: -1;
-      justify-content: center;
-      gap: 1rem;
-      border-top: none;
-      border-bottom: 1px solid var(--border);
-      background: var(--bg);
-    }
-    nav button {
-      flex: none;
-      flex-direction: row;
-      gap: 0.4rem;
-      padding: 0.75rem 1rem;
-      font-size: 0.9rem;
-    }
     main { padding-bottom: 1.25rem; }
   }
 </style>

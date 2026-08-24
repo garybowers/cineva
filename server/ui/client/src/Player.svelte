@@ -29,22 +29,34 @@
   let video: HTMLVideoElement
   let hls: Hls | null = null
   let next: Item | null = $state(null)
-  let subtitle = $state('off') // selected track id, or 'off'
+  let showNext = $state(false)
+  let remaining = $state(0)
+  let subtitle = $state('off')
+
+  // Transport state for the custom controls.
+  let paused = $state(true)
+  let current = $state(0)
+  let duration = $state(info.durationSecs || 0)
+  let bufferedEnd = $state(0)
+  let muted = $state(false)
+  let volume = $state(readVolume())
+  let idle = $state(false)
+
+  let dismissed = false
+  let lastPosted = -100
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
 
   const textSubs = info.subtitles?.filter((t) => t.url) ?? []
   const subLabel = (t: (typeof textSubs)[number]) =>
     t.title || t.language?.toUpperCase() || t.codec
 
-  function selectSubtitle(e: Event) {
-    subtitle = (e.target as HTMLSelectElement).value
-    for (const track of video.textTracks) {
-      track.mode = track.id === subtitle ? 'showing' : 'hidden'
+  function readVolume(): number {
+    try {
+      return Number(localStorage.getItem('cineva-volume') ?? 1)
+    } catch {
+      return 1
     }
   }
-  let showNext = $state(false)
-  let remaining = $state(0)
-  let dismissed = false
-  let lastPosted = -100
 
   const autoplayNext = () => {
     try {
@@ -67,6 +79,7 @@
       if (info.positionSecs > 0) video.currentTime = info.positionSecs
     }
     for (const track of video.textTracks) track.mode = 'hidden' // off until picked
+    video.volume = volume
     video.play().catch(() => {})
     box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     if (item.kind === 'episode') {
@@ -78,6 +91,7 @@
     reportProgress(true)
     hls?.destroy()
     if (info.sessionId) stopSession(info.sessionId)
+    clearTimeout(idleTimer)
   })
 
   function reportProgress(force = false) {
@@ -90,10 +104,12 @@
   }
 
   function onTimeUpdate() {
+    current = video.currentTime
+    if (video.duration && isFinite(video.duration)) duration = video.duration
+    if (video.buffered.length > 0) bufferedEnd = video.buffered.end(video.buffered.length - 1)
     reportProgress()
-    const duration = video.duration || info.durationSecs
     if (!duration) return
-    const left = duration - video.currentTime
+    const left = duration - current
     if (next && !dismissed && left <= CREDITS_WINDOW) {
       showNext = true
       remaining = Math.max(0, Math.ceil(left))
@@ -111,10 +127,78 @@
     }
   }
 
+  function togglePlay() {
+    if (video.paused) video.play().catch(() => {})
+    else video.pause()
+  }
+
+  function skip(secs: number) {
+    video.currentTime = Math.max(0, Math.min(duration || Infinity, video.currentTime + secs))
+  }
+
+  function onSeekInput(e: Event) {
+    const t = Number((e.target as HTMLInputElement).value)
+    video.currentTime = t
+    current = t
+  }
+
+  function onVolumeInput(e: Event) {
+    volume = Number((e.target as HTMLInputElement).value)
+    video.volume = volume
+    if (volume > 0) video.muted = muted = false
+    try {
+      localStorage.setItem('cineva-volume', String(volume))
+    } catch { /* private browsing */ }
+  }
+
+  function toggleMute() {
+    muted = !muted
+    video.muted = muted
+  }
+
   function toggleFullscreen() {
-    // Fullscreen the box (not the video) so the up-next card stays visible.
+    // Fullscreen the box (not the video) so our controls stay usable.
     if (document.fullscreenElement) document.exitFullscreen?.()
     else box.requestFullscreen?.().catch(() => {})
+  }
+
+  function wake() {
+    idle = false
+    clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      if (document.fullscreenElement && !video.paused) idle = true
+    }, 3000)
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    const target = e.target as HTMLElement
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return
+    switch (e.key) {
+      case ' ':
+        e.preventDefault()
+        togglePlay()
+        break
+      case 'ArrowLeft':
+        skip(-10)
+        break
+      case 'ArrowRight':
+        skip(10)
+        break
+      case 'f':
+        toggleFullscreen()
+        break
+      case 'm':
+        toggleMute()
+        break
+    }
+    wake()
+  }
+
+  function selectSubtitle(e: Event) {
+    subtitle = (e.target as HTMLSelectElement).value
+    for (const track of video.textTracks) {
+      track.mode = track.id === subtitle ? 'showing' : 'hidden'
+    }
   }
 
   function changeQuality(e: Event) {
@@ -126,10 +210,22 @@
   const modeLabel = () =>
     info.mode === 'direct' ? 'Direct Play' : `Transcoding${info.reason ? ` — ${info.reason}` : ''}`
 
+  function fmt(secs: number): string {
+    if (!isFinite(secs) || secs < 0) secs = 0
+    const s = Math.floor(secs)
+    const h = Math.floor(s / 3600)
+    const m = Math.floor((s % 3600) / 60)
+    const sec = String(s % 60).padStart(2, '0')
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`
+  }
+
   const epCode = (i: Item) => `S${String(i.seasonNum).padStart(2, '0')}E${String(i.episodeNum).padStart(2, '0')}`
+  const pct = (v: number) => (duration > 0 ? (v / duration) * 100 : 0)
 </script>
 
-<section class="nowplaying" bind:this={box}>
+<svelte:window onkeydown={onKeydown} />
+
+<section class="nowplaying" class:idle bind:this={box} onmousemove={wake}>
   <div class="bar">
     <span class="bartitle">
       {item.title}
@@ -137,27 +233,41 @@
       <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
     </span>
     {#if textSubs.length > 0}
-      <select class="quality" value={subtitle} onchange={selectSubtitle} title="Subtitles">
+      <select class="picker" value={subtitle} onchange={selectSubtitle} title="Subtitles">
         <option value="off">CC Off</option>
         {#each textSubs as t (t.id)}
           <option value={t.id}>{subLabel(t)}</option>
         {/each}
       </select>
     {/if}
-    <select class="quality" value={quality} onchange={changeQuality} title="Playback quality">
+    <select class="picker" value={quality} onchange={changeQuality} title="Playback quality">
       {#each QUALITIES as q (q.id)}
         <option value={q.id}>{q.label}</option>
       {/each}
     </select>
-    <button class="ctl" onclick={toggleFullscreen} title="Fullscreen">⛶</button>
     <button class="ctl" onclick={onclose} title="Stop playback">✕</button>
   </div>
+
   <div class="stage">
-    <video bind:this={video} controls playsinline crossorigin="anonymous" ontimeupdate={onTimeUpdate} onended={onEnded}>
+    <video
+      bind:this={video}
+      playsinline
+      crossorigin="anonymous"
+      ontimeupdate={onTimeUpdate}
+      onended={onEnded}
+      onplay={() => { paused = false; wake() }}
+      onpause={() => (paused = true)}
+      onclick={togglePlay}
+      ondblclick={toggleFullscreen}
+    >
       {#each textSubs as t (t.id)}
         <track id={t.id} kind="subtitles" src={t.url} label={subLabel(t)} srclang={t.language || 'und'} />
       {/each}
     </video>
+
+    {#if paused}
+      <button class="bigplay" onclick={togglePlay} aria-label="Play">▶</button>
+    {/if}
 
     {#if showNext && next}
       <div class="upnext">
@@ -172,6 +282,33 @@
         </div>
       </div>
     {/if}
+  </div>
+
+  <div class="controls">
+    <div class="seekwrap">
+      <div class="seek-buffered" style="width: {pct(bufferedEnd)}%"></div>
+      <div class="seek-played" style="width: {pct(current)}%"></div>
+      <input
+        class="seek"
+        type="range"
+        min="0"
+        max={duration || 0}
+        step="0.5"
+        value={current}
+        oninput={onSeekInput}
+        aria-label="Seek"
+      />
+    </div>
+    <div class="buttons">
+      <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)">↺10</button>
+      <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{paused ? '▶' : '⏸'}</button>
+      <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)">↻10</button>
+      <span class="time">{fmt(current)} / {fmt(duration)}</span>
+      <span class="spacer"></span>
+      <button class="ctl" onclick={toggleMute} title="Mute (m)">{muted || volume === 0 ? '🔇' : '🔊'}</button>
+      <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolumeInput} aria-label="Volume" />
+      <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)">⛶</button>
+    </div>
   </div>
 </section>
 
@@ -192,18 +329,19 @@
   }
   .nowplaying:fullscreen .stage { flex: 1; min-height: 0; }
   .nowplaying:fullscreen video { max-height: none; height: 100%; }
+  .nowplaying:fullscreen .bar { background: rgba(16, 18, 24, 0.9); border-bottom: none; color: #fff; }
+  .nowplaying:fullscreen .controls { background: rgba(16, 18, 24, 0.9); }
+  .nowplaying:fullscreen.idle .bar,
+  .nowplaying:fullscreen.idle .controls { opacity: 0; pointer-events: none; }
+  .nowplaying:fullscreen.idle { cursor: none; }
+  .bar, .controls { transition: opacity 0.25s ease; }
 
   .bar {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: 0.4rem;
     padding: 0.55rem 0.9rem;
     border-bottom: 1px solid var(--border);
-  }
-  .nowplaying:fullscreen .bar {
-    background: rgba(16, 18, 24, 0.9);
-    border-bottom: none;
-    color: #fff;
   }
   .bartitle {
     flex: 1;
@@ -224,7 +362,7 @@
     border-radius: 999px;
     padding: 0.1rem 0.55rem;
   }
-  .quality {
+  .picker {
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
@@ -232,9 +370,80 @@
     font: inherit;
     font-size: 0.82rem;
     padding: 0.25rem 0.4rem;
-    margin-right: 0.35rem;
   }
-  .nowplaying:fullscreen .quality { background: rgba(0, 0, 0, 0.5); color: #fff; }
+  .nowplaying:fullscreen .picker { background: rgba(0, 0, 0, 0.5); color: #fff; }
+
+  .stage { position: relative; background: #000; }
+  video {
+    display: block;
+    width: 100%;
+    max-height: 62vh;
+    aspect-ratio: 16 / 9;
+    cursor: pointer;
+  }
+
+  .bigplay {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 4.5rem;
+    height: 4.5rem;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--accent) 85%, black);
+    color: #fff;
+    font-size: 1.6rem;
+    padding-left: 0.3rem;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  }
+  .bigplay:hover { background: var(--accent); }
+
+  /* ---- Transport controls ---- */
+  .controls { padding: 0.35rem 0.9rem 0.55rem; }
+  .seekwrap { position: relative; height: 14px; display: flex; align-items: center; }
+  .seek-buffered, .seek-played {
+    position: absolute;
+    left: 0;
+    height: 4px;
+    border-radius: 2px;
+    pointer-events: none;
+  }
+  .seekwrap::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+  .seek-buffered { background: color-mix(in srgb, var(--muted) 40%, transparent); }
+  .seek-played { background: var(--accent); z-index: 1; }
+  .seek {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    appearance: none;
+    background: transparent;
+    margin: 0;
+    z-index: 2;
+    cursor: pointer;
+  }
+  .seek::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent-2);
+  }
+  .seek::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent-2);
+  }
+
+  .buttons { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.2rem; }
   .ctl {
     color: var(--muted);
     font-size: 0.95rem;
@@ -244,22 +453,18 @@
   }
   .ctl:hover { background: var(--bg); color: var(--text); }
   .nowplaying:fullscreen .ctl { color: rgba(255, 255, 255, 0.85); }
-
-  .stage {
-    position: relative;
-    background: #000;
-  }
-  video {
-    display: block;
-    width: 100%;
-    max-height: 62vh;
-    aspect-ratio: 16 / 9;
+  .playpause { font-size: 1.15rem; }
+  .time { color: var(--muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; margin-left: 0.3rem; }
+  .spacer { flex: 1; }
+  .vol {
+    width: 5.5rem;
+    accent-color: var(--accent);
   }
 
   .upnext {
     position: absolute;
     right: 1rem;
-    bottom: 4.25rem;
+    bottom: 1rem;
     background: rgba(16, 18, 24, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 12px;

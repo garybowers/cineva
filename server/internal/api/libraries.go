@@ -106,5 +106,11 @@ func (s *server) getItem(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(http.StatusOK, map[string]any{"item": item, "children": children})
+	resp := map[string]any{"item": item, "children": children}
+	if item.Kind == store.KindMovie || item.Kind == store.KindEpisode {
+		if ps, err := s.store.PlayStateFor(ctx, store.LocalUser, item.ID); err == nil {
+			resp["playState"] = ps
+		}
+	}
+	return c.JSON(http.StatusOK, resp)
 }
