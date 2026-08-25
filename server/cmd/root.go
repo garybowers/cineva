@@ -66,6 +66,7 @@ func initConfig() {
 	viper.SetDefault("metadata.musicbrainz.enabled", true)
 	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
 	viper.SetDefault("transcode.segment_secs", 6)
+	viper.SetDefault("stats.sample_secs", 5)
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

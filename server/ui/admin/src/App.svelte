@@ -2,9 +2,11 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs,
-    type Health, type Library, type Scan, type PlaySession, type DirListing,
+    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats,
+    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay,
   } from './lib/api'
+  import LineChart from './LineChart.svelte'
+  import BarChart from './BarChart.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
   type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'settings'
@@ -87,6 +89,50 @@
     }
   }
 
+  // ---- Dashboard: host CPU/RAM samples + play history ----
+  let sysRange: '1h' | '24h' = $state('1h')
+  let playDays = $state(30)
+  let samples: SystemSample[] = $state([])
+  let plays: PlayDay[] = $state([])
+
+  async function loadStats() {
+    try {
+      samples = await systemStats(sysRange)
+      plays = await playStats(playDays)
+    } catch {
+      /* dashboard is best-effort; the poll will retry */
+    }
+  }
+  function setSysRange(r: '1h' | '24h') {
+    sysRange = r
+    systemStats(r).then((x) => (samples = x)).catch(() => {})
+  }
+  function setPlayDays(d: number) {
+    playDays = d
+    playStats(d).then((x) => (plays = x)).catch(() => {})
+  }
+  // Live sample from the event stream: the 1h view takes every sample; the
+  // 24h view keeps one a minute to match the server's coarse ring.
+  function onSample(data: unknown) {
+    const smp = data as SystemSample | null
+    if (!smp?.at) return
+    const last = samples[samples.length - 1]
+    if (sysRange === '24h' && last && Date.parse(smp.at) - Date.parse(last.at) < 60_000) return
+    const keep = sysRange === '1h' ? 3_600_000 : 86_400_000
+    const cut = Date.parse(smp.at) - keep
+    samples = [...samples.filter((x) => Date.parse(x.at) >= cut), smp]
+  }
+  const latest = $derived(samples[samples.length - 1] ?? null)
+  const gb = (b: number) => (b / 1024 ** 3).toFixed(1)
+  const cpuSeries = $derived([{ name: 'CPU', token: 1 as const, points: samples.map((x) => ({ t: Date.parse(x.at), v: x.cpuPct })) }])
+  const memSeries = $derived([
+    { name: 'System used', token: 1 as const, points: samples.map((x) => ({ t: Date.parse(x.at), v: x.memUsed / 1024 ** 3 })) },
+    { name: 'Cineva', token: 2 as const, points: samples.map((x) => ({ t: Date.parse(x.at), v: x.procRss / 1024 ** 3 })) },
+  ])
+  const playBars = $derived(plays.map((d) => ({ label: d.date, values: [d.movies, d.episodes, d.tracks] })))
+  const playsToday = $derived(plays.length ? plays[plays.length - 1].movies + plays[plays.length - 1].episodes + plays[plays.length - 1].tracks : 0)
+  const playsTotal = $derived(plays.reduce((n, d) => n + d.movies + d.episodes + d.tracks, 0))
+
   // Folder picker for the path field: browses the server's filesystem one
   // level at a time (directories only).
   let browsing = $state(false)
@@ -147,12 +193,15 @@
 
   onMount(() => {
     refresh()
+    loadStats()
     listThemes().then((t) => (themes = t)).catch(() => {})
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
         scan: onScanEvent,
         libraries: () => listLibraries().then((l) => (libraries = l)).catch(() => {}),
+        stats: onSample,
+        plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
       },
       (connected) => {
         if (connected && offline) refresh()
@@ -237,6 +286,36 @@
           <div class="k">Active streams</div>
           <div class="v">{sessions.length}</div>
           <div class="sub">{scans.filter((s) => s.status === 'running').length} scans running</div>
+        </div>
+      </div>
+
+      <div class="filters">
+        <span class="muted small">System</span>
+        <button class="chip" class:sel={sysRange === '1h'} onclick={() => setSysRange('1h')}>Last hour</button>
+        <button class="chip" class:sel={sysRange === '24h'} onclick={() => setSysRange('24h')}>Last 24 hours</button>
+        <span class="muted small gap">Plays</span>
+        <button class="chip" class:sel={playDays === 7} onclick={() => setPlayDays(7)}>7 days</button>
+        <button class="chip" class:sel={playDays === 30} onclick={() => setPlayDays(30)}>30 days</button>
+        <button class="chip" class:sel={playDays === 90} onclick={() => setPlayDays(90)}>90 days</button>
+      </div>
+      <div class="graphs">
+        <div class="card">
+          <div class="k">CPU</div>
+          <div class="v">{latest ? `${Math.round(latest.cpuPct)}%` : '—'}</div>
+          <div class="sub">{latest ? `${latest.numCpu} cores · whole host` : 'collecting…'}</div>
+          <LineChart series={cpuSeries} yMax={100} format={(v) => `${Math.round(v)}%`} />
+        </div>
+        <div class="card">
+          <div class="k">Memory</div>
+          <div class="v">{latest ? `${gb(latest.memUsed)} GB` : '—'}</div>
+          <div class="sub">{latest ? `of ${gb(latest.memTotal)} GB · Cineva ${(latest.procRss / 1024 ** 2).toFixed(0)} MB` : 'collecting…'}</div>
+          <LineChart series={memSeries} yMax={latest ? latest.memTotal / 1024 ** 3 : undefined} format={(v) => `${v.toFixed(v < 10 ? 1 : 0)} GB`} />
+        </div>
+        <div class="card wide">
+          <div class="k">Plays</div>
+          <div class="v">{playsToday}</div>
+          <div class="sub">today · {playsTotal} in the last {playDays} days</div>
+          <BarChart bars={playBars} series={['Movies', 'Episodes', 'Tracks']} />
         </div>
       </div>
     {:else if page === 'libraries'}
@@ -422,6 +501,15 @@
   .v.err { color: var(--err); }
   .card:not(:first-child) .v { color: var(--text); }
   .sub { color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+  .filters { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 1.25rem 0 0.75rem; }
+  .filters .gap { margin-left: 0.75rem; }
+  .graphs { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+  .graphs .card .sub { margin-bottom: 0.75rem; }
+  .graphs .card .v { color: var(--text); }
+  @media (min-width: 900px) {
+    .graphs { grid-template-columns: 1fr 1fr; }
+    .graphs .wide { grid-column: 1 / -1; }
+  }
 
   .bar { margin-bottom: 1rem; }
   .primary {

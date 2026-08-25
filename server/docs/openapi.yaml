@@ -226,6 +226,59 @@ paths:
         "403": { description: Permission denied }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /stats/system:
+    get:
+      summary: Host CPU/RAM samples for the admin dashboard
+      description: >
+        In-memory samples only: range=1h returns every sample from the last
+        hour (default 5 s apart); range=24h returns one per minute for the
+        last day. Live samples are also pushed on the /events stream as
+        "stats" events.
+      operationId: systemStats
+      parameters:
+        - { name: range, in: query, required: false, schema: { type: string, enum: [1h, 24h], default: 1h } }
+      responses:
+        "200":
+          description: Samples, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    at: { type: string, format: date-time }
+                    cpuPct: { type: number, description: Whole-host CPU busy, 0–100 }
+                    memUsed: { type: integer, description: Bytes (MemTotal − MemAvailable) }
+                    memTotal: { type: integer }
+                    procRss: { type: integer, description: This server's resident set, bytes }
+                    numCpu: { type: integer }
+
+  /stats/plays:
+    get:
+      summary: Plays per day by media kind
+      description: >
+        One entry per UTC day for the last `days` days including empty days.
+        Every POST /items/{id}/play is recorded; a "plays" event is pushed on
+        the /events stream when the history changes.
+      operationId: playStats
+      parameters:
+        - { name: days, in: query, required: false, schema: { type: integer, default: 30, maximum: 365 } }
+      responses:
+        "200":
+          description: Days, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    date: { type: string, format: date }
+                    movies: { type: integer }
+                    episodes: { type: integer }
+                    tracks: { type: integer }
+
   /scans/{id}/cancel:
     post:
       summary: Cancel a running scan

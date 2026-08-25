@@ -117,7 +117,7 @@ Rules:
 - API routes are versioned under `/api/v1/`. Breaking the API means a new version, not a changed response shape.
 - Database schema changes always come as a new migration file — never edit an applied migration.
 - Frontend: TypeScript, Svelte 5 runes, no component library lock-in yet; keep the API client in one generated/typed module. Build mobile-first: new screens are designed at phone width and scale up, not the reverse.
-- Theming: all UI colours come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--ok`, `--err`) — never hardcode a colour in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change.
+- Theming: all UI colours come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--ok`, `--err`, plus `--chart-1..3` for chart series — categorical, fixed order, validated for colour-vision deficiency against `--panel`) — never hardcode a colour in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change.
 
 ## Milestones
 

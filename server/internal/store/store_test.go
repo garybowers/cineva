@@ -132,3 +132,37 @@ func TestContinueWatchingSurvivesSchema(t *testing.T) {
 		t.Fatalf("continue watching = %+v, want the single in-progress item at 600s", got)
 	}
 }
+
+func TestPlaysByDayHasContinuousSpine(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	lib, err := s.CreateLibrary(ctx, "Movies", MediaMovies, []string{"/m"})
+	if err != nil {
+		t.Fatalf("create library: %v", err)
+	}
+	item, err := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindMovie, Title: "Film", Path: "/m/f.mkv"})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.RecordPlay(ctx, LocalUser, item.ID, KindMovie); err != nil {
+			t.Fatalf("record play: %v", err)
+		}
+	}
+	days, err := s.PlaysByDay(ctx, 7)
+	if err != nil {
+		t.Fatalf("plays by day: %v", err)
+	}
+	if len(days) != 7 {
+		t.Fatalf("got %d days, want 7 (empty days must be present)", len(days))
+	}
+	today := days[6]
+	if today.Movies != 3 || today.Episodes != 0 || today.Tracks != 0 {
+		t.Fatalf("today = %+v, want 3 movie plays", today)
+	}
+	for _, d := range days[:6] {
+		if d.Movies+d.Episodes+d.Tracks != 0 {
+			t.Fatalf("unexpected plays on %s: %+v", d.Date, d)
+		}
+	}
+}

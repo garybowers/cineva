@@ -14,6 +14,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
 )
@@ -102,6 +103,12 @@ func (s *server) playItem(c echo.Context) error {
 	item, err := s.playableItem(c)
 	if err != nil {
 		return err
+	}
+	// Play history for the dashboard; a failure here must not block playback.
+	if err := s.store.RecordPlay(c.Request().Context(), store.LocalUser, item.ID, item.Kind); err != nil {
+		log.Printf("record play: %v", err)
+	} else {
+		s.events.Publish(events.Event{Type: "plays"})
 	}
 	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
 	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)

@@ -54,10 +54,10 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 	sort.Strings(files)
 
 	created := 0
-	artistIDs := map[string]string{}                 // artist name -> item id
-	albumIDs := map[string]string{}                  // album dir -> item id
-	albumArt := map[string]bool{}                    // album dirs whose artwork is done
-	mbData := map[string]*metadata.MusicRelease{}    // album dir -> MB release (nil = looked up, no match)
+	artistIDs := map[string]string{}              // artist name -> item id
+	albumIDs := map[string]string{}               // album dir -> item id
+	albumArt := map[string]bool{}                 // album dirs whose artwork is done
+	mbData := map[string]*metadata.MusicRelease{} // album dir -> MB release (nil = looked up, no match)
 
 	for i, path := range files {
 		if err := ctx.Err(); err != nil {

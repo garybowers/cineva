@@ -55,6 +55,7 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Edit library paths after creation.
 - [x] Scan progress (files seen / total, progress bar, live via the event stream) and cancellation UI. Still open: current file name, files/sec.
 - [ ] `/fs/dirs` (folder picker) must be admin-only once milestone 4 auth lands — it exposes directory names server-wide.
+- [ ] Dashboard stats are in-memory only (1h fine / 24h coarse) and reset on restart; persist coarse samples if longer history is wanted. Play history counts starts only — no duration/completion yet.
 - [ ] Folder picker: multi-select to add several paths at once (pairs with multiple-paths-per-library above).
 
 ## Operational

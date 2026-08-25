@@ -20,6 +20,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/stats"
 	"github.com/garybowers/cineva/server/internal/store"
 	"github.com/garybowers/cineva/server/internal/version"
 	"github.com/garybowers/cineva/server/ui"
@@ -31,6 +32,7 @@ type Config struct {
 	ArtworkDir   string
 	TranscodeDir string
 	SegmentSecs  int
+	SampleSecs   int // host CPU/RAM sampling interval for the admin dashboard
 }
 
 type server struct {
@@ -38,6 +40,7 @@ type server struct {
 	manager     *library.Manager
 	sessions    *media.SessionManager
 	events      *events.Bus
+	sampler     *stats.Sampler
 	subtitleDir string
 	dlCacheDir  string
 }
@@ -48,12 +51,19 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		manager:     manager,
 		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
 		events:      events.NewBus(),
+		sampler:     stats.New(time.Duration(cfg.SampleSecs) * time.Second),
 		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:  filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
 	// Scans run by this server publish progress onto the same bus the
 	// /events stream reads from. CLI scans leave manager.Events nil.
 	manager.Events = s.events
+
+	// Host resource sampling for the dashboard; each sample is also pushed
+	// over the event stream so the graphs move live.
+	samplerCtx, stopSampler := context.WithCancel(context.Background())
+	s.sampler.OnSample = func(smp stats.Sample) { s.events.Publish(events.Event{Type: "stats", Data: smp}) }
+	go s.sampler.Run(samplerCtx)
 
 	e := echo.New()
 	e.HideBanner = true
@@ -74,6 +84,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/search", s.search)
 	v1.GET("/events", s.eventStream)
 	v1.GET("/fs/dirs", s.listDirs)
+	v1.GET("/stats/system", s.systemStats)
+	v1.GET("/stats/plays", s.playStats)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)
@@ -127,6 +139,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		if err := e.Shutdown(ctx); err != nil {
 			log.Printf("shutdown: %v", err)
 		}
+		stopSampler()
 		s.sessions.Close()
 		close(shutdownDone)
 	}()

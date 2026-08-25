@@ -11,4 +11,8 @@
   --accent-2: #4dc3ff;
   --ok: #3ecf8e;
   --err: #ff6b6b;
+  /* Chart series (categorical, fixed order; validated for CVD against --panel) */
+  --chart-1: #7c5cff;
+  --chart-2: #1f8fcc;
+  --chart-3: #ad8312;
 }

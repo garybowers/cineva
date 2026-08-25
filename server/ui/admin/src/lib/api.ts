@@ -98,3 +98,21 @@ export interface DirListing {
 }
 export const browseDirs = (path: string, hidden = false) =>
   req<DirListing>(`/fs/dirs?path=${encodeURIComponent(path)}${hidden ? '&hidden=1' : ''}`)
+
+// Admin dashboard stats.
+export interface SystemSample {
+  at: string
+  cpuPct: number
+  memUsed: number
+  memTotal: number
+  procRss: number
+  numCpu: number
+}
+export interface PlayDay {
+  date: string
+  movies: number
+  episodes: number
+  tracks: number
+}
+export const systemStats = (range: '1h' | '24h') => req<SystemSample[]>(`/stats/system?range=${range}`)
+export const playStats = (days: number) => req<PlayDay[]>(`/stats/plays?days=${days}`)

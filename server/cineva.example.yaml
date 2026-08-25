@@ -33,6 +33,11 @@ transcode:
   # Target HLS segment length in seconds. (CINEVA_TRANSCODE_SEGMENT_SECS)
   segment_secs: 6
 
+stats:
+  # How often the admin dashboard's CPU/RAM sampler reads /proc. Samples are
+  # kept in memory only (last hour fine, last day per-minute). (CINEVA_STATS_SAMPLE_SECS)
+  sample_secs: 5
+
 metadata:
   # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
   # open data, no key needed, rate-limited to 1 request/second.
