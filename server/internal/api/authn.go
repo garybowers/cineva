@@ -2,7 +2,9 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -196,6 +198,10 @@ func (s *server) authLogin(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
+	key := "pw:" + strings.ToLower(strings.TrimSpace(req.Username))
+	if ok, wait := s.throttle.Allow(key); !ok {
+		return tooManyAttempts(c, wait)
+	}
 	u, err := s.store.UserByUsername(ctx, req.Username)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -207,10 +213,15 @@ func (s *server) authLogin(c echo.Context) error {
 		hash = dummyHash
 	}
 	if !auth.VerifyPassword(req.Password, hash) || u.ID == "" || u.Disabled {
+		wait := s.throttle.Fail(key)
 		c.Set(ctxUser, store.User{ID: "anonymous", Username: "anonymous"})
-		s.audit(c, "login.failed", "user", "", strings.TrimSpace(req.Username), "")
+		s.audit(c, "login.failed", "user", "", strings.TrimSpace(req.Username), lockDetail(wait))
+		if wait > 0 {
+			return tooManyAttempts(c, wait)
+		}
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect username or password")
 	}
+	s.throttle.Reset(key)
 	if err := s.startSession(c, u); err != nil {
 		return err
 	}
@@ -220,6 +231,142 @@ func (s *server) authLogin(c echo.Context) error {
 }
 
 var dummyHash, _ = auth.HashPassword("cineva-dummy-timing-equaliser")
+
+func tooManyAttempts(c echo.Context, wait time.Duration) error {
+	c.Response().Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	return echo.NewHTTPError(http.StatusTooManyRequests, fmt.Sprintf("too many attempts — try again in %s", humanWait(wait)))
+}
+
+func humanWait(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%d seconds", int(d.Seconds())+1)
+	}
+	return fmt.Sprintf("%d minutes", int(d.Minutes())+1)
+}
+
+func lockDetail(wait time.Duration) string {
+	if wait > 0 {
+		return "locked for " + humanWait(wait)
+	}
+	return ""
+}
+
+type profile struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName"`
+	HasPassword bool   `json:"hasPassword"`
+}
+
+// GET /auth/profiles — public: the household picker. Only users who can
+// sign in with a PIN are listed, and only when auth.profiles is on.
+func (s *server) authProfiles(c echo.Context) error {
+	out := []profile{}
+	if !s.profiles {
+		return c.JSON(http.StatusOK, out)
+	}
+	users, err := s.store.Profiles(c.Request().Context())
+	if err != nil {
+		return err
+	}
+	for _, u := range users {
+		out = append(out, profile{ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, HasPassword: u.HasPassword})
+	}
+	return c.JSON(http.StatusOK, out)
+}
+
+// POST /auth/pin {userId, pin} — quick sign-in. Throttled per user: five
+// misses lock the PIN for 30 s, doubling from there.
+func (s *server) authPINLogin(c echo.Context) error {
+	ctx := c.Request().Context()
+	var req struct {
+		UserID string `json:"userId"`
+		PIN    string `json:"pin"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	key := "pin:" + req.UserID
+	if ok, wait := s.throttle.Allow(key); !ok {
+		return tooManyAttempts(c, wait)
+	}
+	u, err := s.store.UserByID(ctx, req.UserID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	hash := u.PINHash
+	if hash == "" {
+		hash = dummyHash
+	}
+	if !auth.VerifyPassword(req.PIN, hash) || u.ID == "" || u.Disabled {
+		wait := s.throttle.Fail(key)
+		detail := "pin"
+		if wait > 0 {
+			detail += " · " + lockDetail(wait)
+		}
+		c.Set(ctxUser, store.User{ID: "anonymous", Username: "anonymous"})
+		s.audit(c, "login.failed", "user", req.UserID, u.Username, detail)
+		if wait > 0 {
+			return tooManyAttempts(c, wait)
+		}
+		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect PIN")
+	}
+	s.throttle.Reset(key)
+	if err := s.startSession(c, u); err != nil {
+		return err
+	}
+	c.Set(ctxUser, u)
+	s.audit(c, "login", "user", u.ID, u.Username, "pin")
+	return c.JSON(http.StatusOK, u)
+}
+
+// POST /auth/pin/set {password, pin} — set or clear (pin "") own PIN.
+// Users with a password must present it; PIN-only users present their
+// current PIN in the password field.
+func (s *server) authSetPIN(c echo.Context) error {
+	var req struct {
+		Password string `json:"password"`
+		PIN      string `json:"pin"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	u := currentUser(c)
+	current := u.PasswordHash
+	if current == "" {
+		current = u.PINHash
+	}
+	if !auth.VerifyPassword(req.Password, current) {
+		return echo.NewHTTPError(http.StatusForbidden, "current password (or PIN) is incorrect")
+	}
+	if req.PIN == "" && !u.HasPassword {
+		return echo.NewHTTPError(http.StatusBadRequest, "this account has no password — set one before removing the PIN")
+	}
+	hash, err := pinHash(req.PIN)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if err := s.store.SetPINHash(c.Request().Context(), u.ID, hash); err != nil {
+		return err
+	}
+	detail := "PIN set"
+	if req.PIN == "" {
+		detail = "PIN removed"
+	}
+	s.audit(c, "user.pin", "user", u.ID, u.Username, detail)
+	return c.NoContent(http.StatusNoContent)
+}
+
+// pinHash validates and hashes a PIN; "" means clear.
+func pinHash(pin string) (string, error) {
+	if pin == "" {
+		return "", nil
+	}
+	if err := auth.CheckPINPolicy(pin); err != nil {
+		return "", err
+	}
+	return auth.HashPassword(pin)
+}
 
 func (s *server) startSession(c echo.Context, u store.User) error {
 	token, hash, err := auth.NewToken()
@@ -334,6 +481,7 @@ type userRequest struct {
 	Role        string   `json:"role"`
 	Disabled    bool     `json:"disabled"`
 	LibraryIDs  []string `json:"libraryIds"`
+	PIN         *string  `json:"pin,omitempty"` // set ("1234") or clear ("") on update; optional on create
 }
 
 func (s *server) listUsers(c echo.Context) error {
@@ -349,20 +497,44 @@ func (s *server) createUser(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if err := auth.CheckPasswordPolicy(req.Password); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
 	if req.Role == "" {
 		req.Role = store.RoleUser
 	}
-	hash, err := auth.HashPassword(req.Password)
+	// A household account may be PIN-only; admins always need a password.
+	pin := ""
+	if req.PIN != nil {
+		pin = *req.PIN
+	}
+	if pin == "" && req.Password == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "a password or a PIN is required")
+	}
+	if req.Role == store.RoleAdmin && req.Password == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "admins must have a password")
+	}
+	hash := ""
+	if req.Password != "" {
+		if err := auth.CheckPasswordPolicy(req.Password); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+		var err error
+		if hash, err = auth.HashPassword(req.Password); err != nil {
+			return err
+		}
+	}
+	ph, err := pinHash(pin)
 	if err != nil {
-		return err
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	ctx := c.Request().Context()
 	u, err := s.store.CreateUser(ctx, req.Username, req.DisplayName, hash, req.Role)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if ph != "" {
+		if err := s.store.SetPINHash(ctx, u.ID, ph); err != nil {
+			return err
+		}
+		u.HasPin = true
 	}
 	if len(req.LibraryIDs) > 0 {
 		if err := s.store.SetLibraryGrants(ctx, u.ID, req.LibraryIDs); err != nil {
@@ -415,6 +587,20 @@ func (s *server) updateUser(c echo.Context) error {
 	if req.Disabled {
 		_ = s.store.DeleteUserSessions(ctx, u.ID)
 		detail += " · disabled"
+	}
+	if req.PIN != nil {
+		ph, err := pinHash(*req.PIN)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+		if err := s.store.SetPINHash(ctx, u.ID, ph); err != nil {
+			return err
+		}
+		if *req.PIN == "" {
+			detail += " · PIN removed"
+		} else {
+			detail += " · PIN set"
+		}
 	}
 	s.audit(c, "user.update", "user", u.ID, u.Username, detail)
 	s.events.Publish(events.Event{Type: "users"})

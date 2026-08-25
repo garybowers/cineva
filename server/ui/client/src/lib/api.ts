@@ -104,7 +104,15 @@ export interface User {
   displayName: string
   role: 'admin' | 'user'
   disabled: boolean
+  hasPassword: boolean
+  hasPin: boolean
   libraryIds: string[]
+}
+export interface Profile {
+  id: string
+  username: string
+  displayName: string
+  hasPassword: boolean
 }
 export interface APIKey {
   id: string
@@ -134,6 +142,9 @@ export const login = (username: string, password: string) => post<User>('/auth/l
 export const setupAdmin = (username: string, password: string, displayName: string) =>
   post<User>('/auth/setup', { username, password, displayName })
 export const logout = () => post<void>('/auth/logout')
+export const authProfiles = () => get<Profile[]>('/auth/profiles')
+export const pinLogin = (userId: string, pin: string) => post<User>('/auth/pin', { userId, pin })
+export const setPIN = (password: string, pin: string) => post<void>('/auth/pin/set', { password, pin })
 export const changePassword = (current: string, next: string) => post<void>('/auth/password', { current, new: next })
 export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
 export const createAPIKey = (name: string) => post<APIKey & { key: string }>('/auth/keys', { name })

@@ -62,15 +62,15 @@
   // ---- Users page ----
   let users: User[] = $state([])
   const loadUsers = () => listUsers().then((u) => (users = u)).catch(() => {})
-  let editing: (UserRequest & { id?: string }) | null = $state(null) // null = closed; no id = new
+  let editing: (UserRequest & { id?: string; clearPin?: boolean; hasPin?: boolean }) | null = $state(null) // null = closed; no id = new
   let userErr = $state('')
   let userSaving = $state(false)
   function newUser() {
-    editing = { username: '', displayName: '', password: '', role: 'user', disabled: false, libraryIds: [] }
+    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false, libraryIds: [] }
     userErr = ''
   }
   function editUser(u: User) {
-    editing = { id: u.id, displayName: u.displayName, password: '', role: u.role, disabled: u.disabled, libraryIds: [...u.libraryIds] }
+    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled, libraryIds: [...u.libraryIds] }
     userErr = ''
   }
   function toggleGrant(id: string) {
@@ -85,8 +85,10 @@
     userSaving = true
     userErr = ''
     try {
-      const { id, ...body } = editing
+      const { id, clearPin, hasPin, ...body } = editing
       if (!body.password) delete body.password
+      if (clearPin) body.pin = ''
+      else if (!body.pin) delete body.pin
       if (id) await updateUser(id, body)
       else await createUser(body)
       editing = null
@@ -584,9 +586,15 @@
             <label>Username <input bind:value={editing.username} required autocomplete="off" /></label>
           {/if}
           <label>Display name <input bind:value={editing.displayName} placeholder={editing.username || ''} /></label>
-          <label>{editing.id ? 'New password (leave blank to keep)' : 'Password'}
-            <input type="password" bind:value={editing.password} minlength="8" required={!editing.id} autocomplete="new-password" />
+          <label>{editing.id ? 'New password (leave blank to keep)' : editing.role === 'admin' ? 'Password' : 'Password (optional when a PIN is set)'}
+            <input type="password" bind:value={editing.password} minlength="8" required={!editing.id && (editing.role === 'admin' || !editing.pin)} autocomplete="new-password" />
           </label>
+          <label>{editing.id ? `Quick sign-in PIN (${editing.hasPin ? 'set — enter a new one to change' : 'not set'})` : 'Quick sign-in PIN (optional, 4–6 digits)'}
+            <input type="password" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" bind:value={editing.pin} autocomplete="off" placeholder="Household sign-in: tap name, enter PIN" />
+          </label>
+          {#if editing.id && editing.hasPin}
+            <label class="check"><input type="checkbox" bind:checked={editing.clearPin} /> Remove PIN</label>
+          {/if}
           <label>Role
             <select bind:value={editing.role}><option value="user">user</option><option value="admin">admin</option></select>
           </label>
@@ -621,7 +629,7 @@
                   <div>{u.displayName}{u.disabled ? ' · disabled' : ''}</div>
                   <div class="muted small">{u.username}{u.id === me?.id ? ' (you)' : ''}</div>
                 </td>
-                <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span></td>
+                <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span>{#if u.hasPin}<span class="tag pin">PIN</span>{/if}{#if !u.hasPassword}<span class="muted small"> no password</span>{/if}</td>
                 <td class="muted">{u.role === 'admin' ? 'all' : u.libraryIds.map(libName).join(', ') || 'none'}</td>
                 <td class="muted">{u.createdAt.slice(0, 10)}</td>
                 <td class="actions">
@@ -960,6 +968,7 @@
   }
   .tag.ok { color: var(--ok); border-color: var(--ok); }
   .tag.bad { color: var(--err); border-color: var(--err); }
+  .tag.pin { margin-left: 0.3rem; color: var(--accent-2); }
   .scanbar {
     margin-top: 0.4rem;
     height: 4px;

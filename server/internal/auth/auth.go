@@ -74,6 +74,21 @@ func CheckPasswordPolicy(password string) error {
 	return nil
 }
 
+// ErrBadPIN is returned for PINs that are not 4–6 digits.
+var ErrBadPIN = errors.New("PIN must be 4 to 6 digits")
+
+func CheckPINPolicy(pin string) error {
+	if len(pin) < 4 || len(pin) > 6 {
+		return ErrBadPIN
+	}
+	for _, r := range pin {
+		if r < '0' || r > '9' {
+			return ErrBadPIN
+		}
+	}
+	return nil
+}
+
 // NewToken returns a random bearer token (URL-safe base64, 32 bytes of
 // entropy) and the hash under which it is stored.
 func NewToken() (token, hash string, err error) {

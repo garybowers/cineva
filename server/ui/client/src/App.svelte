@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents,
-    authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, type User as UserT, type APIKey,
+    authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -30,13 +30,57 @@
   let authErr = $state('')
   let authBusy = $state(false)
   let showUserMenu = $state(false)
+  // Household profile picker: users with a PIN get a name tile and a
+  // numeric pad; anyone can switch to username + password.
+  let profiles: Profile[] = $state([])
+  let picked: Profile | null = $state(null)
+  let usePassword = $state(false)
+  let pin = $state('')
+  const loadProfiles = () => authProfiles().then((p) => (profiles = p)).catch(() => (profiles = []))
+  function pickProfile(p: Profile) {
+    picked = p
+    pin = ''
+    authErr = ''
+    setTimeout(() => (document.querySelector('.pinpad input') as HTMLInputElement | null)?.focus(), 30)
+  }
+  async function submitPIN(e: Event) {
+    e.preventDefault()
+    if (!picked) return
+    authBusy = true
+    authErr = ''
+    try {
+      me = await pinLogin(picked.id, pin)
+      gate = 'in'
+      pin = ''
+      boot()
+    } catch (err) {
+      authErr = err instanceof Error ? err.message : String(err)
+      pin = ''
+    } finally {
+      authBusy = false
+    }
+  }
+  // Own PIN (Settings)
+  let pinAuth = $state(''), pinNew = $state(''), pinMsg = $state('')
+  async function submitPIN2(e: Event, clear = false) {
+    e.preventDefault()
+    pinMsg = ''
+    try {
+      await setPIN(pinAuth, clear ? '' : pinNew)
+      pinMsg = clear ? 'PIN removed.' : 'PIN set.'
+      pinAuth = pinNew = ''
+      if (me) me = { ...me, hasPin: !clear }
+    } catch (err) {
+      pinMsg = err instanceof Error ? err.message : String(err)
+    }
+  }
 
   async function checkAuth() {
     try {
       const st = await authStatus()
       if (st.setupRequired) gate = 'setup'
       else if (st.user) { me = st.user; gate = 'in' }
-      else gate = 'login'
+      else { gate = 'login'; loadProfiles() }
     } catch {
       gate = 'login'
       offline = true
@@ -63,7 +107,9 @@
     me = null
     playing = null
     music = null
+    picked = null
     gate = 'login'
+    loadProfiles()
   }
 
   // Change password + API keys (Settings page)
@@ -844,7 +890,7 @@
     listThemes().then((t) => (themes = t)).catch(() => {})
     checkAuth().then(() => { if (gate === 'in') boot() })
     // Any 401 from the API means the session ended: back to sign-in.
-    const onUnauthorised = () => { if (gate === 'in') { me = null; gate = 'login' } }
+    const onUnauthorised = () => { if (gate === 'in') { me = null; picked = null; gate = 'login'; loadProfiles() } }
     window.addEventListener(UNAUTHORISED, onUnauthorised)
     return () => {
       teardown?.()
@@ -865,6 +911,30 @@
   <div class="gate">
     {#if gate === 'checking'}
       <span class="muted">Connecting…</span>
+    {:else if gate === 'login' && profiles.length > 0 && !usePassword && !picked}
+      <div class="picker">
+        <h1>Who's watching?</h1>
+        <div class="tiles">
+          {#each profiles as p (p.id)}
+            <button class="tile" onclick={() => pickProfile(p)}>
+              <span class="tile-avatar">{p.displayName.slice(0, 1).toUpperCase()}</span>
+              <span>{p.displayName}</span>
+            </button>
+          {/each}
+        </div>
+        <button class="link" onclick={() => (usePassword = true)}>Sign in with a username and password</button>
+      </div>
+    {:else if gate === 'login' && picked}
+      <form class="pinpad" onsubmit={submitPIN}>
+        <span class="tile-avatar big">{picked.displayName.slice(0, 1).toUpperCase()}</span>
+        <h1>{picked.displayName}</h1>
+        <p>Enter your PIN</p>
+        <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" bind:value={pin} required aria-label="PIN" />
+        {#if authErr}<span class="err">{authErr}</span>{/if}
+        <button class="go" type="submit" disabled={authBusy || pin.length < 4}>{authBusy ? '…' : 'Sign in'}</button>
+        <button class="link" type="button" onclick={() => { picked = null; authErr = '' }}>Not you? Choose another profile</button>
+        {#if picked.hasPassword}<button class="link" type="button" onclick={() => { authUser = picked?.username ?? ''; picked = null; usePassword = true }}>Use my password instead</button>{/if}
+      </form>
     {:else}
       <form onsubmit={submitAuth}>
         <h1>Cineva</h1>
@@ -878,6 +948,7 @@
         <input type="password" placeholder={gate === 'setup' ? 'Password (8+ characters)' : 'Password'} bind:value={authPass} autocomplete={gate === 'setup' ? 'new-password' : 'current-password'} minlength={gate === 'setup' ? 8 : undefined} required />
         {#if authErr}<span class="err">{authErr}</span>{/if}
         <button class="go" type="submit" disabled={authBusy}>{authBusy ? '…' : gate === 'setup' ? 'Create admin account' : 'Sign in'}</button>
+        {#if gate === 'login' && profiles.length > 0}<button class="link" type="button" onclick={() => { usePassword = false; authErr = '' }}>Back to profiles</button>{/if}
       </form>
     {/if}
   </div>
@@ -1488,6 +1559,16 @@
           {#if pwMsg}<span class="muted small">{pwMsg}</span>{/if}
         </div>
         <div class="row col">
+          <span>Quick sign-in PIN <span class="muted small">— {me?.hasPin ? 'set: tap your name on the sign-in screen and enter it' : 'not set: 4–6 digits for the profile picker'}</span></span>
+          <form class="inline" onsubmit={submitPIN2}>
+            <input type="password" placeholder={me?.hasPassword ? 'Current password' : 'Current PIN'} bind:value={pinAuth} autocomplete="current-password" required />
+            <input type="password" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" placeholder="New PIN (4–6 digits)" bind:value={pinNew} required />
+            <button class="chip" type="submit">{me?.hasPin ? 'Change PIN' : 'Set PIN'}</button>
+            {#if me?.hasPin && me?.hasPassword}<button class="chip" type="button" onclick={(e) => submitPIN2(e, true)}>Remove PIN</button>{/if}
+          </form>
+          {#if pinMsg}<span class="muted small">{pinMsg}</span>{/if}
+        </div>
+        <div class="row col">
           <span>API keys <span class="muted small">— for apps and scripts; send as <code>Authorization: Bearer</code></span></span>
           {#if revealedKey}
             <div class="keyreveal">
@@ -1559,6 +1640,21 @@
   .gate .go { background: var(--accent); color: white; border-radius: 8px; padding: 0.65rem; font-weight: 600; margin-top: 0.3rem; }
   .gate .go:disabled { opacity: 0.5; }
   .gate .err { color: var(--err); font-size: 0.85rem; }
+  .gate .link { color: var(--muted); font-size: 0.85rem; padding: 0.3rem; }
+  .gate .link:hover { color: var(--text); }
+  .picker { display: flex; flex-direction: column; align-items: center; gap: 1.5rem; text-align: center; }
+  .picker h1 { font-size: 1.8rem; }
+  .tiles { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.2rem; max-width: 40rem; }
+  .tile { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; padding: 0.6rem; border-radius: 12px; color: var(--muted); font-size: 0.95rem; }
+  .tile:hover { color: var(--text); background: var(--panel); }
+  .tile-avatar {
+    width: 5.5rem; height: 5.5rem; border-radius: 16px; display: grid; place-items: center;
+    font-size: 2.2rem; font-weight: 600; color: white;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  }
+  .tile-avatar.big { align-self: center; }
+  .pinpad { align-items: center; text-align: center; }
+  .pinpad input { text-align: center; font-size: 1.6rem; letter-spacing: 0.6rem; width: 12rem; }
   .userwrap { position: relative; }
   .avatar .initial { font-weight: 600; font-size: 0.85rem; }
   .usermenu {

@@ -33,6 +33,8 @@ export interface User {
   displayName: string
   role: 'admin' | 'user'
   disabled: boolean
+  hasPassword: boolean
+  hasPin: boolean
   createdAt: string
   libraryIds: string[]
 }
@@ -43,6 +45,7 @@ export interface UserRequest {
   role?: 'admin' | 'user'
   disabled?: boolean
   libraryIds?: string[]
+  pin?: string // set, or '' to clear
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
 export const authStatus = () => req<{ setupRequired: boolean; user?: User }>('/auth/status')

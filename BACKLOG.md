@@ -33,7 +33,9 @@ record it here in the same change — this file is how we find our way back.
 
 ## Milestone 4 — Auth & users
 - [x] Accounts (argon2id), cookie sessions, API keys (Bearer / X-Api-Key), admin + user roles, per-user library grants, first-run setup screen, `user add` / `user passwd` CLI, audit trail attributed to real users. Pre-auth `local` state is adopted by the first admin.
-- [ ] Sign-in rate limiting / lockout — failed logins are audited but not throttled.
+- [x] Sign-in throttling: five failures lock PIN sign-in (per user) or password sign-in (per username) for 30 s, doubling to 15 min; in-memory, resets on restart.
+- [x] Quick sign-in PINs (4–6 digits) with a household profile picker (`auth.profiles`); PIN-only accounts for regular users.
+- [ ] Profile picker avatars: initials only today; per-user avatar image/colour would make the picker feel like Plex Home.
 - [ ] API-key auth via query parameter for media URLs that cannot carry headers (native players handing a stream URL to a system decoder). Header-only today.
 - [ ] Session management: list and revoke a user's active sessions/devices (the data is there: `sessions` records client + IP).
 - [ ] `/artwork` is served without auth so posters load before the session check; acceptable for artwork, revisit if a library is ever considered sensitive.

@@ -69,6 +69,7 @@ func initConfig() {
 	viper.SetDefault("stats.sample_secs", 5)
 	viper.SetDefault("auth.session_days", 30)
 	viper.SetDefault("auth.secure_cookies", false)
+	viper.SetDefault("auth.profiles", true)
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

@@ -84,6 +84,73 @@ paths:
       responses:
         "200": { description: Signed in, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
         "401": { description: Incorrect username or password (or account disabled) }
+  /auth/profiles:
+    get:
+      summary: Household profile picker (public)
+      description: >
+        Enabled users who can sign in with a PIN, for the sign-in screen's
+        name tiles. Empty when auth.profiles is off (then no user names are
+        revealed before sign-in).
+      operationId: authProfiles
+      responses:
+        "200":
+          description: Profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    username: { type: string }
+                    displayName: { type: string }
+                    hasPassword: { type: boolean, description: The user may switch to password sign-in }
+  /auth/pin:
+    post:
+      summary: Quick sign-in with a PIN (public)
+      description: >
+        Five wrong PINs lock that user's PIN sign-in for 30 s, doubling per
+        further failure up to 15 minutes (429 with Retry-After). Password
+        sign-in is throttled the same way per username.
+      operationId: authPINLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, pin]
+              properties:
+                userId: { type: string }
+                pin: { type: string, pattern: "^[0-9]{4,6}$" }
+      responses:
+        "200": { description: Signed in, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "401": { description: Incorrect PIN }
+        "429": { description: Locked out — see Retry-After }
+  /auth/pin/set:
+    post:
+      summary: Set or remove own quick sign-in PIN
+      description: >
+        Requires the current password (or, for PIN-only accounts, the
+        current PIN) in `password`. pin "" removes the PIN, which is refused
+        for accounts that have no password.
+      operationId: authSetPIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password, pin]
+              properties:
+                password: { type: string }
+                pin: { type: string, description: "4–6 digits, or empty to remove" }
+      responses:
+        "204": { description: Done }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Current password/PIN incorrect }
+
   /auth/logout:
     post:
       summary: Sign out this session
@@ -744,6 +811,8 @@ components:
         displayName: { type: string }
         role: { type: string, enum: [admin, user] }
         disabled: { type: boolean }
+        hasPassword: { type: boolean }
+        hasPin: { type: boolean }
         createdAt: { type: string }
         libraryIds: { type: array, items: { type: string }, description: Granted libraries (admins see all regardless) }
     Credentials:
@@ -758,10 +827,11 @@ components:
       properties:
         username: { type: string, description: Create only }
         displayName: { type: string }
-        password: { type: string, minLength: 8, description: Required on create; on update, resets it }
+        password: { type: string, minLength: 8, description: On create, required unless a PIN is given (admins always); on update, resets it }
         role: { type: string, enum: [admin, user] }
         disabled: { type: boolean }
         libraryIds: { type: array, items: { type: string } }
+        pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
     APIKey:
       type: object
       properties:

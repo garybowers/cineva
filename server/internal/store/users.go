@@ -22,6 +22,9 @@ type User struct {
 	Username     string   `json:"username"`
 	DisplayName  string   `json:"displayName"`
 	PasswordHash string   `json:"-"`
+	PINHash      string   `json:"-"`
+	HasPassword  bool     `json:"hasPassword"`
+	HasPin       bool     `json:"hasPin"`
 	Role         string   `json:"role"`
 	Disabled     bool     `json:"disabled"`
 	CreatedAt    string   `json:"createdAt"`
@@ -63,6 +66,8 @@ type UserRepo interface {
 	CountUsers(ctx context.Context) (int, error)
 	UpdateUser(ctx context.Context, id, displayName, role string, disabled bool) error
 	SetPasswordHash(ctx context.Context, id, hash string) error
+	SetPINHash(ctx context.Context, id, hash string) error
+	Profiles(ctx context.Context) ([]User, error)
 	DeleteUser(ctx context.Context, id string) error
 	SetLibraryGrants(ctx context.Context, userID string, libraryIDs []string) error
 	AdoptLocalState(ctx context.Context, userID string) error
@@ -81,13 +86,15 @@ type UserRepo interface {
 
 var _ UserRepo = (*Store)(nil)
 
-const userCols = `id, username, display_name, password_hash, role, disabled, created_at`
+const userCols = `id, username, display_name, password_hash, pin_hash, role, disabled, created_at`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var disabled int
-	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.Role, &disabled, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.PINHash, &u.Role, &disabled, &u.CreatedAt)
 	u.Disabled = disabled == 1
+	u.HasPassword = u.PasswordHash != ""
+	u.HasPin = u.PINHash != ""
 	u.LibraryIDs = []string{}
 	return u, err
 }
@@ -200,6 +207,38 @@ func (s *Store) SetPasswordHash(ctx context.Context, id, hash string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetPINHash sets ("" clears) a user's quick sign-in PIN.
+func (s *Store) SetPINHash(ctx context.Context, id, hash string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET pin_hash = ? WHERE id = ?`, hash, id)
+	if err != nil {
+		return fmt.Errorf("set pin: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Profiles lists enabled users who can sign in with a PIN — what the
+// sign-in screen's profile picker shows before anyone is signed in.
+func (s *Store) Profiles(ctx context.Context) ([]User, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userCols+` FROM users
+		WHERE disabled = 0 AND pin_hash != '' ORDER BY display_name COLLATE NOCASE`)
+	if err != nil {
+		return nil, fmt.Errorf("profiles: %w", err)
+	}
+	defer rows.Close()
+	out := []User{}
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) DeleteUser(ctx context.Context, id string) error {

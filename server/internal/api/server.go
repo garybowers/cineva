@@ -17,6 +17,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/garybowers/cineva/server/internal/auth"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
@@ -36,6 +37,7 @@ type Config struct {
 	SampleSecs   int // host CPU/RAM sampling interval for the admin dashboard
 	SessionDays  int
 	SecureCookie bool
+	Profiles     bool // PIN profile picker on the sign-in screen
 }
 
 type server struct {
@@ -46,6 +48,8 @@ type server struct {
 	sampler       *stats.Sampler
 	playbacks     *playback.Registry
 	sessionTTL    time.Duration
+	throttle      *auth.Throttle
+	profiles      bool // expose the PIN profile picker on the sign-in screen
 	secureCookies bool
 	subtitleDir   string
 	dlCacheDir    string
@@ -61,6 +65,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		playbacks:     playback.NewRegistry(45 * time.Second),
 		sessionTTL:    time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
 		secureCookies: cfg.SecureCookie,
+		throttle:      auth.NewThrottle(),
+		profiles:      cfg.Profiles,
 		subtitleDir:   filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:    filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
@@ -90,6 +96,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	pub.GET("/auth/status", s.authStatusHandler)
 	pub.POST("/auth/login", s.authLogin)
 	pub.POST("/auth/setup", s.authSetup)
+	pub.GET("/auth/profiles", s.authProfiles)
+	pub.POST("/auth/pin", s.authPINLogin)
 
 	// Signed in (session cookie or API key). Library-scoped handlers also
 	// check the caller's grants.
@@ -97,6 +105,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.POST("/auth/logout", s.authLogout)
 	v1.GET("/auth/me", s.authMe)
 	v1.POST("/auth/password", s.authPassword)
+	v1.POST("/auth/pin/set", s.authSetPIN)
 	v1.GET("/auth/keys", s.listAPIKeys)
 	v1.POST("/auth/keys", s.createAPIKey)
 	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)

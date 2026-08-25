@@ -44,6 +44,10 @@ auth:
   # Mark the session cookie Secure so browsers only send it over HTTPS.
   # Turn on when Cineva sits behind a TLS reverse proxy. (CINEVA_AUTH_SECURE_COOKIES)
   secure_cookies: false
+  # Show a profile picker (users with a PIN) on the sign-in screen so a
+  # household can tap a name and enter a PIN. Off = username + password
+  # only, and user names are not listed before sign-in. (CINEVA_AUTH_PROFILES)
+  profiles: true
 
 metadata:
   # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
