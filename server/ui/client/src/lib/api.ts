@@ -118,8 +118,13 @@ export const itemSubtitles = (id: string) => get<SubtitleTrack[]>(`/items/${id}/
 export const searchItems = (q: string) => get<Item[]>(`/search?q=${encodeURIComponent(q)}`)
 export const playItem = (id: string, quality: PlayQuality = 'auto', fromStart = false) =>
   post<PlayInfo>(`/items/${id}/play`, { ...caps, quality, fromStart })
-export const postProgress = (id: string, positionSecs: number) =>
-  post<void>(`/items/${id}/progress`, { positionSecs })
+export const postProgress = (id: string, positionSecs: number, paused = false) =>
+  post<void>(`/items/${id}/progress`, { positionSecs, paused })
+// Tells the server this client has stopped playing the item (drops it from
+// the admin Activity page straight away instead of after the idle timeout).
+export const stopPlayback = (id: string) => fetch(`/api/v1/items/${id}/playback`, { method: 'DELETE' })
+// Same, for page unload: a beacon survives the tab closing where fetch won't.
+export const beaconStop = (id: string) => navigator.sendBeacon?.(`/api/v1/items/${id}/playback/stop`)
 export const continueWatching = () => get<ResumeItem[]>('/continue-watching')
 export const stopSession = (sid: string) => fetch(`/api/v1/play/${sid}`, { method: 'DELETE' })
 export const downloadURL = (id: string) => `/api/v1/items/${id}/download`

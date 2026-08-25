@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte'
   import Hls from 'hls.js'
   import {
-    nextUp, postProgress, stopSession, QUALITIES,
+    nextUp, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
     type Item, type PlayInfo, type PlayQuality,
   } from './lib/api'
   import {
@@ -98,10 +98,22 @@
     }
   })
 
+  // Heartbeat keeps the admin Activity entry alive while paused (no
+  // timeupdate events fire then); the server drops silent clients.
+  const heartbeat = setInterval(() => {
+    if (video) postProgress(item.id, Math.floor(video.currentTime), video.paused).catch(() => {})
+  }, 15000)
+
+  const onHide = () => beaconStop(item.id)
+  window.addEventListener('pagehide', onHide)
+
   onDestroy(() => {
+    clearInterval(heartbeat)
+    window.removeEventListener('pagehide', onHide)
     reportProgress(true)
     hls?.destroy()
     if (info.sessionId) stopSession(info.sessionId)
+    stopPlayback(item.id).catch(() => {})
     clearTimeout(idleTimer)
   })
 
@@ -110,7 +122,7 @@
     const t = Math.floor(video.currentTime)
     if (force || Math.abs(t - lastPosted) >= 10) {
       lastPosted = t
-      postProgress(item.id, t).catch(() => {})
+      postProgress(item.id, t, video.paused).catch(() => {})
     }
   }
 

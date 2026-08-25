@@ -16,6 +16,7 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -110,9 +111,12 @@ func (s *server) playItem(c echo.Context) error {
 	} else {
 		s.events.Publish(events.Event{Type: "plays"})
 	}
+	s.audit(c, "play.start", string(item.Kind), item.ID, item.Title, "")
 	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
 	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)
 	if item.Kind == store.KindTrack {
+		s.registerPlayback(c, item, "direct", "", "")
+		s.registerPlayback(c, item, "direct", "original", "")
 		return c.JSON(http.StatusOK, playInfo{
 			Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
 			DurationSecs: item.RuntimeSecs, Subtitles: []subtitleInfo{},
@@ -169,6 +173,7 @@ func (s *server) playItem(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	s.registerPlayback(c, item, "hls", session.Quality.Label, session.ID)
 	return c.JSON(http.StatusOK, playInfo{
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
@@ -196,6 +201,11 @@ func (s *server) downloadItem(c echo.Context) error {
 	}
 	format := c.QueryParam("format")
 	quality, _ := strconv.Atoi(c.QueryParam("quality"))
+	detail := format
+	if quality > 0 {
+		detail += " " + strconv.Itoa(quality) + " kbps"
+	}
+	s.audit(c, "download", string(item.Kind), item.ID, item.Title, strings.TrimSpace(detail))
 	switch item.Kind {
 	case store.KindTrack:
 		if format != "" && format != "original" {
@@ -361,12 +371,68 @@ func (s *server) hlsFile(c echo.Context) error {
 }
 
 func (s *server) stopSession(c echo.Context) error {
+	if sess, ok := s.sessions.Get(c.Param("sid")); ok {
+		s.audit(c, "transcode.stop", "session", sess.ID, sess.Title, "stopped from admin")
+	}
 	s.sessions.Stop(c.Param("sid"))
+	s.playbacks.StopSession(c.Param("sid"))
 	return c.NoContent(http.StatusNoContent)
 }
 
+// registerPlayback records a play on the activity registry with what the
+// request reveals about the client.
+func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality, sessionID string) {
+	ua := c.Request().UserAgent()
+	browser, osName := playback.ParseUserAgent(ua)
+	p := playback.Playback{
+		UserID: store.LocalUser, ItemID: item.ID, Title: item.Title, Kind: string(item.Kind),
+		Mode: mode, Quality: quality, SessionID: sessionID, DurationSecs: item.RuntimeSecs,
+		Client: playback.Client{IP: c.RealIP(), Browser: browser, OS: osName, UserAgent: ua},
+	}
+	// Context line: "Series · S01E02" for episodes, "Artist · Album" for tracks.
+	switch item.Kind {
+	case store.KindEpisode:
+		if season, err := s.store.Item(c.Request().Context(), item.ParentID); err == nil {
+			if series, err := s.store.Item(c.Request().Context(), season.ParentID); err == nil {
+				p.Subtitle = fmt.Sprintf("%s · S%02dE%02d", series.Title, item.SeasonNum, item.EpisodeNum)
+			}
+		}
+	case store.KindTrack:
+		if album, err := s.store.Item(c.Request().Context(), item.ParentID); err == nil {
+			p.Subtitle = item.Artist + " · " + album.Title
+		}
+	}
+	s.playbacks.Start(p)
+}
+
+// activeSession is an active playback plus its transcode's live numbers.
+type activeSession struct {
+	playback.Playback
+	Transcode *media.Session `json:"transcode,omitempty"`
+}
+
+// GET /play/sessions — everything playing right now, direct or transcoded.
 func (s *server) listSessions(c echo.Context) error {
-	return c.JSON(http.StatusOK, s.sessions.Sessions())
+	out := []activeSession{}
+	for _, p := range s.playbacks.List() {
+		a := activeSession{Playback: p}
+		if p.SessionID != "" {
+			if sess, ok := s.sessions.Get(p.SessionID); ok {
+				a.Transcode = sess
+			}
+		}
+		out = append(out, a)
+	}
+	return c.JSON(http.StatusOK, out)
+}
+
+// DELETE /items/:id/playback — the client has stopped; drop the activity
+// entry straight away (and any transcode behind it).
+func (s *server) stopPlayback(c echo.Context) error {
+	if sid, ok := s.playbacks.Stop(store.LocalUser, c.Param("id")); ok && sid != "" {
+		s.sessions.Stop(sid)
+	}
+	return c.NoContent(http.StatusNoContent)
 }
 
 // POST /items/:id/progress — update watch state.
@@ -376,10 +442,22 @@ func (s *server) postProgress(c echo.Context) error {
 		return err
 	}
 	var req struct {
-		PositionSecs int `json:"positionSecs"`
+		PositionSecs int  `json:"positionSecs"`
+		Paused       bool `json:"paused"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	// Heartbeat for the activity registry. A client whose entry was reaped
+	// (or that predates a restart) is re-registered so it shows up again.
+	if !s.playbacks.Touch(store.LocalUser, item.ID, req.PositionSecs, req.Paused) {
+		s.registerPlayback(c, item, "direct", "", "")
+		s.playbacks.Touch(store.LocalUser, item.ID, req.PositionSecs, req.Paused)
+	}
+	// Music positions are not resume state: tracks are short and would
+	// otherwise litter Continue Watching.
+	if item.Kind == store.KindTrack {
+		return c.JSON(http.StatusOK, store.PlayState{ItemID: item.ID, PositionSecs: req.PositionSecs})
 	}
 	ps, err := s.store.SetProgress(c.Request().Context(), store.LocalUser, item.ID, req.PositionSecs, item.RuntimeSecs)
 	if err != nil {

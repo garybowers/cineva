@@ -279,6 +279,89 @@ paths:
                     episodes: { type: integer }
                     tracks: { type: integer }
 
+  /items/{id}/playback:
+    delete:
+      summary: Client has stopped playing the item
+      description: >
+        Drops the item from the active-playback list immediately (and tears
+        down its transcode session, if any). Without this, an entry lingers
+        until the client misses its progress heartbeats (45 s).
+      operationId: stopPlayback
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Stopped }
+
+  /items/{id}/playback/stop:
+    post:
+      summary: Beacon-friendly alias of DELETE /items/{id}/playback
+      description: navigator.sendBeacon can only POST; used on page unload.
+      operationId: stopPlaybackBeacon
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Stopped }
+
+  /stats/disks:
+    get:
+      summary: Disk space on every filesystem backing a library
+      description: >
+        Library paths on the same filesystem are grouped into one volume.
+        freeBytes is what an unprivileged writer could use. Paths that cannot
+        be stat'ed are listed last with an error.
+      operationId: diskStats
+      responses:
+        "200":
+          description: Volumes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    paths: { type: array, items: { type: string } }
+                    libraries: { type: array, items: { type: string } }
+                    totalBytes: { type: integer }
+                    freeBytes: { type: integer }
+                    usedBytes: { type: integer }
+                    error: { type: string }
+
+  /logs:
+    get:
+      summary: Audit trail — who did what, when, from where
+      description: >
+        Newest first. Actions are dotted verbs (library.create,
+        library.delete, scan.start, scan.cancel, scan.completed, scan.failed,
+        play.start, download, transcode.stop); `action` filters by prefix.
+        Scan completions are recorded by user "system". A "logs" event is
+        pushed on /events whenever an entry is added.
+      operationId: auditLog
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 500 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0 } }
+        - { name: action, in: query, required: false, schema: { type: string }, description: Action prefix filter }
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    at: { type: string }
+                    userId: { type: string }
+                    action: { type: string }
+                    targetKind: { type: string }
+                    targetId: { type: string }
+                    targetTitle: { type: string }
+                    detail: { type: string }
+                    clientIp: { type: string }
+                    client: { type: string, description: "Browser · OS" }
+
   /scans/{id}/cancel:
     post:
       summary: Cancel a running scan
@@ -378,6 +461,7 @@ paths:
               required: [positionSecs]
               properties:
                 positionSecs: { type: integer }
+                paused: { type: boolean, description: Sent with each heartbeat (every 15 s, even while paused) so the admin Activity page can show state; music positions are not stored as resume state }
       responses:
         "200":
           description: Updated play state
@@ -448,7 +532,13 @@ paths:
 
   /play/sessions:
     get:
-      summary: List active HLS playback sessions
+      summary: Everything playing right now — direct or transcoded, video or music
+      description: >
+        One entry per active playback (user + item) with client details
+        (IP, browser, OS from the User-Agent), mode/quality, position and
+        paused state from the client's heartbeats, and the live transcode
+        session when there is one. Entries expire 45 s after the last
+        heartbeat. A "sessions" event is pushed on /events on every change.
       operationId: listSessions
       responses:
         "200":

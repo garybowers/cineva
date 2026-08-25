@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 
@@ -30,6 +31,7 @@ func (s *server) createLibrary(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	s.events.Publish(events.Event{Type: "libraries"})
+	s.audit(c, "library.create", "library", lib.ID, lib.Name, string(lib.MediaType)+" · "+strings.Join(lib.Paths, ", "))
 	return c.JSON(http.StatusCreated, libraryResponse{Library: lib})
 }
 
@@ -63,10 +65,12 @@ func (s *server) getLibrary(c echo.Context) error {
 }
 
 func (s *server) deleteLibrary(c echo.Context) error {
+	lib, _ := s.store.Library(c.Request().Context(), c.Param("id"))
 	if err := s.store.DeleteLibrary(c.Request().Context(), c.Param("id")); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
 	s.events.Publish(events.Event{Type: "libraries"})
+	s.audit(c, "library.delete", "library", c.Param("id"), lib.Name, "")
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -80,6 +84,7 @@ func (s *server) scanLibrary(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	s.audit(c, "scan.start", "library", lib.ID, lib.Name, "")
 	return c.JSON(http.StatusAccepted, scan)
 }
 
@@ -88,6 +93,7 @@ func (s *server) cancelScan(c echo.Context) error {
 	if err := s.manager.CancelScan(c.Request().Context(), c.Param("id")); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	s.audit(c, "scan.cancel", "scan", c.Param("id"), "", "")
 	return c.NoContent(http.StatusNoContent)
 }
 

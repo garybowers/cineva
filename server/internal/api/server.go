@@ -20,6 +20,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/stats"
 	"github.com/garybowers/cineva/server/internal/store"
 	"github.com/garybowers/cineva/server/internal/version"
@@ -41,6 +42,7 @@ type server struct {
 	sessions    *media.SessionManager
 	events      *events.Bus
 	sampler     *stats.Sampler
+	playbacks   *playback.Registry
 	subtitleDir string
 	dlCacheDir  string
 }
@@ -52,6 +54,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
 		events:      events.NewBus(),
 		sampler:     stats.New(time.Duration(cfg.SampleSecs) * time.Second),
+		playbacks:   playback.NewRegistry(45 * time.Second),
 		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:  filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
@@ -64,6 +67,11 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	samplerCtx, stopSampler := context.WithCancel(context.Background())
 	s.sampler.OnSample = func(smp stats.Sample) { s.events.Publish(events.Event{Type: "stats", Data: smp}) }
 	go s.sampler.Run(samplerCtx)
+
+	// Active playbacks: any change (start, heartbeat, stop, idle reap) tells
+	// the UIs to refetch the sessions list.
+	s.playbacks.OnChange = func() { s.events.Publish(events.Event{Type: "sessions"}) }
+	go s.playbacks.Run(samplerCtx)
 
 	e := echo.New()
 	e.HideBanner = true
@@ -86,12 +94,16 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/fs/dirs", s.listDirs)
 	v1.GET("/stats/system", s.systemStats)
 	v1.GET("/stats/plays", s.playStats)
+	v1.GET("/stats/disks", s.diskStats)
+	v1.GET("/logs", s.auditLog)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)
 	v1.GET("/items/:id/stream", s.streamItem)
 	v1.GET("/items/:id/download", s.downloadItem)
 	v1.POST("/items/:id/progress", s.postProgress)
+	v1.DELETE("/items/:id/playback", s.stopPlayback)
+	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
 	v1.GET("/items/:id/next", s.nextUp)
 	v1.GET("/items/:id/subtitles", s.itemSubtitles)
 	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"

@@ -166,3 +166,21 @@ func TestPlaysByDayHasContinuousSpine(t *testing.T) {
 		}
 	}
 }
+
+func TestAuditLogFilterAndOrder(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for _, a := range []string{"scan.start", "play.start", "scan.completed"} {
+		if err := s.RecordAudit(ctx, AuditEntry{UserID: "local", Action: a, TargetTitle: a}); err != nil {
+			t.Fatalf("record %s: %v", a, err)
+		}
+	}
+	all, err := s.AuditLog(ctx, 10, 0, "")
+	if err != nil || len(all) != 3 || all[0].Action != "scan.completed" {
+		t.Fatalf("all = %+v, %v; want 3 newest-first", all, err)
+	}
+	scans, err := s.AuditLog(ctx, 10, 0, "scan.")
+	if err != nil || len(scans) != 2 {
+		t.Fatalf("scan. filter = %+v, %v; want 2", scans, err)
+	}
+}

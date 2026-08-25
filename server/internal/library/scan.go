@@ -203,6 +203,17 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	if err := m.Store.FinishScan(context.WithoutCancel(ctx), scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
 		log.Printf("finish scan %s: %v", scan.ID, err)
 	}
+	detail := fmt.Sprintf("%d files, %d items", filesSeen, itemsCreated)
+	if errMsg != "" {
+		detail += " · " + errMsg
+	}
+	if err := m.Store.RecordAudit(context.WithoutCancel(ctx), store.AuditEntry{
+		UserID: "system", Action: "scan." + status, TargetKind: "library",
+		TargetID: lib.ID, TargetTitle: lib.Name, Detail: detail,
+	}); err != nil {
+		log.Printf("audit scan: %v", err)
+	}
+	m.Events.Publish(events.Event{Type: "logs"})
 	done := scan
 	done.Status, done.Error = status, errMsg
 	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
@@ -315,7 +326,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, report reportFu
 		if !ok {
 			season := store.Item{
 				LibraryID: lib.ID, Kind: store.KindSeason, ParentID: seriesID,
-				Title: "Season " + strconv.Itoa(ep.Season), SeasonNum: ep.Season, Path: seasonDir,
+				Title: fmt.Sprintf("Season %02d", ep.Season), SeasonNum: ep.Season, Path: seasonDir,
 			}
 			// Season-level TMDB data: poster + overview for the season item,
 			// plus per-episode titles/overviews/stills applied below.

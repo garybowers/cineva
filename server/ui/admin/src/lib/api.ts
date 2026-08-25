@@ -57,10 +57,21 @@ export const cancelScan = (id: string) => req<void>(`/scans/${id}/cancel`, { met
 
 export interface PlaySession {
   id: string
+  userId: string
   itemId: string
   title: string
-  segmentSecs: number
-  numSegments: number
+  subtitle?: string
+  kind: string
+  mode: 'direct' | 'hls'
+  quality?: string
+  sessionId?: string
+  client: { ip: string; browser: string; os: string; userAgent: string }
+  positionSecs: number
+  durationSecs: number
+  paused: boolean
+  startedAt: string
+  lastSeenAt: string
+  transcode?: { id: string; segmentSecs: number; numSegments: number; quality: { label: string } }
 }
 
 export const listSessions = () => req<PlaySession[]>('/play/sessions')
@@ -116,3 +127,28 @@ export interface PlayDay {
 }
 export const systemStats = (range: '1h' | '24h') => req<SystemSample[]>(`/stats/system?range=${range}`)
 export const playStats = (days: number) => req<PlayDay[]>(`/stats/plays?days=${days}`)
+
+// Storage and audit trail (admin dashboard / Logs page).
+export interface DiskVolume {
+  paths: string[]
+  libraries: string[]
+  totalBytes: number
+  freeBytes: number
+  usedBytes: number
+  error?: string
+}
+export interface AuditEntry {
+  id: number
+  at: string
+  userId: string
+  action: string
+  targetKind?: string
+  targetId?: string
+  targetTitle?: string
+  detail?: string
+  clientIp?: string
+  client?: string
+}
+export const diskStats = () => req<DiskVolume[]>('/stats/disks')
+export const auditLog = (limit = 100, offset = 0, action = '') =>
+  req<AuditEntry[]>(`/logs?limit=${limit}&offset=${offset}&action=${encodeURIComponent(action)}`)

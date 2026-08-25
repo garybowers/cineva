@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
-  import { postProgress, type Item } from './lib/api'
+  import { playItem, postProgress, stopPlayback, beaconStop, type Item } from './lib/api'
   import {
     Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
     Volume2, VolumeX, X, Music as MusicIcon, Disc3, Download,
@@ -48,9 +48,14 @@
   }
 
   function load(i: number, autoplay = true) {
+    // Previous track is finished as far as the server is concerned.
+    if (track && track.id !== queue[i]?.id) stopPlayback(track.id).catch(() => {})
     index = Math.max(0, Math.min(queue.length - 1, i))
     current = 0
     duration = queue[index].runtimeSecs ?? 0
+    // Register the play (history + admin Activity); the stream URL is fixed
+    // for music so the answer isn't needed.
+    playItem(queue[index].id).catch(() => {})
     audio.src = `/api/v1/items/${queue[index].id}/stream`
     if (autoplay) audio.play().catch(() => {})
     onchange?.(queue[index], index)
@@ -66,7 +71,20 @@
     load(shuffle && queue.length > 1 ? Math.floor(Math.random() * queue.length) : startIndex)
   })
 
-  onDestroy(() => audio?.pause())
+  // Heartbeat for the admin Activity page; the server drops silent clients.
+  const heartbeat = setInterval(() => {
+    if (track && audio) postProgress(track.id, Math.floor(audio.currentTime), audio.paused).catch(() => {})
+  }, 15000)
+
+  const onHide = () => { if (track) beaconStop(track.id) }
+  window.addEventListener('pagehide', onHide)
+
+  onDestroy(() => {
+    clearInterval(heartbeat)
+    window.removeEventListener('pagehide', onHide)
+    audio?.pause()
+    if (track) stopPlayback(track.id).catch(() => {})
+  })
 
   function markPlayed() {
     if (track) postProgress(track.id, track.runtimeSecs ?? 0).catch(() => {})

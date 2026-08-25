@@ -2,19 +2,20 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats,
-    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay,
+    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats, diskStats, auditLog,
+    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type DiskVolume, type AuditEntry,
   } from './lib/api'
   import LineChart from './LineChart.svelte'
   import BarChart from './BarChart.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
-  type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'settings'
+  type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'logs' | 'settings'
   const pages: { id: Page; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'libraries', label: 'Libraries' },
     { id: 'users', label: 'Users' },
     { id: 'activity', label: 'Activity' },
+    { id: 'logs', label: 'Logs' },
     { id: 'settings', label: 'Settings' },
   ]
   const mediaTypes = ['movies', 'tv', 'music', 'audiobooks', 'podcasts', 'books']
@@ -42,6 +43,7 @@
   }
 
   async function refresh() {
+    refreshing = true
     try {
       health = await getHealth()
       offline = false
@@ -50,6 +52,8 @@
       sessions = await listSessions()
     } catch {
       offline = true
+    } finally {
+      refreshing = false
     }
   }
 
@@ -130,6 +134,44 @@
     { name: 'Cineva', token: 2 as const, points: samples.map((x) => ({ t: Date.parse(x.at), v: x.procRss / 1024 ** 3 })) },
   ])
   const playBars = $derived(plays.map((d) => ({ label: d.date, values: [d.movies, d.episodes, d.tracks] })))
+  // Storage: one row per filesystem backing a library.
+  let disks: DiskVolume[] = $state([])
+  const loadDisks = () => diskStats().then((d) => (disks = d)).catch(() => {})
+  const gbShort = (b: number) => (b >= 1024 ** 4 ? `${(b / 1024 ** 4).toFixed(2)} TB` : `${(b / 1024 ** 3).toFixed(0)} GB`)
+  const usedPct = (d: DiskVolume) => (d.totalBytes ? Math.round((d.usedBytes / d.totalBytes) * 100) : 0)
+
+  // Audit trail (Logs page): newest first, filter by action prefix.
+  let logs: AuditEntry[] = $state([])
+  let logFilter = $state('')
+  let logsLoading = $state(false)
+  const logFilters = [
+    { id: '', label: 'All' }, { id: 'play.', label: 'Playback' }, { id: 'download', label: 'Downloads' },
+    { id: 'scan.', label: 'Scans' }, { id: 'library.', label: 'Libraries' }, { id: 'transcode.', label: 'Transcodes' },
+  ]
+  async function loadLogs(more = false) {
+    logsLoading = true
+    try {
+      const page = await auditLog(100, more ? logs.length : 0, logFilter)
+      logs = more ? [...logs, ...page] : page
+    } catch {
+      /* fallback poll retries */
+    } finally {
+      logsLoading = false
+    }
+  }
+  function setLogFilter(f: string) {
+    logFilter = f
+    loadLogs()
+  }
+  const actionLabel = (a: string) =>
+    ({ 'play.start': 'Played', download: 'Downloaded', 'scan.start': 'Started scan', 'scan.cancel': 'Cancelled scan',
+      'scan.completed': 'Scan completed', 'scan.failed': 'Scan failed', 'library.create': 'Created library',
+      'library.delete': 'Deleted library', 'transcode.stop': 'Stopped transcode' })[a] ?? a
+  const when = (iso: string) => {
+    const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z')
+    return d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  }
+
   const playsToday = $derived(plays.length ? plays[plays.length - 1].movies + plays[plays.length - 1].episodes + plays[plays.length - 1].tracks : 0)
   const playsTotal = $derived(plays.reduce((n, d) => n + d.movies + d.episodes + d.tracks, 0))
 
@@ -165,6 +207,16 @@
     return [{ name: '/', path: '/' }, ...parts.map((n, i) => ({ name: n, path: '/' + parts.slice(0, i + 1).join('/') }))]
   }
 
+  let refreshing = $state(false)
+  const clock = (secs: number) => {
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = Math.floor(secs % 60)
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
+  }
+  const since = (iso: string) => {
+    const mins = Math.round((Date.now() - Date.parse(iso)) / 60000)
+    return mins < 1 ? 'just now' : mins < 60 ? `${mins} min ago` : `${Math.floor(mins / 60)} h ${mins % 60} min ago`
+  }
+
   function libName(id: string): string {
     return libraries.find((l) => l.id === id)?.name ?? id.slice(0, 8)
   }
@@ -194,13 +246,17 @@
   onMount(() => {
     refresh()
     loadStats()
+    loadDisks()
+    loadLogs()
     listThemes().then((t) => (themes = t)).catch(() => {})
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
         scan: onScanEvent,
-        libraries: () => listLibraries().then((l) => (libraries = l)).catch(() => {}),
+        libraries: () => { listLibraries().then((l) => (libraries = l)).catch(() => {}); loadDisks() },
         stats: onSample,
+        logs: () => { if (!logsLoading) loadLogs() },
+        sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
       },
       (connected) => {
@@ -317,6 +373,31 @@
           <div class="sub">today · {playsTotal} in the last {playDays} days</div>
           <BarChart bars={playBars} series={['Movies', 'Episodes', 'Tracks']} />
         </div>
+        <div class="card wide">
+          <div class="k">Storage</div>
+          {#if disks.length === 0}
+            <div class="sub">No library paths yet.</div>
+          {:else}
+            <ul class="disks">
+              {#each disks as d (d.paths.join('|'))}
+                <li>
+                  <div class="disk-head">
+                    <span class="disk-libs">{d.libraries.join(', ')}</span>
+                    <span class="muted small">{d.paths.join(', ')}</span>
+                  </div>
+                  {#if d.error}
+                    <div class="muted small">{d.error}</div>
+                  {:else}
+                    <div class="meter" role="meter" aria-valuenow={usedPct(d)} aria-valuemin="0" aria-valuemax="100" aria-label="{d.libraries.join(', ')} disk usage">
+                      <div class="meter-fill" class:warn={usedPct(d) >= 85} class:crit={usedPct(d) >= 95} style="width: {usedPct(d)}%"></div>
+                    </div>
+                    <div class="disk-nums"><strong>{gbShort(d.freeBytes)} free</strong><span class="muted">{gbShort(d.usedBytes)} used of {gbShort(d.totalBytes)} · {usedPct(d)}%</span></div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
       </div>
     {:else if page === 'libraries'}
       <h1>Libraries</h1>
@@ -368,20 +449,44 @@
       <h1>Users</h1>
       <div class="empty">User management arrives in milestone 4. Until then, use the <code>cineva user add</code> CLI.</div>
     {:else if page === 'activity'}
-      <h1>Activity</h1>
-      <h2>Streams</h2>
+      <div class="titlerow">
+        <h1>Activity</h1>
+        <button class="refresh" onclick={refresh} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh'}</button>
+      </div>
+      <h2>Now playing</h2>
       {#if sessions.length === 0}
-        <div class="empty slim">No active playback sessions.</div>
+        <div class="empty slim">Nothing is playing right now.</div>
       {:else}
         <div class="tablewrap">
           <table>
-            <thead><tr><th>Title</th><th>Session</th><th></th></tr></thead>
+            <thead><tr><th>Title</th><th>Client</th><th>Playback</th><th>Progress</th><th>Started</th><th></th></tr></thead>
             <tbody>
               {#each sessions as s (s.id)}
                 <tr>
-                  <td>{s.title}</td>
-                  <td class="muted">{s.id.slice(0, 8)} · {s.numSegments} segments</td>
-                  <td class="actions"><button class="danger" onclick={() => stopSession(s.id).then(refresh)}>Stop</button></td>
+                  <td>
+                    <div>{s.title}</div>
+                    {#if s.subtitle}<div class="muted small">{s.subtitle}</div>{/if}
+                  </td>
+                  <td>
+                    <div>{s.client.browser}{s.client.os ? ` · ${s.client.os}` : ''}</div>
+                    <div class="muted small">{s.client.ip} · {s.userId}</div>
+                  </td>
+                  <td>
+                    <span class="tag">{s.mode === 'hls' ? `transcode · ${s.transcode?.quality?.label ?? s.quality ?? ''}` : 'direct play'}</span>
+                    {#if s.transcode}<div class="muted small">{s.transcode.numSegments} segments ready</div>{/if}
+                  </td>
+                  <td>
+                    <div>{clock(s.positionSecs)}{s.durationSecs ? ` / ${clock(s.durationSecs)}` : ''}{s.paused ? ' · paused' : ''}</div>
+                    {#if s.durationSecs}
+                      <div class="scanbar"><div class="scanbar-fill" style="width: {Math.min(100, (s.positionSecs / s.durationSecs) * 100)}%"></div></div>
+                    {/if}
+                  </td>
+                  <td class="muted">{since(s.startedAt)}</td>
+                  <td class="actions">
+                    {#if s.sessionId}
+                      <button class="danger" onclick={() => stopSession(s.sessionId!).then(refresh)}>Stop transcode</button>
+                    {/if}
+                  </td>
                 </tr>
               {/each}
             </tbody>
@@ -419,6 +524,43 @@
             </tbody>
           </table>
         </div>
+      {/if}
+    {:else if page === 'logs'}
+      <div class="titlerow">
+        <h1>Logs</h1>
+        <button class="refresh" onclick={() => loadLogs()} disabled={logsLoading}>{logsLoading ? 'Refreshing…' : 'Refresh'}</button>
+      </div>
+      <div class="filters">
+        {#each logFilters as f (f.id)}
+          <button class="chip" class:sel={logFilter === f.id} onclick={() => setLogFilter(f.id)}>{f.label}</button>
+        {/each}
+      </div>
+      {#if logs.length === 0}
+        <div class="empty slim">Nothing logged yet.</div>
+      {:else}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>When</th><th>Who</th><th>What</th><th>Target</th><th>Detail</th><th>Client</th></tr></thead>
+            <tbody>
+              {#each logs as e (e.id)}
+                <tr>
+                  <td class="muted nowrap">{when(e.at)}</td>
+                  <td>{e.userId}</td>
+                  <td><span class="tag">{actionLabel(e.action)}</span></td>
+                  <td>
+                    {#if e.targetTitle}<div>{e.targetTitle}</div>{/if}
+                    {#if e.targetKind}<div class="muted small">{e.targetKind}</div>{/if}
+                  </td>
+                  <td class="muted">{e.detail ?? ''}</td>
+                  <td class="muted small">{e.client ?? ''}{e.clientIp ? ` · ${e.clientIp}` : ''}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        {#if logs.length % 100 === 0}
+          <div class="bar top"><button class="refresh" onclick={() => loadLogs(true)} disabled={logsLoading}>Load more</button></div>
+        {/if}
       {/if}
     {:else}
       <h1>Settings</h1>
@@ -501,6 +643,16 @@
   .v.err { color: var(--err); }
   .card:not(:first-child) .v { color: var(--text); }
   .sub { color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+  .disks { list-style: none; display: flex; flex-direction: column; gap: 0.9rem; margin-top: 0.75rem; }
+  .disk-head { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.35rem; }
+  .disk-libs { font-weight: 500; }
+  .meter { height: 8px; border-radius: 999px; background: var(--bg); overflow: hidden; }
+  .meter-fill { height: 100%; border-radius: 999px; background: var(--chart-1); transition: width 0.6s ease; }
+  .meter-fill.warn { background: var(--chart-3); }
+  .meter-fill.crit { background: var(--err); }
+  .disk-nums { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.85rem; margin-top: 0.35rem; flex-wrap: wrap; }
+  .nowrap { white-space: nowrap; }
+  .bar.top { margin-top: 1rem; }
   .filters { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 1.25rem 0 0.75rem; }
   .filters .gap { margin-left: 0.75rem; }
   .graphs { display: grid; grid-template-columns: 1fr; gap: 1rem; }
@@ -512,6 +664,11 @@
   }
 
   .bar { margin-bottom: 1rem; }
+  .titlerow { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .titlerow h1 { margin-bottom: 1rem; }
+  .refresh { border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.8rem; color: var(--text); margin-bottom: 1rem; }
+  .refresh:hover { border-color: var(--accent); }
+  .refresh:disabled { opacity: 0.5; }
   .primary {
     background: var(--accent);
     color: white;
