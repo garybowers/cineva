@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents,
+    authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, type User as UserT, type APIKey,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -10,7 +11,7 @@
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
-    RotateCcw, AudioLines,
+    RotateCcw, AudioLines, LogOut, KeyRound,
   } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
@@ -19,6 +20,80 @@
     { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
     { id: 'settings' as Tab, label: 'Settings', icon: SettingsIcon },
   ]
+
+  // ---- Accounts: who is signed in, and the sign-in / first-run gate ----
+  let me: UserT | null = $state(null)
+  let gate: 'checking' | 'setup' | 'login' | 'in' = $state('checking')
+  let authUser = $state('')
+  let authPass = $state('')
+  let authName = $state('')
+  let authErr = $state('')
+  let authBusy = $state(false)
+  let showUserMenu = $state(false)
+
+  async function checkAuth() {
+    try {
+      const st = await authStatus()
+      if (st.setupRequired) gate = 'setup'
+      else if (st.user) { me = st.user; gate = 'in' }
+      else gate = 'login'
+    } catch {
+      gate = 'login'
+      offline = true
+    }
+  }
+  async function submitAuth(e: Event) {
+    e.preventDefault()
+    authBusy = true
+    authErr = ''
+    try {
+      me = gate === 'setup' ? await setupAdmin(authUser, authPass, authName) : await login(authUser, authPass)
+      gate = 'in'
+      authPass = ''
+      boot()
+    } catch (err) {
+      authErr = err instanceof Error ? err.message : String(err)
+    } finally {
+      authBusy = false
+    }
+  }
+  async function signOut() {
+    showUserMenu = false
+    try { await logout() } catch { /* already gone */ }
+    me = null
+    playing = null
+    music = null
+    gate = 'login'
+  }
+
+  // Change password + API keys (Settings page)
+  let pwCurrent = $state(''), pwNew = $state(''), pwMsg = $state('')
+  async function submitPassword(e: Event) {
+    e.preventDefault()
+    pwMsg = ''
+    try {
+      await changePassword(pwCurrent, pwNew)
+      pwCurrent = pwNew = ''
+      pwMsg = 'Password changed.'
+    } catch (err) {
+      pwMsg = err instanceof Error ? err.message : String(err)
+    }
+  }
+  let apiKeys: APIKey[] = $state([])
+  let newKeyName = $state('')
+  let revealedKey = $state('')
+  const loadKeys = () => listAPIKeys().then((k) => (apiKeys = k)).catch(() => {})
+  async function addKey(e: Event) {
+    e.preventDefault()
+    try {
+      const k = await createAPIKey(newKeyName || 'API key')
+      revealedKey = k.key
+      newKeyName = ''
+      loadKeys()
+    } catch (err) {
+      pwMsg = err instanceof Error ? err.message : String(err)
+    }
+  }
 
   let tab: Tab = $state('home')
   let health: Health | null = $state(null)
@@ -727,10 +802,15 @@
     else gridItems = items.filter(gridFilter(currentLib))
   }
 
-  onMount(() => {
+  // boot runs once signed in: data loads, routing, the live event stream.
+  let booted = false
+  let teardown: (() => void) | null = null
+  function boot() {
+    if (booted) return
+    booted = true
     poll()
-    listThemes().then((t) => (themes = t)).catch(() => {})
     applyRoute(location.pathname)
+    if (tab === 'settings') loadKeys()
     const onPop = () => applyRoute(location.pathname)
     window.addEventListener('popstate', onPop)
     // Live updates over SSE; the slow poll below is only the fallback for
@@ -753,10 +833,22 @@
       },
     )
     const id = setInterval(poll, 30000)
-    return () => {
+    teardown = () => {
       clearInterval(id)
       closeEvents()
       window.removeEventListener('popstate', onPop)
+    }
+  }
+
+  onMount(() => {
+    listThemes().then((t) => (themes = t)).catch(() => {})
+    checkAuth().then(() => { if (gate === 'in') boot() })
+    // Any 401 from the API means the session ended: back to sign-in.
+    const onUnauthorised = () => { if (gate === 'in') { me = null; gate = 'login' } }
+    window.addEventListener(UNAUTHORISED, onUnauthorised)
+    return () => {
+      teardown?.()
+      window.removeEventListener(UNAUTHORISED, onUnauthorised)
     }
   })
 </script>
@@ -768,6 +860,28 @@
     <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}><span>{#if item.kind === 'album' || item.kind === 'track'}<MusicIcon size={30} />{:else}{item.title.slice(0, 1)}{/if}</span></div>
   {/if}
 {/snippet}
+
+{#if gate !== 'in'}
+  <div class="gate">
+    {#if gate === 'checking'}
+      <span class="muted">Connecting…</span>
+    {:else}
+      <form onsubmit={submitAuth}>
+        <h1>Cineva</h1>
+        {#if gate === 'setup'}
+          <p>Welcome. Create the first account — it will be the administrator.</p>
+          <input placeholder="Display name" bind:value={authName} autocomplete="name" />
+        {:else}
+          <p>Sign in to continue.</p>
+        {/if}
+        <input placeholder="Username" bind:value={authUser} autocomplete="username" required />
+        <input type="password" placeholder={gate === 'setup' ? 'Password (8+ characters)' : 'Password'} bind:value={authPass} autocomplete={gate === 'setup' ? 'new-password' : 'current-password'} minlength={gate === 'setup' ? 8 : undefined} required />
+        {#if authErr}<span class="err">{authErr}</span>{/if}
+        <button class="go" type="submit" disabled={authBusy}>{authBusy ? '…' : gate === 'setup' ? 'Create admin account' : 'Sign in'}</button>
+      </form>
+    {/if}
+  </div>
+{/if}
 
 <div class="shell">
   <div class="topbar">
@@ -837,7 +951,20 @@
     {/if}
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
     <button class="topbtn" class:active={tab === 'settings'} onclick={() => setTab('settings')} title="Settings"><SettingsIcon size={17} /></button>
-    <button class="avatar" title="Local user — accounts arrive with milestone 4"><User size={17} /></button>
+    <div class="userwrap">
+      <button class="avatar" title={me ? `${me.displayName} (${me.username})` : 'Account'} onclick={() => (showUserMenu = !showUserMenu)}>
+        {#if me}<span class="initial">{me.displayName.slice(0, 1).toUpperCase()}</span>{:else}<User size={17} />{/if}
+      </button>
+      {#if showUserMenu && me}
+        <div class="usermenu">
+          <div class="um-name">{me.displayName}</div>
+          <div class="um-sub">{me.username} · {me.role}</div>
+          {#if me.role === 'admin'}<a class="um-item" href="/admin/">Admin</a>{/if}
+          <button class="um-item" onclick={() => { showUserMenu = false; setTab('settings'); loadKeys() }}><KeyRound size={14} /> Account settings</button>
+          <button class="um-item" onclick={signOut}><LogOut size={14} /> Sign out</button>
+        </div>
+      {/if}
+    </div>
   </div>
 
   <div class="body">
@@ -1351,6 +1478,36 @@
           <span>Server</span>
           <span class="muted">{offline ? 'unreachable' : `${health?.service} ${health?.version}`}</span>
         </div>
+        <div class="row col">
+          <span>Password</span>
+          <form class="inline" onsubmit={submitPassword}>
+            <input type="password" placeholder="Current password" bind:value={pwCurrent} autocomplete="current-password" required />
+            <input type="password" placeholder="New password (8+ characters)" bind:value={pwNew} autocomplete="new-password" minlength="8" required />
+            <button class="chip" type="submit">Change</button>
+          </form>
+          {#if pwMsg}<span class="muted small">{pwMsg}</span>{/if}
+        </div>
+        <div class="row col">
+          <span>API keys <span class="muted small">— for apps and scripts; send as <code>Authorization: Bearer</code></span></span>
+          {#if revealedKey}
+            <div class="keyreveal">
+              <span>New key — copy it now, it will not be shown again:</span>
+              <code>{revealedKey}</code>
+              <button class="chip" onclick={() => (revealedKey = '')}>Done</button>
+            </div>
+          {/if}
+          {#each apiKeys as k (k.id)}
+            <div class="keyrow">
+              <span>{k.name}</span>
+              <span class="muted small">created {k.createdAt.slice(0, 10)}{k.lastUsedAt ? ` · last used ${k.lastUsedAt.slice(0, 16)}` : ' · never used'}</span>
+              <button class="chip" onclick={() => deleteAPIKey(k.id).then(loadKeys)}>Revoke</button>
+            </div>
+          {/each}
+          <form class="inline" onsubmit={addKey}>
+            <input placeholder="Key name (e.g. Phone)" bind:value={newKeyName} />
+            <button class="chip" type="submit">Create key</button>
+          </form>
+        </div>
         <div class="row">
           <span>Music streaming quality</span>
           <div class="theme-picker">
@@ -1388,6 +1545,38 @@
   .shell { min-height: 100vh; display: flex; flex-direction: column; }
   .body { flex: 1; display: flex; }
   .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+  /* ---- Sign-in / first-run gate ---- */
+  .gate { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: var(--bg); padding: 1rem; }
+  .gate form {
+    width: min(22rem, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1.6rem; display: flex; flex-direction: column; gap: 0.7rem;
+  }
+  .gate h1 { font-size: 1.6rem; margin-bottom: 0.2rem; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .gate p { color: var(--muted); font-size: 0.85rem; margin-bottom: 0.4rem; }
+  .gate input { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.6rem 0.75rem; font: inherit; }
+  .gate input:focus { outline: none; border-color: var(--accent); }
+  .gate .go { background: var(--accent); color: white; border-radius: 8px; padding: 0.65rem; font-weight: 600; margin-top: 0.3rem; }
+  .gate .go:disabled { opacity: 0.5; }
+  .gate .err { color: var(--err); font-size: 0.85rem; }
+  .userwrap { position: relative; }
+  .avatar .initial { font-weight: 600; font-size: 0.85rem; }
+  .usermenu {
+    position: absolute; right: 0; top: calc(100% + 0.4rem); min-width: 12rem; z-index: 60;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.4rem;
+    display: flex; flex-direction: column; box-shadow: 0 8px 24px color-mix(in srgb, var(--bg) 70%, transparent);
+  }
+  .um-name { font-weight: 600; padding: 0.4rem 0.6rem 0; }
+  .um-sub { color: var(--muted); font-size: 0.78rem; padding: 0 0.6rem 0.4rem; border-bottom: 1px solid var(--border); margin-bottom: 0.3rem; }
+  .um-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.6rem; border-radius: 6px; color: var(--text); text-align: left; text-decoration: none; font-size: 0.9rem; }
+  .um-item:hover { background: var(--bg); }
+  .row.col { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+  .inline { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .inline input { flex: 1; min-width: 10rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.45rem 0.6rem; font: inherit; }
+  .keyrow { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+  .keyrow span:first-child { font-weight: 500; }
+  .keyreveal { display: flex; flex-direction: column; gap: 0.4rem; background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 8px; padding: 0.6rem 0.8rem; }
+  .keyreveal code { user-select: all; word-break: break-all; color: var(--accent-2); }
 
   /* ---- Persistent top bar: logo, universal search, profile ---- */
   :root { --topbar-h: 3.4rem; }

@@ -3,7 +3,8 @@
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
     cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats, diskStats, auditLog,
-    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type DiskVolume, type AuditEntry,
+    authStatus, login, logout, listUsers, createUser, updateUser, deleteUser, UNAUTHORISED,
+    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type DiskVolume, type AuditEntry, type User, type UserRequest,
   } from './lib/api'
   import LineChart from './LineChart.svelte'
   import BarChart from './BarChart.svelte'
@@ -19,6 +20,92 @@
     { id: 'settings', label: 'Settings' },
   ]
   const mediaTypes = ['movies', 'tv', 'music', 'audiobooks', 'podcasts', 'books']
+
+  // ---- Sign-in gate: the admin UI is for admins only ----
+  let me: User | null = $state(null)
+  let gate: 'checking' | 'login' | 'forbidden' | 'in' = $state('checking')
+  let authUser = $state(''), authPass = $state(''), authErr = $state(''), authBusy = $state(false)
+  async function checkAuth() {
+    try {
+      const st = await authStatus()
+      if (st.setupRequired) { location.href = '/'; return } // first-run screen lives in the client
+      if (!st.user) gate = 'login'
+      else if (st.user.role !== 'admin') { me = st.user; gate = 'forbidden' }
+      else { me = st.user; gate = 'in' }
+    } catch {
+      gate = 'login'
+    }
+  }
+  async function submitAuth(e: Event) {
+    e.preventDefault()
+    authBusy = true
+    authErr = ''
+    try {
+      const u = await login(authUser, authPass)
+      authPass = ''
+      if (u.role !== 'admin') { me = u; gate = 'forbidden'; return }
+      me = u
+      gate = 'in'
+      boot()
+    } catch (err) {
+      authErr = err instanceof Error ? err.message : String(err)
+    } finally {
+      authBusy = false
+    }
+  }
+  async function signOut() {
+    try { await logout() } catch { /* gone */ }
+    me = null
+    gate = 'login'
+  }
+
+  // ---- Users page ----
+  let users: User[] = $state([])
+  const loadUsers = () => listUsers().then((u) => (users = u)).catch(() => {})
+  let editing: (UserRequest & { id?: string }) | null = $state(null) // null = closed; no id = new
+  let userErr = $state('')
+  let userSaving = $state(false)
+  function newUser() {
+    editing = { username: '', displayName: '', password: '', role: 'user', disabled: false, libraryIds: [] }
+    userErr = ''
+  }
+  function editUser(u: User) {
+    editing = { id: u.id, displayName: u.displayName, password: '', role: u.role, disabled: u.disabled, libraryIds: [...u.libraryIds] }
+    userErr = ''
+  }
+  function toggleGrant(id: string) {
+    if (!editing) return
+    const set = new Set(editing.libraryIds ?? [])
+    if (set.has(id)) set.delete(id); else set.add(id)
+    editing.libraryIds = [...set]
+  }
+  async function saveUser(e: Event) {
+    e.preventDefault()
+    if (!editing) return
+    userSaving = true
+    userErr = ''
+    try {
+      const { id, ...body } = editing
+      if (!body.password) delete body.password
+      if (id) await updateUser(id, body)
+      else await createUser(body)
+      editing = null
+      loadUsers()
+    } catch (err) {
+      userErr = err instanceof Error ? err.message : String(err)
+    } finally {
+      userSaving = false
+    }
+  }
+  async function removeUser(u: User) {
+    if (!confirm(`Delete user "${u.username}"? Their watch history, sessions and API keys go with them.`)) return
+    try {
+      await deleteUser(u.id)
+      loadUsers()
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
 
   let page: Page = $state('dashboard')
   let health: Health | null = $state(null)
@@ -243,12 +330,16 @@
     return s.status === 'running' && total ? Math.min(100, Math.round((s.filesSeen / total) * 100)) : null
   }
 
-  onMount(() => {
+  let booted = false
+  let teardown: (() => void) | null = null
+  function boot() {
+    if (booted) return
+    booted = true
     refresh()
     loadStats()
     loadDisks()
     loadLogs()
-    listThemes().then((t) => (themes = t)).catch(() => {})
+    loadUsers()
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
@@ -256,6 +347,7 @@
         libraries: () => { listLibraries().then((l) => (libraries = l)).catch(() => {}); loadDisks() },
         stats: onSample,
         logs: () => { if (!logsLoading) loadLogs() },
+        users: loadUsers,
         sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
       },
@@ -264,12 +356,47 @@
       },
     )
     const id = setInterval(refresh, 30000)
-    return () => {
+    teardown = () => {
       clearInterval(id)
       closeEvents()
     }
+  }
+
+  onMount(() => {
+    listThemes().then((t) => (themes = t)).catch(() => {})
+    checkAuth().then(() => { if (gate === 'in') boot() })
+    const onUnauthorised = () => { if (gate === 'in') { me = null; gate = 'login' } }
+    window.addEventListener(UNAUTHORISED, onUnauthorised)
+    return () => {
+      teardown?.()
+      window.removeEventListener(UNAUTHORISED, onUnauthorised)
+    }
   })
 </script>
+
+{#if gate !== 'in'}
+  <div class="gate">
+    {#if gate === 'checking'}
+      <span class="muted">Connecting…</span>
+    {:else if gate === 'forbidden'}
+      <form onsubmit={(e) => { e.preventDefault(); signOut() }}>
+        <h1>Admin only</h1>
+        <p>{me?.displayName} is signed in but is not an administrator.</p>
+        <a class="primary" href="/">Back to Cineva</a>
+        <button type="submit">Sign out</button>
+      </form>
+    {:else}
+      <form onsubmit={submitAuth}>
+        <h1>Cineva admin</h1>
+        <p>Sign in with an administrator account.</p>
+        <input placeholder="Username" bind:value={authUser} autocomplete="username" required />
+        <input type="password" placeholder="Password" bind:value={authPass} autocomplete="current-password" required />
+        {#if authErr}<span class="err">{authErr}</span>{/if}
+        <button class="primary" type="submit" disabled={authBusy}>{authBusy ? '…' : 'Sign in'}</button>
+      </form>
+    {/if}
+  </div>
+{/if}
 
 <div class="shell">
   <aside>
@@ -279,6 +406,7 @@
         <button class:active={page === p.id} onclick={() => (page = p.id)}>{p.label}</button>
       {/each}
     </nav>
+    {#if me}<div class="who">{me.displayName} <button onclick={signOut}>Sign out</button></div>{/if}
     <a class="back" href="/">← Back to Cineva</a>
   </aside>
 
@@ -446,8 +574,65 @@
         </div>
       {/if}
     {:else if page === 'users'}
-      <h1>Users</h1>
-      <div class="empty">User management arrives in milestone 4. Until then, use the <code>cineva user add</code> CLI.</div>
+      <div class="titlerow">
+        <h1>Users</h1>
+        <button class="primary" onclick={newUser}>+ Add user</button>
+      </div>
+      {#if editing}
+        <form class="panel form wide" onsubmit={saveUser}>
+          {#if !editing.id}
+            <label>Username <input bind:value={editing.username} required autocomplete="off" /></label>
+          {/if}
+          <label>Display name <input bind:value={editing.displayName} placeholder={editing.username || ''} /></label>
+          <label>{editing.id ? 'New password (leave blank to keep)' : 'Password'}
+            <input type="password" bind:value={editing.password} minlength="8" required={!editing.id} autocomplete="new-password" />
+          </label>
+          <label>Role
+            <select bind:value={editing.role}><option value="user">user</option><option value="admin">admin</option></select>
+          </label>
+          {#if editing.role !== 'admin'}
+            <fieldset class="grants">
+              <legend>Libraries this user can see</legend>
+              {#each libraries as lib (lib.id)}
+                <label class="check"><input type="checkbox" checked={editing.libraryIds?.includes(lib.id)} onchange={() => toggleGrant(lib.id)} /> {lib.name} <span class="muted small">({lib.mediaType})</span></label>
+              {/each}
+              {#if libraries.length === 0}<span class="muted small">No libraries yet.</span>{/if}
+            </fieldset>
+          {:else}
+            <p class="hint">Admins see every library and can manage the server.</p>
+          {/if}
+          {#if editing.id && editing.id !== me?.id}
+            <label class="check"><input type="checkbox" bind:checked={editing.disabled} /> Disabled (cannot sign in)</label>
+          {/if}
+          {#if userErr}<div class="error slim">{userErr}</div>{/if}
+          <div class="formrow">
+            <button class="primary" type="submit" disabled={userSaving}>{userSaving ? 'Saving…' : editing.id ? 'Save' : 'Create'}</button>
+            <button type="button" onclick={() => (editing = null)}>Cancel</button>
+          </div>
+        </form>
+      {/if}
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>User</th><th>Role</th><th>Libraries</th><th>Created</th><th></th></tr></thead>
+          <tbody>
+            {#each users as u (u.id)}
+              <tr>
+                <td>
+                  <div>{u.displayName}{u.disabled ? ' · disabled' : ''}</div>
+                  <div class="muted small">{u.username}{u.id === me?.id ? ' (you)' : ''}</div>
+                </td>
+                <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span></td>
+                <td class="muted">{u.role === 'admin' ? 'all' : u.libraryIds.map(libName).join(', ') || 'none'}</td>
+                <td class="muted">{u.createdAt.slice(0, 10)}</td>
+                <td class="actions">
+                  <button onclick={() => editUser(u)}>Edit</button>
+                  {#if u.id !== me?.id}<button class="danger" onclick={() => removeUser(u)}>Delete</button>{/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     {:else if page === 'activity'}
       <div class="titlerow">
         <h1>Activity</h1>
@@ -695,6 +880,21 @@
     font: inherit;
   }
   .hint { color: var(--muted); font-size: 0.8rem; }
+  .form.wide { max-width: 34rem; }
+  .grants { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; display: flex; flex-direction: column; gap: 0.35rem; }
+  .grants legend { color: var(--muted); font-size: 0.8rem; padding: 0 0.3rem; }
+  .check { flex-direction: row !important; align-items: center; gap: 0.5rem !important; color: var(--text) !important; }
+  .formrow { display: flex; gap: 0.6rem; }
+  .formrow button:not(.primary) { color: var(--muted); }
+  .who { color: var(--muted); font-size: 0.85rem; display: flex; gap: 0.6rem; align-items: center; }
+  .who button { color: var(--accent-2); }
+  .gate { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: var(--bg); padding: 1rem; }
+  .gate form { width: min(22rem, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 1.6rem; display: flex; flex-direction: column; gap: 0.7rem; }
+  .gate h1 { margin-bottom: 0.2rem; }
+  .gate p { color: var(--muted); font-size: 0.85rem; }
+  .gate input { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.6rem 0.75rem; font: inherit; }
+  .gate .err { color: var(--err); font-size: 0.85rem; }
+  .gate .primary { padding: 0.65rem; }
   .pathrow { display: flex; gap: 0.5rem; }
   .pathrow input { flex: 1; min-width: 0; }
   .pathrow button {

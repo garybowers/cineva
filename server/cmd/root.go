@@ -67,6 +67,8 @@ func initConfig() {
 	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
 	viper.SetDefault("transcode.segment_secs", 6)
 	viper.SetDefault("stats.sample_secs", 5)
+	viper.SetDefault("auth.session_days", 30)
+	viper.SetDefault("auth.secure_cookies", false)
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

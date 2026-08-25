@@ -41,8 +41,12 @@ func (s *server) listLibraries(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	me := currentUser(c)
 	out := make([]libraryResponse, 0, len(libs))
 	for _, lib := range libs {
+		if !canSeeLibrary(me, lib.ID) {
+			continue
+		}
 		resp := libraryResponse{Library: lib}
 		for _, kind := range []store.ItemKind{store.KindMovie, store.KindEpisode, store.KindTrack} {
 			n, err := s.store.CountItems(ctx, lib.ID, kind)
@@ -58,7 +62,7 @@ func (s *server) listLibraries(c echo.Context) error {
 
 func (s *server) getLibrary(c echo.Context) error {
 	lib, err := s.store.Library(c.Request().Context(), c.Param("id"))
-	if err != nil {
+	if err != nil || !canSeeLibrary(currentUser(c), lib.ID) {
 		return echo.NewHTTPError(http.StatusNotFound, "library not found")
 	}
 	return c.JSON(http.StatusOK, libraryResponse{Library: lib})
@@ -106,6 +110,9 @@ func (s *server) listScans(c echo.Context) error {
 }
 
 func (s *server) libraryItems(c echo.Context) error {
+	if !canSeeLibrary(currentUser(c), c.Param("id")) {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
 	items, err := s.store.ItemsByLibrary(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return err
@@ -123,13 +130,20 @@ func (s *server) search(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(http.StatusOK, items)
+	me := currentUser(c)
+	visible := items[:0]
+	for _, it := range items {
+		if canSeeLibrary(me, it.LibraryID) {
+			visible = append(visible, it)
+		}
+	}
+	return c.JSON(http.StatusOK, visible)
 }
 
 func (s *server) getItem(c echo.Context) error {
 	ctx := c.Request().Context()
 	item, err := s.store.Item(ctx, c.Param("id"))
-	if err != nil {
+	if err != nil || !canSeeLibrary(currentUser(c), item.LibraryID) {
 		return echo.NewHTTPError(http.StatusNotFound, "item not found")
 	}
 	children, err := s.store.ItemsByParent(ctx, item.ID)
@@ -138,7 +152,7 @@ func (s *server) getItem(c echo.Context) error {
 	}
 	resp := map[string]any{"item": item, "children": children}
 	if item.Kind == store.KindMovie || item.Kind == store.KindEpisode {
-		if ps, err := s.store.PlayStateFor(ctx, store.LocalUser, item.ID); err == nil {
+		if ps, err := s.store.PlayStateFor(ctx, userID(c), item.ID); err == nil {
 			resp["playState"] = ps
 		}
 	}

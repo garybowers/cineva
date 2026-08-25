@@ -96,11 +96,48 @@ export interface ResumeItem extends Item {
   positionSecs: number
 }
 
+// Accounts (milestone 4). A 401 anywhere means the session is gone: the
+// app listens for this event and shows the sign-in screen.
+export interface User {
+  id: string
+  username: string
+  displayName: string
+  role: 'admin' | 'user'
+  disabled: boolean
+  libraryIds: string[]
+}
+export interface APIKey {
+  id: string
+  name: string
+  createdAt: string
+  lastUsedAt?: string
+}
+export const UNAUTHORISED = 'cineva:unauthorised'
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api/v1${path}`, init)
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORISED))
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`
+    try {
+      const body = await res.json()
+      if (body?.message) msg = String(body.message)
+    } catch { /* not JSON */ }
+    throw new Error(msg)
+  }
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
+
+export const authStatus = () => get<{ setupRequired: boolean; user?: User }>('/auth/status')
+export const login = (username: string, password: string) => post<User>('/auth/login', { username, password })
+export const setupAdmin = (username: string, password: string, displayName: string) =>
+  post<User>('/auth/setup', { username, password, displayName })
+export const logout = () => post<void>('/auth/logout')
+export const changePassword = (current: string, next: string) => post<void>('/auth/password', { current, new: next })
+export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
+export const createAPIKey = (name: string) => post<APIKey & { key: string }>('/auth/keys', { name })
+export const deleteAPIKey = (id: string) => req<void>(`/auth/keys/${id}`, { method: 'DELETE' })
 
 const get = <T>(path: string) => req<T>(path)
 const post = <T>(path: string, body?: unknown) =>

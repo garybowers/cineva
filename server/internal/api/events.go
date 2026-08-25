@@ -8,6 +8,9 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// adminEvents carry server-wide information only admins may see.
+var adminEvents = map[string]bool{"stats": true, "sessions": true, "logs": true, "users": true, "scan": true}
+
 // eventStream is the /api/v1/events endpoint: a Server-Sent Events stream of
 // state changes (scan progress, library changes) so UIs update live instead
 // of polling. Events are advisory — the payload is a hint and clients refetch
@@ -21,6 +24,7 @@ func (s *server) eventStream(c echo.Context) error {
 	res.Flush()
 
 	ctx := c.Request().Context()
+	admin := currentUser(c).IsAdmin()
 	sub := s.events.Subscribe(ctx)
 	for {
 		select {
@@ -29,6 +33,9 @@ func (s *server) eventStream(c echo.Context) error {
 		case ev, ok := <-sub:
 			if !ok {
 				return nil
+			}
+			if !admin && adminEvents[ev.Type] {
+				continue
 			}
 			data, err := json.Marshal(ev.Data)
 			if err != nil {

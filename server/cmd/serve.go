@@ -46,6 +46,8 @@ var serveCmd = &cobra.Command{
 			TranscodeDir: viper.GetString("transcode.dir"),
 			SegmentSecs:  viper.GetInt("transcode.segment_secs"),
 			SampleSecs:   viper.GetInt("stats.sample_secs"),
+			SessionDays:  viper.GetInt("auth.session_days"),
+			SecureCookie: viper.GetBool("auth.secure_cookies"),
 		}, st, newManager(st, artworkDir))
 	},
 }

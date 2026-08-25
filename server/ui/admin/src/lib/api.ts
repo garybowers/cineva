@@ -27,19 +27,48 @@ export interface Scan {
   finishedAt?: string
 }
 
+export interface User {
+  id: string
+  username: string
+  displayName: string
+  role: 'admin' | 'user'
+  disabled: boolean
+  createdAt: string
+  libraryIds: string[]
+}
+export interface UserRequest {
+  username?: string
+  displayName?: string
+  password?: string
+  role?: 'admin' | 'user'
+  disabled?: boolean
+  libraryIds?: string[]
+}
+export const UNAUTHORISED = 'cineva:unauthorised'
+export const authStatus = () => req<{ setupRequired: boolean; user?: User }>('/auth/status')
+export const login = (username: string, password: string) =>
+  req<User>('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) })
+export const logout = () => req<void>('/auth/logout', { method: 'POST' })
+export const listUsers = () => req<User[]>('/users')
+export const createUser = (u: UserRequest) =>
+  req<User>('/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
+export const updateUser = (id: string, u: UserRequest) =>
+  req<User>(`/users/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
+export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api/v1${path}`, init)
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORISED))
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
     try {
       const body = await res.json()
-      if (body.message) msg = body.message
-    } catch {
-      /* not json */
-    }
+      if (body?.message) msg = String(body.message)
+    } catch { /* not JSON */ }
     throw new Error(msg)
   }
-  return res.status === 204 ? (undefined as T) : (res.json() as Promise<T>)
+  if (res.status === 204) return undefined as T
+  return res.json() as Promise<T>
 }
 
 export const getHealth = () => req<Health>('/health')

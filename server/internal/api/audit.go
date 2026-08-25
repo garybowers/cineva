@@ -21,7 +21,7 @@ func (s *server) audit(c echo.Context, action, targetKind, targetID, targetTitle
 		client += " · " + osName
 	}
 	e := store.AuditEntry{
-		UserID: store.LocalUser, Action: action,
+		UserID: userID(c), Action: action,
 		TargetKind: targetKind, TargetID: targetID, TargetTitle: targetTitle, Detail: detail,
 		ClientIP: c.RealIP(), Client: client,
 	}

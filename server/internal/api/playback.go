@@ -88,7 +88,7 @@ type playInfo struct {
 
 func (s *server) playableItem(c echo.Context) (store.Item, error) {
 	item, err := s.store.Item(c.Request().Context(), c.Param("id"))
-	if err != nil {
+	if err != nil || !canSeeLibrary(currentUser(c), item.LibraryID) {
 		return store.Item{}, echo.NewHTTPError(http.StatusNotFound, "item not found")
 	}
 	switch item.Kind {
@@ -106,7 +106,7 @@ func (s *server) playItem(c echo.Context) error {
 		return err
 	}
 	// Play history for the dashboard; a failure here must not block playback.
-	if err := s.store.RecordPlay(c.Request().Context(), store.LocalUser, item.ID, item.Kind); err != nil {
+	if err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind); err != nil {
 		log.Printf("record play: %v", err)
 	} else {
 		s.events.Publish(events.Event{Type: "plays"})
@@ -129,7 +129,7 @@ func (s *server) playItem(c echo.Context) error {
 		caps = capabilities{Containers: body.Containers, VideoCodecs: body.VideoCodecs, AudioCodecs: body.AudioCodecs}
 	}
 	quality := body.Quality
-	ps, err := s.store.PlayStateFor(c.Request().Context(), store.LocalUser, item.ID)
+	ps, err := s.store.PlayStateFor(c.Request().Context(), userID(c), item.ID)
 	if err != nil {
 		return err
 	}
@@ -207,7 +207,7 @@ func (s *server) streamItem(c echo.Context) error {
 func (s *server) downloadItem(c echo.Context) error {
 	ctx := c.Request().Context()
 	item, err := s.store.Item(ctx, c.Param("id"))
-	if err != nil {
+	if err != nil || !canSeeLibrary(currentUser(c), item.LibraryID) {
 		return echo.NewHTTPError(http.StatusNotFound, "item not found")
 	}
 	format := c.QueryParam("format")
@@ -396,7 +396,7 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 	ua := c.Request().UserAgent()
 	browser, osName := playback.ParseUserAgent(ua)
 	p := playback.Playback{
-		UserID: store.LocalUser, ItemID: item.ID, Title: item.Title, Kind: string(item.Kind),
+		UserID: userID(c), ItemID: item.ID, Title: item.Title, Kind: string(item.Kind),
 		Mode: mode, Quality: quality, SessionID: sessionID, DurationSecs: item.RuntimeSecs,
 		Client: playback.Client{IP: c.RealIP(), Browser: browser, OS: osName, UserAgent: ua},
 	}
@@ -440,7 +440,7 @@ func (s *server) listSessions(c echo.Context) error {
 // DELETE /items/:id/playback — the client has stopped; drop the activity
 // entry straight away (and any transcode behind it).
 func (s *server) stopPlayback(c echo.Context) error {
-	if sid, ok := s.playbacks.Stop(store.LocalUser, c.Param("id")); ok && sid != "" {
+	if sid, ok := s.playbacks.Stop(userID(c), c.Param("id")); ok && sid != "" {
 		s.sessions.Stop(sid)
 	}
 	return c.NoContent(http.StatusNoContent)
@@ -461,16 +461,16 @@ func (s *server) postProgress(c echo.Context) error {
 	}
 	// Heartbeat for the activity registry. A client whose entry was reaped
 	// (or that predates a restart) is re-registered so it shows up again.
-	if !s.playbacks.Touch(store.LocalUser, item.ID, req.PositionSecs, req.Paused) {
+	if !s.playbacks.Touch(userID(c), item.ID, req.PositionSecs, req.Paused) {
 		s.registerPlayback(c, item, "direct", "", "")
-		s.playbacks.Touch(store.LocalUser, item.ID, req.PositionSecs, req.Paused)
+		s.playbacks.Touch(userID(c), item.ID, req.PositionSecs, req.Paused)
 	}
 	// Music positions are not resume state: tracks are short and would
 	// otherwise litter Continue Watching.
 	if item.Kind == store.KindTrack {
 		return c.JSON(http.StatusOK, store.PlayState{ItemID: item.ID, PositionSecs: req.PositionSecs})
 	}
-	ps, err := s.store.SetProgress(c.Request().Context(), store.LocalUser, item.ID, req.PositionSecs, item.RuntimeSecs)
+	ps, err := s.store.SetProgress(c.Request().Context(), userID(c), item.ID, req.PositionSecs, item.RuntimeSecs)
 	if err != nil {
 		return err
 	}
@@ -491,7 +491,7 @@ func (s *server) nextUp(c echo.Context) error {
 
 // GET /continue-watching — resume row for the home screen.
 func (s *server) continueWatching(c echo.Context) error {
-	items, err := s.store.ContinueWatching(c.Request().Context(), store.LocalUser, 20)
+	items, err := s.store.ContinueWatching(c.Request().Context(), userID(c), 20)
 	if err != nil {
 		return err
 	}

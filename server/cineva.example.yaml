@@ -38,6 +38,13 @@ stats:
   # kept in memory only (last hour fine, last day per-minute). (CINEVA_STATS_SAMPLE_SECS)
   sample_secs: 5
 
+auth:
+  # Browser sessions expire this many days after sign-in. (CINEVA_AUTH_SESSION_DAYS)
+  session_days: 30
+  # Mark the session cookie Secure so browsers only send it over HTTPS.
+  # Turn on when Cineva sits behind a TLS reverse proxy. (CINEVA_AUTH_SECURE_COOKIES)
+  secure_cookies: false
+
 metadata:
   # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
   # open data, no key needed, rate-limited to 1 request/second.

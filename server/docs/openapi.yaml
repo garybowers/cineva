@@ -38,6 +38,155 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Theme" }
 
+  # ---- Authentication & users (milestone 4) ----
+  # Every endpoint except /health, /themes, /auth/status, /auth/login and
+  # /auth/setup requires a signed-in caller: the cineva_session cookie
+  # (browsers) or an API key via `Authorization: Bearer cnv_…` /
+  # `X-Api-Key` (clients). Admin-only endpoints answer 403 to regular
+  # users. Library-scoped endpoints answer 404 for libraries the caller
+  # has not been granted; admins see every library.
+  /auth/status:
+    get:
+      summary: Setup state and the caller's identity (public)
+      operationId: authStatus
+      responses:
+        "200":
+          description: setupRequired is true until the first admin exists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  setupRequired: { type: boolean }
+                  user: { $ref: "#/components/schemas/User" }
+  /auth/setup:
+    post:
+      summary: Create the first admin (public; 409 once any user exists)
+      operationId: authSetup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "201": { description: Admin created and signed in, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: Setup already completed }
+  /auth/login:
+    post:
+      summary: Sign in (sets the session cookie)
+      operationId: authLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "200": { description: Signed in, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "401": { description: Incorrect username or password (or account disabled) }
+  /auth/logout:
+    post:
+      summary: Sign out this session
+      operationId: authLogout
+      responses:
+        "204": { description: Signed out }
+  /auth/me:
+    get:
+      summary: The signed-in user
+      operationId: authMe
+      responses:
+        "200": { description: User, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+  /auth/password:
+    post:
+      summary: Change own password (other sessions are signed out)
+      operationId: authPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current, new]
+              properties:
+                current: { type: string }
+                new: { type: string, minLength: 8 }
+      responses:
+        "204": { description: Changed }
+        "403": { description: Current password incorrect }
+  /auth/keys:
+    get:
+      summary: List own API keys
+      operationId: listAPIKeys
+      responses:
+        "200": { description: Keys (never the secret), content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } }
+    post:
+      summary: Create an API key — the secret is returned exactly once
+      operationId: createAPIKey
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+      responses:
+        "201":
+          description: Key created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/APIKey"
+                  - type: object
+                    properties:
+                      key: { type: string, description: "Bearer secret, prefixed cnv_; shown only here" }
+  /auth/keys/{id}:
+    delete:
+      summary: Revoke an API key
+      operationId: deleteAPIKey
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /users:
+    get:
+      summary: List users (admin)
+      operationId: listUsers
+      responses:
+        "200": { description: Users, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/User" } } } } }
+        "403": { description: Admin only }
+    post:
+      summary: Create a user (admin)
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UserRequest" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /users/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Update a user — display name, role, disabled, library grants, optional password reset (admin)
+      description: Resetting the password or disabling signs the user out everywhere. Admins cannot demote, disable or delete themselves.
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UserRequest" }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a user and everything of theirs (admin)
+      operationId: deleteUser
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /libraries:
     get:
       summary: List libraries
@@ -587,6 +736,40 @@ paths:
 
 components:
   schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        username: { type: string }
+        displayName: { type: string }
+        role: { type: string, enum: [admin, user] }
+        disabled: { type: boolean }
+        createdAt: { type: string }
+        libraryIds: { type: array, items: { type: string }, description: Granted libraries (admins see all regardless) }
+    Credentials:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, minLength: 8 }
+        displayName: { type: string }
+    UserRequest:
+      type: object
+      properties:
+        username: { type: string, description: Create only }
+        displayName: { type: string }
+        password: { type: string, minLength: 8, description: Required on create; on update, resets it }
+        role: { type: string, enum: [admin, user] }
+        disabled: { type: boolean }
+        libraryIds: { type: array, items: { type: string } }
+    APIKey:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        name: { type: string }
+        createdAt: { type: string }
+        lastUsedAt: { type: string }
     MediaType:
       type: string
       enum: [movies, tv, music, audiobooks, podcasts, books]

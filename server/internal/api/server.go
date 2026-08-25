@@ -34,29 +34,35 @@ type Config struct {
 	TranscodeDir string
 	SegmentSecs  int
 	SampleSecs   int // host CPU/RAM sampling interval for the admin dashboard
+	SessionDays  int
+	SecureCookie bool
 }
 
 type server struct {
-	store       *store.Store
-	manager     *library.Manager
-	sessions    *media.SessionManager
-	events      *events.Bus
-	sampler     *stats.Sampler
-	playbacks   *playback.Registry
-	subtitleDir string
-	dlCacheDir  string
+	store         *store.Store
+	manager       *library.Manager
+	sessions      *media.SessionManager
+	events        *events.Bus
+	sampler       *stats.Sampler
+	playbacks     *playback.Registry
+	sessionTTL    time.Duration
+	secureCookies bool
+	subtitleDir   string
+	dlCacheDir    string
 }
 
 func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s := &server{
-		store:       st,
-		manager:     manager,
-		sessions:    media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
-		events:      events.NewBus(),
-		sampler:     stats.New(time.Duration(cfg.SampleSecs) * time.Second),
-		playbacks:   playback.NewRegistry(45 * time.Second),
-		subtitleDir: filepath.Join(cfg.TranscodeDir, "subtitles"),
-		dlCacheDir:  filepath.Join(cfg.TranscodeDir, "dlcache"),
+		store:         st,
+		manager:       manager,
+		sessions:      media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		events:        events.NewBus(),
+		sampler:       stats.New(time.Duration(cfg.SampleSecs) * time.Second),
+		playbacks:     playback.NewRegistry(45 * time.Second),
+		sessionTTL:    time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
+		secureCookies: cfg.SecureCookie,
+		subtitleDir:   filepath.Join(cfg.TranscodeDir, "subtitles"),
+		dlCacheDir:    filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
 	// Scans run by this server publish progress onto the same bus the
 	// /events stream reads from. CLI scans leave manager.Events nil.
@@ -77,25 +83,29 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	e.HideBanner = true
 	e.Use(middleware.Recover(), middleware.Logger())
 
-	v1 := e.Group("/api/v1")
-	v1.GET("/health", health)
-	v1.GET("/themes", listThemes)
+	// Public: liveness, themes, and the sign-in / first-run endpoints.
+	pub := e.Group("/api/v1")
+	pub.GET("/health", health)
+	pub.GET("/themes", listThemes)
+	pub.GET("/auth/status", s.authStatusHandler)
+	pub.POST("/auth/login", s.authLogin)
+	pub.POST("/auth/setup", s.authSetup)
+
+	// Signed in (session cookie or API key). Library-scoped handlers also
+	// check the caller's grants.
+	v1 := e.Group("/api/v1", s.authenticate)
+	v1.POST("/auth/logout", s.authLogout)
+	v1.GET("/auth/me", s.authMe)
+	v1.POST("/auth/password", s.authPassword)
+	v1.GET("/auth/keys", s.listAPIKeys)
+	v1.POST("/auth/keys", s.createAPIKey)
+	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)
 	v1.GET("/libraries", s.listLibraries)
-	v1.POST("/libraries", s.createLibrary)
 	v1.GET("/libraries/:id", s.getLibrary)
-	v1.DELETE("/libraries/:id", s.deleteLibrary)
-	v1.POST("/libraries/:id/scan", s.scanLibrary)
 	v1.GET("/libraries/:id/items", s.libraryItems)
 	v1.GET("/items/:id", s.getItem)
-	v1.GET("/scans", s.listScans)
-	v1.POST("/scans/:id/cancel", s.cancelScan)
 	v1.GET("/search", s.search)
 	v1.GET("/events", s.eventStream)
-	v1.GET("/fs/dirs", s.listDirs)
-	v1.GET("/stats/system", s.systemStats)
-	v1.GET("/stats/plays", s.playStats)
-	v1.GET("/stats/disks", s.diskStats)
-	v1.GET("/logs", s.auditLog)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)
@@ -108,14 +118,31 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/items/:id/subtitles", s.itemSubtitles)
 	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
 	v1.GET("/continue-watching", s.continueWatching)
-	v1.GET("/play/sessions", s.listSessions)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
 	v1.GET("/play/:sid/:file", s.hlsFile)
-	v1.DELETE("/play/:sid", s.stopSession)
+
+	// Admin only.
+	adm := v1.Group("", requireAdmin)
+	adm.POST("/libraries", s.createLibrary)
+	adm.DELETE("/libraries/:id", s.deleteLibrary)
+	adm.POST("/libraries/:id/scan", s.scanLibrary)
+	adm.GET("/scans", s.listScans)
+	adm.POST("/scans/:id/cancel", s.cancelScan)
+	adm.GET("/fs/dirs", s.listDirs)
+	adm.GET("/stats/system", s.systemStats)
+	adm.GET("/stats/plays", s.playStats)
+	adm.GET("/stats/disks", s.diskStats)
+	adm.GET("/logs", s.auditLog)
+	adm.GET("/play/sessions", s.listSessions)
+	adm.DELETE("/play/:sid", s.stopSession)
+	adm.GET("/users", s.listUsers)
+	adm.POST("/users", s.createUser)
+	adm.PATCH("/users/:id", s.updateUser)
+	adm.DELETE("/users/:id", s.deleteUser)
 
 	e.StaticFS("/themes", ui.Themes())
 	if cfg.ArtworkDir != "" {
-		e.Static("/artwork", cfg.ArtworkDir)
+		e.Static("/artwork", cfg.ArtworkDir) // posters only; the UI needs them before sign-in resolves
 	}
 
 	// Admin UI shares the main port at /admin. Do not alias /settings here —

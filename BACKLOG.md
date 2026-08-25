@@ -31,6 +31,15 @@ record it here in the same change — this file is how we find our way back.
 - [ ] Transcode session survival across server restart (sessions die with the process; clients recover by re-requesting play).
 - [ ] Per-user default quality/autoplay stored server-side (after milestone 4; localStorage today).
 
+## Milestone 4 — Auth & users
+- [x] Accounts (argon2id), cookie sessions, API keys (Bearer / X-Api-Key), admin + user roles, per-user library grants, first-run setup screen, `user add` / `user passwd` CLI, audit trail attributed to real users. Pre-auth `local` state is adopted by the first admin.
+- [ ] Sign-in rate limiting / lockout — failed logins are audited but not throttled.
+- [ ] API-key auth via query parameter for media URLs that cannot carry headers (native players handing a stream URL to a system decoder). Header-only today.
+- [ ] Session management: list and revoke a user's active sessions/devices (the data is there: `sessions` records client + IP).
+- [ ] `/artwork` is served without auth so posters load before the session check; acceptable for artwork, revisit if a library is ever considered sensitive.
+- [ ] `auth.secure_cookies` must be set by hand behind HTTPS; consider auto-detecting `X-Forwarded-Proto`.
+- [ ] Per-user settings on the server (theme, autoplay, music quality are still browser-local).
+
 ## Milestone 5 — Web client (partially built early)
 - [x] Real URL routing: name-based paths (/libraries/TV Shows/Succession/Season 2), browser back/forward, deep links with server-side SPA fallback.
 - [ ] Cast & Crew row + ratings on detail pages (needs TMDB key + credits fetch in the scanner; see the Plex reference screenshots).
