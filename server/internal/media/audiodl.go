@@ -16,8 +16,10 @@ type DownloadFormat struct {
 }
 
 var downloadFormats = map[string]DownloadFormat{
-	"mp3": {Encoder: "libmp3lame", Ext: "mp3"},
-	"ogg": {Encoder: "vorbis", Ext: "ogg"},
+	"mp3":  {Encoder: "libmp3lame", Ext: "mp3"},
+	"ogg":  {Encoder: "vorbis", Ext: "ogg"},
+	"opus": {Encoder: "libopus", Ext: "opus"}, // streaming: best quality per bit
+	"aac":  {Encoder: "aac", Ext: "m4a"},      // streaming: the universal fallback (Safari)
 }
 
 // AudioDownloadFormat resolves a user-facing format name ("mp3", "ogg").
@@ -35,7 +37,13 @@ var mp3Rates = map[int]bool{8000: true, 11025: true, 12000: true, 16000: true,
 // layout but can pass packed frames (e.g. FLAC's s16) straight through to a
 // planar-configured encoder, which reads invalid channel pointers.
 func audioFilterSpec(rate, frameSize int) string {
-	spec := fmt.Sprintf("aformat=sample_fmts=fltp:sample_rates=%d:channel_layouts=stereo", rate)
+	return audioFilterSpecFmt("fltp", rate, frameSize)
+}
+
+// audioFilterSpecFmt is audioFilterSpec for encoders that want a different
+// sample format (libopus takes packed flt, not planar).
+func audioFilterSpecFmt(sampleFmt string, rate, frameSize int) string {
+	spec := fmt.Sprintf("aformat=sample_fmts=%s:sample_rates=%d:channel_layouts=stereo", sampleFmt, rate)
 	if frameSize > 0 {
 		spec += fmt.Sprintf(",asetnsamples=n=%d:p=0", frameSize)
 	}
@@ -65,6 +73,11 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 	if rate <= 0 || (encoderName == "libmp3lame" && !mp3Rates[rate]) {
 		rate = 44100
 	}
+	sampleFmt, fmtName := ffmpeg.AVSampleFmtFltp, "fltp"
+	if encoderName == "libopus" {
+		rate = 48000 // Opus is 48 kHz by definition
+		sampleFmt, fmtName = ffmpeg.AVSampleFmtFlt, "flt"
+	}
 
 	encName := ffmpeg.ToCStr(encoderName)
 	codec := ffmpeg.AVCodecFindEncoderByName(encName)
@@ -73,7 +86,7 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 		return fmt.Errorf("encoder %s unavailable", encoderName)
 	}
 	aenc, err := av.NewEncoder(codec, func(cc *ffmpeg.AVCodecContext) {
-		cc.SetSampleFmt(ffmpeg.AVSampleFmtFltp)
+		cc.SetSampleFmt(sampleFmt)
 		cc.SetSampleRate(rate)
 		ffmpeg.AVChannelLayoutDefault(cc.ChLayout(), 2)
 		cc.SetBitRate(int64(bitrateKbps) * 1000)
@@ -89,8 +102,8 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 	defer aenc.Close()
 
 	filter, err := av.NewAudioFilterGraphFromContext(adec.Raw(),
-		audioFilterSpec(rate, aenc.Raw().FrameSize()),
-		ffmpeg.AVSampleFmtFltp, rate, aenc.Raw().ChLayout())
+		audioFilterSpecFmt(fmtName, rate, aenc.Raw().FrameSize()),
+		sampleFmt, rate, aenc.Raw().ChLayout())
 	if err != nil {
 		return fmt.Errorf("audio transcode filter: %w", err)
 	}

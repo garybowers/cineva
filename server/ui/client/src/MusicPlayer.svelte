@@ -1,9 +1,14 @@
 <script lang="ts">
+  // Music playback engine. Tracks are decoded with Web Audio and the next
+  // one is scheduled sample-accurately at the current one's end, so albums
+  // play gapless (a plain <audio> leaves an audible gap between files).
+  // A silent <audio> element holds the browser's media session so lock
+  // screens and hardware keys work while Web Audio does the actual playing.
   import { onDestroy, onMount } from 'svelte'
   import { playItem, postProgress, stopPlayback, beaconStop, type Item } from './lib/api'
   import {
     Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
-    Volume2, VolumeX, X, Music as MusicIcon, Disc3, Download,
+    X, Music as MusicIcon, Disc3,
   } from '@lucide/svelte'
 
   let {
@@ -26,9 +31,9 @@
     ontime?: (secs: number) => void
   } = $props()
 
-  let audio: HTMLAudioElement
   let index = $state(0)
-  let paused = $state(false)
+  let paused = $state(true)
+  let loading = $state(false)
   let current = $state(0)
   let duration = $state(0)
   let shuffle = $state(startShuffle)
@@ -39,6 +44,27 @@
 
   const track = $derived(queue[index])
 
+  // ---- Streaming quality (Settings page) ----
+  // 'original' streams the file; otherwise a server-side Opus transcode.
+  // Whatever the choice, a decode failure falls back to AAC, which every
+  // browser can decode (Safari cannot do Ogg/Opus in Web Audio).
+  export type MusicQuality = 'original' | 'opus-128' | 'opus-64'
+  function readMusicQuality(): MusicQuality {
+    try {
+      return (localStorage.getItem('cineva-music-quality') as MusicQuality) || 'original'
+    } catch {
+      return 'original'
+    }
+  }
+  function streamURL(id: string, fallback = false): string {
+    const base = `/api/v1/items/${id}/stream`
+    if (fallback) return `${base}?format=aac&quality=192`
+    const q = readMusicQuality()
+    if (q === 'original') return base
+    const [format, kbps] = q.split('-')
+    return `${base}?format=${format}&quality=${kbps}`
+  }
+
   function readVolume(): number {
     try {
       return Number(localStorage.getItem('cineva-volume') ?? 1)
@@ -47,47 +73,162 @@
     }
   }
 
-  function load(i: number, autoplay = true) {
-    // Previous track is finished as far as the server is concerned.
-    if (track && track.id !== queue[i]?.id) stopPlayback(track.id).catch(() => {})
-    index = Math.max(0, Math.min(queue.length - 1, i))
-    current = 0
-    duration = queue[index].runtimeSecs ?? 0
-    // Register the play (history + admin Activity); the stream URL is fixed
-    // for music so the answer isn't needed.
-    playItem(queue[index].id).catch(() => {})
-    audio.src = `/api/v1/items/${queue[index].id}/stream`
-    if (autoplay) audio.play().catch(() => {})
-    onchange?.(queue[index], index)
+  // ---- Web Audio engine ----
+  let ctx: AudioContext | null = null
+  let gain: GainNode | null = null
+  interface Playing {
+    src: AudioBufferSourceNode
+    buffer: AudioBuffer
+    startedAt: number // ctx time the buffer's `offset` second began
+    offset: number
+    idx: number
+    stopped: boolean // true when we stopped it ourselves (seek/skip): ignore onended
+  }
+  let cur: Playing | null = null
+  // The pre-scheduled next track (decoded, source started at cur's end).
+  let sched: { idx: number; src: AudioBufferSourceNode; buffer: AudioBuffer; at: number; cancelled: boolean } | null = null
+  let prepareGen = 0 // invalidates in-flight prepare() calls
+  const buffers = new Map<string, Promise<AudioBuffer>>() // small decoded cache
+
+  function engine(): AudioContext {
+    if (!ctx) {
+      ctx = new AudioContext()
+      gain = ctx.createGain()
+      gain.gain.value = muted ? 0 : volume
+      gain.connect(ctx.destination)
+    }
+    return ctx
   }
 
-  // Jump to a queue position (used by the listening-session view).
-  export function jumpTo(i: number) {
-    load(i)
+  async function decode(item: Item): Promise<AudioBuffer> {
+    const key = item.id
+    let p = buffers.get(key)
+    if (!p) {
+      p = (async () => {
+        const ac = engine()
+        const fetchAndDecode = async (url: string) => ac.decodeAudioData(await (await fetch(url)).arrayBuffer())
+        try {
+          return await fetchAndDecode(streamURL(item.id))
+        } catch {
+          // Undecodable here (wma/alac/ogg-on-Safari…): the universal fallback.
+          return await fetchAndDecode(streamURL(item.id, true))
+        }
+      })()
+      buffers.set(key, p)
+      p.catch(() => buffers.delete(key))
+      // Keep only a handful decoded — a FLAC album is hundreds of MB as PCM.
+      for (const k of [...buffers.keys()].slice(0, Math.max(0, buffers.size - 3))) buffers.delete(k)
+    }
+    return p
   }
 
-  onMount(() => {
-    audio.volume = volume
-    load(shuffle && queue.length > 1 ? Math.floor(Math.random() * queue.length) : startIndex)
-  })
+  function position(): number {
+    if (!cur || !ctx) return 0
+    return Math.min(cur.buffer.duration, Math.max(0, ctx.currentTime - cur.startedAt + cur.offset))
+  }
 
-  // Heartbeat for the admin Activity page; the server drops silent clients.
-  const heartbeat = setInterval(() => {
-    if (track && audio) postProgress(track.id, Math.floor(audio.currentTime), audio.paused).catch(() => {})
-  }, 15000)
+  function cancelScheduled() {
+    if (sched) {
+      sched.cancelled = true
+      try { sched.src.stop() } catch { /* not started yet is fine */ }
+      sched = null
+    }
+    prepareGen++
+  }
 
-  const onHide = () => { if (track) beaconStop(track.id) }
-  window.addEventListener('pagehide', onHide)
+  // Start `queue[i]` from `offset` seconds right now.
+  async function play(i: number, offset = 0) {
+    const ac = engine()
+    i = Math.max(0, Math.min(queue.length - 1, i))
+    const item = queue[i]
+    cancelScheduled()
+    if (cur) {
+      cur.stopped = true
+      try { cur.src.stop() } catch { /* already ended */ }
+      if (cur.idx !== i || queue[cur.idx].id !== item.id) stopPlayback(queue[cur.idx].id).catch(() => {})
+      cur = null
+    }
+    index = i
+    current = offset
+    duration = item.runtimeSecs ?? 0
+    loading = true
+    onchange?.(item, i)
+    if (offset === 0) playItem(item.id).catch(() => {}) // history + admin Activity
+    const gen = ++prepareGen
+    let buffer: AudioBuffer
+    try {
+      buffer = await decode(item)
+    } catch {
+      loading = false
+      next() // skip what we cannot play
+      return
+    }
+    if (gen !== prepareGen) return // superseded by another play()
+    loading = false
+    if (ac.state === 'suspended' && !paused) await ac.resume()
+    const src = ac.createBufferSource()
+    src.buffer = buffer
+    src.connect(gain!)
+    const startAt = ac.currentTime + 0.02
+    src.start(startAt, Math.min(offset, buffer.duration))
+    const me: Playing = { src, buffer, startedAt: startAt, offset, idx: i, stopped: false }
+    cur = me
+    duration = buffer.duration
+    src.onended = () => onSourceEnded(me)
+    prepare(me)
+    updateMediaSession()
+  }
 
-  onDestroy(() => {
-    clearInterval(heartbeat)
-    window.removeEventListener('pagehide', onHide)
-    audio?.pause()
-    if (track) stopPlayback(track.id).catch(() => {})
-  })
+  // Decode the following track and schedule it to start exactly when the
+  // current one ends. Lives on `me` so a superseded play() can't schedule
+  // against the wrong track.
+  async function prepare(me: Playing) {
+    const n = pickNext()
+    if (n === null) return
+    const gen = prepareGen
+    let buffer: AudioBuffer
+    try {
+      buffer = await decode(queue[n])
+    } catch {
+      return // onended will try to move on and skip it then
+    }
+    if (gen !== prepareGen || cur !== me || !ctx || !gain) return
+    const endAt = me.startedAt + (me.buffer.duration - me.offset)
+    if (endAt <= ctx.currentTime + 0.05) return // too late; onended handles it
+    const src = ctx.createBufferSource()
+    src.buffer = buffer
+    src.connect(gain)
+    src.start(endAt)
+    const s = { idx: n, src, buffer, at: endAt, cancelled: false }
+    sched = s
+    src.onended = () => {
+      if (s.cancelled) return
+      // Scheduled source finished on its own (it became cur in onSourceEnded).
+    }
+  }
 
-  function markPlayed() {
-    if (track) postProgress(track.id, track.runtimeSecs ?? 0).catch(() => {})
+  function onSourceEnded(me: Playing) {
+    if (me.stopped || cur !== me) return
+    markPlayed(queue[me.idx])
+    if (sched && !sched.cancelled && ctx) {
+      // Seamless hand-over: the scheduled source is already sounding.
+      const s = sched
+      sched = null
+      const handed: Playing = { src: s.src, buffer: s.buffer, startedAt: s.at, offset: 0, idx: s.idx, stopped: false }
+      cur = handed
+      index = s.idx
+      current = 0
+      duration = s.buffer.duration
+      s.src.onended = () => onSourceEnded(handed)
+      stopPlayback(queue[me.idx].id).catch(() => {})
+      playItem(queue[s.idx].id).catch(() => {})
+      onchange?.(queue[s.idx], s.idx)
+      updateMediaSession()
+      prepare(handed)
+      return
+    }
+    cur = null
+    next()
   }
 
   function pickNext(): number | null {
@@ -104,56 +245,164 @@
   function next() {
     const n = pickNext()
     if (n === null) {
+      // End of the queue: stay on the last track, stopped.
+      if (cur) { cur.stopped = true; try { cur.src.stop() } catch { /* ended */ } }
+      cur = null
       paused = true
-      audio.pause()
+      current = 0
+      ctx?.suspend()
+      updateMediaSession()
     } else {
-      load(n)
+      paused = false
+      play(n)
     }
   }
 
   function prev() {
-    if (audio.currentTime > 3 || index === 0) {
-      audio.currentTime = 0
-    } else {
-      load(index - 1)
-    }
+    if (position() > 3 || index === 0) seekTo(0)
+    else { paused = false; play(index - 1) }
   }
 
-  function onEnded() {
-    markPlayed()
-    next()
+  function seekTo(secs: number) {
+    if (!cur) return
+    play(cur.idx, Math.max(0, Math.min(secs, cur.buffer.duration - 0.05)))
   }
 
   function togglePlay() {
-    if (audio.paused) audio.play().catch(() => {})
-    else audio.pause()
+    if (!ctx) { paused = false; play(index); return }
+    if (!cur) { paused = false; play(index, current); return }
+    if (paused) { paused = false; ctx.resume() } else { paused = true; ctx.suspend() }
+    updateMediaSession()
   }
 
   function cycleRepeat() {
     repeat = repeat === 'off' ? 'all' : repeat === 'all' ? 'one' : 'off'
+    reschedule()
+  }
+  function toggleShuffle() {
+    shuffle = !shuffle
+    reschedule()
+  }
+  // Shuffle/repeat changed: the pre-scheduled next track may be wrong now.
+  function reschedule() {
+    cancelScheduled()
+    if (cur) prepare(cur)
+  }
+
+  // Jump to a queue position (used by the listening-session view).
+  export function jumpTo(i: number) {
+    paused = false
+    play(i)
+  }
+
+  function markPlayed(item: Item) {
+    postProgress(item.id, item.runtimeSecs ?? 0).catch(() => {})
   }
 
   // Dragging previews the position; the actual seek happens once on release.
-  // Seeking on every input event fires dozens of decoder seeks per second
-  // (audible crackle) while timeupdate fights the thumb (haywire bar).
   function onSeekPreview(e: Event) {
     seeking = true
     current = Number((e.target as HTMLInputElement).value)
   }
-
   function onSeekCommit(e: Event) {
-    audio.currentTime = Number((e.target as HTMLInputElement).value)
     seeking = false
+    seekTo(Number((e.target as HTMLInputElement).value))
   }
 
   function onVolume(e: Event) {
     volume = Number((e.target as HTMLInputElement).value)
-    audio.volume = volume
-    if (volume > 0) audio.muted = muted = false
+    if (volume > 0) muted = false
+    if (gain) gain.gain.value = muted ? 0 : volume
     try {
       localStorage.setItem('cineva-volume', String(volume))
     } catch { /* private browsing */ }
   }
+
+  // ---- Clock: position readout, admin heartbeat, media session ----
+  const tick = setInterval(() => {
+    if (!cur || paused) return
+    if (!seeking) current = position()
+    ontime?.(current)
+    if ('mediaSession' in navigator && duration > 0) {
+      try { navigator.mediaSession.setPositionState({ duration, position: Math.min(current, duration), playbackRate: 1 }) } catch { /* unsupported */ }
+    }
+  }, 250)
+  const heartbeat = setInterval(() => {
+    if (track && ctx) postProgress(track.id, Math.floor(position()), paused).catch(() => {})
+  }, 15000)
+
+  // ---- Media Session (lock screen / hardware keys) ----
+  // Browsers only surface media controls for a playing HTMLMediaElement, so
+  // a looping silent clip runs alongside Web Audio purely to hold the session.
+  let holder: HTMLAudioElement
+  function silentWav(): string {
+    const rate = 8000, secs = 10, n = rate * secs
+    const buf = new ArrayBuffer(44 + n)
+    const v = new DataView(buf)
+    const str = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)) }
+    str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ')
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true)
+    v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true)
+    str(36, 'data'); v.setUint32(40, n, true)
+    new Uint8Array(buf, 44).fill(128)
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }))
+  }
+  function updateMediaSession() {
+    if (!('mediaSession' in navigator)) return
+    const t = queue[index]
+    if (!t) return
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: t.title, artist: t.artist ?? '',
+        artwork: t.poster ? [{ src: t.poster, sizes: '512x512', type: 'image/jpeg' }] : [],
+      })
+      navigator.mediaSession.playbackState = paused ? 'paused' : 'playing'
+    } catch { /* metadata unsupported */ }
+    if (holder) {
+      if (paused) holder.pause()
+      else holder.play().catch(() => {})
+    }
+  }
+  function installMediaHandlers() {
+    if (!('mediaSession' in navigator)) return
+    const ms = navigator.mediaSession
+    const set = (a: MediaSessionAction, h: MediaSessionActionHandler) => { try { ms.setActionHandler(a, h) } catch { /* unsupported action */ } }
+    set('play', () => { if (paused) togglePlay() })
+    set('pause', () => { if (!paused) togglePlay() })
+    set('previoustrack', prev)
+    set('nexttrack', next)
+    set('seekto', (d) => { if (d.seekTime !== undefined) seekTo(d.seekTime) })
+    set('seekbackward', (d) => seekTo(position() - (d.seekOffset ?? 10)))
+    set('seekforward', (d) => seekTo(position() + (d.seekOffset ?? 10)))
+    set('stop', onclose)
+  }
+
+  onMount(() => {
+    holder.src = silentWav()
+    holder.loop = true
+    holder.volume = 0.01 // inaudible; some browsers drop the session at 0
+    installMediaHandlers()
+    paused = false
+    play(shuffle && queue.length > 1 ? Math.floor(Math.random() * queue.length) : startIndex)
+  })
+
+  const onHide = () => { if (track) beaconStop(track.id) }
+  window.addEventListener('pagehide', onHide)
+
+  onDestroy(() => {
+    clearInterval(tick)
+    clearInterval(heartbeat)
+    window.removeEventListener('pagehide', onHide)
+    cancelScheduled()
+    if (cur) { cur.stopped = true; try { cur.src.stop() } catch { /* ended */ } }
+    if (track) stopPlayback(track.id).catch(() => {})
+    holder?.pause()
+    if (holder?.src) URL.revokeObjectURL(holder.src)
+    ctx?.close()
+    if ('mediaSession' in navigator) {
+      try { navigator.mediaSession.metadata = null; navigator.mediaSession.playbackState = 'none' } catch { /* ignore */ }
+    }
+  })
 
   function fmt(secs: number): string {
     if (!isFinite(secs) || secs < 0) secs = 0
@@ -164,13 +413,7 @@
   const pct = (v: number) => (duration > 0 ? (v / duration) * 100 : 0)
 </script>
 
-<audio
-  bind:this={audio}
-  ontimeupdate={() => { if (!seeking) current = audio.currentTime; if (isFinite(audio.duration)) duration = audio.duration; ontime?.(audio.currentTime) }}
-  onplay={() => (paused = false)}
-  onpause={() => (paused = true)}
-  onended={onEnded}
-></audio>
+<audio bind:this={holder} aria-hidden="true"></audio>
 
 {#if track}
   <div class="musicbar">
@@ -184,13 +427,13 @@
 
     <div class="info">
       <button class="mb-title" onclick={() => onlocate(track)} title="Go to album">{track.title}</button>
-      <span class="mb-artist">{track.artist}</span>
+      <span class="mb-artist">{track.artist}{loading ? ' · loading…' : ''}</span>
     </div>
 
     <div class="transport">
-      <button class="ctl" class:on={shuffle} onclick={() => (shuffle = !shuffle)} title="Shuffle"><Shuffle size={16} /></button>
+      <button class="ctl" class:on={shuffle} onclick={toggleShuffle} title="Shuffle"><Shuffle size={16} /></button>
       <button class="ctl" onclick={prev} title="Previous"><SkipBack size={17} /></button>
-      <button class="ctl big" onclick={togglePlay}>{#if paused}<Play size={22} />{:else}<Pause size={22} />{/if}</button>
+      <button class="ctl big" onclick={togglePlay} title={paused ? 'Play' : 'Pause'}>{#if paused}<Play size={22} />{:else}<Pause size={22} />{/if}</button>
       <button class="ctl" onclick={next} title="Next"><SkipForward size={17} /></button>
       <button class="ctl" class:on={repeat !== 'off'} onclick={cycleRepeat} title="Repeat: {repeat}">
         {#if repeat === 'one'}<Repeat1 size={16} />{:else}<Repeat size={16} />{/if}
@@ -293,7 +536,6 @@
     border-radius: 6px;
   }
   .ctl:hover { background: var(--bg); color: var(--text); }
-  .dl-a { display: grid; place-items: center; }
   .dlsel {
     background: var(--bg);
     color: var(--muted);

@@ -42,11 +42,11 @@ record it here in the same change — this file is how we find our way back.
 - [x] MusicBrainz + Cover Art Archive enrichment: queried only for albums missing art/year/titles (1 req/s throttle, proper User-Agent); canonical track titles for untagged files matched by track number.
 - [ ] Optional local MusicBrainz mirror/dataset: MB publishes full DB dumps — a local mirror would remove the 1 req/s limit for very large untagged libraries.
 - [ ] Transcoded ZIP downloads pre-warm serially — a whole artist as MP3 transcodes each track on the fly during the download; fine for albums, slow for artists. Consider a prepare-then-fetch job when milestone 8's async infrastructure lands.
-- [ ] Gapless album playback (needs Web Audio API preloading/crossfeed; plain `<audio>` has a small gap between tracks).
-- [ ] Audio transcode fallback for browser-unsupported codecs (wma, alac in some browsers) — everything currently direct plays.
+- [x] Gapless album playback: Web Audio engine decodes the next track ahead and schedules it at the current one's exact end. Whole tracks are decoded to PCM (a long FLAC is ~100 MB decoded; the cache holds three) — chunked scheduling would cut that if phones struggle.
+- [x] Streaming transcode: `/stream?format=opus|aac&quality=` with a client Music streaming quality setting (Original / Opus 128k / Opus 64k); any decode failure retries as AAC 192k, which every browser handles (Safari cannot decode Ogg/Opus in Web Audio). Transcodes are cached whole before serving — first play of a track waits ~1.5 s; a streamed-while-encoding variant would remove that.
 - [ ] Artist pages (grid shows albums; an artist view listing their albums exists only via breadcrumb/parent navigation).
 - [ ] Playlists (manual + smart), play counts / recently-played rows from the listen history already being recorded.
-- [ ] Media Session API on the music bar (lock-screen / hardware-key controls).
+- [x] Media Session API: metadata, artwork, play/pause/prev/next/seek handlers, position state; a silent looping clip holds the session because browsers only surface controls for a playing media element. Album name is not passed to the metadata yet (the bar only knows the track).
 - [ ] Audiobooks: M4B chapters, playback speed, precise resume (milestone item, not started).
 - [ ] Podcasts (milestone 8 in the roadmap numbering): RSS subscriptions, polling, retention.
 

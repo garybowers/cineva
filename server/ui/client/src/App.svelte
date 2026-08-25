@@ -153,6 +153,17 @@
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
   let music: { queue: Item[]; startIndex: number; shuffle: boolean; gen: number } | null = $state(null)
   let autoplay = $state(readAutoplay())
+  // Music streaming quality: original file, or a server-side Opus transcode
+  // for slow connections. Takes effect from the next track.
+  type MusicQuality = 'original' | 'opus-128' | 'opus-64'
+  const musicQualities: { id: MusicQuality; label: string }[] = [
+    { id: 'original', label: 'Original' }, { id: 'opus-128', label: 'High (Opus 128k)' }, { id: 'opus-64', label: 'Data saver (Opus 64k)' },
+  ]
+  let musicQuality: MusicQuality = $state((() => { try { return (localStorage.getItem('cineva-music-quality') as MusicQuality) || 'original' } catch { return 'original' } })())
+  function setMusicQuality(q: MusicQuality) {
+    musicQuality = q
+    try { localStorage.setItem('cineva-music-quality', q) } catch { /* private browsing */ }
+  }
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
 
@@ -1339,6 +1350,14 @@
         <div class="row">
           <span>Server</span>
           <span class="muted">{offline ? 'unreachable' : `${health?.service} ${health?.version}`}</span>
+        </div>
+        <div class="row">
+          <span>Music streaming quality</span>
+          <div class="theme-picker">
+            {#each musicQualities as q (q.id)}
+              <button class="chip" class:sel={musicQuality === q.id} onclick={() => setMusicQuality(q.id)}>{q.label}</button>
+            {/each}
+          </div>
         </div>
         <div class="row">
           <span>Next-episode autoplay</span>

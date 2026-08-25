@@ -182,10 +182,21 @@ func (s *server) playItem(c echo.Context) error {
 }
 
 // GET /items/:id/stream — direct play with HTTP range support.
+// GET /items/:id/stream[?format=opus|aac|mp3|ogg&quality=kbps] — the file
+// itself with range support, or (music only) a cached transcode for
+// bandwidth saving and for codecs the browser cannot decode.
 func (s *server) streamItem(c echo.Context) error {
 	item, err := s.playableItem(c)
 	if err != nil {
 		return err
+	}
+	if format := c.QueryParam("format"); format != "" && format != "original" && item.Kind == store.KindTrack {
+		quality, _ := strconv.Atoi(c.QueryParam("quality"))
+		path, _, err := s.transcodedTrack(c.Request().Context(), item, format, quality)
+		if err != nil {
+			return err
+		}
+		return c.File(path)
 	}
 	return c.File(item.Path)
 }
@@ -220,7 +231,7 @@ func (s *server) downloadItem(c echo.Context) error {
 	return echo.NewHTTPError(http.StatusBadRequest, "item is not downloadable")
 }
 
-var allowedBitrates = map[int]bool{128: true, 192: true, 256: true, 320: true}
+var allowedBitrates = map[int]bool{64: true, 96: true, 128: true, 192: true, 256: true, 320: true}
 
 // transcodedTrack ensures a cached transcode of a track exists and returns
 // its path plus the download filename.
