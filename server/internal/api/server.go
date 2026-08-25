@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -181,16 +180,40 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// sessions and removes their temp dirs.
 	shutdownDone := make(chan struct{})
 	go func() {
-		sig := make(chan os.Signal, 1)
+		sig := make(chan os.Signal, 2)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
+		got := <-sig
+		name := "SIGTERM"
+		if got == os.Interrupt {
+			name = "Ctrl-C"
+		}
+		fmt.Printf("\n%s received — shutting down… (press Ctrl-C again to force)\n", name)
+		// A second signal skips the graceful path.
+		go func() {
+			<-sig
+			fmt.Println("forced exit")
+			os.Exit(1)
+		}()
+		if n := len(s.playbacks.List()); n > 0 {
+			fmt.Printf("  %d active playback(s) will be cut off\n", n)
+		}
+		fmt.Print("  stopping HTTP server (waiting up to 10 s for requests)… ")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := e.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
+			fmt.Printf("%v\n", err)
+		} else {
+			fmt.Println("done")
 		}
 		stopSampler()
-		s.sessions.Close()
+		if n := len(s.sessions.Sessions()); n > 0 {
+			fmt.Printf("  stopping %d transcode session(s) and removing temp files… ", n)
+			s.sessions.Close()
+			fmt.Println("done")
+		} else {
+			s.sessions.Close()
+		}
+		fmt.Println("bye")
 		close(shutdownDone)
 	}()
 
