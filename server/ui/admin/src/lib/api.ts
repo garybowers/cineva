@@ -58,6 +58,12 @@ export const createUser = (u: UserRequest) =>
 export const updateUser = (id: string, u: UserRequest) =>
   req<User>(`/users/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
 export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
+export interface ServerSettings {
+  loginMode: 'picker' | 'form'
+}
+export const getSettings = () => req<ServerSettings>('/settings')
+export const putSettings = (s: Partial<ServerSettings>) =>
+  req<ServerSettings>('/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(s) })
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api/v1${path}`, init)

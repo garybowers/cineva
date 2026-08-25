@@ -3,7 +3,8 @@
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
     cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats, diskStats, auditLog,
-    authStatus, login, logout, listUsers, createUser, updateUser, deleteUser, UNAUTHORISED,
+    authStatus, login, logout, listUsers, createUser, updateUser, deleteUser, UNAUTHORISED, getSettings, putSettings,
+    type ServerSettings,
     type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type DiskVolume, type AuditEntry, type User, type UserRequest,
   } from './lib/api'
   import LineChart from './LineChart.svelte'
@@ -57,6 +58,17 @@
     try { await logout() } catch { /* gone */ }
     me = null
     gate = 'login'
+  }
+
+  // ---- Server settings (runtime, stored in the database) ----
+  let settings: ServerSettings | null = $state(null)
+  const loadSettings = () => getSettings().then((s) => (settings = s)).catch(() => {})
+  async function setLoginMode(mode: 'picker' | 'form') {
+    try {
+      settings = await putSettings({ loginMode: mode })
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+    }
   }
 
   // ---- Users page ----
@@ -342,6 +354,7 @@
     loadDisks()
     loadLogs()
     loadUsers()
+    loadSettings()
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
@@ -350,6 +363,7 @@
         stats: onSample,
         logs: () => { if (!logsLoading) loadLogs() },
         users: loadUsers,
+        settings: loadSettings,
         sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
       },
@@ -759,6 +773,13 @@
       <h1>Settings</h1>
       <div class="panel">
         <div class="setting">
+          <span>Sign-in screen <span class="muted small">— what everyone sees before signing in</span></span>
+          <div class="theme-picker">
+            <button class="chip" class:sel={settings?.loginMode === 'picker'} onclick={() => setLoginMode('picker')} title="Every user shown as a tile; pick one and enter its PIN or password">Choose a user</button>
+            <button class="chip" class:sel={settings?.loginMode === 'form'} onclick={() => setLoginMode('form')} title="A username box and a password-or-PIN box; no names are revealed">Username + password / PIN</button>
+          </div>
+        </div>
+        <div class="setting">
           <span>Theme</span>
           <div class="theme-picker">
             {#each themes as t (t.id)}
@@ -768,8 +789,8 @@
         </div>
       </div>
       <div class="empty">
-        Server settings are file/env driven for now — edit <code>cineva.yaml</code> or set
-        <code>CINEVA_*</code> variables, then restart. A UI for safe-to-change settings comes later.
+        Everything else (ports, paths, metadata keys) lives in <code>cineva.yaml</code> or
+        <code>CINEVA_*</code> variables and needs a restart.
       </div>
     {/if}
   </main>
@@ -985,6 +1006,7 @@
   }
   .small { font-size: 0.78rem; }
 
+  .setting + .setting { margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px solid var(--border); }
   .setting {
     display: flex;
     justify-content: space-between;

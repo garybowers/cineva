@@ -37,38 +37,38 @@ type Config struct {
 	SampleSecs   int // host CPU/RAM sampling interval for the admin dashboard
 	SessionDays  int
 	SecureCookie bool
-	Profiles     bool // PIN profile picker on the sign-in screen
+	LoginMode    string // "picker" | "form" default for the sign-in screen
 }
 
 type server struct {
-	store         *store.Store
-	manager       *library.Manager
-	sessions      *media.SessionManager
-	events        *events.Bus
-	sampler       *stats.Sampler
-	playbacks     *playback.Registry
-	sessionTTL    time.Duration
-	throttle      *auth.Throttle
-	profiles      bool // expose the PIN profile picker on the sign-in screen
-	secureCookies bool
-	subtitleDir   string
-	dlCacheDir    string
+	store            *store.Store
+	manager          *library.Manager
+	sessions         *media.SessionManager
+	events           *events.Bus
+	sampler          *stats.Sampler
+	playbacks        *playback.Registry
+	sessionTTL       time.Duration
+	throttle         *auth.Throttle
+	defaultLoginMode string // from config; the database setting overrides
+	secureCookies    bool
+	subtitleDir      string
+	dlCacheDir       string
 }
 
 func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s := &server{
-		store:         st,
-		manager:       manager,
-		sessions:      media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
-		events:        events.NewBus(),
-		sampler:       stats.New(time.Duration(cfg.SampleSecs) * time.Second),
-		playbacks:     playback.NewRegistry(45 * time.Second),
-		sessionTTL:    time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
-		secureCookies: cfg.SecureCookie,
-		throttle:      auth.NewThrottle(),
-		profiles:      cfg.Profiles,
-		subtitleDir:   filepath.Join(cfg.TranscodeDir, "subtitles"),
-		dlCacheDir:    filepath.Join(cfg.TranscodeDir, "dlcache"),
+		store:            st,
+		manager:          manager,
+		sessions:         media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		events:           events.NewBus(),
+		sampler:          stats.New(time.Duration(cfg.SampleSecs) * time.Second),
+		playbacks:        playback.NewRegistry(45 * time.Second),
+		sessionTTL:       time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
+		secureCookies:    cfg.SecureCookie,
+		throttle:         auth.NewThrottle(),
+		defaultLoginMode: cfg.LoginMode,
+		subtitleDir:      filepath.Join(cfg.TranscodeDir, "subtitles"),
+		dlCacheDir:       filepath.Join(cfg.TranscodeDir, "dlcache"),
 	}
 	// Scans run by this server publish progress onto the same bus the
 	// /events stream reads from. CLI scans leave manager.Events nil.
@@ -144,6 +144,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	adm.GET("/logs", s.auditLog)
 	adm.GET("/play/sessions", s.listSessions)
 	adm.DELETE("/play/:sid", s.stopSession)
+	adm.GET("/settings", s.getSettings)
+	adm.PUT("/settings", s.putSettings)
 	adm.GET("/users", s.listUsers)
 	adm.POST("/users", s.createUser)
 	adm.PATCH("/users/:id", s.updateUser)

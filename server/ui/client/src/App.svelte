@@ -35,13 +35,33 @@
   let profiles: Profile[] = $state([])
   let picked: Profile | null = $state(null)
   let usePassword = $state(false)
+  let loginMode: 'picker' | 'form' = $state('picker')
   let pin = $state('')
   const loadProfiles = () => authProfiles().then((p) => (profiles = p)).catch(() => (profiles = []))
   function pickProfile(p: Profile) {
     picked = p
     pin = ''
+    authPass = ''
+    authUser = p.username
     authErr = ''
     setTimeout(() => (document.querySelector('.pinpad input') as HTMLInputElement | null)?.focus(), 30)
+  }
+  // A picked profile without a PIN signs in with its password.
+  async function submitPickedPassword(e: Event) {
+    e.preventDefault()
+    if (!picked) return
+    authBusy = true
+    authErr = ''
+    try {
+      me = await login(picked.username, authPass)
+      gate = 'in'
+      authPass = ''
+      boot()
+    } catch (err) {
+      authErr = err instanceof Error ? err.message : String(err)
+    } finally {
+      authBusy = false
+    }
   }
   async function submitPIN(e: Event) {
     e.preventDefault()
@@ -78,9 +98,10 @@
   async function checkAuth() {
     try {
       const st = await authStatus()
+      loginMode = st.loginMode ?? 'picker'
       if (st.setupRequired) gate = 'setup'
       else if (st.user) { me = st.user; gate = 'in' }
-      else { gate = 'login'; loadProfiles() }
+      else { gate = 'login'; if (loginMode === 'picker') await loadProfiles() }
     } catch {
       gate = 'login'
       offline = true
@@ -911,7 +932,7 @@
   <div class="gate">
     {#if gate === 'checking'}
       <span class="muted">Connecting…</span>
-    {:else if gate === 'login' && profiles.length > 0 && !usePassword && !picked}
+    {:else if gate === 'login' && loginMode === 'picker' && profiles.length > 0 && !usePassword && !picked}
       <div class="picker">
         <h1>Who's watching?</h1>
         <div class="tiles">
@@ -925,15 +946,20 @@
         <button class="link" onclick={() => (usePassword = true)}>Sign in with a username and password</button>
       </div>
     {:else if gate === 'login' && picked}
-      <form class="pinpad" onsubmit={submitPIN}>
+      <form class="pinpad" onsubmit={picked.hasPin ? submitPIN : submitPickedPassword}>
         <span class="tile-avatar big">{picked.displayName.slice(0, 1).toUpperCase()}</span>
         <h1>{picked.displayName}</h1>
-        <p>Enter your PIN</p>
-        <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" bind:value={pin} required aria-label="PIN" />
+        {#if picked.hasPin}
+          <p>Enter your PIN</p>
+          <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" bind:value={pin} required aria-label="PIN" />
+        {:else}
+          <p>Enter your password</p>
+          <input type="password" class="pw" autocomplete="current-password" bind:value={authPass} required aria-label="Password" />
+        {/if}
         {#if authErr}<span class="err">{authErr}</span>{/if}
-        <button class="go" type="submit" disabled={authBusy || pin.length < 4}>{authBusy ? '…' : 'Sign in'}</button>
+        <button class="go" type="submit" disabled={authBusy || (picked.hasPin ? pin.length < 4 : !authPass)}>{authBusy ? '…' : 'Sign in'}</button>
         <button class="link" type="button" onclick={() => { picked = null; authErr = '' }}>Not you? Choose another profile</button>
-        {#if picked.hasPassword}<button class="link" type="button" onclick={() => { authUser = picked?.username ?? ''; picked = null; usePassword = true }}>Use my password instead</button>{/if}
+        {#if picked.hasPin && picked.hasPassword}<button class="link" type="button" onclick={() => { authUser = picked?.username ?? ''; picked = null; usePassword = true }}>Use my password instead</button>{/if}
       </form>
     {:else}
       <form onsubmit={submitAuth}>
@@ -945,10 +971,10 @@
           <p>Sign in to continue.</p>
         {/if}
         <input placeholder="Username" bind:value={authUser} autocomplete="username" required />
-        <input type="password" placeholder={gate === 'setup' ? 'Password (8+ characters)' : 'Password'} bind:value={authPass} autocomplete={gate === 'setup' ? 'new-password' : 'current-password'} minlength={gate === 'setup' ? 8 : undefined} required />
+        <input type="password" placeholder={gate === 'setup' ? 'Password (8+ characters)' : 'Password or PIN'} bind:value={authPass} autocomplete={gate === 'setup' ? 'new-password' : 'current-password'} minlength={gate === 'setup' ? 8 : undefined} required />
         {#if authErr}<span class="err">{authErr}</span>{/if}
         <button class="go" type="submit" disabled={authBusy}>{authBusy ? '…' : gate === 'setup' ? 'Create admin account' : 'Sign in'}</button>
-        {#if gate === 'login' && profiles.length > 0}<button class="link" type="button" onclick={() => { usePassword = false; authErr = '' }}>Back to profiles</button>{/if}
+        {#if gate === 'login' && loginMode === 'picker' && profiles.length > 0}<button class="link" type="button" onclick={() => { usePassword = false; authErr = '' }}>Back to profiles</button>{/if}
       </form>
     {/if}
   </div>
@@ -1655,6 +1681,7 @@
   .tile-avatar.big { align-self: center; }
   .pinpad { align-items: center; text-align: center; }
   .pinpad input { text-align: center; font-size: 1.6rem; letter-spacing: 0.6rem; width: 12rem; }
+  .pinpad input.pw { font-size: 1rem; letter-spacing: normal; width: 16rem; }
   .userwrap { position: relative; }
   .avatar .initial { font-weight: 600; font-size: 0.85rem; }
   .usermenu {

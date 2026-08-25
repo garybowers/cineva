@@ -48,7 +48,7 @@ var serveCmd = &cobra.Command{
 			SampleSecs:   viper.GetInt("stats.sample_secs"),
 			SessionDays:  viper.GetInt("auth.session_days"),
 			SecureCookie: viper.GetBool("auth.secure_cookies"),
-			Profiles:     viper.GetBool("auth.profiles"),
+			LoginMode:    viper.GetString("auth.login_mode"),
 		}, st, newManager(st, artworkDir))
 	},
 }

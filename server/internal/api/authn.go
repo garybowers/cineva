@@ -124,6 +124,7 @@ func clientLabel(c echo.Context) string {
 
 type authStatus struct {
 	SetupRequired bool        `json:"setupRequired"`
+	LoginMode     string      `json:"loginMode"`
 	User          *store.User `json:"user,omitempty"`
 }
 
@@ -135,7 +136,7 @@ func (s *server) authStatusHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	out := authStatus{SetupRequired: n == 0}
+	out := authStatus{SetupRequired: n == 0, LoginMode: s.loginMode(c)}
 	if n > 0 {
 		// Resolve the caller without failing the request when anonymous.
 		if ck, err := c.Cookie(sessionCookie); err == nil && ck.Value != "" {
@@ -212,7 +213,13 @@ func (s *server) authLogin(c echo.Context) error {
 	if hash == "" {
 		hash = dummyHash
 	}
-	if !auth.VerifyPassword(req.Password, hash) || u.ID == "" || u.Disabled {
+	// The secret may be the password or, for users with one, the PIN
+	// (the form-mode box accepts either).
+	ok := auth.VerifyPassword(req.Password, hash)
+	if !ok && u.PINHash != "" && auth.CheckPINPolicy(req.Password) == nil {
+		ok = auth.VerifyPassword(req.Password, u.PINHash)
+	}
+	if !ok || u.ID == "" || u.Disabled {
 		wait := s.throttle.Fail(key)
 		c.Set(ctxUser, store.User{ID: "anonymous", Username: "anonymous"})
 		s.audit(c, "login.failed", "user", "", strings.TrimSpace(req.Username), lockDetail(wait))
@@ -256,21 +263,25 @@ type profile struct {
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName"`
 	HasPassword bool   `json:"hasPassword"`
+	HasPin      bool   `json:"hasPin"`
 }
 
-// GET /auth/profiles — public: the household picker. Only users who can
-// sign in with a PIN are listed, and only when auth.profiles is on.
+// GET /auth/profiles — public: every enabled user, for the "Who's
+// watching?" picker. Empty in form mode so no names leak before sign-in.
 func (s *server) authProfiles(c echo.Context) error {
 	out := []profile{}
-	if !s.profiles {
+	if s.loginMode(c) != LoginModePicker {
 		return c.JSON(http.StatusOK, out)
 	}
-	users, err := s.store.Profiles(c.Request().Context())
+	users, err := s.store.Users(c.Request().Context())
 	if err != nil {
 		return err
 	}
 	for _, u := range users {
-		out = append(out, profile{ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, HasPassword: u.HasPassword})
+		if u.Disabled {
+			continue
+		}
+		out = append(out, profile{ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, HasPassword: u.HasPassword, HasPin: u.HasPin})
 	}
 	return c.JSON(http.StatusOK, out)
 }

@@ -58,6 +58,7 @@ paths:
                 type: object
                 properties:
                   setupRequired: { type: boolean }
+                  loginMode: { type: string, enum: [picker, form], description: What the sign-in screen shows (admin setting) }
                   user: { $ref: "#/components/schemas/User" }
   /auth/setup:
     post:
@@ -75,6 +76,7 @@ paths:
   /auth/login:
     post:
       summary: Sign in (sets the session cookie)
+      description: The password field also accepts the user's PIN, when they have one.
       operationId: authLogin
       requestBody:
         required: true
@@ -86,11 +88,10 @@ paths:
         "401": { description: Incorrect username or password (or account disabled) }
   /auth/profiles:
     get:
-      summary: Household profile picker (public)
+      summary: Sign-in profile picker (public)
       description: >
-        Enabled users who can sign in with a PIN, for the sign-in screen's
-        name tiles. Empty when auth.profiles is off (then no user names are
-        revealed before sign-in).
+        Every enabled user, for the "Who's watching?" tiles. Empty when the
+        sign-in screen is in form mode, so no names are revealed then.
       operationId: authProfiles
       responses:
         "200":
@@ -106,6 +107,7 @@ paths:
                     username: { type: string }
                     displayName: { type: string }
                     hasPassword: { type: boolean, description: The user may switch to password sign-in }
+                    hasPin: { type: boolean, description: Ask for a PIN; otherwise ask for the password }
   /auth/pin:
     post:
       summary: Quick sign-in with a PIN (public)
@@ -213,6 +215,24 @@ paths:
       responses:
         "204": { description: Revoked }
         "404": { $ref: "#/components/responses/NotFound" }
+  /settings:
+    get:
+      summary: Runtime settings (admin)
+      operationId: getSettings
+      responses:
+        "200": { description: Settings, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
+    put:
+      summary: Change runtime settings (admin) — only the fields sent change
+      operationId: putSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Settings" }
+      responses:
+        "200": { description: Updated settings, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
   /users:
     get:
       summary: List users (admin)
@@ -832,6 +852,13 @@ components:
         disabled: { type: boolean }
         libraryIds: { type: array, items: { type: string } }
         pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
+    Settings:
+      type: object
+      properties:
+        loginMode:
+          type: string
+          enum: [picker, form]
+          description: picker = every user as a tile, then their PIN or password; form = username + password-or-PIN box. Default from auth.login_mode.
     APIKey:
       type: object
       properties:

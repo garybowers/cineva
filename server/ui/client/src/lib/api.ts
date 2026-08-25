@@ -113,6 +113,7 @@ export interface Profile {
   username: string
   displayName: string
   hasPassword: boolean
+  hasPin: boolean
 }
 export interface APIKey {
   id: string
@@ -137,7 +138,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export const authStatus = () => get<{ setupRequired: boolean; user?: User }>('/auth/status')
+export const authStatus = () => get<{ setupRequired: boolean; loginMode: 'picker' | 'form'; user?: User }>('/auth/status')
 export const login = (username: string, password: string) => post<User>('/auth/login', { username, password })
 export const setupAdmin = (username: string, password: string, displayName: string) =>
   post<User>('/auth/setup', { username, password, displayName })
