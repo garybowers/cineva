@@ -88,3 +88,13 @@ export function subscribeEvents(
   es.onerror = () => onState?.(false)
   return () => es.close()
 }
+
+// Folder picker: the server lists subdirectories of an absolute path
+// (directories only) for the add-library form.
+export interface DirListing {
+  path: string
+  parent?: string
+  dirs: { name: string; path: string }[]
+}
+export const browseDirs = (path: string, hidden = false) =>
+  req<DirListing>(`/fs/dirs?path=${encodeURIComponent(path)}${hidden ? '&hidden=1' : ''}`)

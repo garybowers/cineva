@@ -194,6 +194,38 @@ paths:
             text/event-stream:
               schema: { type: string }
 
+  /fs/dirs:
+    get:
+      summary: List subdirectories of a server path (admin folder picker)
+      description: >
+        Directories only, one level at a time — never file contents. Hidden
+        (dot) directories are omitted unless hidden=1. Symlinked directories
+        are followed so linked media mounts are browsable.
+      operationId: listDirs
+      parameters:
+        - { name: path, in: query, required: false, schema: { type: string }, description: Absolute path (default "/") }
+        - { name: hidden, in: query, required: false, schema: { type: string, enum: ["1"] } }
+      responses:
+        "200":
+          description: Listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  parent: { type: string }
+                  dirs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        path: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Permission denied }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /scans/{id}/cancel:
     post:
       summary: Cancel a running scan

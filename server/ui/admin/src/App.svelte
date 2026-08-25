@@ -2,8 +2,8 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    cancelScan, listSessions, stopSession, subscribeEvents,
-    type Health, type Library, type Scan, type PlaySession,
+    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs,
+    type Health, type Library, type Scan, type PlaySession, type DirListing,
   } from './lib/api'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
@@ -87,6 +87,38 @@
     }
   }
 
+  // Folder picker for the path field: browses the server's filesystem one
+  // level at a time (directories only).
+  let browsing = $state(false)
+  let listing: DirListing | null = $state(null)
+  let browseErr = $state('')
+  let showHidden = $state(false)
+
+  async function browse(path: string) {
+    browseErr = ''
+    try {
+      listing = await browseDirs(path, showHidden)
+    } catch (e) {
+      browseErr = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  function openBrowser() {
+    browsing = true
+    const start = newPath.trim() && newPath.startsWith('/') ? newPath.trim() : '/'
+    browse(start)
+  }
+
+  function chooseFolder() {
+    if (listing) newPath = listing.path
+    browsing = false
+  }
+
+  const crumbs = (p: string) => {
+    const parts = p.split('/').filter(Boolean)
+    return [{ name: '/', path: '/' }, ...parts.map((n, i) => ({ name: n, path: '/' + parts.slice(0, i + 1).join('/') }))]
+  }
+
   function libName(id: string): string {
     return libraries.find((l) => l.id === id)?.name ?? id.slice(0, 8)
   }
@@ -145,6 +177,44 @@
     <a class="back" href="/">← Back to Cineva</a>
   </aside>
 
+  {#if browsing}
+    <div class="modal-bg" role="presentation" onclick={() => (browsing = false)}>
+      <div class="modal" role="dialog" aria-label="Choose a folder" onclick={(e) => e.stopPropagation()}>
+        <div class="modal-head">
+          <strong>Choose a folder</strong>
+          <label class="hidden-toggle"><input type="checkbox" bind:checked={showHidden} onchange={() => listing && browse(listing.path)} /> Show hidden</label>
+        </div>
+        {#if listing}
+          <div class="crumbs">
+            {#each crumbs(listing.path) as c, i (c.path)}
+              {#if i > 0}<span class="sep">/</span>{/if}
+              <button type="button" class="crumb" onclick={() => browse(c.path)}>{c.name}</button>
+            {/each}
+          </div>
+        {/if}
+        {#if browseErr}<div class="error slim">{browseErr}</div>{/if}
+        <ul class="dirs">
+          {#if listing?.parent}
+            <li><button type="button" onclick={() => browse(listing!.parent!)}>‥ up</button></li>
+          {/if}
+          {#each listing?.dirs ?? [] as d (d.path)}
+            <li><button type="button" onclick={() => browse(d.path)}>{d.name}</button></li>
+          {/each}
+          {#if listing && listing.dirs.length === 0}
+            <li class="muted small">No subfolders</li>
+          {/if}
+        </ul>
+        <div class="modal-foot">
+          <span class="muted small">{listing?.path ?? ''}</span>
+          <span>
+            <button type="button" onclick={() => (browsing = false)}>Cancel</button>
+            <button type="button" class="primary" disabled={!listing} onclick={chooseFolder}>Select this folder</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   <main>
     {#if error}
       <div class="error">{error} <button onclick={() => (error = '')}>✕</button></div>
@@ -182,7 +252,12 @@
               {#each mediaTypes as t (t)}<option value={t}>{t}</option>{/each}
             </select>
           </label>
-          <label>Path <input bind:value={newPath} placeholder="/media/movies" required /></label>
+          <label>Path
+            <span class="pathrow">
+              <input bind:value={newPath} placeholder="/media/movies" required />
+              <button type="button" onclick={openBrowser}>Browse…</button>
+            </span>
+          </label>
           <button class="primary" disabled={saving} type="submit">{saving ? 'Creating…' : 'Create'}</button>
           <p class="hint">One media type per library, chosen now and immutable. Add more paths later.</p>
         </form>
@@ -375,6 +450,51 @@
     font: inherit;
   }
   .hint { color: var(--muted); font-size: 0.8rem; }
+  .pathrow { display: flex; gap: 0.5rem; }
+  .pathrow input { flex: 1; min-width: 0; }
+  .pathrow button {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 0.8rem;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .pathrow button:hover { border-color: var(--accent); }
+
+  /* Folder picker */
+  .modal-bg {
+    position: fixed; inset: 0; z-index: 50;
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    display: grid; place-items: center; padding: 1rem;
+  }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: min(34rem, 100%);
+    max-height: 80vh;
+    display: flex; flex-direction: column;
+  }
+  .modal-head, .modal-foot {
+    display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+    padding: 0.8rem 1rem;
+  }
+  .modal-head { border-bottom: 1px solid var(--border); }
+  .modal-foot { border-top: 1px solid var(--border); }
+  .modal-foot button { padding: 0.45rem 0.9rem; border-radius: 8px; }
+  .modal-foot button:not(.primary) { color: var(--muted); }
+  .hidden-toggle { font-size: 0.8rem; color: var(--muted); display: flex; gap: 0.4rem; align-items: center; }
+  .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.1rem; padding: 0.5rem 1rem; font-size: 0.85rem; }
+  .crumb { color: var(--accent-2); padding: 0.1rem 0.25rem; border-radius: 4px; }
+  .crumb:hover { background: var(--bg); }
+  .sep { color: var(--muted); }
+  .dirs { list-style: none; overflow-y: auto; flex: 1; min-height: 12rem; padding: 0.25rem 0.5rem; }
+  .dirs li button {
+    width: 100%; text-align: left; padding: 0.45rem 0.6rem; border-radius: 6px;
+  }
+  .dirs li button:hover { background: var(--bg); }
+  .dirs li.muted { padding: 0.6rem; }
+  .error.slim { margin: 0.5rem 1rem; padding: 0.4rem 0.7rem; }
 
   .tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }

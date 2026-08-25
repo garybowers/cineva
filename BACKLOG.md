@@ -53,7 +53,9 @@ record it here in the same change — this file is how we find our way back.
 ## Milestone 6 — Admin UI
 - [ ] Multiple paths per library in the add form (API supports it; form takes one).
 - [ ] Edit library paths after creation.
-- [ ] Scan progress detail (files/sec, current file) and scan cancellation UI.
+- [x] Scan progress (files seen / total, progress bar, live via the event stream) and cancellation UI. Still open: current file name, files/sec.
+- [ ] `/fs/dirs` (folder picker) must be admin-only once milestone 4 auth lands — it exposes directory names server-wide.
+- [ ] Folder picker: multi-select to add several paths at once (pairs with multiple-paths-per-library above).
 
 ## Operational
 - [ ] CI: build UIs, `go vet`/test, lint on push (no CI at all yet).
