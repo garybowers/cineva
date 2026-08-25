@@ -2,12 +2,12 @@
   import { onDestroy, onMount } from 'svelte'
   import Hls from 'hls.js'
   import {
-    nextUp, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
+    nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
     type Item, type PlayInfo, type PlayQuality,
   } from './lib/api'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize,
-    Maximize2,
+    Maximize2, SkipBack, SkipForward,
   } from '@lucide/svelte'
 
   let {
@@ -39,6 +39,7 @@
   let video: HTMLVideoElement
   let hls: Hls | null = null
   let next: Item | null = $state(null)
+  let prev: Item | null = $state(null)
   let showNext = $state(false)
   let remaining = $state(0)
   let subtitle = $state('off')
@@ -95,6 +96,7 @@
     if (!compact) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     if (item.kind === 'episode') {
       nextUp(item.id).then((n) => (next = n)).catch(() => {})
+      prevEpisode(item.id).then((p) => (prev = p)).catch(() => {})
     }
   })
 
@@ -205,6 +207,11 @@
   function onKeydown(e: KeyboardEvent) {
     const target = e.target as HTMLElement
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return
+    if (e.shiftKey && (e.key === 'N' || e.key === 'P')) {
+      const ep = e.key === 'N' ? next : prev
+      if (ep) { e.preventDefault(); onnext(ep) }
+      return
+    }
     switch (e.key) {
       case ' ':
         e.preventDefault()
@@ -331,9 +338,15 @@
       <span class="time">{fmt(current)} / {fmt(duration)}</span>
     </div>
     <div class="mini-transport">
+      {#if item.kind === 'episode'}
+        <button class="ctl" onclick={() => prev && onnext(prev)} disabled={!prev} title={prev ? `Previous episode · ${epCode(prev)}` : 'First episode'}><SkipBack size={16} /></button>
+      {/if}
       <button class="ctl" onclick={() => skip(-10)} title="Back 10s"><RotateCcw size={16} /></button>
       <button class="ctl playpause" onclick={togglePlay}>{#if paused}<Play size={19} />{:else}<Pause size={19} />{/if}</button>
       <button class="ctl" onclick={() => skip(10)} title="Forward 10s"><RotateCw size={16} /></button>
+      {#if item.kind === 'episode'}
+        <button class="ctl" onclick={() => next && onnext(next)} disabled={!next} title={next ? `Next episode · ${epCode(next)}` : 'Last episode'}><SkipForward size={16} /></button>
+      {/if}
     </div>
     <div class="mini-actions">
       <button class="ctl" onclick={onexpand} title="Expand"><Maximize2 size={16} /></button>
@@ -357,9 +370,15 @@
         />
       </div>
       <div class="buttons">
+        {#if item.kind === 'episode'}
+          <button class="ctl" onclick={() => prev && onnext(prev)} disabled={!prev} title={prev ? `Previous episode · ${epCode(prev)} (shift+P)` : 'First episode'}><SkipBack size={16} /></button>
+        {/if}
         <button class="ctl" onclick={() => skip(-10)} title="Back 10s (←)"><RotateCcw size={16} /></button>
         <button class="ctl playpause" onclick={togglePlay} title="Play/pause (space)">{#if paused}<Play size={19} />{:else}<Pause size={19} />{/if}</button>
         <button class="ctl" onclick={() => skip(10)} title="Forward 10s (→)"><RotateCw size={16} /></button>
+        {#if item.kind === 'episode'}
+          <button class="ctl" onclick={() => next && onnext(next)} disabled={!next} title={next ? `Next episode · ${epCode(next)} (shift+N)` : 'Last episode'}><SkipForward size={16} /></button>
+        {/if}
         <span class="time">{fmt(current)} / {fmt(duration)}</span>
         <span class="spacer"></span>
         <button class="ctl" onclick={toggleMute} title="Mute (m)">{#if muted || volume === 0}<VolumeX size={17} />{:else}<Volume2 size={17} />{/if}</button>
@@ -560,6 +579,7 @@
     border-radius: 6px;
     flex: none;
   }
+  .ctl:disabled { opacity: 0.35; cursor: default; }
   .ctl:hover { background: var(--bg); color: var(--text); }
   .nowplaying:fullscreen .ctl { color: rgba(255, 255, 255, 0.85); }
   .playpause { font-size: 1.15rem; }

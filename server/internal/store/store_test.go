@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -182,5 +183,32 @@ func TestAuditLogFilterAndOrder(t *testing.T) {
 	scans, err := s.AuditLog(ctx, 10, 0, "scan.")
 	if err != nil || len(scans) != 2 {
 		t.Fatalf("scan. filter = %+v, %v; want 2", scans, err)
+	}
+}
+
+func TestAdjacentEpisodesCrossSeasons(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	lib, _ := s.CreateLibrary(ctx, "TV", MediaTV, []string{"/tv"})
+	series, _ := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindSeries, Title: "Show", Path: "/tv/show"})
+	var eps []Item
+	for season := 1; season <= 2; season++ {
+		se, _ := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindSeason, ParentID: series.ID, Title: "S", SeasonNum: season, Path: fmt.Sprintf("/tv/show/s%d", season)})
+		for n := 1; n <= 2; n++ {
+			e, _ := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindEpisode, ParentID: se.ID, Title: "E", SeasonNum: season, EpisodeNum: n, Path: fmt.Sprintf("/tv/show/s%de%d.mkv", season, n)})
+			eps = append(eps, e)
+		}
+	}
+	if p, ok, _ := s.PrevEpisode(ctx, eps[0].ID); ok {
+		t.Fatalf("first episode has a previous: %+v", p)
+	}
+	if n, ok, _ := s.NextEpisode(ctx, eps[3].ID); ok {
+		t.Fatalf("last episode has a next: %+v", n)
+	}
+	if p, ok, _ := s.PrevEpisode(ctx, eps[2].ID); !ok || p.ID != eps[1].ID {
+		t.Fatalf("prev of S02E01 = %+v, want S01E02", p)
+	}
+	if n, ok, _ := s.NextEpisode(ctx, eps[1].ID); !ok || n.ID != eps[2].ID {
+		t.Fatalf("next of S01E02 = %+v, want S02E01", n)
 	}
 }

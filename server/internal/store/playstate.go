@@ -32,6 +32,7 @@ type PlayStateRepo interface {
 	PlayStateFor(ctx context.Context, userID, itemID string) (PlayState, error)
 	ContinueWatching(ctx context.Context, userID string, limit int) ([]ResumeItem, error)
 	NextEpisode(ctx context.Context, episodeID string) (Item, bool, error)
+	PrevEpisode(ctx context.Context, episodeID string) (Item, bool, error)
 }
 
 var _ PlayStateRepo = (*Store)(nil)
@@ -100,6 +101,15 @@ func (s *Store) ContinueWatching(ctx context.Context, userID string, limit int) 
 // NextEpisode returns the episode after the given one within its series,
 // crossing season boundaries.
 func (s *Store) NextEpisode(ctx context.Context, episodeID string) (Item, bool, error) {
+	return s.adjacentEpisode(ctx, episodeID, 1)
+}
+
+// PrevEpisode is NextEpisode's mirror, for the player's back button.
+func (s *Store) PrevEpisode(ctx context.Context, episodeID string) (Item, bool, error) {
+	return s.adjacentEpisode(ctx, episodeID, -1)
+}
+
+func (s *Store) adjacentEpisode(ctx context.Context, episodeID string, step int) (Item, bool, error) {
 	ep, err := s.Item(ctx, episodeID)
 	if err != nil || ep.Kind != KindEpisode || ep.ParentID == "" {
 		return Item{}, false, err
@@ -117,8 +127,11 @@ func (s *Store) NextEpisode(ctx context.Context, episodeID string) (Item, bool, 
 		return Item{}, false, err
 	}
 	for i, e := range episodes {
-		if e.ID == episodeID && i+1 < len(episodes) {
-			return episodes[i+1], true, nil
+		if e.ID == episodeID {
+			if j := i + step; j >= 0 && j < len(episodes) {
+				return episodes[j], true, nil
+			}
+			break
 		}
 	}
 	return Item{}, false, nil

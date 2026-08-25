@@ -479,6 +479,9 @@ func (s *server) postProgress(c echo.Context) error {
 
 // GET /items/:id/next — the server-side next-up decision (see CLAUDE.md).
 func (s *server) nextUp(c echo.Context) error {
+	if _, err := s.playableItem(c); err != nil {
+		return err
+	}
 	next, ok, err := s.store.NextEpisode(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return err
@@ -487,6 +490,21 @@ func (s *server) nextUp(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	return c.JSON(http.StatusOK, next)
+}
+
+// GET /items/:id/prev — the episode before this one (204 at the start).
+func (s *server) prevEpisode(c echo.Context) error {
+	if _, err := s.playableItem(c); err != nil {
+		return err
+	}
+	prev, ok, err := s.store.PrevEpisode(c.Request().Context(), c.Param("id"))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.NoContent(http.StatusNoContent)
+	}
+	return c.JSON(http.StatusOK, prev)
 }
 
 // GET /continue-watching — resume row for the home screen.

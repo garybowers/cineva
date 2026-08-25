@@ -178,6 +178,12 @@ export const continueWatching = () => get<ResumeItem[]>('/continue-watching')
 export const stopSession = (sid: string) => fetch(`/api/v1/play/${sid}`, { method: 'DELETE' })
 export const downloadURL = (id: string) => `/api/v1/items/${id}/download`
 
+export async function prevEpisode(id: string): Promise<Item | null> {
+  const res = await fetch(`/api/v1/items/${id}/prev`)
+  if (res.status === 204 || !res.ok) return null
+  return res.json() as Promise<Item>
+}
+
 export async function nextUp(id: string): Promise<Item | null> {
   const res = await fetch(`/api/v1/items/${id}/next`)
   if (res.status === 204 || !res.ok) return null

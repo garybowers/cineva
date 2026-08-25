@@ -721,6 +721,20 @@ paths:
               schema: { $ref: "#/components/schemas/Item" }
         "204": { description: No next episode (end of series, or not an episode) }
 
+  /items/{id}/prev:
+    get:
+      summary: The episode before this one (player back button)
+      operationId: prevEpisode
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The next episode
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Item" }
+        "204": { description: No next episode (end of series, or not an episode) }
+
   /items/{id}/subtitles:
     get:
       summary: List an item's subtitle tracks (embedded and sidecar)
