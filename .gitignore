@@ -19,3 +19,9 @@ artwork/
 # reference is server/cineva.example.yaml
 server/cineva.yaml
 .env
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
