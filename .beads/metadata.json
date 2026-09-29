@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "cineva",
-  "project_id": "c50b5f55-532e-43c0-9d25-05a432466947"
-}
