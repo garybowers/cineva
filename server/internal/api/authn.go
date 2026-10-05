@@ -66,7 +66,31 @@ func bearerKey(c echo.Context) string {
 	if h := c.Request().Header.Get(echo.HeaderAuthorization); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
+	// ?api_key= is the escape hatch for URLs that cannot carry a header: a
+	// native app handing a stream URL to the system video decoder, or a
+	// <video src> that the browser fetches itself. Accepted only on the
+	// media routes — see queryKeyAllowed — because a key in a URL ends up
+	// in history, logs and referrers, which is a poor place for a
+	// credential and not worth it for routes that can send a header.
+	if queryKeyAllowed(c.Path()) {
+		return c.QueryParam("api_key")
+	}
 	return ""
+}
+
+// queryKeyAllowed reports whether a route may authenticate from the query
+// string. Deliberately a short allow-list of the routes a media player opens
+// directly, rather than a global switch.
+func queryKeyAllowed(route string) bool {
+	switch route {
+	case "/api/v1/items/:id/stream",
+		"/api/v1/items/:id/download",
+		"/api/v1/subtitles/:file",
+		"/api/v1/play/:sid/index.m3u8",
+		"/api/v1/play/:sid/:file":
+		return true
+	}
+	return false
 }
 
 // requireAdmin gates admin-only routes.
@@ -104,8 +128,33 @@ func canSeeLibrary(u store.User, libraryID string) bool {
 func (s *server) setSessionCookie(c echo.Context, token string, expires time.Time) {
 	c.SetCookie(&http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", Expires: expires,
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookies,
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.cookieSecure(c),
 	})
+}
+
+// cookieSecure decides the Secure flag for this request.
+//
+// The config setting forces it on, for an operator who knows their setup.
+// Otherwise it is inferred: a request that reached us over TLS, or through a
+// proxy that terminated TLS and said so, should get a Secure cookie. Without
+// this the common deployment — Cineva behind nginx or Caddy doing HTTPS —
+// silently issues cookies that would travel in clear text if the connection
+// ever downgraded, and the operator has to know to set a flag they have no
+// reason to look for.
+//
+// X-Forwarded-Proto is only trusted because the alternative is worse: a
+// client that sets it on a plain-HTTP connection merely gives itself a
+// Secure cookie its own browser then refuses to send back. It cannot use the
+// header to weaken anything.
+func (s *server) cookieSecure(c echo.Context) bool {
+	if s.secureCookies {
+		return true
+	}
+	r := c.Request()
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 func clearSessionCookie(c echo.Context) {

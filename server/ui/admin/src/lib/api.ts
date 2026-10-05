@@ -60,6 +60,13 @@ export const updateUser = (id: string, u: UserRequest) =>
 export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
 export interface ServerSettings {
   loginMode: 'picker' | 'form'
+  hwAccel: boolean
+  /** Read-only: the backend detected at startup, or "none". */
+  hwAccelStatus: string
+  /** ISO 3166-1 country whose content rating is stored and shown. */
+  certRegion: string
+  /** Read-only: the regions the server offers. */
+  certRegions: string[]
 }
 export const getSettings = () => req<ServerSettings>('/settings')
 export const putSettings = (s: Partial<ServerSettings>) =>
@@ -111,6 +118,82 @@ export interface PlaySession {
   lastSeenAt: string
   transcode?: { id: string; segmentSecs: number; numSegments: number; quality: { label: string } }
 }
+
+// ---- Library contents and metadata management ----
+export interface Item {
+  id: string
+  libraryId: string
+  kind: string
+  title: string
+  year?: number
+  path: string
+  sizeBytes?: number
+  width?: number
+  height?: number
+  videoCodec?: string
+  tmdbId?: number
+  overview?: string
+  poster?: string
+  versionOf?: string
+  tagline?: string
+  backdrop?: string
+  rating?: number
+  certification?: string
+  collectionName?: string
+  genres?: string[]
+  /** Fields an operator has edited; automatic updates leave these alone. */
+  lockedFields?: string[]
+}
+
+export interface MatchCandidate {
+  tmdbId: number
+  title: string
+  year?: number
+  overview?: string
+  poster?: string
+}
+
+export const libraryItems = (libraryId: string) => req<Item[]>(`/libraries/${libraryId}/items`)
+
+/** Candidate matches for an item; q and year default to the item's own. */
+export const itemMatches = (id: string, q?: string, year?: number) => {
+  const p = new URLSearchParams()
+  if (q) p.set('q', q)
+  if (year !== undefined) p.set('year', String(year))
+  const qs = p.toString()
+  return req<{ query: string; year: number; results: MatchCandidate[] }>(
+    `/items/${id}/matches${qs ? `?${qs}` : ''}`,
+  )
+}
+
+export const applyMatch = (id: string, tmdbId: number) =>
+  req<Item>(`/items/${id}/match`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tmdbId }),
+  })
+
+export const refreshItem = (id: string) => req<Item>(`/items/${id}/refresh`, { method: 'POST' })
+
+export interface RefreshProgress {
+  libraryId: string
+  done: number
+  total: number
+  matched: number
+  failed: number
+  running: boolean
+}
+
+/** itemIds limits the run to those items; omit for the whole library. */
+export const refreshLibrary = (id: string, itemIds?: string[]) =>
+  req<RefreshProgress>(`/libraries/${id}/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemIds: itemIds ?? [] }),
+  })
+export const cancelRefresh = (id: string) =>
+  req<void>(`/libraries/${id}/refresh`, { method: 'DELETE' })
+export const refreshStatus = (id: string) => req<RefreshProgress>(`/libraries/${id}/refresh`)
 
 export const listSessions = () => req<PlaySession[]>('/play/sessions')
 export const stopSession = (id: string) => req<void>(`/play/${id}`, { method: 'DELETE' })
@@ -190,3 +273,71 @@ export interface AuditEntry {
 export const diskStats = () => req<DiskVolume[]>('/stats/disks')
 export const auditLog = (limit = 100, offset = 0, action = '') =>
   req<AuditEntry[]>(`/logs?limit=${limit}&offset=${offset}&action=${encodeURIComponent(action)}`)
+
+// ---- Collections -----------------------------------------------------
+/**
+ * A set of films presented as one. `key` is "tmdb:<id>" while the provider's
+ * grouping is in use, or a row id once an operator has edited it — editing
+ * any provider collection adopts it, copying the current membership and
+ * order in first.
+ */
+export interface Collection {
+  key: string
+  tmdbId?: number
+  name: string
+  count: number
+  poster?: string
+  /** True once edited: membership and order then come from the database. */
+  managed: boolean
+  watched: number
+  nextUpId?: string
+  nextUpName?: string
+}
+export interface CollectionDetail {
+  collection: Collection
+  items: Item[]
+}
+export const libraryCollections = (libraryId: string) =>
+  req<Collection[]>(`/libraries/${libraryId}/collections`)
+export const collectionDetail = (libraryId: string, key: string) =>
+  req<CollectionDetail>(`/libraries/${libraryId}/collections/${encodeURIComponent(key)}`)
+export const createCollection = (libraryId: string, name: string, itemIds: string[] = []) =>
+  req<Collection>(`/libraries/${libraryId}/collections`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, itemIds }),
+  })
+export const renameCollection = (libraryId: string, key: string, name: string) =>
+  req<CollectionDetail>(`/libraries/${libraryId}/collections/${encodeURIComponent(key)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+/** The list sent is the membership *and* the order — add, remove and reorder in one call. */
+export const setCollectionItems = (libraryId: string, key: string, itemIds: string[]) =>
+  req<CollectionDetail>(`/libraries/${libraryId}/collections/${encodeURIComponent(key)}/items`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemIds }),
+  })
+/** Deleting an override restores the provider's own grouping. */
+export const deleteCollection = (libraryId: string, key: string) =>
+  req<void>(`/libraries/${libraryId}/collections/${encodeURIComponent(key)}`, { method: 'DELETE' })
+
+// ---- Manual metadata edits -------------------------------------------
+/** Only the fields sent are changed, and each one sent is locked against automatic updates. */
+export interface ItemEdit {
+  title?: string
+  year?: number
+  overview?: string
+  tagline?: string
+  certification?: string
+  rating?: number
+  poster?: string
+  backdrop?: string
+  genres?: string[]
+}
+export const updateItem = (id: string, edit: ItemEdit) =>
+  req<Item>(`/items/${id}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(edit),
+  })
+/** Hand the item back to the provider; values stay until the next refresh. */
+export const clearItemLocks = (id: string) => req<void>(`/items/${id}/locks`, { method: 'DELETE' })

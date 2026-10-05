@@ -3,11 +3,11 @@
   import Hls from 'hls.js'
   import {
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
-    type Item, type PlayInfo, type PlayQuality,
+    type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
   } from './lib/api'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize,
-    Maximize2, SkipBack, SkipForward,
+    Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge,
   } from '@lucide/svelte'
 
   let {
@@ -17,7 +17,9 @@
     compact = false,
     onclose,
     onnext,
+    onended,
     onquality,
+    onaudiotrack,
     onexpand,
     ontime,
   }: {
@@ -27,7 +29,12 @@
     compact?: boolean
     onclose: () => void
     onnext: (next: Item) => void
+    /** The film finished and there is no next episode to roll into. The
+        host decides what follows — the next thing in the play queue, or
+        closing the player. */
+    onended: () => void
     onquality: (q: PlayQuality) => void
+    onaudiotrack: (streamIndex: number) => void
     onexpand: () => void
     ontime?: (secs: number) => void
   } = $props()
@@ -43,6 +50,10 @@
   let showNext = $state(false)
   let remaining = $state(0)
   let subtitle = $state('off')
+  let showInfo = $state(false)
+  // The track in play. The server resolves the file's default, so this
+  // starts from what it actually chose rather than guessing.
+  let audioTrack = $state(info.audioTrack ?? -1)
 
   // Transport state for the custom controls.
   let paused = $state(true)
@@ -84,11 +95,19 @@
       // seek before the manifest loads makes hls.js first fetch segment 0,
       // thrashing the server-side transcoder with a restart-to-zero.
       hls = new Hls({ startPosition: info.positionSecs > 0 ? info.positionSecs : -1 })
+      hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
+        noteSegment(data.frag.stats?.total ?? 0, data.frag.duration)
+      })
       hls.loadSource(info.url)
       hls.attachMedia(video)
     } else {
       video.src = info.url // direct play, or Safari's native HLS
       if (info.positionSecs > 0) video.currentTime = info.positionSecs
+      // Nothing is being segmented, so the file's own average is the honest
+      // figure rather than a measurement that cannot be taken.
+      if (item.sizeBytes && item.runtimeSecs) {
+        bitrateKbps = Math.round((item.sizeBytes * 8) / item.runtimeSecs / 1000)
+      }
     }
     for (const track of video.textTracks) track.mode = 'hidden' // off until picked
     video.volume = volume
@@ -112,8 +131,18 @@
   onDestroy(() => {
     clearInterval(heartbeat)
     window.removeEventListener('pagehide', onHide)
-    reportProgress(true)
+    reportProgress(true) // reads currentTime, so it runs before the teardown
     hls?.destroy()
+    // hls.destroy() only covers the HLS path. A direct-play <video> keeps its
+    // range request open after the element leaves the DOM — one abandoned
+    // 4K stream held a connection for ~55 s and 100 MB, and with the event
+    // stream and admin polling also in flight that exhausted the browser's
+    // six-per-origin limit, stalling the next title's segment fetches.
+    if (video) {
+      video.pause()
+      video.removeAttribute('src')
+      video.load() // aborts the in-flight request
+    }
     if (info.sessionId) stopSession(info.sessionId)
     stopPlayback(item.id).catch(() => {})
     clearTimeout(idleTimer)
@@ -149,7 +178,7 @@
     if (next && !dismissed && autoplayNext()) {
       onnext(next)
     } else {
-      onclose()
+      onended()
     }
   }
 
@@ -159,7 +188,15 @@
   }
 
   function skip(secs: number) {
-    video.currentTime = Math.max(0, Math.min(duration || Infinity, video.currentTime + secs))
+    seekTo(video.currentTime + secs)
+  }
+
+  /** Absolute seek, clamped to the media. */
+  function seekTo(t: number) {
+    if (!video) return
+    const target = Math.max(0, Math.min(duration || Infinity, t))
+    video.currentTime = target
+    current = target
   }
 
   // Preview while dragging; the real seek fires once on release. Per-tick
@@ -229,21 +266,184 @@
       case 'm':
         toggleMute()
         break
+      // Chapter skip, matching the bracket keys most desktop players use.
+      case '[':
+        e.preventDefault()
+        skipChapter(-1)
+        break
+      case ']':
+        e.preventDefault()
+        skipChapter(1)
+        break
+      case '<':
+      case ',':
+        setSpeed(SPEEDS[Math.max(0, SPEEDS.indexOf(speed) - 1)])
+        break
+      case '>':
+      case '.':
+        setSpeed(SPEEDS[Math.min(SPEEDS.length - 1, SPEEDS.indexOf(speed) + 1)])
+        break
     }
     wake()
   }
 
-  function selectSubtitle(e: Event) {
-    subtitle = (e.target as HTMLSelectElement).value
+  function selectSubtitle(id: string) {
+    subtitle = id
     for (const track of video.textTracks) {
       track.mode = track.id === subtitle ? 'showing' : 'hidden'
     }
+    openMenu = null
   }
 
-  function changeQuality(e: Event) {
-    const q = (e.target as HTMLSelectElement).value as PlayQuality
+  function changeQuality(q: PlayQuality) {
+    openMenu = null
+    if (q === quality) return
     reportProgress(true) // so the new session resumes at the same spot
     onquality(q)
+  }
+
+  // ---- Chapters ----
+  // Chapters come from the container itself, so the list is whatever the
+  // file carries — often nothing, in which case the control is not shown.
+  const chapters = $derived(info.chapters ?? [])
+  /** The chapter the playhead is inside, or -1. */
+  const currentChapter = $derived.by(() => {
+    for (let i = chapters.length - 1; i >= 0; i--) {
+      if (current >= chapters[i].startSecs) return i
+    }
+    return chapters.length > 0 ? 0 : -1
+  })
+
+  function seekToChapter(c: Chapter) {
+    seekTo(c.startSecs)
+    openMenu = null
+  }
+
+  /** Skip by whole chapters; falls back to nothing when the file has none. */
+  function skipChapter(delta: number) {
+    if (chapters.length === 0) return
+    // Going back within the first few seconds of a chapter means "the
+    // previous one", which is how every disc player behaves.
+    let target = currentChapter + delta
+    if (delta < 0 && current - (chapters[currentChapter]?.startSecs ?? 0) > 3) target = currentChapter
+    if (target < 0 || target >= chapters.length) return
+    seekTo(chapters[target].startSecs)
+  }
+
+  const chapterLabel = (c: Chapter, i: number) => c.title?.trim() || `Chapter ${i + 1}`
+
+  // ---- Playback speed ----
+  // Audiobook-style speeds are not useful for film, but 1.25x/1.5x are for
+  // getting through something slow, and 0.75x helps with dense dialogue.
+  const SPEEDS = [0.75, 1, 1.25, 1.5, 2]
+  let speed = $state(1)
+  function setSpeed(v: number) {
+    speed = v
+    if (video) video.playbackRate = v
+    openMenu = null
+  }
+  // Reapplied whenever the element is replaced (a quality change rebuilds
+  // the <video>), or the rate silently reverts to 1.
+  $effect(() => {
+    if (video && video.playbackRate !== speed) video.playbackRate = speed
+  })
+
+  // ---- Control-bar menus ----
+  // One menu open at a time, closing on a pick, on Escape, or on a click
+  // anywhere else — the usual expectations for a popup over a video.
+  type Menu = 'cc' | 'audio' | 'quality' | 'chapters' | 'speed'
+  let openMenu: Menu | null = $state(null)
+  const toggleMenu = (m: Menu) => (openMenu = openMenu === m ? null : m)
+
+  $effect(() => {
+    if (openMenu === null) return
+    const close = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest('.menuwrap')) openMenu = null
+    }
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') openMenu = null
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', esc)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('keydown', esc)
+    }
+  })
+
+  // "English · 5.1 · EAC3", skipping whatever the file does not say.
+  function audioLabel(a: AudioTrack): string {
+    const parts: string[] = []
+    if (a.title) parts.push(a.title)
+    else if (a.language) parts.push(languageName(a.language))
+    else parts.push(`Track ${a.streamIndex}`)
+    if (a.channels) parts.push(channelLabel(a.channels))
+    if (a.codec) parts.push(a.codec.toUpperCase())
+    return parts.join(' · ')
+  }
+
+  const channelLabel = (n: number) =>
+    n === 1 ? 'Mono' : n === 2 ? 'Stereo' : n === 6 ? '5.1' : n === 8 ? '7.1' : `${n}ch`
+
+  // Three-letter ISO codes are what media files carry; show the few that
+  // come up often in full and fall back to the code itself.
+  const LANGUAGES: Record<string, string> = {
+    eng: 'English', fre: 'French', fra: 'French', ger: 'German', deu: 'German',
+    spa: 'Spanish', ita: 'Italian', por: 'Portuguese', dut: 'Dutch', nld: 'Dutch',
+    jpn: 'Japanese', kor: 'Korean', chi: 'Chinese', zho: 'Chinese', rus: 'Russian',
+    pol: 'Polish', swe: 'Swedish', nor: 'Norwegian', dan: 'Danish', fin: 'Finnish',
+    hin: 'Hindi', ara: 'Arabic', tur: 'Turkish', tha: 'Thai', vie: 'Vietnamese',
+  }
+  const languageName = (code: string) => LANGUAGES[code.toLowerCase()] ?? code.toUpperCase()
+
+  const hdrLabel = (src: PlaySource) =>
+    src.dvProfile ? `Dolby Vision (profile ${src.dvProfile})` : src.hdrFormat === 'pq' ? 'HDR10' : 'HLG'
+
+  // What is happening to the video, in the viewer's terms.
+  function videoLine(): string {
+    const src = info.source
+    if (!src) return info.mode === 'direct' ? 'Direct play' : 'Transcoding'
+    if (src.video === 'direct') return 'Direct play — untouched'
+    if (src.video === 'remux') return 'Copied 1:1 — container changed only'
+    const parts = [`Re-encoded to ${src.outHeight ? `${src.outHeight}p ` : ''}H.264`]
+    // Which path is doing the work is the first thing anyone asks when a
+    // transcode is struggling.
+    if (src.accel) parts.push(src.accel === 'none' ? 'on the CPU' : `on ${src.accel}`)
+    if (src.hdrToneMapped) parts.push('HDR tone mapped to SDR')
+    return parts.join(' · ')
+  }
+
+  // ---- Live bitrate ----
+  // Measured from the segments hls.js actually fetched: bytes over the media
+  // time they cover. That is the number that says whether the link will keep
+  // up, and it needs no extra request. Direct play has no segments, so the
+  // file's own average is used instead — it is a fixed property of the file,
+  // not something that can vary mid-stream.
+  let bitrateKbps = $state(0)
+
+  /** Feed one fetched segment into the rolling average. */
+  function noteSegment(bytes: number, seconds: number) {
+    if (bytes <= 0 || seconds <= 0) return
+    const kbps = (bytes * 8) / seconds / 1000
+    // A short window: a single slow segment should show, but one outlier
+    // should not define the reading.
+    bitrateKbps = bitrateKbps === 0 ? Math.round(kbps) : Math.round(bitrateKbps * 0.7 + kbps * 0.3)
+  }
+
+  function audioLine(): string {
+    const src = info.source
+    const chosen = info.audio?.find((a) => a.streamIndex === audioTrack)
+    const from = chosen ? audioLabel(chosen) : (item.audioCodec ?? '')
+    if (!src || src.audio === 'direct') return `${from} — untouched`
+    return `${from} → ${(src.audioCodec ?? 'aac').toUpperCase()}`
+  }
+
+  function pickAudio(idx: number) {
+    openMenu = null
+    if (idx === audioTrack) return
+    audioTrack = idx
+    reportProgress(true) // the new session resumes at the same spot
+    onaudiotrack(idx)
   }
 
   const modeLabel = () =>
@@ -276,19 +476,6 @@
         {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
         <span class="mode" title={info.reason ?? ''}>{modeLabel()}</span>
       </span>
-      {#if textSubs.length > 0}
-        <select class="picker" value={subtitle} onchange={selectSubtitle} title="Subtitles">
-          <option value="off">CC Off</option>
-          {#each textSubs as t (t.id)}
-            <option value={t.id}>{subLabel(t)}</option>
-          {/each}
-        </select>
-      {/if}
-      <select class="picker" value={quality} onchange={changeQuality} title="Playback quality">
-        {#each QUALITIES as q (q.id)}
-          <option value={q.id}>{q.label}</option>
-        {/each}
-      </select>
       <button class="ctl" onclick={onclose} title="Stop playback"><X size={17} /></button>
     </div>
   {/if}
@@ -312,6 +499,37 @@
 
     {#if paused && !compact}
       <button class="bigplay" onclick={togglePlay} aria-label="Play"><Play size={30} /></button>
+    {/if}
+
+    {#if showInfo}
+      <div class="info" role="status">
+        <div class="info-head">
+          Playback info
+          <button class="info-x" onclick={() => (showInfo = false)} aria-label="Close playback info"><X size={13} /></button>
+        </div>
+        <dl>
+          <dt>Source</dt>
+          <dd>
+            {info.source?.width ?? item.width}×{info.source?.height ?? item.height}
+            {info.source?.videoCodec ?? item.videoCodec ?? ''}
+            {#if info.source?.hdrFormat}· {hdrLabel(info.source)}{/if}
+            {#if info.source?.container}· {info.source.container}{/if}
+          </dd>
+          <dt>Video</dt>
+          <dd>{videoLine()}</dd>
+          <dt>Audio</dt>
+          <dd>{audioLine()}</dd>
+          {#if info.reason}
+            <dt>Why</dt>
+            <dd>{info.reason}</dd>
+          {/if}
+          <dt>Buffer</dt>
+          <dd>
+            {Math.max(0, Math.round(bufferedEnd - current))}s ahead
+            {#if bitrateKbps > 0}· ~{(bitrateKbps / 1000).toFixed(1)} Mbps{/if}
+          </dd>
+        </dl>
+      </div>
     {/if}
 
     {#if showNext && next && !compact}
@@ -383,6 +601,116 @@
         <span class="spacer"></span>
         <button class="ctl" onclick={toggleMute} title="Mute (m)">{#if muted || volume === 0}<VolumeX size={17} />{:else}<Volume2 size={17} />{/if}</button>
         <input class="vol" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} oninput={onVolumeInput} aria-label="Volume" />
+        {#if info.audio && info.audio.length > 1}
+          <div class="menuwrap">
+            <button
+              class="ctl" class:on={openMenu === 'audio'}
+              onclick={() => toggleMenu('audio')}
+              title="Audio track" aria-label="Audio track"
+              aria-haspopup="menu" aria-expanded={openMenu === 'audio'}><Languages size={16} /></button>
+            {#if openMenu === 'audio'}
+              <div class="menu" role="menu">
+                <div class="menu-head">Audio</div>
+                {#each info.audio as a (a.streamIndex)}
+                  <button
+                    class="menu-item" class:sel={a.streamIndex === audioTrack}
+                    role="menuitemradio" aria-checked={a.streamIndex === audioTrack}
+                    onclick={() => pickAudio(a.streamIndex)}>{audioLabel(a)}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+        {#if textSubs.length > 0}
+          <div class="menuwrap">
+            <button
+              class="ctl" class:on={openMenu === 'cc' || subtitle !== 'off'}
+              onclick={() => toggleMenu('cc')}
+              title="Subtitles" aria-label="Subtitles"
+              aria-haspopup="menu" aria-expanded={openMenu === 'cc'}><Captions size={16} /></button>
+            {#if openMenu === 'cc'}
+              <div class="menu" role="menu">
+                <div class="menu-head">Subtitles</div>
+                <button
+                  class="menu-item" class:sel={subtitle === 'off'}
+                  role="menuitemradio" aria-checked={subtitle === 'off'}
+                  onclick={() => selectSubtitle('off')}>Off</button>
+                {#each textSubs as t (t.id)}
+                  <button
+                    class="menu-item" class:sel={subtitle === t.id}
+                    role="menuitemradio" aria-checked={subtitle === t.id}
+                    onclick={() => selectSubtitle(t.id)}>{subLabel(t)}</button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+        {#if chapters.length > 0}
+          <div class="menuwrap">
+            <button
+              class="ctl" class:on={openMenu === 'chapters'}
+              onclick={() => toggleMenu('chapters')}
+              title="Chapters" aria-label="Chapters"
+              aria-haspopup="menu" aria-expanded={openMenu === 'chapters'}><List size={16} /></button>
+            {#if openMenu === 'chapters'}
+              <div class="menu" role="menu">
+                <div class="menu-head">Chapters</div>
+                {#each chapters as c, i (c.startSecs)}
+                  <button
+                    class="menu-item ch-row" class:sel={i === currentChapter}
+                    role="menuitemradio" aria-checked={i === currentChapter}
+                    onclick={() => seekToChapter(c)}>
+                    <span class="ch-name">{chapterLabel(c, i)}</span>
+                    <span class="ch-at">{fmt(c.startSecs)}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+        <div class="menuwrap">
+          <button
+            class="ctl" class:on={openMenu === 'speed'}
+            onclick={() => toggleMenu('speed')}
+            title="Playback speed" aria-label="Playback speed"
+            aria-haspopup="menu" aria-expanded={openMenu === 'speed'}><Gauge size={16} /></button>
+          {#if openMenu === 'speed'}
+            <div class="menu" role="menu">
+              <div class="menu-head">Speed</div>
+              {#each SPEEDS as v (v)}
+                <button
+                  class="menu-item" class:sel={v === speed}
+                  role="menuitemradio" aria-checked={v === speed}
+                  onclick={() => setSpeed(v)}>{v === 1 ? 'Normal' : `${v}×`}</button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <div class="menuwrap">
+          <button
+            class="ctl" class:on={openMenu === 'quality'}
+            onclick={() => toggleMenu('quality')}
+            title="Playback quality" aria-label="Playback quality"
+            aria-haspopup="menu" aria-expanded={openMenu === 'quality'}><Settings size={16} /></button>
+          {#if openMenu === 'quality'}
+            <div class="menu" role="menu">
+              <div class="menu-head">Quality</div>
+              {#each QUALITIES as q (q.id)}
+                <button
+                  class="menu-item" class:sel={q.id === quality}
+                  role="menuitemradio" aria-checked={q.id === quality}
+                  onclick={() => changeQuality(q.id)}>{q.label}</button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <button
+          class="ctl"
+          class:on={showInfo}
+          onclick={() => (showInfo = !showInfo)}
+          title="Playback info"
+          aria-label="Playback info"
+          aria-pressed={showInfo}><Info size={16} /></button>
         <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)"><Maximize size={16} /></button>
       </div>
     </div>
@@ -390,6 +718,99 @@
 </section>
 
 <style>
+  /* Sits over the picture, dark enough to read against a bright frame
+     without hiding it. */
+  .info {
+    position: absolute;
+    top: 0.75rem;
+    left: 0.75rem;
+    max-width: min(22rem, calc(100% - 1.5rem));
+    padding: 0.6rem 0.75rem;
+    border-radius: 10px;
+    border: 1px solid rgb(255 255 255 / 0.14);
+    background: rgb(10 12 16 / 0.82);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    z-index: 4;
+  }
+  .info-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .info-x {
+    border: 0;
+    background: none;
+    color: inherit;
+    opacity: 0.7;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+  }
+  .info-x:hover { opacity: 1; }
+  .info dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.15rem 0.7rem;
+    margin: 0;
+  }
+  .info dt { opacity: 0.6; white-space: nowrap; }
+  .info dd { margin: 0; overflow-wrap: anywhere; }
+
+  /* .menu-item is display:block for the plain text rows; a chapter row needs
+     two columns, so it opts into flex rather than changing the shared rule. */
+  .ch-row { display: flex; align-items: center; }
+  /* A chapter row is a name and its timestamp, the name taking the slack. */
+  .ch-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ch-at { opacity: 0.6; font-variant-numeric: tabular-nums; margin-left: 0.75rem; }
+
+  .menuwrap { position: relative; display: flex; }
+  .menu {
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    right: 0;
+    min-width: 11rem;
+    max-height: 15rem;
+    overflow-y: auto;
+    padding: 0.3rem;
+    border-radius: 10px;
+    border: 1px solid rgb(255 255 255 / 0.14);
+    background: rgb(10 12 16 / 0.92);
+    backdrop-filter: blur(6px);
+    z-index: 6;
+  }
+  .menu-head {
+    padding: 0.25rem 0.55rem 0.35rem;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: rgb(255 255 255 / 0.5);
+  }
+  .menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.35rem 0.55rem;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: #fff;
+    font: inherit;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .menu-item:hover { background: rgb(255 255 255 / 0.1); }
+  /* The selected row is marked with a tick rather than colour alone. */
+  .menu-item.sel { background: rgb(255 255 255 / 0.08); font-weight: 600; }
+  .menu-item.sel::before { content: '✓ '; }
+  .menu-item:not(.sel)::before { content: ''; padding-left: 0.85rem; }
+
   .nowplaying {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -491,17 +912,6 @@
     border-radius: 999px;
     padding: 0.1rem 0.55rem;
   }
-  .picker {
-    background: var(--bg);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    font: inherit;
-    font-size: 0.82rem;
-    padding: 0.25rem 0.4rem;
-  }
-  .nowplaying:fullscreen .picker { background: rgba(0, 0, 0, 0.5); color: #fff; }
-
   .stage { position: relative; background: #000; }
   video {
     display: block;

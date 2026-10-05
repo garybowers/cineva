@@ -6,6 +6,7 @@ cineva.db
 cineva.db-*
 
 # Local binaries and logs
+/bin/
 /server/cineva
 *.log
 
@@ -16,12 +17,11 @@ artwork/
 # `go build` (go:embed needs the built assets). Revisit once CI builds them.
 
 # Real local config (may hold secrets like the TMDB key) — the committed
-# reference is server/cineva.example.yaml
+# reference is server/cineva.example.yaml. Viper searches the working
+# directory, so the file lands wherever the binary is run from: ignore both
+# the repo root and server/ so a key cannot be committed by accident.
+cineva.yaml
 server/cineva.yaml
 .env
-
-# Beads / Dolt files (added by bd init)
-.dolt/
-*.db
-.beads-credential-key
-.beads/proxieddb/
+# Local build settings (TMDB_KEY and the like), pulled in by the Makefile.
+local.mk

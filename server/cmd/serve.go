@@ -45,6 +45,9 @@ var serveCmd = &cobra.Command{
 			ArtworkDir:   artworkDir,
 			TranscodeDir: viper.GetString("transcode.dir"),
 			SegmentSecs:  viper.GetInt("transcode.segment_secs"),
+			HWAccel:      viper.GetString("transcode.hwaccel"),
+			CertRegion:   viper.GetString("metadata.cert_region"),
+			TranscodeMax: viper.GetInt64("transcode.max_bytes"),
 			SampleSecs:   viper.GetInt("stats.sample_secs"),
 			SessionDays:  viper.GetInt("auth.session_days"),
 			SecureCookie: viper.GetBool("auth.secure_cookies"),
@@ -58,5 +61,6 @@ func init() {
 	serveCmd.Flags().String("host", "0.0.0.0", "address to bind")
 	_ = viper.BindPFlag("server.port", serveCmd.Flags().Lookup("port"))
 	_ = viper.BindPFlag("server.host", serveCmd.Flags().Lookup("host"))
+	addTMDBKeyFlag(serveCmd)
 	rootCmd.AddCommand(serveCmd)
 }

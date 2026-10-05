@@ -29,6 +29,7 @@ type ResumeItem struct {
 
 type PlayStateRepo interface {
 	SetProgress(ctx context.Context, userID, itemID string, positionSecs, runtimeSecs int) (PlayState, error)
+	SetWatched(ctx context.Context, userID, itemID string, watched bool) (PlayState, error)
 	PlayStateFor(ctx context.Context, userID, itemID string) (PlayState, error)
 	ContinueWatching(ctx context.Context, userID string, limit int) ([]ResumeItem, error)
 	NextEpisode(ctx context.Context, episodeID string) (Item, bool, error)
@@ -38,6 +39,9 @@ type PlayStateRepo interface {
 var _ PlayStateRepo = (*Store)(nil)
 
 func (s *Store) SetProgress(ctx context.Context, userID, itemID string, positionSecs, runtimeSecs int) (PlayState, error) {
+	// Recorded against the primary so every version of a film shares one
+	// resume position (see primaryID).
+	itemID = s.primaryID(ctx, itemID)
 	watched := 0
 	if runtimeSecs > 0 && float64(positionSecs) >= watchedFraction*float64(runtimeSecs) {
 		watched = 1
@@ -56,6 +60,7 @@ func (s *Store) SetProgress(ctx context.Context, userID, itemID string, position
 }
 
 func (s *Store) PlayStateFor(ctx context.Context, userID, itemID string) (PlayState, error) {
+	itemID = s.primaryID(ctx, itemID)
 	var ps PlayState
 	var watched int
 	err := s.db.QueryRowContext(ctx,
@@ -84,13 +89,11 @@ func (s *Store) ContinueWatching(ctx context.Context, userID string, limit int) 
 	defer rows.Close()
 	out := []ResumeItem{}
 	for rows.Next() {
-		// Mirrors scanItem's column order, plus the trailing position column.
+		// The item's own columns, then the trailing position. Sharing
+		// itemScanTargets means a new item column cannot desynchronise this.
 		var r ResumeItem
-		if err := rows.Scan(&r.ID, &r.LibraryID, &r.Kind, &r.ParentID, &r.Title, &r.Year,
-			&r.SeasonNum, &r.EpisodeNum, &r.DiscNum, &r.TrackNum, &r.Artist,
-			&r.Path, &r.SizeBytes, &r.RuntimeSecs,
-			&r.Container, &r.VideoCodec, &r.AudioCodec, &r.Width, &r.Height,
-			&r.TmdbID, &r.Overview, &r.Poster, &r.AddedAt, &r.UpdatedAt, &r.PositionSecs); err != nil {
+		targets := append(itemScanTargets(&r.Item), &r.PositionSecs)
+		if err := rows.Scan(targets...); err != nil {
 			return nil, fmt.Errorf("scan resume item: %w", err)
 		}
 		out = append(out, r)
@@ -135,4 +138,81 @@ func (s *Store) adjacentEpisode(ctx context.Context, episodeID string, step int)
 		}
 	}
 	return Item{}, false, nil
+}
+
+// SetWatched marks an item watched or unwatched explicitly, rather than
+// letting the ~90% threshold decide.
+//
+// Both directions clear the resume position, which is what the viewer means
+// either way: marking watched should stop it offering to resume, and marking
+// unwatched should start it from the beginning. Note the MAX() in
+// SetProgress, which only ever raises the flag — without this, nothing could
+// ever lower it.
+func (s *Store) SetWatched(ctx context.Context, userID, itemID string, watched bool) (PlayState, error) {
+	itemID = s.primaryID(ctx, itemID)
+	w := 0
+	if watched {
+		w = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO play_state (user_id, item_id, position_secs, watched)
+		VALUES (?, ?, 0, ?)
+		ON CONFLICT (user_id, item_id) DO UPDATE SET
+			position_secs = 0,
+			watched = excluded.watched,
+			updated_at = datetime('now')`,
+		userID, itemID, w)
+	if err != nil {
+		return PlayState{}, fmt.Errorf("set watched: %w", err)
+	}
+	return s.PlayStateFor(ctx, userID, itemID)
+}
+
+// primaryID maps a version to the film it is a version of, so that watch
+// state is shared across the versions of one title: starting a 4K rip and
+// resuming on the 1080p one continues where it left off rather than from
+// zero. A row that is not a version, or an id that no longer exists, maps
+// to itself.
+func (s *Store) primaryID(ctx context.Context, itemID string) string {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT CASE WHEN version_of <> '' THEN version_of ELSE id END FROM items WHERE id = ?`,
+		itemID).Scan(&id)
+	if err != nil || id == "" {
+		return itemID
+	}
+	return id
+}
+
+// PlayStatesByLibrary returns every play-state row this user has for items in
+// one library, keyed by item id. The grid needs watched/resume for thousands
+// of tiles at once, and a per-item query would be a request per tile.
+//
+// Keyed by the *primary* id, matching primaryID, so a grid tile (always a
+// primary) finds the state recorded while playing any of its versions.
+func (s *Store) PlayStatesByLibrary(ctx context.Context, userID, libraryID string) (map[string]PlayState, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT CASE WHEN i.version_of <> '' THEN i.version_of ELSE i.id END,
+		        p.position_secs, p.watched, p.updated_at
+		 FROM play_state p JOIN items i ON i.id = p.item_id
+		 WHERE p.user_id = ? AND i.library_id = ?`, userID, libraryID)
+	if err != nil {
+		return nil, fmt.Errorf("play states by library: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]PlayState{}
+	for rows.Next() {
+		var ps PlayState
+		var watched int
+		if err := rows.Scan(&ps.ItemID, &ps.PositionSecs, &watched, &ps.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan play state: %w", err)
+		}
+		ps.Watched = watched == 1
+		// Two versions of one film can each carry a row; keep the most
+		// recently touched, which is the one the viewer last watched.
+		if prev, ok := out[ps.ItemID]; ok && prev.UpdatedAt > ps.UpdatedAt {
+			continue
+		}
+		out[ps.ItemID] = ps
+	}
+	return out, rows.Err()
 }

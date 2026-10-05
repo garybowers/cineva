@@ -26,17 +26,37 @@ export interface Item {
   seasonNum?: number
   episodeNum?: number
   runtimeSecs?: number
+  sizeBytes?: number
+  rating?: number
+  voteCount?: number
+  tagline?: string
+  backdrop?: string
+  collectionName?: string
+  /** Content rating for the server's configured region ("15", "PG-13"). */
+  certification?: string
+  genres?: string[]
   videoCodec?: string
+  audioCodec?: string
   width?: number
   height?: number
   overview?: string
   poster?: string
+  addedAt?: string
+  /** The viewer's own state, stamped on by the library listing. */
+  watched?: boolean
+  positionSecs?: number
+  /** When this viewer last touched it, for a "recently watched" ordering. */
+  watchedAt?: string
 }
 
 export interface ItemDetail {
   item: Item
   children: Item[]
   playState?: { itemId: string; positionSecs: number; watched: boolean }
+  /** The same film held more than once — primary first. Absent when single. */
+  versions?: Item[]
+  cast?: Person[]
+  crew?: Person[]
 }
 
 export interface SubtitleTrack {
@@ -48,6 +68,13 @@ export interface SubtitleTrack {
   url?: string // absent for image-based tracks (burn-in not yet available)
 }
 
+export interface PlayState {
+  itemId: string
+  positionSecs: number
+  watched: boolean
+  updatedAt: string
+}
+
 export interface PlayInfo {
   mode: 'direct' | 'hls'
   url: string
@@ -56,6 +83,18 @@ export interface PlayInfo {
   positionSecs: number
   reason?: string
   subtitles: SubtitleTrack[]
+  audio: AudioTrack[]
+  audioTrack: number
+  /** The file's own chapter marks, in order. Absent for files with none. */
+  chapters?: Chapter[]
+  source: PlaySource
+}
+
+export interface Chapter {
+  startSecs: number
+  endSecs: number
+  /** Often absent — a disc rip usually just numbers them. */
+  title?: string
 }
 
 export type PlayQuality = 'auto' | 'original' | '1080p' | '720p' | '480p'
@@ -161,12 +200,116 @@ const post = <T>(path: string, body?: unknown) =>
 
 export const getHealth = () => get<Health>('/health')
 export const listLibraries = () => get<Library[]>('/libraries')
-export const libraryItems = (id: string) => get<Item[]>(`/libraries/${id}/items`)
+export interface Person {
+  id: string
+  tmdbId: number
+  name: string
+  profile?: string
+  /** Character for cast, job for crew. */
+  role?: string
+  kind?: 'cast' | 'crew'
+}
+
+/** One film in a person's filmography, with what they did on it. */
+export interface PersonCredit extends Item {
+  /** "cast" or "crew" — distinct from Item.kind, which is the media kind. */
+  creditKind: 'cast' | 'crew'
+  /** Character for cast, job for crew; several joined with " · ". */
+  role?: string
+}
+
+/** A person, their filmography here, and the shape of it. */
+export interface PersonProfile extends Person {
+  credits: PersonCredit[]
+  castCount: number
+  crewCount: number
+  firstYear?: number
+  lastYear?: number
+  /** Distinct crew jobs, most frequent first — "Director, Writer". */
+  jobs?: string[]
+}
+
+export const personDetail = (id: string) => get<PersonProfile>(`/people/${id}`)
+
+export interface GenreCount { genre: string; count: number }
+
+/** One shelf on the Recommended tab, decided server-side. */
+export interface RecRow {
+  kind: 'because' | 'toprated' | 'genre' | 'unwatched'
+  title: string
+  /** Set on a genre row, so its heading can open the full genre listing. */
+  genre?: string
+  items: Item[]
+}
+export const libraryRecommended = (id: string) => get<RecRow[]>(`/libraries/${id}/recommended`)
+
+/** The genres this library actually holds, most common first. */
+export const libraryGenres = (id: string) => req<GenreCount[]>(`/libraries/${id}/genres`)
+
+export const libraryItems = (id: string, genre?: string) =>
+  get<Item[]>(`/libraries/${id}/items${genre ? `?genre=${encodeURIComponent(genre)}` : ''}`)
+
+/**
+ * The library's items plus the mark to resume from. Passing a previous mark
+ * returns only what has changed since — a scan rewrites every item it sees,
+ * so polling during one otherwise refetches the whole list (~200 KB a second
+ * at four thousand items) for a handful of new tiles.
+ *
+ * Deletions are not expressible: a pruned row simply stops existing. Those
+ * are reconciled by the full refetch on the "libraries" event at scan end,
+ * which is when pruning and version grouping happen.
+ */
+export async function libraryItemsSince(
+  id: string,
+  since?: string,
+): Promise<{ items: Item[]; mark: string }> {
+  const q = since ? `?since=${encodeURIComponent(since)}` : ''
+  const res = await fetch(`/api/v1/libraries/${id}/items${q}`)
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORISED))
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  return { items: (await res.json()) as Item[], mark: res.headers.get('X-Items-Mark') ?? '' }
+}
 export const itemDetail = (id: string) => get<ItemDetail>(`/items/${id}`)
 export const itemSubtitles = (id: string) => get<SubtitleTrack[]>(`/items/${id}/subtitles`)
 export const searchItems = (q: string) => get<Item[]>(`/search?q=${encodeURIComponent(q)}`)
-export const playItem = (id: string, quality: PlayQuality = 'auto', fromStart = false) =>
-  post<PlayInfo>(`/items/${id}/play`, { ...caps, quality, fromStart })
+export interface AudioTrack {
+  id: string
+  streamIndex: number
+  codec: string
+  language?: string
+  title?: string
+  channels?: number
+  bitRate?: number
+  default?: boolean
+}
+
+/** What the server is actually sending, for the player's info panel. */
+export interface PlaySource {
+  /** The transcode path built — a device name, or "none" for software. */
+  accel?: string
+  /** True when an HDR source is being mapped to SDR for this stream. */
+  hdrToneMapped?: boolean
+  container?: string
+  videoCodec?: string
+  width?: number
+  height?: number
+  hdrFormat?: string
+  dvProfile?: number
+  video: 'direct' | 'remux' | 'transcode'
+  outHeight?: number
+  audio: 'direct' | 'transcode'
+  audioCodec?: string
+}
+
+export const playItem = (id: string, quality: PlayQuality = 'auto', fromStart = false, audioTrack?: number) =>
+  post<PlayInfo>(`/items/${id}/play`, { ...caps, quality, fromStart, audioTrack })
+/** Mark an item watched or unwatched by hand; both directions clear resume. */
+export const setWatched = (id: string, watched: boolean) =>
+  req<PlayState>(`/items/${id}/watched`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ watched }),
+  })
 export const postProgress = (id: string, positionSecs: number, paused = false) =>
   post<void>(`/items/${id}/progress`, { positionSecs, paused })
 // Tells the server this client has stopped playing the item (drops it from
@@ -212,3 +355,29 @@ export function subscribeEvents(
   es.onerror = () => onState?.(false)
   return () => es.close()
 }
+/** A TMDB collection ("The Matrix Collection") the library holds 2+ films from. */
+export interface CollectionInfo {
+  /** "tmdb:<id>" while the provider's grouping is in use, else a row id. */
+  key: string
+  tmdbId?: number
+  name: string
+  count: number
+  poster?: string
+  /** True once an operator has edited membership or order. */
+  managed: boolean
+  /** How many of the held films this viewer has finished. */
+  watched: number
+  /** The first film they have not, in the collection's order — absent once complete. */
+  nextUpId?: string
+  nextUpName?: string
+}
+export interface CollectionDetail {
+  collection: CollectionInfo
+  /** In release order, which is how a series is watched. */
+  items: Item[]
+}
+export const libraryCollections = (id: string) =>
+  req<CollectionInfo[]>(`/libraries/${id}/collections`)
+export const collectionDetail = (id: string, key: string) =>
+  req<CollectionDetail>(`/libraries/${id}/collections/${encodeURIComponent(key)}`)
+

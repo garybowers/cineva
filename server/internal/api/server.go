@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,42 +35,88 @@ type Config struct {
 	ArtworkDir   string
 	TranscodeDir string
 	SegmentSecs  int
-	SampleSecs   int // host CPU/RAM sampling interval for the admin dashboard
+	HWAccel      string // "auto" | "none" | "vaapi" | "nvenc" | "qsv"
+	TranscodeMax int64  // segment-cache ceiling in bytes; 0 disables the cap
+	SampleSecs   int    // host CPU/RAM sampling interval for the admin dashboard
 	SessionDays  int
 	SecureCookie bool
 	LoginMode    string // "picker" | "form" default for the sign-in screen
+	// CertRegion is the ISO 3166-1 country whose content rating is stored.
+	// Config supplies the default; the admin setting overrides it.
+	CertRegion string
 }
 
 type server struct {
-	store            *store.Store
-	manager          *library.Manager
-	sessions         *media.SessionManager
-	events           *events.Bus
-	sampler          *stats.Sampler
-	playbacks        *playback.Registry
-	sessionTTL       time.Duration
-	throttle         *auth.Throttle
-	defaultLoginMode string // from config; the database setting overrides
-	secureCookies    bool
-	subtitleDir      string
-	dlCacheDir       string
+	store             *store.Store
+	manager           *library.Manager
+	sessions          *media.SessionManager
+	events            *events.Bus
+	sampler           *stats.Sampler
+	playbacks         *playback.Registry
+	sessionTTL        time.Duration
+	throttle          *auth.Throttle
+	defaultLoginMode  string // from config; the database setting overrides
+	defaultCertRegion string
+	secureCookies     bool
+	subtitleDir       string
+	dlCacheDir        string
+
+	// Library-wide metadata refreshes in flight, keyed by library id.
+	refreshMu sync.Mutex
+	refreshes map[string]*refreshJob
 }
 
 func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s := &server{
-		store:            st,
-		manager:          manager,
-		sessions:         media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
-		events:           events.NewBus(),
-		sampler:          stats.New(time.Duration(cfg.SampleSecs) * time.Second),
-		playbacks:        playback.NewRegistry(45 * time.Second),
-		sessionTTL:       time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
-		secureCookies:    cfg.SecureCookie,
-		throttle:         auth.NewThrottle(),
-		defaultLoginMode: cfg.LoginMode,
-		subtitleDir:      filepath.Join(cfg.TranscodeDir, "subtitles"),
-		dlCacheDir:       filepath.Join(cfg.TranscodeDir, "dlcache"),
+		store:             st,
+		manager:           manager,
+		sessions:          media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
+		events:            events.NewBus(),
+		sampler:           stats.New(time.Duration(cfg.SampleSecs) * time.Second),
+		playbacks:         playback.NewRegistry(45 * time.Second),
+		sessionTTL:        time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
+		secureCookies:     cfg.SecureCookie,
+		throttle:          auth.NewThrottle(),
+		defaultLoginMode:  cfg.LoginMode,
+		defaultCertRegion: cfg.CertRegion,
+		subtitleDir:       filepath.Join(cfg.TranscodeDir, "subtitles"),
+		dlCacheDir:        filepath.Join(cfg.TranscodeDir, "dlcache"),
+		refreshes:         map[string]*refreshJob{},
 	}
+	// Segments outlive the process that made them, so anything already in
+	// the transcode directory is an orphan from a previous run. Swept before
+	// the first session starts, while "every directory here is stale" still
+	// holds.
+	if n, freed, err := media.SweepOrphans(cfg.TranscodeDir); err != nil {
+		log.Printf("transcode sweep: %v", err)
+	} else if n > 0 {
+		log.Printf("transcode: removed %d orphaned session directory(ies), freed %d MiB", n, freed>>20)
+	}
+
+	// Probe for a hardware transcoder once at startup rather than per
+	// session: opening a GPU device is slow, and the result cannot change
+	// while the process runs. A nil result means software, which is a
+	// supported outcome — DetectHW logs which path was taken and why.
+	s.sessions.MaxBytes = cfg.TranscodeMax
+
+	hw := media.DetectHW(cfg.HWAccel)
+	defer hw.Close()
+	s.sessions.HW = hw
+	// The admin switch is persisted, so honour it from the first session
+	// rather than only after someone visits the settings page.
+	if v, err := st.Setting(context.Background(), settingHWAccel, "true"); err == nil {
+		s.sessions.SetHWEnabled(v != "false")
+	}
+
+	// The scanner stamps the configured region's content rating onto items
+	// as it matches them, so it has to know the setting before the first
+	// scan rather than only after someone opens the settings page.
+	if v, err := st.Setting(context.Background(), settingCertRegion, cfg.CertRegion); err == nil && v != "" {
+		manager.CertRegion = v
+	} else {
+		manager.CertRegion = defaultCertRegion
+	}
+
 	// Scans run by this server publish progress onto the same bus the
 	// /events stream reads from. CLI scans leave manager.Events nil.
 	manager.Events = s.events
@@ -111,6 +159,11 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/libraries", s.listLibraries)
 	v1.GET("/libraries/:id", s.getLibrary)
 	v1.GET("/libraries/:id/items", s.libraryItems)
+	v1.GET("/libraries/:id/genres", s.libraryGenres)
+	v1.GET("/libraries/:id/recommended", s.libraryRecommended)
+	v1.GET("/libraries/:id/collections", s.libraryCollections)
+	v1.GET("/libraries/:id/collections/:key", s.collectionItems)
+	v1.GET("/people/:id", s.getPerson)
 	v1.GET("/items/:id", s.getItem)
 	v1.GET("/search", s.search)
 	v1.GET("/events", s.eventStream)
@@ -120,6 +173,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/items/:id/stream", s.streamItem)
 	v1.GET("/items/:id/download", s.downloadItem)
 	v1.POST("/items/:id/progress", s.postProgress)
+	v1.PUT("/items/:id/watched", s.putWatched)
 	v1.DELETE("/items/:id/playback", s.stopPlayback)
 	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
 	v1.GET("/items/:id/next", s.nextUp)
@@ -138,6 +192,22 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	adm.GET("/scans", s.listScans)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)
+	// Metadata management: inspect a match, search for the right title,
+	// apply it, or re-run matching.
+	// Collection management: override the provider's grouping — rename,
+	// add/remove films, reorder, or create one outright.
+	adm.POST("/libraries/:id/collections", s.createCollection)
+	adm.PATCH("/libraries/:id/collections/:key", s.renameCollection)
+	adm.PUT("/libraries/:id/collections/:key/items", s.setCollectionItems)
+	adm.DELETE("/libraries/:id/collections/:key", s.deleteCollection)
+	adm.GET("/items/:id/matches", s.itemMatches)
+	adm.PUT("/items/:id/match", s.putItemMatch)
+	adm.POST("/items/:id/refresh", s.refreshItem)
+	adm.PATCH("/items/:id", s.updateItemMetadata)
+	adm.DELETE("/items/:id/locks", s.clearItemLocks)
+	adm.POST("/libraries/:id/refresh", s.refreshLibrary)
+	adm.DELETE("/libraries/:id/refresh", s.cancelRefresh)
+	adm.GET("/libraries/:id/refresh", s.refreshStatus)
 	adm.GET("/stats/system", s.systemStats)
 	adm.GET("/stats/plays", s.playStats)
 	adm.GET("/stats/disks", s.diskStats)
@@ -161,18 +231,26 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	e.StaticFS("/admin", ui.Admin())
 	e.StaticFS("/", ui.Client())
 
-	// SPA fallback: the client owns URL routing (/libraries/..., /settings),
-	// so unknown extension-less GETs outside the API get index.html.
+	// SPA fallback. Both apps own their URL routing — the client at
+	// /libraries/..., the admin at /admin/libraries/... — so an unknown
+	// extension-less GET returns the owning app's index.html and lets its
+	// router read the path. Without this a deep link or a reload anywhere
+	// but the root 404s.
 	e.HTTPErrorHandler = func(err error, c echo.Context) {
 		he, ok := err.(*echo.HTTPError)
 		p := c.Request().URL.Path
 		if ok && he.Code == http.StatusNotFound && c.Request().Method == http.MethodGet &&
 			!strings.ContainsRune(path.Base(p), '.') &&
-			!hasAnyPrefix(p, "/api/", "/admin", "/themes/", "/artwork/") {
-			if data, ferr := fs.ReadFile(ui.Client(), "index.html"); ferr == nil {
+			!hasAnyPrefix(p, "/api/", "/themes/", "/artwork/") {
+			app, name := ui.Client(), "client"
+			if hasAnyPrefix(p, "/admin") {
+				app, name = ui.Admin(), "admin"
+			}
+			if data, ferr := fs.ReadFile(app, "index.html"); ferr == nil {
 				_ = c.HTMLBlob(http.StatusOK, data)
 				return
 			}
+			log.Printf("spa fallback: %s index.html unreadable", name)
 		}
 		e.DefaultHTTPErrorHandler(err, c)
 	}

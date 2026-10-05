@@ -12,6 +12,10 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* Reserve the scrollbar's width whether or not the page needs one, so the
+   layout does not shift sideways between a short page and a tall one. */
+html { scrollbar-gutter: stable; }
+
 body {
   background: var(--bg);
   color: var(--text);

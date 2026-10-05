@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,8 +35,15 @@ type Session struct {
 	SegmentSecs int     `json:"segmentSecs"`
 	NumSegments int     `json:"numSegments"`
 	Quality     Quality `json:"quality"`
+	// Accel names the path this session's pipeline was built with
+	// ("vaapi (/dev/dri/renderD128)", "none"), so the admin Activity page
+	// shows whether a stream is costing GPU or CPU.
+	Accel string `json:"accel"`
 
 	mu           sync.Mutex
+	hw           *HWContext // device this session encodes on, nil for software
+	audioTrack   int        // stream index to play, -1 for the best stream
+	hdr          string     // Info.HDRFormat, so a restart-at-offset job tone maps too
 	cancel       context.CancelFunc
 	startSegment int
 	lastReq      int // highest segment index a client asked for
@@ -45,6 +54,17 @@ type Session struct {
 type SessionManager struct {
 	Root        string
 	SegmentSecs int
+	// HW is the hardware transcoder detected at startup, or nil when none
+	// is usable. The device stays open either way; the admin switch only
+	// decides whether new sessions use it, so toggling needs no restart
+	// and no re-probe.
+	HW        *HWContext
+	hwEnabled atomic.Bool
+
+	// MaxBytes caps the total size of the segment cache; the janitor evicts
+	// least-recently-used session directories to stay under it. Zero
+	// disables the cap.
+	MaxBytes int64
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -60,15 +80,49 @@ func NewSessionManager(root string, segmentSecs int) *SessionManager {
 		sessions:    map[string]*Session{},
 		baseCtx:     ctx,
 		stop:        cancel,
+		MaxBytes:    DefaultTranscodeMaxBytes,
 	}
+	sm.hwEnabled.Store(true) // the admin switch defaults to on
 	go sm.janitor()
 	return sm
+}
+
+// SetHWEnabled flips the admin switch. Running sessions keep the pipeline
+// they were built with; the next one picks up the change.
+func (m *SessionManager) SetHWEnabled(on bool) { m.hwEnabled.Store(on) }
+
+// hardware returns the device a new session should use: nil when none was
+// detected, or when an admin has switched hardware transcoding off.
+func (m *SessionManager) hardware() *HWContext {
+	if !m.hwEnabled.Load() {
+		return nil
+	}
+	return m.HW
 }
 
 // Start creates a session and begins transcoding from the given position.
 // Any existing session for the same item is stopped first — replaying or
 // changing quality must not stack transcoders (single-user until milestone 4).
-func (sm *SessionManager) Start(itemID, title, inputPath string, runtimeSecs, startSecs int, q Quality) (*Session, error) {
+// StartOpts describes the playback a session is being started for. It is a
+// struct rather than a positional list because the fields are mostly strings
+// and ints in adjacent runs, which is exactly the shape that silently
+// transposes when someone inserts an argument.
+type StartOpts struct {
+	ItemID      string
+	Title       string
+	InputPath   string
+	RuntimeSecs int
+	StartSecs   int
+	Quality     Quality
+	AudioTrack  int
+	// HDR is Info.HDRFormat ("pq", "hlg" or ""), used to tone map when the
+	// video is re-encoded. See HLSJob.HDR.
+	HDR string
+}
+
+func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
+	itemID, title, inputPath := o.ItemID, o.Title, o.InputPath
+	runtimeSecs, startSecs, q, audioTrack := o.RuntimeSecs, o.StartSecs, o.Quality, o.AudioTrack
 	sm.mu.Lock()
 	var stale []*Session
 	for id, existing := range sm.sessions {
@@ -91,10 +145,20 @@ func (sm *SessionManager) Start(itemID, title, inputPath string, runtimeSecs, st
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("session dir: %w", err)
 	}
+	// Resolved once, at session start: the admin switch can flip while this
+	// session runs, but its pipeline is already built, so the device bound
+	// here stays correct for the life of the session. Accel starts as the
+	// intended path and RunHLS corrects it if the device turns out to be
+	// unusable and it falls back to software.
+	hw := sm.hardware()
 	s := &Session{
-		ID: id, ItemID: itemID, Title: title, InputPath: inputPath,
+		hdr:        o.HDR,
+		audioTrack: audioTrack,
+		ID:         id, ItemID: itemID, Title: title, InputPath: inputPath,
 		Dir: dir, SegmentSecs: sm.SegmentSecs, NumSegments: numSeg,
 		Quality:    q,
+		Accel:      hw.Name(),
+		hw:         hw,
 		lastAccess: time.Now(),
 	}
 	s.restartLocked(sm.baseCtx, startSecs/sm.SegmentSecs)
@@ -169,9 +233,33 @@ func (sm *SessionManager) janitor() {
 					log.Printf("session %s: idle, cleaned up", id)
 				}
 			}
+			// Live session directories, which must survive eviction even if
+			// they are the largest thing in the cache.
+			live := make(map[string]bool, len(sm.sessions))
+			for id := range sm.sessions {
+				live[id] = true
+			}
 			sm.mu.Unlock()
+			if n, freed := enforceCap(sm.Root, sm.MaxBytes, live); n > 0 {
+				log.Printf("transcode cache over %s: evicted %d session(s), freed %s",
+					humanBytes(sm.MaxBytes), n, humanBytes(freed))
+			}
 		}
 	}
+}
+
+// humanBytes formats a byte count for a log line.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
 }
 
 func (s *Session) touch() {
@@ -198,6 +286,16 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 		InputPath: s.InputPath, OutDir: s.Dir,
 		SegmentSecs: s.SegmentSecs, StartSegment: startSegment,
 		VideoHeight: s.Quality.Height, VideoBitrateKbps: s.Quality.BitrateKbps,
+		HDR:        s.hdr,
+		HW:         s.hw,
+		AudioTrack: s.audioTrack,
+		// RunHLS reports the path it actually built, so a device that opens
+		// but cannot allocate frames is not still advertised as hardware.
+		OnAccel: func(name string) {
+			s.mu.Lock()
+			s.Accel = name
+			s.mu.Unlock()
+		},
 		Throttle: func(ctx context.Context, posSecs int64) error {
 			for {
 				s.mu.Lock()
@@ -287,6 +385,7 @@ func (s *Session) Init(ctx context.Context) ([]byte, error) {
 			// buffered range far past the playhead (silent stall); Chrome
 			// ignores them. Strip edts so both agree with the playlist.
 			data = stripEdts(data)
+			data = forceHVC1(data)
 			s.mu.Lock()
 			if s.initBytes == nil {
 				s.initBytes = data
@@ -359,4 +458,22 @@ func (s *Session) maybeRestart(segIdx int) {
 		log.Printf("session %s: seek to segment %d (head %d)", s.ID, segIdx, head)
 		s.restartLocked(context.Background(), segIdx)
 	}
+}
+
+// forceHVC1 rewrites an HEVC sample entry from hev1 to hvc1 in a written
+// init segment.
+//
+// The two differ in where parameter sets may live: hvc1 keeps them in the
+// hvcC box, hev1 also allows them in-band. Browsers are far happier with
+// hvc1 — a copied HEVC stream labelled hev1 is a common cause of a player
+// that loads segments and renders nothing. Setting codec_tag on the output
+// stream is the documented way to ask for it and does reach
+// avformat_write_header, but the HLS muxer writes hev1 into init.mp4
+// regardless, so the four bytes are corrected here, next to stripEdts which
+// patches the same file for the same kind of reason.
+//
+// Only the first occurrence is touched: that is the sample entry in stsd.
+// A file with no hev1 in it is returned unchanged.
+func forceHVC1(data []byte) []byte {
+	return bytes.Replace(data, []byte("hev1"), []byte("hvc1"), 1)
 }

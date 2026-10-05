@@ -1,0 +1,11 @@
+-- Manually edited fields, as a comma-separated list of field names.
+--
+-- Without this, editing metadata by hand is a lie: the next scan or
+-- "Refresh metadata" overwrites the correction with the provider's answer,
+-- which is what the operator was disagreeing with. A locked field is left
+-- alone by anything automatic — the provider may still fill in everything
+-- the operator has not touched.
+--
+-- Field names are the Item struct's JSON names ("title", "year", "overview",
+-- "tagline", "certification", "rating", "poster", "backdrop", "genres").
+ALTER TABLE items ADD COLUMN locked_fields TEXT NOT NULL DEFAULT '';

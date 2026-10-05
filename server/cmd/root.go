@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/garybowers/cineva/server/internal/media"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,10 +63,15 @@ func initConfig() {
 	viper.SetDefault("server.port", 4747)
 	viper.SetDefault("database.path", "cineva.db")
 	viper.SetDefault("libraries.artwork_dir", "artwork")
+	// Empty default: metadata.APIKey falls back to the built-in project key
+	// when nothing overrides it.
 	viper.SetDefault("metadata.tmdb.api_key", "")
 	viper.SetDefault("metadata.musicbrainz.enabled", true)
 	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
 	viper.SetDefault("transcode.segment_secs", 6)
+	viper.SetDefault("transcode.hwaccel", "auto")
+	viper.SetDefault("metadata.cert_region", "GB")
+	viper.SetDefault("transcode.max_bytes", int64(media.DefaultTranscodeMaxBytes))
 	viper.SetDefault("stats.sample_secs", 5)
 	viper.SetDefault("auth.session_days", 30)
 	viper.SetDefault("auth.secure_cookies", false)

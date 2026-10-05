@@ -32,6 +32,20 @@ transcode:
   # dir: /tmp/cineva-transcode
   # Target HLS segment length in seconds. (CINEVA_TRANSCODE_SEGMENT_SECS)
   segment_secs: 6
+  # Hardware-accelerated transcoding. "auto" probes for a usable GPU at
+  # startup and falls back to the CPU when there is none; "none" forces
+  # software. Name a backend ("nvenc", "qsv", "vaapi") to pin one on a host
+  # with several GPUs. The server logs which path it chose on startup.
+  # (CINEVA_TRANSCODE_HWACCEL)
+  hwaccel: auto
+  # Ceiling for the segment cache, in bytes. The janitor evicts whole
+  # least-recently-used session directories to stay under it; directories
+  # belonging to a live playback are never evicted. 0 disables the cap.
+  # This matters more than it looks: the default transcode dir is under
+  # /tmp, which on a systemd host is tmpfs — i.e. RAM — so an unbounded
+  # cache evicts page cache and can exhaust memory.
+  # (CINEVA_TRANSCODE_MAX_BYTES)
+  max_bytes: 8589934592
 
 stats:
   # How often the admin dashboard's CPU/RAM sampler reads /proc. Samples are
@@ -51,15 +65,29 @@ auth:
   login_mode: picker
 
 metadata:
+  # Country whose content rating (certification) is stored and shown. These
+  # are issued per country by different boards — a BBFC "15" and an FSK "16"
+  # are different judgements, not two spellings — so pick the one that means
+  # something where this server is. Falls back to the US rating when a title
+  # is unclassified in your region. Overridable in the admin UI; changing it
+  # affects titles scanned or refreshed afterwards.
+  # (CINEVA_METADATA_CERT_REGION)
+  cert_region: GB
   # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
   # open data, no key needed, rate-limited to 1 request/second.
   # (CINEVA_METADATA_MUSICBRAINZ_ENABLED)
   musicbrainz:
     enabled: true
   tmdb:
-    # TMDB API key for movie/TV metadata + posters. Free at
-    # https://www.themoviedb.org/settings/api — leave empty to scan without
-    # metadata enrichment. (CINEVA_METADATA_TMDB_API_KEY)
+    # TMDB API key for movie/TV metadata + posters.
+    #
+    # Leave this empty: release builds carry the project's own key, so
+    # metadata works out of the box. Set it only to deliberately override
+    # that — your own key, a different account, or a source build that has
+    # no key baked in. Free at https://www.themoviedb.org/settings/api.
+    #
+    # Precedence: --tmdb-key > CINEVA_METADATA_TMDB_API_KEY > this file >
+    # the built-in key.
     api_key: ""
 
 # --- Sections arriving with later milestones (do not uncomment until the

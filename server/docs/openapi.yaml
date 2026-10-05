@@ -419,9 +419,13 @@ paths:
       description: >
         A Server-Sent Events stream of state changes so clients update
         without polling. Event types: "scan" (data: a Scan, plus filesTotal
-        while running — the scanner's upfront file count) and "libraries"
-        (no data — an invalidation hint: refetch library lists and counts).
-        Events are advisory; clients refetch what they display on receipt.
+        while running — the scanner's upfront file count; admin-only),
+        "items" (data: {libraryId} — that library's contents changed,
+        published repeatedly during a scan as items land so open views fill
+        in live) and "libraries" (no data — an invalidation hint: refetch
+        library lists and counts). Events are advisory; clients refetch what
+        they display on receipt, and a dropped event costs staleness until
+        the next one, not correctness.
       operationId: eventStream
       responses:
         "200":
@@ -429,6 +433,165 @@ paths:
           content:
             text/event-stream:
               schema: { type: string }
+
+  /items/{id}/matches:
+    get:
+      summary: Candidate TMDB matches for an item (admin)
+      description: >
+        Used by the admin "Fix match" dialogue. q and year default to the
+        item's own, so the common case needs no arguments. All candidates are
+        returned rather than just the best: TMDB's year parameter only nudges
+        relevance rather than filtering, so the top hit is regularly wrong for
+        a common title.
+      operationId: itemMatches
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: q, in: query, required: false, schema: { type: string }, description: Title to search for (default the item's own) }
+        - { name: year, in: query, required: false, schema: { type: integer }, description: Year hint; 0 drops it }
+      responses:
+        "200":
+          description: Candidates, best first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query: { type: string }
+                  year: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/MatchCandidate" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: No TMDB key configured }
+
+  /items/{id}/match:
+    put:
+      summary: Pin an item to a chosen TMDB title (admin)
+      description: >
+        The "fix match" operation. Unlike a scan this replaces the title,
+        overview and artwork outright — the operator has just asserted which
+        film it is, so keeping what the wrong match left behind would defeat
+        the point.
+      operationId: applyMatch
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tmdbId]
+              properties:
+                tmdbId: { type: integer }
+      responses:
+        "200": { description: Updated item, content: { application/json: { schema: { $ref: "#/components/schemas/Item" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { description: No TMDB key configured }
+
+  /items/{id}/refresh:
+    post:
+      summary: Re-run metadata matching for an item (admin)
+      description: >
+        Re-derives the title from the file path rather than the stored title,
+        so a refresh also recovers from an earlier bad match having
+        overwritten it.
+      operationId: refreshItem
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Updated item, content: { application/json: { schema: { $ref: "#/components/schemas/Item" } } } }
+        "404": { description: No match found }
+        "503": { description: No TMDB key configured }
+
+  /people/{id}:
+    get:
+      summary: A person and the library titles they are credited on
+      description: >
+        Backs "more with this actor". Only titles the viewer may see are
+        returned, so a person credited on a library this user has no grant
+        for does not leak its contents.
+      operationId: getPerson
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Person and their titles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  person: { $ref: "#/components/schemas/Person" }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Item" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/genres:
+    get:
+      summary: The genres this library actually holds, with counts
+      description: >
+        Derived from the films rather than a fixed vocabulary, so a library
+        never offers a genre nothing is tagged with. Alternative versions are
+        excluded, so a film held twice counts once.
+      operationId: libraryGenres
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Genres, most common first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    genre: { type: string }
+                    count: { type: integer }
+
+  /libraries/{id}/collections:
+    get:
+      summary: The collections this library holds more than one film from
+      description: >
+        Collections come from the metadata provider's own grouping (TMDB's
+        belongs_to_collection), so Harry Potter, James Bond, The Lord of the
+        Rings and the rest are detected without any franchise list of our
+        own — a film simply has to be matched. A collection the library holds
+        only one film from is excluded: labelling a single film as a set is
+        noise rather than grouping. Alternative versions are excluded, so a
+        film held twice counts once.
+      operationId: libraryCollections
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Collections, largest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Collection" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/collections/{cid}:
+    get:
+      summary: One collection's films, in release order
+      operationId: collectionItems
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: cid, in: path, required: true, schema: { type: integer }, description: Provider collection id }
+      responses:
+        "200":
+          description: Films in release order, which is how a series is watched
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Item" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /fs/dirs:
     get:
@@ -684,6 +847,32 @@ paths:
         "200": { description: The media file or ZIP archive, Content-Disposition attachment }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /items/{id}/watched:
+    put:
+      summary: Mark an item watched or unwatched by hand
+      description: >
+        Separate from /progress, which reports the playhead and lets the ~90%
+        threshold decide. Progress only ever raises the watched flag, so this
+        is the only way to lower it. Both directions clear the resume
+        position: marking watched should stop offering a resume, and marking
+        unwatched should start from the beginning.
+      operationId: setWatched
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [watched]
+              properties:
+                watched: { type: boolean }
+      responses:
+        "200": { description: Updated play state, content: { application/json: { schema: { $ref: "#/components/schemas/PlayState" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /items/{id}/progress:
     post:
       summary: Report playback position (crossing ~90% marks the item watched)
@@ -873,6 +1062,35 @@ components:
           type: string
           enum: [picker, form]
           description: picker = every user as a tile, then their PIN or password; form = username + password-or-PIN box. Default from auth.login_mode.
+        hwAccel:
+          type: boolean
+          description: >
+            Whether new transcode sessions may use the GPU. Default true;
+            with no usable device the server transcodes on the CPU regardless.
+            Takes effect on the next session, not on sessions already running.
+        hwAccelStatus:
+          type: string
+          readOnly: true
+          description: >
+            The backend detected at startup, for display beside the switch —
+            e.g. "vaapi (/dev/dri/renderD128)", "nvenc", or "none" when the
+            host has no usable hardware transcoder.
+        certRegion:
+          type: string
+          description: >
+            ISO 3166-1 country whose content rating is stored and shown.
+            Certifications are issued per country by different boards, so a
+            BBFC "15" and an FSK "16" are different judgements rather than two
+            spellings of one value. Falls back to the US rating where a title
+            is unclassified in the chosen region. Default from
+            metadata.cert_region (GB). Applies to titles scanned or refreshed
+            afterwards; existing rows keep the rating they were given.
+          example: GB
+        certRegions:
+          type: array
+          readOnly: true
+          items: { type: string }
+          description: The regions this server offers, for the admin picker.
     APIKey:
       type: object
       properties:
@@ -885,10 +1103,25 @@ components:
       type: string
       enum: [movies, tv, music, audiobooks, podcasts, books]
 
+    Collection:
+      type: object
+      description: >
+        A set of films grouped by the metadata provider — "The Matrix
+        Collection", "Harry Potter Collection".
+      properties:
+        id: { type: integer, description: Provider collection id }
+        name: { type: string }
+        count: { type: integer, description: How many of the set this library holds }
+        poster:
+          type: string
+          description: >
+            Artwork standing in for the set — the earliest film's poster, so
+            the row is recognisable rather than arbitrary.
+
     Theme:
       type: object
       properties:
-        id: { type: string, description: Folder name; stylesheet at /themes/{id}/theme.css }
+        id: { type: string, description: "Folder name; stylesheet at /themes/{id}/theme.css" }
         name: { type: string }
         appearance: { type: string, enum: [dark, light] }
 
@@ -933,6 +1166,37 @@ components:
         poster: { type: string, description: Server-relative artwork URL (/artwork/...) }
         addedAt: { type: string }
         updatedAt: { type: string }
+        versionOf:
+          type: string
+          description: >
+            Id of the item this is an alternative version of — the same film
+            at a different quality. Empty for a primary, which is what the
+            library grid lists.
+        rating: { type: number, format: double, description: Provider score, 0-10 }
+        voteCount: { type: integer }
+        certification:
+          type: string
+          description: >
+            Content rating for the server's configured region ("15",
+            "PG-13"). Free text: the scale is per-country, since each board
+            classifies separately. See Settings.certRegion.
+        tagline: { type: string }
+        backdrop: { type: string, description: Server-relative wide artwork URL }
+        collectionId: { type: integer }
+        collectionName: { type: string, description: e.g. "The Matrix Collection" }
+        genres:
+          type: array
+          items: { type: string }
+          description: Filled by the endpoints that need it, not by every item query.
+        watched:
+          type: boolean
+          description: >
+            The requesting user's own state, stamped on by the library
+            listing. Shared across a film's versions: it is recorded against
+            the primary.
+        positionSecs:
+          type: integer
+          description: The requesting user's resume position, as for watched.
 
     PlayInfo:
       type: object
@@ -946,6 +1210,51 @@ components:
         subtitles:
           type: array
           items: { $ref: "#/components/schemas/SubtitleTrack" }
+        audio:
+          type: array
+          description: The file's audio streams, for the player's track picker.
+          items: { $ref: "#/components/schemas/AudioTrack" }
+        audioTrack:
+          type: integer
+          description: >
+            Stream index actually being played — the file's default unless
+            the request asked for another. -1 when the file has no audio.
+        source:
+          $ref: "#/components/schemas/PlaySource"
+
+    AudioTrack:
+      type: object
+      description: One embedded audio stream — another language, a commentary, or a different mix.
+      properties:
+        id: { type: string, format: uuid }
+        itemId: { type: string, format: uuid }
+        streamIndex: { type: integer }
+        codec: { type: string }
+        language: { type: string, description: ISO 639-2 code as the file carries it }
+        title: { type: string }
+        channels: { type: integer, description: 2 = stereo, 6 = 5.1, 8 = 7.1 }
+        bitRate: { type: integer }
+        default: { type: boolean, description: The track the file marks as default }
+
+    PlaySource:
+      type: object
+      description: >
+        What the viewer is actually being sent, so the player's info panel can
+        show it rather than leaving them to guess why a 4K title looks soft.
+      properties:
+        container: { type: string }
+        videoCodec: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        hdrFormat: { type: string, enum: [pq, hlg], description: Transfer characteristic when the source is HDR }
+        dvProfile: { type: integer, description: Dolby Vision profile, absent when the stream carries none }
+        video:
+          type: string
+          enum: [direct, remux, transcode]
+          description: direct = untouched file; remux = video copied bit-for-bit, container changed; transcode = re-encoded.
+        outHeight: { type: integer, description: Height being sent; absent when the video is untouched }
+        audio: { type: string, enum: [direct, transcode] }
+        audioCodec: { type: string, description: Codec being sent }
 
     SubtitleTrack:
       type: object
@@ -957,11 +1266,31 @@ components:
         forced: { type: boolean }
         url: { type: string, description: WebVTT url; absent for image-based tracks }
 
+    Person:
+      type: object
+      description: Someone credited on an item.
+      properties:
+        id: { type: string, format: uuid }
+        tmdbId: { type: integer }
+        name: { type: string }
+        profile: { type: string, description: /artwork/... headshot }
+        role: { type: string, description: Character for cast, job for crew }
+        kind: { type: string, enum: [cast, crew] }
+
+    MatchCandidate:
+      type: object
+      properties:
+        tmdbId: { type: integer }
+        title: { type: string }
+        year: { type: integer }
+        overview: { type: string }
+        poster: { type: string, description: Absolute TMDB image URL }
+
     PlayState:
       type: object
       properties:
-        itemId: { type: string }
-        positionSecs: { type: integer }
+        itemId: { type: string, format: uuid }
+        positionSecs: { type: integer, description: Resume position; 0 once watched or explicitly unwatched }
         watched: { type: boolean }
         updatedAt: { type: string }
 
@@ -973,6 +1302,12 @@ components:
         title: { type: string }
         segmentSecs: { type: integer }
         numSegments: { type: integer }
+        accel:
+          type: string
+          description: >
+            The transcode path this session was built with — a backend name
+            such as "vaapi (/dev/dri/renderD128)", or "none" for software.
+            Fixed for the life of the session even if the admin switch moves.
 
     Scan:
       type: object

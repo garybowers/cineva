@@ -33,6 +33,9 @@ type capabilities struct {
 	// "original"   — force direct play of the untouched file
 	// "1080p", "720p", "480p" — force a video transcode at that level
 	Quality string `json:"quality"`
+	// AudioTrack picks an audio stream by index; nil uses the file's
+	// default. Changing it restarts the session, like a quality change.
+	AudioTrack *int `json:"audioTrack"`
 	// FromStart ignores the stored resume position and plays from 00:00.
 	FromStart bool `json:"fromStart"`
 }
@@ -61,6 +64,72 @@ var defaultCaps = capabilities{
 	AudioCodecs: []string{"aac", "mp3"},
 }
 
+// videoCodecSupported reports whether the device can decode the item's video
+// stream. It is asked separately from directPlayReason because the two lead
+// to different transcodes: a container or audio mismatch only needs a remux,
+// but a video codec the device cannot decode has to be re-encoded.
+func videoCodecSupported(item store.Item, caps capabilities) bool {
+	return item.VideoCodec == "" || contains(caps.VideoCodecs, item.VideoCodec)
+}
+
+// remuxSafe reports whether a video stream can be copied into fMP4 and still
+// play on a device that says it can decode it.
+//
+// Copying is always the better answer when it works: the video reaches the
+// client bit-for-bit, at full resolution, for almost no CPU. Re-encoding
+// costs quality and a great deal of CPU, so it is the fallback, not the
+// default.
+//
+// HEVC needs the hvc1 sample-entry tag to be copied into fMP4 (the muxer
+// otherwise warns "Stream HEVC is not hvc1" and browsers reject it); RunHLS
+// sets it. Dolby Vision is the remaining question, and it depends on the
+// profile rather than on Dolby Vision being present at all: profile 8 with
+// base-layer compatibility 1 is plain HDR10 underneath and decodes correctly
+// anywhere, whereas profile 5 carries an IPT base layer that renders as
+// false colour without a Dolby Vision display pipeline. Only the latter has
+// to be re-encoded.
+func remuxSafe(item store.Item, info media.Info) bool {
+	switch item.VideoCodec {
+	case "", "h264":
+		return true
+	case "hevc":
+		// Profile 5 signals its base layer is not independently viewable
+		// (compatibility id 0): the pixels are IPT, which renders as false
+		// colour anywhere without a Dolby Vision pipeline. Profile 8 with
+		// compatibility 1 is HDR10 underneath and copies fine.
+		return info.DVProfile == 0 || info.DVBLCompat != 0
+	}
+	return false
+}
+
+// defaultAudioTrack is the stream the file marks default, else the first.
+// -1 when there is no audio at all.
+func defaultAudioTrack(tracks []store.AudioTrack) int {
+	if len(tracks) == 0 {
+		return -1
+	}
+	for _, t := range tracks {
+		if t.Default {
+			return t.StreamIndex
+		}
+	}
+	return tracks[0].StreamIndex
+}
+
+// autoVideoQuality picks an encode rung for a source whose video codec the
+// device cannot decode. Capped at 1080p: software-encoding 2160p cannot keep
+// ahead of a playhead, and the ladder tops out there anyway.
+func autoVideoQuality(item store.Item) media.Quality {
+	switch {
+	case item.Height == 0 || item.Height >= 1080:
+		return qualityLevels["1080p"]
+	case item.Height >= 720:
+		return qualityLevels["720p"]
+	default:
+		return qualityLevels["480p"]
+	}
+}
+
 // directPlayReason returns "" when the device can direct play the item, else
 // a human-readable reason for transcoding.
 func directPlayReason(item store.Item, caps capabilities) string {
@@ -77,13 +146,51 @@ func directPlayReason(item store.Item, caps capabilities) string {
 }
 
 type playInfo struct {
-	Mode         string         `json:"mode"` // "direct" | "hls"
-	URL          string         `json:"url"`
-	SessionID    string         `json:"sessionId,omitempty"`
-	DurationSecs int            `json:"durationSecs"`
-	PositionSecs int            `json:"positionSecs"`     // resume point
-	Reason       string         `json:"reason,omitempty"` // why transcoding was chosen
-	Subtitles    []subtitleInfo `json:"subtitles"`
+	Mode         string `json:"mode"` // "direct" | "hls"
+	URL          string `json:"url"`
+	SessionID    string `json:"sessionId,omitempty"`
+	DurationSecs int    `json:"durationSecs"`
+	PositionSecs int    `json:"positionSecs"` // resume point
+	Reason       string `json:"reason,omitempty"`
+	// Chapters are the file's own marks, for the player's chapter list and
+	// skip. Read from the probe already done here, so they cost nothing.
+	Chapters  []media.Chapter `json:"chapters,omitempty"` // why transcoding was chosen
+	Subtitles []subtitleInfo  `json:"subtitles"`
+	// Audio lists the file's audio streams so the player can offer a
+	// picker; AudioTrack is the stream index actually being played.
+	Audio      []store.AudioTrack `json:"audio"`
+	AudioTrack int                `json:"audioTrack"`
+	// What the viewer is actually being sent, for the player's info panel.
+	Source Source `json:"source"`
+}
+
+// Source describes the stream behind a playback, so the player can show what
+// is really happening rather than leaving the viewer to guess why a 4K title
+// looks soft.
+type Source struct {
+	Container  string `json:"container,omitempty"`
+	VideoCodec string `json:"videoCodec,omitempty"`
+	Width      int    `json:"width,omitempty"`
+	Height     int    `json:"height,omitempty"`
+	HDRFormat  string `json:"hdrFormat,omitempty"`
+	DVProfile  int    `json:"dvProfile,omitempty"`
+	// Video is "direct", "remux" (copied untouched) or "transcode".
+	Video string `json:"video"`
+	// OutHeight is the height being sent; 0 when the video is untouched.
+	OutHeight int `json:"outHeight,omitempty"`
+	// Audio is "direct" or "transcode", with the codec being sent.
+	Audio      string `json:"audio"`
+	AudioCodec string `json:"audioCodec,omitempty"`
+	// Accel names the transcode path actually built — the device, or "none"
+	// for software. The session reports it after the pipeline is up (a
+	// device that opens but cannot allocate frames falls back), so it is
+	// empty at the moment play is answered and the client reads the live
+	// value from the session.
+	Accel string `json:"accel,omitempty"`
+	// HDRToneMapped is true when an HDR source is being mapped to SDR for
+	// this stream — worth saying, since it is why the picture differs from
+	// the file.
+	HDRToneMapped bool `json:"hdrToneMapped,omitempty"`
 }
 
 func (s *server) playableItem(c echo.Context) (store.Item, error) {
@@ -115,7 +222,6 @@ func (s *server) playItem(c echo.Context) error {
 	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
 	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)
 	if item.Kind == store.KindTrack {
-		s.registerPlayback(c, item, "direct", "", "")
 		s.registerPlayback(c, item, "direct", "original", "")
 		return c.JSON(http.StatusOK, playInfo{
 			Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
@@ -144,22 +250,89 @@ func (s *server) playItem(c echo.Context) error {
 	}
 	subs := subtitleInfos(tracks)
 
+	// The remux decision needs facts the items table does not carry (Dolby
+	// Vision profile, HDR transfer), so the file is probed once here. It is
+	// a header read, and only on starting playback. A failure is not fatal:
+	// the zero Info reads as "no Dolby Vision", which is the common case.
+	vinfo, err := media.Probe(item.Path)
+	if err != nil {
+		log.Printf("play %s: probe: %v", item.Title, err)
+	}
+
+	audio, err := s.store.AudioTracksForItem(c.Request().Context(), item.ID)
+	if err != nil {
+		return err
+	}
+	// The requested track, defaulting to the file's own default.
+	chosen := defaultAudioTrack(audio)
+	if body.AudioTrack != nil {
+		for _, a := range audio {
+			if a.StreamIndex == *body.AudioTrack {
+				chosen = a.StreamIndex
+			}
+		}
+	}
+	src := Source{
+		Container: item.Container, VideoCodec: item.VideoCodec,
+		Width: item.Width, Height: item.Height,
+		HDRFormat: vinfo.HDRFormat, DVProfile: vinfo.DVProfile,
+	}
+
 	direct := playInfo{
 		Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
 		DurationSecs: item.RuntimeSecs, PositionSecs: resume,
-		Subtitles: subs,
+		Subtitles: subs, Audio: audio, AudioTrack: chosen,
+		Chapters: vinfo.Chapters,
+		Source: func() Source {
+			d := src
+			d.Video, d.Audio, d.AudioCodec = "direct", "direct", item.AudioCodec
+			return d
+		}(),
 	}
 
 	var sessionQuality media.Quality // zero value = remux (video copy)
 	var reason string
 	switch {
 	case quality == "original":
-		return c.JSON(http.StatusOK, direct)
+		// "Original" means keep the video exactly as it is — not "hand the
+		// browser a file it cannot open". Where only the container or the
+		// audio codec is the obstacle, a remux still delivers the original
+		// video stream bit-for-bit, so fall through to one instead of
+		// returning a direct-play URL that cannot play (mkv, most often).
+		if directPlayReason(item, caps) == "" {
+			return c.JSON(http.StatusOK, direct)
+		}
+		if remuxSafe(item, vinfo) {
+			sessionQuality = media.Quality{Label: "original"} // zero height = copy the video
+			reason = "original video, remuxed for the browser"
+			break
+		}
+		// The video cannot survive a copy into fMP4, so bit-for-bit is not
+		// on offer. Re-encode rather than fail: the viewer asked for the
+		// best available, and the reason says why it is not a copy. Note
+		// autoVideoQuality caps at 1080p, so a 4K source is downscaled.
+		sessionQuality = autoVideoQuality(item)
+		reason = item.VideoCodec + " cannot be remuxed to fMP4 — re-encoding"
 	case quality == "" || quality == "auto":
 		if reason = directPlayReason(item, caps); reason == "" {
 			return c.JSON(http.StatusOK, direct)
 		}
+		// A container or audio-only mismatch is fixed by a remux, which
+		// copies the video stream untouched and costs almost nothing.
 		sessionQuality = media.Quality{Label: "auto"}
+		switch {
+		case !videoCodecSupported(item, caps):
+			// Copying a codec the device already said it cannot decode just
+			// hands it the same undecodable stream — the player loads
+			// segments and then sits there. Re-encode instead.
+			sessionQuality = autoVideoQuality(item)
+			reason = "video codec " + item.VideoCodec + " not supported by device"
+		case !remuxSafe(item, vinfo):
+			// The device claims it can decode this, but the stream cannot
+			// survive the copy into fMP4. See remuxSafe.
+			sessionQuality = autoVideoQuality(item)
+			reason = item.VideoCodec + " cannot be remuxed to fMP4 — re-encoding"
+		}
 	default:
 		level, ok := qualityLevels[quality]
 		if !ok {
@@ -169,15 +342,32 @@ func (s *server) playItem(c echo.Context) error {
 		reason = "quality " + quality + " requested"
 	}
 
-	session, err := s.sessions.Start(item.ID, item.Title, item.Path, item.RuntimeSecs, resume, sessionQuality)
+	session, err := s.sessions.Start(media.StartOpts{
+		ItemID: item.ID, Title: item.Title, InputPath: item.Path,
+		RuntimeSecs: item.RuntimeSecs, StartSecs: resume,
+		Quality: sessionQuality, AudioTrack: chosen,
+		// Only consulted when the video is re-encoded; a remux keeps the
+		// HDR stream untouched.
+		HDR: vinfo.HDRFormat,
+	})
 	if err != nil {
 		return err
 	}
 	s.registerPlayback(c, item, "hls", session.Quality.Label, session.ID)
+	src.Video, src.OutHeight = "transcode", sessionQuality.Height
+	if sessionQuality.Height == 0 {
+		src.Video, src.OutHeight = "remux", 0 // video copied bit-for-bit
+	}
+	src.Audio, src.AudioCodec = "transcode", "aac"
+	src.Accel = session.Accel
+	// Only the re-encode path tone maps; a copied stream keeps its HDR.
+	src.HDRToneMapped = sessionQuality.Height > 0 && vinfo.HDRFormat != ""
 	return c.JSON(http.StatusOK, playInfo{
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
-		Reason: reason, Subtitles: subs,
+		Reason: reason, Subtitles: subs, Audio: audio, AudioTrack: chosen,
+		Chapters: vinfo.Chapters,
+		Source:   src,
 	})
 }
 
@@ -447,6 +637,32 @@ func (s *server) stopPlayback(c echo.Context) error {
 }
 
 // POST /items/:id/progress — update watch state.
+// PUT /items/:id/watched — mark an item watched or unwatched by hand.
+//
+// Separate from /progress because the two mean different things: progress
+// reports where the playhead is and lets the threshold decide, while this
+// states the outcome directly. Without it nothing can ever lower the flag,
+// since SetProgress only raises it.
+func (s *server) putWatched(c echo.Context) error {
+	item, err := s.playableItem(c)
+	if err != nil {
+		return err
+	}
+	var req struct {
+		Watched *bool `json:"watched"`
+	}
+	if err := c.Bind(&req); err != nil || req.Watched == nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "watched must be true or false")
+	}
+	ps, err := s.store.SetWatched(c.Request().Context(), userID(c), item.ID, *req.Watched)
+	if err != nil {
+		return err
+	}
+	// Continue-watching rows and any open grid change as a result.
+	s.events.Publish(events.Event{Type: "items", Data: map[string]string{"libraryId": item.LibraryID}})
+	return c.JSON(http.StatusOK, ps)
+}
+
 func (s *server) postProgress(c echo.Context) error {
 	item, err := s.playableItem(c)
 	if err != nil {

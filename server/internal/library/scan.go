@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,12 @@ type Manager struct {
 	ArtworkDir string
 	Probe      func(path string) (media.Info, error)
 	Events     *events.Bus // nil outside the server (CLI scans)
+	// CertRegion is the ISO 3166-1 country whose content rating is stored
+	// ("GB", "US", "DE"). Certification is regional — a BBFC 15 and an FSK
+	// 16 are different boards' judgements, not two spellings — so which one
+	// is meaningful depends on where the viewer is. Set from the admin
+	// setting; "" falls back to US inside CertificationFor.
+	CertRegion string
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // libraryID -> cancel for the active scan
@@ -146,6 +153,14 @@ type scanEvent struct {
 	FilesTotal int `json:"filesTotal,omitempty"`
 }
 
+// itemsEvent is the payload of "items" events: a hint that the named
+// library's contents changed and open views should refetch them. It carries
+// no progress detail — unlike "scan", which is admin-only — so every user
+// receives it and a grid fills in live as a scan runs.
+type itemsEvent struct {
+	LibraryID string `json:"libraryId"`
+}
+
 func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library) {
 	var filesSeen, itemsCreated int
 	var scanErr error
@@ -159,6 +174,9 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	// report streams progress to the scans table and the event bus, at most
 	// once a second so a fast local scan doesn't turn into a write storm.
 	var lastReport time.Time
+	// itemsSent is the created count at the last "items" event, so the grid
+	// is only told to refetch when the scan actually added something.
+	itemsSent := 0
 	report := func(seen, created, total int) {
 		if time.Since(lastReport) < time.Second {
 			return
@@ -170,6 +188,10 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 			log.Printf("scan progress %s: %v", lib.Name, err)
 		}
 		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: snap, FilesTotal: total}})
+		if created > itemsSent {
+			itemsSent = created
+			m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID}})
+		}
 	}
 
 	switch lib.MediaType {
@@ -188,6 +210,15 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 			log.Printf("prune %s: %v", lib.Name, err)
 		} else if pruned > 0 {
 			log.Printf("scan %s: pruned %d stale item(s)", lib.Name, pruned)
+		}
+		// After pruning, so a removed file cannot leave an item pointing at
+		// a primary that no longer exists.
+		if lib.MediaType == store.MediaMovies {
+			if linked, err := m.Store.GroupVersions(context.WithoutCancel(ctx), lib.ID); err != nil {
+				log.Printf("group versions %s: %v", lib.Name, err)
+			} else if linked > 0 {
+				log.Printf("scan %s: grouped %d alternative version(s)", lib.Name, linked)
+			}
 		}
 	}
 
@@ -218,6 +249,9 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	done.Status, done.Error = status, errMsg
 	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
 	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
+	// The throttle means the last upserts (and any prune) came after the
+	// final report, so close with an unconditional refetch hint.
+	m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID}})
 	m.Events.Publish(events.Event{Type: "libraries"})
 }
 
@@ -232,7 +266,15 @@ func (m *Manager) videoFiles(lib store.Library) ([]string, error) {
 			if err != nil {
 				return err
 			}
-			if !d.IsDir() && IsVideoFile(path) {
+			// Skip an extras folder whole rather than filtering its files
+			// one by one: nothing inside one is ever a feature.
+			if d.IsDir() {
+				if path != root && extrasDirRe.MatchString(d.Name()) {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if IsVideoFile(path) && !IsExtra(path) {
 				files = append(files, path)
 			}
 			return nil
@@ -251,32 +293,140 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, report repo
 		return 0, 0, err
 	}
 	created := 0
-	for i, path := range files {
-		if err := ctx.Err(); err != nil {
-			return len(files), created, err
-		}
-		report(i, created, len(files))
-		info := ParseMovie(path)
-		item := store.Item{
-			LibraryID: lib.ID, Kind: store.KindMovie,
-			Title: info.Title, Year: info.Year, Path: path,
-		}
-		m.fillFileInfo(&item, path)
-		if m.Video != nil {
-			// Search with the tag-corrected title/year when available —
-			// embedded tags restore punctuation the filename mangles.
-			if r, err := m.Video.SearchMovie(ctx, item.Title, item.Year); err == nil {
-				m.applyVideoResult(ctx, &item, r)
+	// Files are probed a batch at a time in parallel (see probeBatch); the
+	// rest of the loop stays serial, because metadata lookups are rate
+	// limited and SQLite takes one writer.
+	for start := 0; start < len(files); start += probeBatchSize {
+		end := min(start+probeBatchSize, len(files))
+		batch := files[start:end]
+		probes := m.probeBatch(ctx, batch)
+
+		for bi, path := range batch {
+			i := start + bi
+			if err := ctx.Err(); err != nil {
+				return len(files), created, err
 			}
+			report(i, created, len(files))
+			info := ParseMovie(path)
+			item := store.Item{
+				LibraryID: lib.ID, Kind: store.KindMovie,
+				Title: info.Title, Year: info.Year, Path: path,
+			}
+			m.applyProbe(&item, probes[bi])
+
+			// A sidecar written by Kodi, Jellyfin, Radarr or Sonarr is the
+			// operator's own curation, so it outranks anything we would guess:
+			// its title and year drive the search, and its tmdb id skips the
+			// search entirely.
+			nfo, hasNFO, nerr := ReadNFO(path)
+			if nerr != nil {
+				log.Printf("scan: %s: %v", filepath.Base(path), nerr)
+			}
+			if hasNFO {
+				if t := strings.TrimSpace(nfo.Title); t != "" {
+					item.Title = t
+				} else if t := strings.TrimSpace(nfo.OriginalTitle); t != "" {
+					item.Title = t
+				}
+				if y := nfo.ReleaseYear(); y > 0 {
+					item.Year = y
+				}
+				if id, _ := nfo.ResolvedIDs(); id > 0 && info.TmdbID == 0 {
+					info.TmdbID = id
+				}
+			}
+
+			var videoResult metadata.VideoResult
+			if m.Video != nil {
+				// An explicit id in the filename is the operator telling us the
+				// answer, so it skips searching entirely — that is the whole
+				// point of the convention. Anything else searches with the
+				// tag-corrected title/year, since embedded tags restore
+				// punctuation the filename mangles.
+				var r metadata.VideoResult
+				var err error
+				if info.TmdbID > 0 {
+					r, err = m.Video.MovieByID(ctx, info.TmdbID)
+					if err != nil {
+						// A bad hint must not silently become a wrong match, so
+						// fall back to searching rather than to nothing.
+						log.Printf("scan: %s: tmdbid=%d hint failed (%v), searching instead", filepath.Base(path), info.TmdbID, err)
+						r, err = m.Video.SearchMovie(ctx, item.Title, item.Year)
+					}
+				} else {
+					r, err = m.Video.SearchMovie(ctx, item.Title, item.Year)
+				}
+				if err == nil {
+					videoResult = r
+					m.applyVideoResult(ctx, &item, r)
+				}
+			}
+			// Applied after the provider so the operator's own files win: they
+			// chose to put them there, and a local poster is the whole point of
+			// curating one.
+			if hasNFO {
+				applyNFO(&item, nfo)
+			}
+			m.applyLocalArtwork(&item, path)
+
+			saved, err := m.Store.UpsertItem(ctx, item)
+			if err != nil {
+				return len(files), created, err
+			}
+			m.saveGenres(ctx, saved.ID, item.Genres)
+			m.saveCredits(ctx, saved.ID, videoResult)
+			m.syncSubtitles(ctx, saved.ID, path)
+			m.syncAudioTracks(ctx, saved.ID, path)
+			created++
 		}
-		saved, err := m.Store.UpsertItem(ctx, item)
-		if err != nil {
-			return len(files), created, err
-		}
-		m.syncSubtitles(ctx, saved.ID, path)
-		created++
 	}
 	return len(files), created, nil
+}
+
+// saveCredits stores an item's cast and crew, downloading each headshot
+// once. People are shared across films, so a cast member in twenty titles
+// costs one row and one image, not twenty.
+func (m *Manager) saveCredits(ctx context.Context, itemID string, r metadata.VideoResult) {
+	if len(r.Cast) == 0 && len(r.Crew) == 0 {
+		return
+	}
+	convert := func(people []metadata.Person, roleOf func(metadata.Person) string) []store.Person {
+		out := make([]store.Person, 0, len(people))
+		for _, p := range people {
+			sp := store.Person{TmdbID: p.TmdbID, Name: p.Name, Role: roleOf(p), Order: p.Order}
+			if p.ProfileURL != "" && m.ArtworkDir != "" {
+				name := "person-" + strconv.Itoa(p.TmdbID)
+				// DownloadArtwork skips a file that already exists, so a
+				// person seen again costs a stat, not a request.
+				if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, p.ProfileURL, m.ArtworkDir, name); err == nil {
+					sp.Profile = "/artwork/" + file
+				}
+			}
+			out = append(out, sp)
+		}
+		return out
+	}
+	cast := convert(r.Cast, func(p metadata.Person) string { return p.Character })
+	crew := convert(r.Crew, func(p metadata.Person) string { return p.Job })
+	if err := m.Store.ReplaceCredits(ctx, itemID, cast, crew); err != nil {
+		log.Printf("save credits for %s: %v", itemID, err)
+	}
+}
+
+// saveGenres writes an item's genres, leaving what is there when a match
+// produced none — the same rule the other metadata fields follow.
+func (m *Manager) saveGenres(ctx context.Context, itemID string, genres []string) {
+	if len(genres) == 0 {
+		return
+	}
+	// Genres live in their own table, so the lock that UpsertItem applies to
+	// the item's own columns does not reach them; check it here instead.
+	if it, err := m.Store.Item(ctx, itemID); err == nil && it.IsLocked("genres") {
+		return
+	}
+	if err := m.Store.ReplaceGenres(ctx, itemID, genres); err != nil {
+		log.Printf("save genres for %s: %v", itemID, err)
+	}
 }
 
 func (m *Manager) scanTV(ctx context.Context, lib store.Library, report reportFunc) (int, int, error) {
@@ -354,10 +504,12 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, report reportFu
 			LibraryID: lib.ID, Kind: store.KindEpisode, ParentID: seasonID,
 			Title: ep.Title, SeasonNum: ep.Season, EpisodeNum: ep.Episode, Path: path,
 		}
+		// Probe first: the placeholder below must not stand in for a parsed
+		// title, or a genuine title tag would be rejected as a mismatch.
+		m.fillFileInfo(&item, path)
 		if item.Title == "" {
 			item.Title = fmt.Sprintf("Episode %d", ep.Episode)
 		}
-		m.fillFileInfo(&item, path)
 		// TMDB episode data fills whatever tags and filenames didn't provide.
 		if sr, ok := seasonData[seasonDir]; ok {
 			for _, te := range sr.Episodes {
@@ -384,23 +536,38 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, report reportFu
 			return len(files), created, err
 		}
 		m.syncSubtitles(ctx, saved.ID, path)
+		m.syncAudioTracks(ctx, saved.ID, path)
 		created++
 	}
 	return len(files), created, nil
 }
 
-// fillFileInfo probes technical info plus embedded metadata: tags override
+// fillFileInfo probes technical info plus embedded metadata: tags refine
 // filename parsing (they carry correct punctuation, years, and synopses in
-// iTunes-style files), and attached cover art becomes the item's poster.
+// iTunes-style files) and attached cover art becomes the item's poster. The
+// title tag is only taken when PreferTagTitle accepts it — scene releases
+// stamp their own release name there, which would otherwise overwrite a
+// perfectly good title parsed from a clean path.
+// fillFileInfo probes the file and applies what it finds. Kept for the
+// callers that handle one file at a time (a single-item metadata refresh);
+// the scanners use probeBatch and applyProbe so the reads run in parallel.
 func (m *Manager) fillFileInfo(item *store.Item, path string) {
+	r := probed{Path: path}
 	if st, err := os.Stat(path); err == nil {
-		item.SizeBytes = st.Size()
+		r.SizeBytes = st.Size()
 	}
-	info, err := m.Probe(path)
-	if err != nil {
-		log.Printf("probe %s: %v", path, err)
+	r.Info, r.Err = m.Probe(path)
+	m.applyProbe(item, r)
+}
+
+// applyProbe copies an already-read probe onto an item.
+func (m *Manager) applyProbe(item *store.Item, r probed) {
+	item.SizeBytes = r.SizeBytes
+	if r.Err != nil {
+		log.Printf("probe %s: %v", r.Path, r.Err)
 		return
 	}
+	info := r.Info
 	item.RuntimeSecs = info.RuntimeSecs
 	item.Container = info.Container
 	item.VideoCodec = info.VideoCodec
@@ -409,8 +576,8 @@ func (m *Manager) fillFileInfo(item *store.Item, path string) {
 	item.Height = info.Height
 
 	t := info.Tags
-	if t.Title != "" {
-		item.Title = t.Title
+	if title, ok := PreferTagTitle(t.Title, item.Title); ok {
+		item.Title = title
 	}
 	if t.Year != 0 && item.Year == 0 {
 		item.Year = t.Year
@@ -425,8 +592,8 @@ func (m *Manager) fillFileInfo(item *store.Item, path string) {
 		item.EpisodeNum = t.EpisodeNum
 	}
 	if info.HasCoverArt && item.Poster == "" {
-		if img := media.ExtractCoverArt(path); img != nil {
-			if p := m.cacheArtwork("embed", path, img); p != "" {
+		if img := media.ExtractCoverArt(r.Path); img != nil {
+			if p := m.cacheArtwork("embed", r.Path, img); p != "" {
 				item.Poster = p
 			}
 		}
@@ -458,11 +625,46 @@ func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
 	}
 }
 
+// syncAudioTracks catalogues the file's audio streams so the player can
+// offer a picker without reprobing, mirroring syncSubtitles.
+func (m *Manager) syncAudioTracks(ctx context.Context, itemID, path string) {
+	streams, err := media.ProbeAudioTracks(path)
+	if err != nil {
+		log.Printf("probe audio %s: %v", path, err)
+		return
+	}
+	tracks := make([]store.AudioTrack, 0, len(streams))
+	for _, a := range streams {
+		tracks = append(tracks, store.AudioTrack{
+			StreamIndex: a.Index, Codec: a.Codec, Language: a.Language,
+			Title: a.Title, Channels: a.Channels, BitRate: a.BitRate, Default: a.Default,
+		})
+	}
+	if err := m.Store.ReplaceAudioTracks(ctx, itemID, tracks); err != nil {
+		log.Printf("save audio tracks for %s: %v", path, err)
+	}
+}
+
 func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r metadata.VideoResult) {
 	item.TmdbID = r.TmdbID
 	item.Overview = r.Overview
+	item.Rating, item.VoteCount = r.Rating, r.VoteCount
+	item.Tagline = r.Tagline
+	item.Certification = r.CertificationFor(m.CertRegion)
+	item.CollectionID, item.CollectionName = r.CollectionID, r.CollectionName
+	// Carried on the item so the caller can store them once the row has an
+	// id; genres live in their own table.
+	item.Genres = r.Genres
 	if r.Year > 0 && item.Year == 0 {
 		item.Year = r.Year
+	}
+	if r.BackdropURL != "" && m.ArtworkDir != "" {
+		name := "tmdb-" + strconv.Itoa(r.TmdbID) + "-backdrop"
+		if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, r.BackdropURL, m.ArtworkDir, name); err == nil {
+			item.Backdrop = "/artwork/" + file
+		} else {
+			log.Printf("backdrop for %s: %v", item.Title, err)
+		}
 	}
 	if r.PosterURL != "" && m.ArtworkDir != "" {
 		name := "tmdb-" + strconv.Itoa(r.TmdbID)

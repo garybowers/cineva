@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -12,17 +13,29 @@ import (
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
-// newManager builds a scan manager, wiring TMDB in only when a key is set.
+// newManager builds a scan manager, wiring TMDB in when a key is available —
+// the configured override if there is one, else the built-in project key.
 func newManager(st *store.Store, artworkDir string) *library.Manager {
 	var video metadata.VideoProvider
-	if key := viper.GetString("metadata.tmdb.api_key"); key != "" {
+	if key, ok := metadata.APIKey(viper.GetString("metadata.tmdb.api_key")); ok {
 		video = metadata.NewTMDB(key)
+	} else {
+		log.Printf("metadata: no TMDB key — titles will carry only what the files themselves hold. " +
+			"Set metadata.tmdb.api_key, CINEVA_METADATA_TMDB_API_KEY, or --tmdb-key.")
 	}
 	mgr := library.NewManager(st, video, artworkDir)
 	if viper.GetBool("metadata.musicbrainz.enabled") {
 		mgr.Music = metadata.NewMusicBrainz()
 	}
 	return mgr
+}
+
+// addTMDBKeyFlag registers --tmdb-key on a command. The flag is the top of
+// the usual precedence (flag > env > config > built-in default), so it is
+// the way to try a different key without editing anything.
+func addTMDBKeyFlag(cmd *cobra.Command) {
+	cmd.Flags().String("tmdb-key", "", "TMDB API key, overriding the built-in one")
+	_ = viper.BindPFlag("metadata.tmdb.api_key", cmd.Flags().Lookup("tmdb-key"))
 }
 
 var scanCmd = &cobra.Command{
@@ -78,5 +91,6 @@ var scanCmd = &cobra.Command{
 }
 
 func init() {
+	addTMDBKeyFlag(scanCmd)
 	rootCmd.AddCommand(scanCmd)
 }

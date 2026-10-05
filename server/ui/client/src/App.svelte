@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    getHealth, listLibraries, libraryItems, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents,
+    getHealth, listLibraries, libraryItems, libraryItemsSince, libraryGenres, type GenreCount,
+    libraryCollections, collectionDetail, type CollectionInfo,
+    libraryRecommended, type RecRow,
+    personDetail, type PersonProfile, type PersonCredit, type Person as PersonT, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents, setWatched,
     authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
@@ -11,7 +14,7 @@
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
-    RotateCcw, AudioLines, LogOut, KeyRound,
+    RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
   } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'settings'
@@ -156,8 +159,20 @@
       const k = await createAPIKey(newKeyName || 'API key')
       revealedKey = k.key
       newKeyName = ''
-      loadKeys()
+      apiKeys = [...apiKeys, k]
     } catch (err) {
+      pwMsg = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  // Revoking drops the row immediately; a failure restores it and says why.
+  async function revokeKey(id: string) {
+    const before = apiKeys
+    apiKeys = apiKeys.filter((k) => k.id !== id)
+    try {
+      await deleteAPIKey(id)
+    } catch (err) {
+      apiKeys = before
       pwMsg = err instanceof Error ? err.message : String(err)
     }
   }
@@ -167,13 +182,47 @@
   let offline = $state(false)
   let routing = false // true while applyRoute drives state (suppresses pushState)
 
-  // ---- URL routing: /libraries/<Library>/<Title>/... (names, not ids) ----
+  // ---- URL routing: /libraries/<Library>/<view>/<Title>/... (names, not ids) ----
+  //
+  // `genres`, `collections` and `library` are reserved as the first segment
+  // after a library name, so a view is linkable and survives a reload. A
+  // film actually titled one of those three is shadowed by the view — a
+  // trade worth making for routes that read the way the breadcrumb does.
+  const libViewSegments = ['genres', 'collections', 'library']
+
+  function viewPath(): string {
+    if (libTab === 'genres') return '/genres' + (genre ? '/' + encodeURIComponent(genre) : '')
+    if (libTab === 'collections') return '/collections' + (collection ? '/' + encodeURIComponent(collection.name) : '')
+    if (libTab === 'library') return '/library'
+    return '' // recommended is the default view and needs no segment
+  }
+
+  // The library view as breadcrumb steps: "Collections › Scream Collection".
+  // Derived from the same state the route is, so the two cannot disagree.
+  type ViewCrumb = { label: string; go: () => void }
+  const viewCrumbs = $derived.by<ViewCrumb[]>(() => {
+    const out: ViewCrumb[] = []
+    if (libTab === 'genres') {
+      out.push({ label: 'Genres', go: () => { detail = null; trail = []; genre = null; syncURL() } })
+      if (genre) out.push({ label: genre, go: () => { detail = null; trail = []; syncURL() } })
+    } else if (libTab === 'collections') {
+      out.push({ label: 'Collections', go: () => { detail = null; trail = []; collection = null; syncURL() } })
+      if (collection) out.push({ label: collection.name, go: () => { detail = null; trail = []; syncURL() } })
+    }
+    return out
+  })
+
   function buildPath(): string {
     if (listening && music) return '/listening'
     if (tab === 'home') return '/'
     if (tab === 'settings') return '/settings'
     let p = '/libraries'
-    if (currentLib) p += '/' + encodeURIComponent(currentLib.name)
+    if (currentLib) {
+      p += '/' + encodeURIComponent(currentLib.name)
+      // Kept on item URLs too, so opening a film from inside a collection
+      // and reloading still shows where you came from.
+      p += viewPath()
+    }
     if (detail) {
       for (const a of trail) p += '/' + encodeURIComponent(a.title)
       p += '/' + encodeURIComponent(detail.item.title)
@@ -230,7 +279,34 @@
         return
       }
       await openLibrary(lib)
-      const segs = parts.slice(2)
+      let segs = parts.slice(2)
+
+      // A reserved view segment, and then the genre or collection name —
+      // which is unambiguous here because we are already inside that view.
+      switch (segs[0]) {
+        case 'genres':
+          libTab = 'genres'
+          segs = segs.slice(1)
+          if (segs.length > 0) {
+            await openGenre(segs[0])
+            segs = segs.slice(1)
+          }
+          break
+        case 'collections':
+          libTab = 'collections'
+          segs = segs.slice(1)
+          if (segs.length > 0) {
+            if (collections.length === 0) await loadCollections(lib)
+            const c = collections.find((x) => x.name === segs[0])
+            if (c) await openCollection(c)
+            segs = segs.slice(1)
+          }
+          break
+        case 'library':
+          libTab = 'library'
+          segs = segs.slice(1)
+          break
+      }
       if (segs.length === 0) return
 
       // Resolve title segments against the library's item tree.
@@ -376,7 +452,7 @@
       const seasonIds = new Set(items.filter((i) => i.parentId === root.id).map((i) => i.id))
       return items
         .filter((i) => i.kind === 'episode' && i.parentId && seasonIds.has(i.parentId))
-        .toSorted((a, b) => (a.seasonNum ?? 0) - (b.seasonNum ?? 0) || (a.episodeNum ?? 0) - (b.episodeNum ?? 0))
+        .sort((a, b) => (a.seasonNum ?? 0) - (b.seasonNum ?? 0) || (a.episodeNum ?? 0) - (b.episodeNum ?? 0))
     }
     return []
   }
@@ -507,13 +583,369 @@
   const gridFilter = (lib: Library) => (i: Item) =>
     lib.mediaType === 'music' ? i.kind === 'album' : i.kind === 'movie' || i.kind === 'series'
 
+  // ---- Library view: sub-tabs, a text filter and a sort order ----
+  type LibTab = 'recommended' | 'library' | 'genres' | 'collections'
+  let libTab: LibTab = $state('recommended')
+  let gridQuery = $state('')
+  // Date added, rating and runtime are all already on the item, so these
+  // cost nothing beyond the comparator.
+  type GridSort = 'title' | 'year' | 'added' | 'rating' | 'runtime' | 'watched'
+  let gridSort: GridSort = $state('title')
+  // Narrowing to what is still unseen is the usual way of picking something
+  // to watch, so it is a first-class control rather than a search term.
+  let gridWatch: 'all' | 'unwatched' | 'watched' = $state('all')
+  // Minimum provider score. "Something good tonight" is a real way of
+  // choosing, and the rating is already on every matched item.
+  let gridMinRating = $state(0)
+  let activeLetter = $state('')
+
+  // Titles are sorted and bucketed on a leading-article-stripped key, so
+  // "The Matrix" files under M where a viewer looks for it.
+  const sortKey = (t: string) => t.replace(/^(the|a|an)\s+/i, '').toLocaleLowerCase()
+  const initialOf = (t: string) => {
+    const c = sortKey(t).charAt(0).toUpperCase()
+    return c >= 'A' && c <= 'Z' ? c : '#'
+  }
+
+  /** How far through the viewer is, 0 when unstarted or finished. */
+  const progressPct = (i: Item) =>
+    !i.watched && i.positionSecs && i.runtimeSecs
+      ? Math.min(100, Math.round((i.positionSecs / i.runtimeSecs) * 100))
+      : 0
+
+  const byTitle = (a: Item, b: Item) => sortKey(a.title).localeCompare(sortKey(b.title))
+  // Every comparator falls back to title, so equal keys (no rating, same
+  // year, missing runtime) still come out in a stable, meaningful order
+  // rather than whatever the query happened to return.
+  const comparators: Record<GridSort, (a: Item, b: Item) => number> = {
+    title: byTitle,
+    year: (a, b) => (b.year ?? 0) - (a.year ?? 0) || byTitle(a, b),
+    added: (a, b) => (b.addedAt ?? '').localeCompare(a.addedAt ?? '') || byTitle(a, b),
+    rating: (a, b) => (b.rating ?? 0) - (a.rating ?? 0) || byTitle(a, b),
+    runtime: (a, b) => (b.runtimeSecs ?? 0) - (a.runtimeSecs ?? 0) || byTitle(a, b),
+    // Never-touched films sort last rather than first: an empty timestamp
+    // would otherwise lead the list under a plain string comparison.
+    watched: (a, b) => (b.watchedAt ?? '').localeCompare(a.watchedAt ?? '') || byTitle(a, b),
+  }
+
+  const visibleItems = $derived.by(() => {
+    const q = gridQuery.trim().toLocaleLowerCase()
+    const out = gridItems.filter((i) => {
+      if (gridWatch === 'unwatched' && i.watched) return false
+      if (gridWatch === 'watched' && !i.watched) return false
+      // An unrated film is excluded by any minimum rather than treated as
+      // zero: "7+" means "known to be good", not "not known to be bad".
+      if (gridMinRating > 0 && (i.rating ?? 0) < gridMinRating) return false
+      if (!q) return true
+      // Matched across the fields the item carries. Cast is searched through
+      // the server's /search, which can reach the credits tables; this box
+      // filters the list already in hand.
+      return (
+        i.title.toLocaleLowerCase().includes(q) ||
+        (i.artist?.toLocaleLowerCase().includes(q) ?? false) ||
+        (i.overview?.toLocaleLowerCase().includes(q) ?? false) ||
+        String(i.year ?? '').includes(q)
+      )
+    })
+    return out.sort(comparators[gridSort])
+  })
+
+  // A–Z sections, and the rail that jumps between them. Sorting by year
+  // makes an alphabetical index meaningless, so both disappear.
+  const sections = $derived.by(() => {
+    if (gridSort !== 'title') return []
+    const by = new Map<string, Item[]>()
+    for (const i of visibleItems) {
+      const k = initialOf(i.title)
+      const list = by.get(k)
+      if (list) list.push(i)
+      else by.set(k, [i])
+    }
+    const letters = [...by.keys()].filter((c) => c !== '#').sort()
+    if (by.has('#')) letters.push('#')
+    return letters.map((letter) => ({ letter, items: by.get(letter)! }))
+  })
+
+  // Height of everything pinned above the grid, so a jump lands the heading
+  // just below it instead of under it.
+  // The sticky header (tabs + filter bar) and the top bar together eat a
+  // real slice of a short laptop screen in landscape, so the header slides
+  // away while scrolling down through the grid and comes back the moment
+  // the viewer scrolls up — the gesture people already make when they want
+  // the controls.
+  let headHidden = $state(false)
+
+  function stuckOffset(): number {
+    const bar = document.querySelector('.topbar') as HTMLElement | null
+    const head = document.querySelector('.libhead') as HTMLElement | null
+    // A hidden header is not occupying space at the top of the viewport, so
+    // a jump must not reserve room for it or every landing is short.
+    const headH = headHidden ? 0 : (head?.offsetHeight ?? 0)
+    return (bar?.offsetHeight ?? 0) + headH
+  }
+
+  // The rail is one tab stop, not one per letter: a roving tabindex. Twenty-
+  // six stops between the filter box and the grid would be worse for a
+  // keyboard user than the rail is worth, and arrow keys are what the WAI
+  // pattern for a toolbar expects anyway.
+  let railFocus = $state(0)
+
+  function railKey(e: KeyboardEvent) {
+    const last = sections.length - 1
+    if (last < 0) return
+    let next = railFocus
+    switch (e.key) {
+      case 'ArrowDown':
+      case 'ArrowRight':
+        next = Math.min(railFocus + 1, last)
+        break
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        next = Math.max(railFocus - 1, 0)
+        break
+      case 'Home':
+        next = 0
+        break
+      case 'End':
+        next = last
+        break
+      default:
+        return // leave Enter/Space to the button itself
+    }
+    e.preventDefault()
+    railFocus = next
+    // Move focus with the roving index, then jump — so the letter under the
+    // cursor is both focused and shown.
+    const el = railEl?.querySelectorAll('.azl')[next] as HTMLElement | undefined
+    el?.focus()
+    jumpTo(sections[next].letter)
+  }
+
+  // Keep the tab stop on the letter the viewer is actually looking at, so
+  // tabbing into the rail after scrolling lands where they are.
+  $effect(() => {
+    const i = sections.findIndex((sec) => sec.letter === activeLetter)
+    if (i >= 0) railFocus = i
+  })
+
+  function jumpTo(letter: string) {
+    const el = document.getElementById('az-' + letter)
+    if (!el) return
+    // Using the rail means the viewer is navigating, so bring the header
+    // back rather than landing under a hidden one.
+    headHidden = false
+    const y = el.getBoundingClientRect().top + window.scrollY - stuckOffset() - 8
+    window.scrollTo({ top: Math.max(0, y) })
+    activeLetter = letter
+  }
+
+  // Dragging a finger down the rail tracks through the letters, so the whole
+  // alphabet is reachable in one gesture at any height.
+  let railEl: HTMLElement | null = $state(null)
+  let railDragging = false
+  function railAt(clientY: number) {
+    if (!railEl || sections.length === 0) return
+    const r = railEl.getBoundingClientRect()
+    const i = Math.floor(((clientY - r.top) / r.height) * sections.length)
+    const s = sections[Math.min(sections.length - 1, Math.max(0, i))]
+    if (s && s.letter !== activeLetter) jumpTo(s.letter)
+  }
+  function railDown(e: PointerEvent) {
+    railDragging = true
+    railEl?.setPointerCapture(e.pointerId)
+    railAt(e.clientY)
+  }
+  function railMove(e: PointerEvent) {
+    if (railDragging) railAt(e.clientY)
+  }
+  function railUp(e: PointerEvent) {
+    railDragging = false
+    railEl?.releasePointerCapture(e.pointerId)
+  }
+
+  // Scroll spy: the active letter is the last section whose top has passed
+  // the top of the viewport — read straight off the layout in document
+  // order. An IntersectionObserver reports only the sections whose state
+  // changed, in no particular order, which highlighted B while A filled the
+  // screen.
+  $effect(() => {
+    if (sections.length === 0) return
+    const letters = sections.map((sec) => sec.letter)
+    let queued = false
+    let lastY = window.scrollY
+    const sync = () => {
+      queued = false
+
+      // Collapse on the way down, reveal on the way up. The threshold stops
+      // the header flickering on the small scroll jitter a trackpad makes,
+      // and it always returns near the top so the controls are never
+      // stranded out of reach.
+      const y = window.scrollY
+      const delta = y - lastY
+      if (Math.abs(delta) > 6) {
+        headHidden = delta > 0 && y > stuckOffset() * 2
+        lastY = y
+      }
+
+      let current = letters[0]
+      for (const l of letters) {
+        const el = document.getElementById('az-' + l)
+        if (el && el.getBoundingClientRect().top <= stuckOffset() + 16) current = l
+        else break
+      }
+      activeLetter = current
+    }
+    const onScroll = () => {
+      if (queued) return
+      queued = true
+      requestAnimationFrame(sync)
+    }
+    sync()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+    }
+  })
+
+  // ---- People ----
+  // Opening a cast member shows everything else in the library they are in,
+  // which turns the cast list into a way through the collection rather than
+  // a list of names.
+  let person: PersonProfile | null = $state(null)
+
+  /**
+   * A filmography reads by what someone did, not by a flat list of titles:
+   * acting roles first (the usual reason to tap a cast member), then the
+   * crew work, each newest first — which is the order the server returns.
+   */
+  const personActing = $derived(person?.credits.filter((c) => c.creditKind === 'cast') ?? [])
+  const personCrew = $derived(person?.credits.filter((c) => c.creditKind === 'crew') ?? [])
+
+  /** "Director, Writer · 1994–2024 · 12 titles" */
+  const personSummary = $derived.by(() => {
+    if (!person) return ''
+    const parts: string[] = []
+    if (person.jobs?.length) parts.push(person.jobs.slice(0, 3).join(', '))
+    if (person.firstYear) {
+      parts.push(person.firstYear === person.lastYear ? `${person.firstYear}` : `${person.firstYear}–${person.lastYear}`)
+    }
+    const n = person.credits.length
+    parts.push(`${n} ${n === 1 ? 'title' : 'titles'} here`)
+    return parts.join(' · ')
+  })
+
+  async function openPerson(id: string) {
+    try {
+      person = await personDetail(id)
+      syncURL()
+    } catch (err) {
+      console.error('person lookup failed', err)
+    }
+  }
+
+  const closePerson = () => (person = null)
+
+  // ---- Genres ----
+  // The list is whatever this library's films carry, so it reflects the
+  // collection rather than a fixed vocabulary.
+  let genres: GenreCount[] = $state([])
+  let genre: string | null = $state(null)
+  let genreItems: Item[] = $state([])
+
+  async function loadGenres(lib: Library) {
+    try {
+      genres = await libraryGenres(lib.id)
+    } catch {
+      genres = []
+    }
+  }
+
+  // Collections come from TMDB's belongs_to_collection — Harry Potter,
+  // James Bond, The Lord of the Rings and so on are all detected there, so
+  // this needs no franchise list of its own. The server only reports a
+  // collection once the library holds more than one of its films.
+  let collections: CollectionInfo[] = $state([])
+  let collection: CollectionInfo | null = $state(null)
+  let collItems: Item[] = $state([])
+
+  // Recommended shelves, decided server-side. Reloaded when watch state
+  // changes, since every row is "things you have not seen".
+  let recRows: RecRow[] = $state([])
+
+  async function loadRecommended(lib: Library) {
+    try {
+      recRows = await libraryRecommended(lib.id)
+    } catch {
+      recRows = []
+    }
+  }
+
+  async function loadCollections(lib: Library) {
+    try {
+      collections = await libraryCollections(lib.id)
+    } catch {
+      collections = []
+    }
+  }
+
+  async function openCollection(c: CollectionInfo) {
+    collection = c
+    collItems = []
+    syncURL()
+    if (!currentLib) return
+    try {
+      const d = await collectionDetail(currentLib.id, c.key)
+      // The server's summary is authoritative — it knows the viewer's
+      // progress and which film is next; the tile we were clicked from may
+      // be a cached copy.
+      collection = d.collection
+      collItems = d.items
+    } catch {
+      collItems = []
+    }
+  }
+
+  /**
+   * Play a collection from where the viewer left off: the queue is the whole
+   * set in its own order, starting at the server's next-up. Watching through
+   * a series is then one click rather than one per film.
+   */
+  function playCollection() {
+    const id = collection?.nextUpId
+    const from = id ? collItems.findIndex((i) => i.id === id) : 0
+    playList(collItems, from < 0 ? 0 : from)
+  }
+
+  async function openGenre(name: string) {
+    genre = name
+    genreItems = []
+    syncURL()
+    if (!currentLib) return
+    try {
+      genreItems = await libraryItems(currentLib.id, name)
+    } catch {
+      genreItems = []
+    }
+  }
+
+  // ---- Recommended ----
+  const resumeHere = $derived(resume.filter((r) => r.libraryId === currentLib?.id))
+  const recentlyAdded = $derived(
+    gridItems
+      .filter((i) => i.addedAt)
+      .sort((a, b) => (b.addedAt ?? '').localeCompare(a.addedAt ?? ''))
+      .slice(0, 12),
+  )
+
   // ---- Music view: artist rail + album shelves ----
   let musicAll: Item[] = $state([])
   let selArtist = $state('ALL') // artist item id | 'ALL' | 'COMP'
   let selAlbumId: string | null = $state(null) // expanded album panel
 
   const mArtists = $derived(
-    musicAll.filter((i) => i.kind === 'artist').toSorted((a, b) => a.title.localeCompare(b.title)),
+    musicAll.filter((i) => i.kind === 'artist').sort((a, b) => a.title.localeCompare(b.title)),
   )
   const mAlbums = $derived(musicAll.filter((i) => i.kind === 'album'))
   const mTracks = $derived(musicAll.filter((i) => i.kind === 'track'))
@@ -540,14 +972,14 @@
   // Shelf groups: one per artist for "All", a single group otherwise.
   const shelfGroups = $derived.by(() => {
     if (selArtist === 'COMP') {
-      return [{ id: 'COMP', title: 'Compilations', albums: mAlbums.filter((a) => compAlbumIds.has(a.id)).toSorted(byYear) }]
+      return [{ id: 'COMP', title: 'Compilations', albums: mAlbums.filter((a) => compAlbumIds.has(a.id)).sort(byYear) }]
     }
     if (selArtist !== 'ALL') {
       const a = mArtists.find((x) => x.id === selArtist)
-      return [{ id: selArtist, title: a?.title ?? '', albums: mAlbums.filter((al) => al.parentId === selArtist).toSorted(byYear) }]
+      return [{ id: selArtist, title: a?.title ?? '', albums: mAlbums.filter((al) => al.parentId === selArtist).sort(byYear) }]
     }
     return mArtists
-      .map((a) => ({ id: a.id, title: a.title, albums: mAlbums.filter((al) => al.parentId === a.id).toSorted(byYear) }))
+      .map((a) => ({ id: a.id, title: a.title, albums: mAlbums.filter((al) => al.parentId === a.id).sort(byYear) }))
       .filter((g) => g.albums.length > 0)
   })
   const shelfAlbumCount = $derived(shelfGroups.reduce((n, g) => n + g.albums.length, 0))
@@ -672,7 +1104,7 @@
         gridItems = items.filter(gridFilter(lib))
       })
     }
-    await openItem(target.id)
+    await openItem(target.id, false, target)
   }
 
   function readQuality(): PlayQuality {
@@ -707,19 +1139,80 @@
 
   async function poll() {
     try {
-      health = await getHealth()
+      const [h, libs, res] = await Promise.all([getHealth(), listLibraries(), continueWatching()])
+      health = h
+      libraries = libs
+      resume = res
       offline = false
-      libraries = await listLibraries()
-      resume = await continueWatching()
+      // The bus drops events for a subscriber whose buffer is full, so the
+      // grid cannot rely on hints alone to be current. Its own failure is
+      // not a connectivity verdict, so it never flips the offline flag.
+      if (currentLib) refreshLibraryItems().catch(() => {})
     } catch {
       health = null
       offline = true
     }
   }
 
-  async function startPlay(item: Item, quality: PlayQuality = readQuality(), fromStart = false) {
+  // ---- Play queue ----
+  //
+  // Playing a single film replaces the queue with just that film, so the
+  // default stays "play this and stop". Playing a collection loads the set,
+  // and the player rolls through it.
+  let queue: Item[] = $state([])
+  let queueIndex = $state(0)
+  const upNext = $derived(queue.slice(queueIndex + 1))
+
+  /** Queue a collection (or any list) and start at the given position. */
+  function playList(items: Item[], startIndex = 0) {
+    if (items.length === 0) return
+    const at = Math.max(0, Math.min(startIndex, items.length - 1))
+    queue = items
+    queueIndex = at
+    startPlay(items[at], readQuality(), false, undefined, true)
+  }
+
+  function enqueue(item: Item) {
+    // Appending to an empty queue while nothing plays would silently do
+    // nothing visible, so it starts playing instead.
+    if (queue.length === 0 && !playing) {
+      playList([item])
+      return
+    }
+    queue = [...queue, item]
+  }
+
+  const dequeue = (index: number) => {
+    const absolute = queueIndex + 1 + index
+    queue = queue.filter((_, i) => i !== absolute)
+  }
+
+  const clearQueue = () => {
+    queue = playing ? [playing.item] : []
+    queueIndex = 0
+  }
+
+  /** Called when a film ends with no next episode to roll into. */
+  function queueAdvance() {
+    const next = queue[queueIndex + 1]
+    if (!next) {
+      closePlayer()
+      return
+    }
+    queueIndex += 1
+    playing = null
+    startPlay(next, readQuality(), false, undefined, true)
+  }
+
+  async function startPlay(item: Item, quality: PlayQuality = readQuality(), fromStart = false, audioTrack?: number, keepQueue = false) {
+    // Anything the viewer starts directly is a fresh queue of one; only the
+    // queue itself plays on without resetting it.
+    if (!keepQueue) {
+      queue = [item]
+      queueIndex = 0
+    }
     try {
-      const info = await playItem(item.id, quality, fromStart)
+      const info = await playItem(item.id, quality, fromStart, audioTrack)
       music = null // video and music are mutually exclusive
       playingPos = info.positionSecs || 0
       playing = { item, info, quality, gen: ++playGen }
@@ -737,7 +1230,7 @@
 
   function playNext(next: Item) {
     playing = null
-    startPlay(next)
+    startPlay(next, readQuality(), false, undefined, true)
   }
 
   function changeQuality(q: PlayQuality) {
@@ -746,13 +1239,30 @@
     } catch {
       /* private browsing */
     }
-    if (playing) startPlay(playing.item, q)
+    if (playing) startPlay(playing.item, q, false, undefined, true)
+  }
+
+  // Switching audio track restarts the session with that stream, the same
+  // way a quality change does — the transcoder picks one track per session.
+  function changeAudioTrack(streamIndex: number) {
+    if (playing) startPlay(playing.item, playing.quality, false, streamIndex, true)
   }
 
   async function openLibrary(lib: Library) {
     currentLib = lib
     detail = null
     trail = []
+    gridItems = [] // never show the previous library's tiles under the new name
+    musicAll = []
+    libTab = 'recommended'
+    gridQuery = ''
+    activeLetter = ''
+    genre = null
+    genreItems = []
+    itemsMark = ''
+    loadGenres(lib)
+    loadCollections(lib)
+    loadRecommended(lib)
     const items = await libraryItems(lib.id)
     if (lib.mediaType === 'music') {
       musicAll = items
@@ -768,10 +1278,25 @@
   // fromChild: opened via the current detail's children list (drill-down);
   // otherwise the trail is rebuilt by walking the parent chain, so direct
   // jumps (resume, search) still show the full path.
-  async function openItem(id: string, fromChild = false) {
+  // known: the Item the caller already has (a grid tile, a children list).
+  // Passing it paints the page on the click instead of after the fetch.
+  async function openItem(id: string, fromChild = false, known?: Item) {
     const parent = fromChild && detail ? detail.item : null
+    const baseTrail = trail // captured: the instant paint below may extend it
+
+    // Paint from what we already know so the click lands at once; children,
+    // play state and breadcrumbs fill in when the fetch returns. Episodes are
+    // excluded — they redirect to their season, so painting the episode first
+    // would flash a page we are about to leave.
+    if (known && known.kind !== 'episode') {
+      detail = { item: known, children: [] }
+      epDetail = null
+      detailSubs = []
+      if (parent) trail = [...baseTrail, parent]
+      syncURL()
+    }
+
     let d = await itemDetail(id)
-    let ancestors: Item[] | null = null
     // Seasons are the last navigation level: opening an episode opens its
     // season with the episode selected in-page.
     let selectEp: Item | null = null
@@ -782,9 +1307,12 @@
     detail = d
     epDetail = null
     if (parent && !selectEp) {
-      trail = [...trail, parent]
+      trail = [...baseTrail, parent]
     } else {
-      ancestors = []
+      // Each parent id comes from the item before it, so this walk cannot be
+      // parallelised — but the page is already painted, so it only delays the
+      // breadcrumbs rather than the content.
+      const ancestors: Item[] = []
       let parentId = detail.item.parentId
       while (parentId && ancestors.length < 4) {
         try {
@@ -839,10 +1367,16 @@
     syncURL()
   }
 
+  // Clicking the library crumb returns to the library itself, so it also
+  // leaves whichever view (genre, collection) you had drilled into —
+  // otherwise the crumb would be a no-op from inside one.
   function toGrid() {
     detail = null
     epDetail = null
     trail = []
+    libTab = 'recommended'
+    genre = null
+    collection = null
     syncURL()
   }
 
@@ -860,13 +1394,127 @@
     return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`
   }
 
+  // Grouped by role — "Director: Phil Lord, Christopher Miller" — rather
+  // than one entry per credit, which repeats the role for every co-director
+  // and reads as noise. Producer credits are dropped: a big film has a
+  // dozen and nobody scans a detail page for them.
+  const CREW_ROLES = ['Director', 'Screenplay', 'Writer', 'Story', 'Novel', 'Director of Photography', 'Original Music Composer']
+
+  function crewByRole(crew: PersonT[]): { role: string; people: PersonT[] }[] {
+    const groups = new Map<string, PersonT[]>()
+    for (const c of crew) {
+      if (!c.role || !CREW_ROLES.includes(c.role)) continue
+      const list = groups.get(c.role) ?? []
+      if (!list.some((p) => p.id === c.id)) list.push(c)
+      groups.set(c.role, list)
+    }
+    return CREW_ROLES.filter((r) => groups.has(r)).map((r) => ({ role: r, people: groups.get(r)! }))
+  }
+
+  // "2160p HEVC · 28.4 GB" — enough to tell two copies apart at a glance.
+  function versionLabel(v: Item): string {
+    const parts: string[] = []
+    if (v.height) parts.push(`${v.height}p`)
+    if (v.videoCodec) parts.push(v.videoCodec.toUpperCase())
+    if (v.sizeBytes) parts.push(fmtSize(v.sizeBytes))
+    return parts.join(' · ') || 'Version'
+  }
+
+  const fmtSize = (b: number) =>
+    b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`
+
+  // Marking watched is optimistic: the flag flips at once and the server
+  // confirms. Both directions clear the resume position, so the Resume
+  // button and "min left" follow from the same state.
+  async function toggleWatched() {
+    if (!detail) return
+    const item = detail.item
+    const before = detail
+    const next = !detail.playState?.watched
+    detail = { ...detail, playState: { itemId: item.id, positionSecs: 0, watched: next } }
+    try {
+      await setWatched(item.id, next)
+      continueWatching().then((r) => (resume = r)).catch(() => {})
+    } catch (err) {
+      detail = before
+      console.error('mark watched failed', err)
+    }
+  }
+
+  /**
+   * Toggle watched straight from a grid tile, so marking a stack of films
+   * seen does not mean opening each one. Optimistic: the tile flips at once
+   * and reverts if the server refuses.
+   */
+  async function toggleWatchedOn(item: Item, e: Event) {
+    // The tile itself is a button that opens the film; this sits inside it.
+    e.stopPropagation()
+    e.preventDefault()
+    const next = !item.watched
+    const before = gridItems
+    gridItems = gridItems.map((i) => (i.id === item.id ? { ...i, watched: next, positionSecs: 0 } : i))
+    // The genre, collection and person lists hold their own copies.
+    const patch = (list: Item[]) => list.map((i) => (i.id === item.id ? { ...i, watched: next, positionSecs: 0 } : i))
+    genreItems = patch(genreItems)
+    collItems = patch(collItems)
+    try {
+      await setWatched(item.id, next)
+      continueWatching().then((r) => (resume = r)).catch(() => {})
+    } catch (err) {
+      gridItems = before
+      console.error('mark watched failed', err)
+    }
+  }
+
   // Refetch the open library's items in place, without disturbing the view
-  // (selected artist, expanded album, breadcrumbs stay put).
-  async function refreshLibraryItems() {
+  // (selected artist, expanded album, breadcrumbs stay put). The grid is
+  // keyed by item id, so a scan's new items appear without re-rendering the
+  // tiles already on screen.
+  //
+  // A running scan fires refetch hints about once a second. Only one request
+  // is ever in flight: a hint arriving during one sets refreshPending and is
+  // served by a single trailing refetch, so a big library that takes longer
+  // than a second to fetch self-throttles instead of queueing up requests.
+  let refreshing = false
+  let refreshPending = false
+  // The high-water mark of the last items response, so a refetch during a
+  // scan asks only for what changed. Reset whenever the library changes.
+  let itemsMark = $state('')
+
+  async function refreshLibraryItems(full = false) {
     if (!currentLib) return
-    const items = await libraryItems(currentLib.id)
-    if (currentLib.mediaType === 'music') musicAll = items
-    else gridItems = items.filter(gridFilter(currentLib))
+    if (refreshing) {
+      refreshPending = true
+      return
+    }
+    refreshing = true
+    const lib = currentLib
+    try {
+      const { items, mark } = await libraryItemsSince(lib.id, full ? undefined : itemsMark || undefined)
+      // The library may have been switched while the request was in flight;
+      // applying another library's items would blank the grid.
+      if (currentLib?.id !== lib.id) return
+      itemsMark = mark || itemsMark
+
+      const merge = (prev: Item[], incoming: Item[]) => {
+        if (incoming.length === 0) return prev
+        const byID = new Map(prev.map((i) => [i.id, i]))
+        for (const i of incoming) byID.set(i.id, i)
+        return [...byID.values()]
+      }
+      // A delta is merged into what is on screen; a full fetch replaces it,
+      // which is also how rows that were pruned or folded into a version
+      // finally disappear.
+      const next = full || !itemsMark ? items : merge(lib.mediaType === 'music' ? musicAll : gridItems, items)
+      if (lib.mediaType === 'music') musicAll = next
+      else gridItems = next.filter(gridFilter(lib))
+    } finally {
+      refreshing = false
+      if (refreshPending) {
+        refreshPending = false
+        refreshLibraryItems().catch(() => {})
+      }
+    }
   }
 
   // boot runs once signed in: data loads, routing, the live event stream.
@@ -887,10 +1535,15 @@
         libraries: () => {
           listLibraries().then((l) => (libraries = l)).catch(() => {})
           continueWatching().then((r) => (resume = r)).catch(() => {})
+          // Scan end: pruning and version grouping have run, and neither is
+          // expressible as a delta (a removed row simply stops existing), so
+          // this is the one refetch that must be a full one.
+          if (currentLib) refreshLibraryItems(true).catch(() => {})
         },
-        scan: (data) => {
-          const s = data as { libraryId?: string; status?: string } | null
-          if (s?.status === 'completed' && currentLib?.id === s.libraryId) {
+        // Fired throughout a scan as items land, so the grid fills in live.
+        items: (data) => {
+          const e = data as { libraryId?: string } | null
+          if (e?.libraryId && currentLib?.id === e.libraryId) {
             refreshLibraryItems().catch(() => {})
           }
         },
@@ -924,8 +1577,107 @@
   {#if item.poster}
     <img class="poster" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'} src={item.poster} alt={item.title} loading="lazy" />
   {:else}
-    <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}><span>{#if item.kind === 'album' || item.kind === 'track'}<MusicIcon size={30} />{:else}{item.title.slice(0, 1)}{/if}</span></div>
+    <div class="poster placeholder" class:square={item.kind === 'album' || item.kind === 'artist' || item.kind === 'track'}>
+      <span>
+        {#if item.kind === 'album' || item.kind === 'track' || item.kind === 'artist'}
+          <MusicIcon size={26} />
+        {:else if item.kind === 'series' || item.kind === 'season' || item.kind === 'episode'}
+          <Tv size={26} />
+        {:else}
+          <Clapperboard size={26} />
+        {/if}
+      </span>
+    </div>
   {/if}
+{/snippet}
+
+{#snippet personPanel()}
+  {#if person}
+    <div class="pback" role="presentation" onclick={closePerson}></div>
+    <div class="ppanel" role="dialog" aria-modal="true" aria-label={person.name}>
+      <div class="phead">
+        {#if person.profile}
+          <img class="headshot lg" src={person.profile} alt="" />
+        {:else}
+          <span class="headshot lg ph"><User size={26} /></span>
+        {/if}
+        <div>
+          <h2>{person.name}</h2>
+          <p class="muted small">{personSummary}</p>
+        </div>
+        <button class="ctlx" onclick={closePerson} aria-label="Close"><X size={16} /></button>
+      </div>
+      {#if person.credits.length === 0}
+        <p class="muted">Nothing else here with them yet.</p>
+      {:else}
+        {#if personActing.length > 0}
+          <h3 class="psec">
+            {personCrew.length > 0 ? 'Acting' : 'Films'}
+            <span class="muted">{personActing.length}</span>
+          </h3>
+          {@render filmography(personActing)}
+        {/if}
+        {#if personCrew.length > 0}
+          <h3 class="psec">Crew <span class="muted">{personCrew.length}</span></h3>
+          {@render filmography(personCrew)}
+        {/if}
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+<!-- A filmography row shows the role, which is the point of a person page:
+     "Ryland Grace" or "Director" is what distinguishes one credit from
+     another, and a bare poster grid loses it. -->
+{#snippet filmography(credits: PersonCredit[])}
+  <div class="grid">
+    {#each credits as c (c.id + c.creditKind)}
+      <button class="cell" onclick={() => { closePerson(); openItem(c.id, false, c) }}>
+        <span class="posterwrap">
+          {@render poster(c)}
+          {#if c.watched}<span class="seen" title="Watched"><Check size={13} /></span>{/if}
+        </span>
+        <span class="cell-title">{c.title}</span>
+        <span class="cell-sub">
+          {c.year ?? ''}{#if c.role}<span class="prole">{c.role}</span>{/if}
+        </span>
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet cell(item: Item)}
+  <button class="cell" onclick={() => openItem(item.id, false, item)}>
+    <span class="posterwrap">
+      {@render poster(item)}
+      {#if item.kind === 'movie' || item.kind === 'episode'}
+        <!-- Always in the DOM so it is reachable by keyboard and on touch,
+             where there is no hover to reveal it; CSS fades it in on hover
+             for pointer devices. -->
+        <span
+          class="seentoggle"
+          class:on={item.watched}
+          role="button"
+          tabindex="0"
+          aria-label={item.watched ? `Mark ${item.title} unwatched` : `Mark ${item.title} watched`}
+          title={item.watched ? 'Watched — click to unmark' : 'Mark watched'}
+          onclick={(e) => toggleWatchedOn(item, e)}
+          onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') toggleWatchedOn(item, e) }}
+        >
+          <Check size={13} />
+        </span>
+      {:else if item.watched}
+        <span class="seen" title="Watched"><Check size={13} /></span>
+      {/if}
+      {#if progressPct(item) > 0}
+        <span class="resume" title="{progressPct(item)}% watched"><span style="width: {progressPct(item)}%"></span></span>
+      {/if}
+    </span>
+    <span class="cell-title">{item.title}</span>
+    <span class="cell-sub">
+      {#if item.kind === 'album'}{item.artist}{#if item.year} · {item.year}{/if}{:else if item.year}{item.year}{/if}
+    </span>
+  </button>
 {/snippet}
 
 {#if gate !== 'in'}
@@ -1084,8 +1836,11 @@
       {/if}
     </div>
     <div class="side-status side-bottom">
-      <span class="status" class:offline></span>
-      <span>{offline ? 'offline' : health?.version ?? ''}</span>
+      <!-- Connection state only. The build version is a maintainer's
+           detail, not something a viewer needs on every screen; it is still
+           on the settings page and at /api/v1/health. -->
+      <span class="status" class:offline title={offline ? 'Server unreachable' : 'Connected'}></span>
+      {#if offline}<span>offline</span>{/if}
     </div>
   </aside>
 
@@ -1097,12 +1852,26 @@
         <span class="sep">›</span>
         {#if detail}
           <button class="crumb" onclick={toGrid}>{currentLib.name}</button>
+          {#each viewCrumbs as c (c.label)}
+            <span class="sep">›</span>
+            <button class="crumb" onclick={c.go}>{c.label}</button>
+          {/each}
           {#each trail as ancestor, i (ancestor.id)}
             <span class="sep">›</span>
             <button class="crumb" onclick={() => toCrumb(i)}>{ancestor.title}</button>
           {/each}
           <span class="sep">›</span>
           <span class="crumb-current">{detail.item.title}</span>
+        {:else if viewCrumbs.length > 0}
+          <button class="crumb" onclick={toGrid}>{currentLib.name}</button>
+          {#each viewCrumbs as c, i (c.label)}
+            <span class="sep">›</span>
+            {#if i === viewCrumbs.length - 1}
+              <span class="crumb-current">{c.label}</span>
+            {:else}
+              <button class="crumb" onclick={c.go}>{c.label}</button>
+            {/if}
+          {/each}
         {:else}
           <span class="crumb-current">{currentLib.name}</span>
         {/if}
@@ -1132,11 +1901,36 @@
           compact={playerCompact}
           onclose={closePlayer}
           onnext={playNext}
+          onended={queueAdvance}
           onquality={changeQuality}
+          onaudiotrack={changeAudioTrack}
           onexpand={() => playing && showItem(playing.item)}
           ontime={(t) => (playingPos = t)}
         />
       {/key}
+      {#if upNext.length > 0 && !playerCompact}
+        <section class="queue" aria-label="Play queue">
+          <header>
+            <strong>Up next</strong>
+            <span class="muted small">{upNext.length} queued</span>
+            <span class="qspacer"></span>
+            <button class="linkish" onclick={clearQueue}>Clear</button>
+          </header>
+          <ol>
+            {#each upNext as q, i (q.id)}
+              <li>
+                <span class="qpos muted">{i + 1}</span>
+                <button class="qtitle" onclick={() => playList(queue, queueIndex + 1 + i)}>
+                  {q.title}{#if q.year}<span class="qyear muted">{q.year}</span>{/if}
+                </button>
+                <button class="qdrop" onclick={() => dequeue(i)} aria-label="Remove {q.title} from the queue">
+                  <X size={14} />
+                </button>
+              </li>
+            {/each}
+          </ol>
+        </section>
+      {/if}
     {/if}
     {#if listening && music && musicNow}
       {@const albumId = musicNow.track.parentId ?? ''}
@@ -1234,6 +2028,18 @@
       </section>
     {:else if tab === 'libraries'}
       {#if detail}
+        {#if detail.item.backdrop || detail.item.poster}
+          <!-- The film's own artwork behind the page. The backdrop is the
+               wide still meant for this; the poster is a fallback and is
+               blurred harder, since cropping a 2:3 image to a wide band
+               magnifies it. -->
+          <div
+            class="pagebg"
+            class:from-poster={!detail.item.backdrop}
+            style="background-image: url({detail.item.backdrop || detail.item.poster})"
+            aria-hidden="true"
+          ></div>
+        {/if}
         <div class="detail">
           {@render poster(detail.item)}
           <div class="detail-body">
@@ -1280,10 +2086,71 @@
                     <RotateCcw size={14} /> Start over
                   </button>
                 {/if}
+                <button class="dl" onclick={toggleWatched} title={detail.playState?.watched ? 'Mark as unwatched' : 'Mark as watched'}>
+                  {#if detail.playState?.watched}
+                    <EyeOff size={14} /> Mark unwatched
+                  {:else}
+                    <Eye size={14} /> Mark watched
+                  {/if}
+                </button>
+                {#if detail.item.kind === 'movie'}
+                  <button class="dl" onclick={() => detail && enqueue(detail.item)} title="Play after what is queued">
+                    Add to queue
+                  </button>
+                {/if}
                 <a class="dl" href={downloadURL(detail.item.id)} download><Download size={14} /> Download</a>
               </div>
+              {#if detail.versions && detail.versions.length > 1}
+                <div class="versions">
+                  <span class="muted small">This film is held {detail.versions.length} times:</span>
+                  <div class="vchips">
+                    {#each detail.versions as v (v.id)}
+                      <button
+                        class="chip" class:sel={v.id === detail.item.id}
+                        onclick={() => openItem(v.id, false, v)}
+                        title={v.path}>{versionLabel(v)}</button>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if detail.item.tagline}
+                <p class="tagline">{detail.item.tagline}</p>
+              {/if}
+              {#if detail.item.rating || detail.item.certification || detail.item.genres?.length}
+                <p class="facts">
+                  {#if detail.item.rating}
+                    <span class="score" title="{detail.item.voteCount} votes on TMDB">★ {detail.item.rating.toFixed(1)}</span>
+                  {/if}
+                  {#if detail.item.certification}
+                    <span class="cert" title="Content rating">{detail.item.certification}</span>
+                  {/if}
+                  {#if detail.item.genres?.length}
+                    <span class="muted">{detail.item.genres.join(' · ')}</span>
+                  {/if}
+                  {#if detail.item.collectionName}
+                    <span class="muted">· {detail.item.collectionName}</span>
+                  {/if}
+                </p>
+              {/if}
+              {#if detail.crew?.length}
+                <dl class="crew">
+                  {#each crewByRole(detail.crew) as g (g.role)}
+                    <div>
+                      <dt>{g.role}</dt>
+                      <dd>
+                        {#each g.people as c, i (c.id)}
+                          {#if i > 0}<span class="muted">, </span>{/if}
+                          <button class="linkish" onclick={() => openPerson(c.id)}>{c.name}</button>
+                        {/each}
+                      </dd>
+                    </div>
+                  {/each}
+                </dl>
+              {/if}
               <dl class="tech">
-                <div><dt>Video</dt><dd>{detail.item.height}p ({detail.item.videoCodec})</dd></div>
+                <!-- An item that has not been probed has no height; "p (h264)"
+                     reads as a glitch, so show just the codec. -->
+                <div><dt>Video</dt><dd>{detail.item.height ? `${detail.item.height}p ` : ''}({detail.item.videoCodec})</dd></div>
                 <div><dt>Audio</dt><dd>{(detail.item.audioCodec ?? '').toUpperCase()}</dd></div>
                 <div>
                   <dt>Subtitles</dt>
@@ -1293,12 +2160,30 @@
             {/if}
           </div>
         </div>
+        {#if detail.cast?.length}
+          <section class="castsec">
+            <h2>Cast</h2>
+            <div class="castrow">
+              {#each detail.cast as c (c.id)}
+                <button class="castcard" onclick={() => openPerson(c.id)} title="More with {c.name}">
+                  {#if c.profile}
+                    <img class="headshot" src={c.profile} alt="" loading="lazy" />
+                  {:else}
+                    <span class="headshot ph"><User size={20} /></span>
+                  {/if}
+                  <span class="castname">{c.name}</span>
+                  {#if c.role}<span class="castrole muted">{c.role}</span>{/if}
+                </button>
+              {/each}
+            </div>
+          </section>
+        {/if}
         {#if detail.children.length > 0}
           {#if detail.item.kind === 'series'}
             <!-- Seasons as a poster grid -->
             <div class="grid seasons">
               {#each detail.children as child (child.id)}
-                <button class="cell" onclick={() => openItem(child.id, true)}>
+                <button class="cell" onclick={() => openItem(child.id, true, child)}>
                   {@render poster(child)}
                   <span class="cell-title">{child.title}</span>
                 </button>
@@ -1366,7 +2251,7 @@
                       <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
                     </button>
                   {:else}
-                    <button onclick={() => openItem(child.id, true)}>
+                    <button onclick={() => openItem(child.id, true, child)}>
                       <span>
                         {child.title}
                         {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
@@ -1530,17 +2415,258 @@
         {#if gridItems.length === 0}
           <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
         {:else}
-          <div class="grid">
-            {#each gridItems as item (item.id)}
-              <button class="cell" onclick={() => openItem(item.id)}>
-                {@render poster(item)}
-                <span class="cell-title">{item.title}</span>
-                <span class="cell-sub">
-                  {#if item.kind === 'album'}{item.artist}{#if item.year} · {item.year}{/if}{:else if item.year}{item.year}{/if}
-                </span>
-              </button>
+          <div class="libhead" class:hidden={headHidden}>
+          <nav class="subtabs" aria-label="{currentLib.name} views">
+            {#each [['recommended', 'Recommended'], ['library', 'Library'], ['genres', 'Genres'], ['collections', 'Collections']] as [id, label] (id)}
+              <button
+                class="subtab"
+                class:on={libTab === id}
+                aria-current={libTab === id ? 'page' : undefined}
+                onclick={() => { libTab = id as LibTab; genre = null; collection = null; syncURL() }}>{label}</button>
             {/each}
+          </nav>
+          {#if libTab === 'library'}
+            <div class="filters">
+              <div class="fbar">
+                <label class="ffield">
+                  <Search size={15} />
+                  <input
+                    type="search"
+                    placeholder="Filter by title, year or synopsis…"
+                    bind:value={gridQuery}
+                    aria-label="Filter {currentLib.name}"
+                  />
+                </label>
+                <select class="fsel" bind:value={gridSort} aria-label="Sort order">
+                  <option value="title">A–Z</option>
+                  <option value="year">Newest first</option>
+                  <option value="added">Recently added</option>
+                  <option value="rating">Highest rated</option>
+                  <option value="runtime">Longest first</option>
+                  <option value="watched">Recently watched</option>
+                </select>
+                <select class="fsel" bind:value={gridWatch} aria-label="Watched filter">
+                  <option value="all">All</option>
+                  <option value="unwatched">Unwatched</option>
+                  <option value="watched">Watched</option>
+                </select>
+                <select class="fsel" bind:value={gridMinRating} aria-label="Minimum rating">
+                  <option value={0}>Any rating</option>
+                  <option value={6}>★ 6+</option>
+                  <option value={7}>★ 7+</option>
+                  <option value={8}>★ 8+</option>
+                </select>
+              </div>
+              <div class="fcount muted">
+                {visibleItems.length}
+                {visibleItems.length === 1 ? 'title' : 'titles'}
+                {#if visibleItems.length !== gridItems.length}of {gridItems.length}{/if}
+              </div>
+            </div>
+          {/if}
           </div>
+
+          {#if libTab === 'recommended'}
+            {#if resumeHere.length > 0}
+              <section>
+                <h2>Continue Watching</h2>
+                <div class="grid">
+                  {#each resumeHere as r (r.id)}
+                    <button class="cell" onclick={() => startPlay(r)}>
+                      {@render poster(r)}
+                      <div class="progress"><div class="progress-fill" style="width: {Math.min(100, (r.positionSecs / (r.runtimeSecs || 1)) * 100)}%"></div></div>
+                      <span class="cell-title">{r.title}</span>
+                      {#if r.kind === 'episode'}<span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')}</span>{/if}
+                    </button>
+                  {/each}
+                </div>
+              </section>
+            {/if}
+            <section>
+              <h2>Recently Added</h2>
+              <div class="grid">
+                {#each recentlyAdded as item (item.id)}
+                  {@render cell(item)}
+                {/each}
+              </div>
+            </section>
+            {#each recRows as row (row.kind + row.title)}
+              <section>
+                <h2>
+                  {#if row.genre}
+                    <button class="h2link" onclick={() => { libTab = 'genres'; openGenre(row.genre!) }}>
+                      {row.title} <span class="muted">→</span>
+                    </button>
+                  {:else}
+                    {row.title}
+                  {/if}
+                </h2>
+                <div class="grid">
+                  {#each row.items as item (item.id)}
+                    {@render cell(item)}
+                  {/each}
+                </div>
+              </section>
+            {/each}
+            <section>
+              <h2>Browse</h2>
+              <p class="muted">
+                {gridItems.length} titles in {currentLib.name}.
+                <button class="linkish" onclick={() => (libTab = 'library')}>Open the full library →</button>
+              </p>
+            </section>
+
+          {:else if libTab === 'collections'}
+            {#if collections.length === 0}
+              <div class="empty tall">
+                <p><strong>No collections yet.</strong></p>
+                <p>
+                  Collections come from the metadata provider — Harry Potter,
+                  James Bond, The Lord of the Rings and the rest are grouped
+                  automatically once their films are matched. A set appears here
+                  when this library holds more than one of its titles.
+                </p>
+              </div>
+            {:else if !collection}
+              <div class="grid">
+                {#each collections as c (c.key)}
+                  <button class="cell" onclick={() => openCollection(c)}>
+                    <span class="posterwrap">
+                      {#if c.poster}
+                        <img class="poster" src={c.poster} alt={c.name} loading="lazy" />
+                      {:else}
+                        <div class="poster placeholder"><span><Clapperboard size={26} /></span></div>
+                      {/if}
+                      {#if c.watched >= c.count}
+                        <span class="seen" title="Collection complete"><Check size={13} /></span>
+                      {:else}
+                        <span class="collcount">{c.watched}/{c.count}</span>
+                      {/if}
+                      {#if c.watched > 0 && c.watched < c.count}
+                        <span class="resume" title="{c.watched} of {c.count} watched">
+                          <span style="width: {(c.watched / c.count) * 100}%"></span>
+                        </span>
+                      {/if}
+                    </span>
+                    <span class="cell-title">{c.name}</span>
+                    <span class="cell-sub">
+                      {#if c.watched >= c.count}Watched{:else if c.watched > 0}{c.count - c.watched} left{:else}{c.count} films{/if}
+                    </span>
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <div class="collhead">
+                <p class="gcount muted">
+                  {collItems.length} {collItems.length === 1 ? 'title' : 'titles'}
+                  {#if collection.count > 0}
+                    · {collection.watched} watched
+                  {/if}
+                </p>
+                <div class="collacts">
+                  {#if collection.nextUpId}
+                    <button class="play" onclick={playCollection}>
+                      <Play size={15} />
+                      {collection.watched > 0 ? 'Continue' : 'Play'} collection
+                      <span class="nextname">{collection.nextUpName}</span>
+                    </button>
+                  {:else}
+                    <button class="play" onclick={() => playList(collItems, 0)}>
+                      <Play size={15} /> Play from the start
+                    </button>
+                  {/if}
+                  <button class="dl" onclick={() => collItems.forEach(enqueue)}>Add all to queue</button>
+                </div>
+              </div>
+              {#if collItems.length === 0}
+                <div class="empty">Nothing in this collection.</div>
+              {:else}
+                <div class="grid">
+                  {#each collItems as item (item.id)}
+                    {@render cell(item)}
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+
+          {:else if libTab === 'genres'}
+            {#if genres.length === 0}
+              <div class="empty tall">
+                <p><strong>No genres yet.</strong></p>
+                <p>Genres arrive with metadata — scan this library once a provider is configured.</p>
+              </div>
+            {:else if !genre}
+              <div class="genres">
+                {#each genres as g (g.genre)}
+                  <button class="genre" onclick={() => openGenre(g.genre)}>
+                    <span class="genre-name">{g.genre}</span>
+                    <span class="genre-n muted">{g.count}</span>
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <p class="gcount muted">{genreItems.length} {genreItems.length === 1 ? 'title' : 'titles'}</p>
+              {#if genreItems.length === 0}
+                <div class="empty">Nothing in this genre.</div>
+              {:else}
+                <div class="grid">
+                  {#each genreItems as item (item.id)}
+                    {@render cell(item)}
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+
+          {:else}
+            {#if visibleItems.length === 0}
+              <div class="empty">
+                Nothing matches that filter.
+                <button class="linkish" onclick={() => (gridQuery = '')}>Clear filter</button>
+              </div>
+            {:else if sections.length > 0}
+              <div class="azwrap">
+                <div class="azcol">
+                  {#each sections as sec (sec.letter)}
+                    <section class="azsec" id="az-{sec.letter}" data-letter={sec.letter}>
+                      <h2 class="azhead">{sec.letter === '#' ? '0–9' : sec.letter}</h2>
+                      <div class="grid">
+                        {#each sec.items as item (item.id)}
+                          {@render cell(item)}
+                        {/each}
+                      </div>
+                    </section>
+                  {/each}
+                </div>
+                <nav
+                  class="azrail"
+                  bind:this={railEl}
+                  aria-label="Jump to initial"
+                  onpointerdown={railDown}
+                  onpointermove={railMove}
+                  onpointerup={railUp}
+                  onpointercancel={railUp}
+                  onkeydown={railKey}
+                >
+                  {#each sections as sec, i (sec.letter)}
+                    <button
+                      class="azl"
+                      class:on={activeLetter === sec.letter}
+                      tabindex={i === railFocus ? 0 : -1}
+                      aria-label="Jump to {sec.letter === '#' ? '0 to 9' : sec.letter}"
+                      aria-current={activeLetter === sec.letter ? 'true' : undefined}
+                      onfocus={() => (railFocus = i)}
+                      onclick={() => jumpTo(sec.letter)}>{sec.letter === '#' ? '#' : sec.letter}</button>
+                  {/each}
+                </nav>
+              </div>
+            {:else}
+              <div class="grid">
+                {#each visibleItems as item (item.id)}
+                  {@render cell(item)}
+                {/each}
+              </div>
+            {/if}
+          {/if}
         {/if}
       {:else}
         <h1>Libraries</h1>
@@ -1607,7 +2733,7 @@
             <div class="keyrow">
               <span>{k.name}</span>
               <span class="muted small">created {k.createdAt.slice(0, 10)}{k.lastUsedAt ? ` · last used ${k.lastUsedAt.slice(0, 16)}` : ' · never used'}</span>
-              <button class="chip" onclick={() => deleteAPIKey(k.id).then(loadKeys)}>Revoke</button>
+              <button class="chip" onclick={() => revokeKey(k.id)}>Revoke</button>
             </div>
           {/each}
           <form class="inline" onsubmit={addKey}>
@@ -1631,8 +2757,26 @@
           </div>
         </div>
       </section>
+
+      <!-- Required by TMDB's terms wherever their data is used. -->
+      <section class="card">
+        <div class="row">
+          <span>
+            Metadata
+            <span class="muted small">
+              — film and programme details, artwork and cast come from
+              <a href="https://www.themoviedb.org/" target="_blank" rel="noreferrer noopener">TMDB</a>.
+            </span>
+          </span>
+        </div>
+        <p class="muted small attrib">
+          This product uses the TMDB API but is not endorsed or certified by TMDB.
+        </p>
+      </section>
     {/if}
   </main>
+
+  {@render personPanel()}
 
   <nav class="tabbar">
     {#each tabs as t (t.id)}
@@ -1902,10 +3046,52 @@
   .status.offline { background: var(--err); box-shadow: 0 0 8px var(--err); }
 
   main {
+    position: relative; /* the detail backdrop positions against this */
+    /* Makes this a stacking context so the backdrop's negative z-index is
+       trapped here and lands above main's own background but below every
+       descendant, rather than escaping behind the page. */
+    isolation: isolate;
+    /* The backdrop deliberately bleeds past this padding and is scaled a
+       little, which would otherwise widen the page and give every detail
+       view a horizontal scrollbar. `clip` trims it without creating a
+       scroll container, so the sticky library header still sticks —
+       `hidden` would force overflow-y to auto and break it. */
+    overflow-x: clip;
     flex: 1;
     padding: 1.25rem 1.5rem;
     padding-bottom: 5rem;
     width: 100%;
+  }
+  /* Bleeds past main's padding to the content edges, fades out before the
+     page does, and sits under everything. The scrim is --bg, so it works
+     in a light theme as well as a dark one without a second rule. */
+  .pagebg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 32rem;
+    margin: -1.25rem -1.5rem 0;
+    background-size: cover;
+    background-position: center 25%;
+    /* Strong enough to read as the film's own artwork, weak enough that
+       the synopsis over it keeps its contrast in a light theme as well as
+       a dark one. */
+    opacity: 0.3;
+    filter: saturate(0.7) blur(2px);
+    transform: scale(1.03); /* hides the blur's soft edges */
+    pointer-events: none;
+    /* Negative, so it paints under all in-flow content — including the
+       player, which is not positioned and would otherwise be painted over
+       by any positioned sibling no matter the DOM order. */
+    z-index: -1;
+    -webkit-mask-image: linear-gradient(to bottom, rgb(0 0 0 / 1) 0%, rgb(0 0 0 / 0.6) 40%, rgb(0 0 0 / 0.2) 72%, rgb(0 0 0 / 0) 100%);
+    mask-image: linear-gradient(to bottom, rgb(0 0 0 / 1) 0%, rgb(0 0 0 / 0.6) 40%, rgb(0 0 0 / 0.2) 72%, rgb(0 0 0 / 0) 100%);
+  }
+  .pagebg.from-poster { filter: saturate(0.7) blur(16px); opacity: 0.24; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pagebg { transform: none; }
   }
   h1 { font-size: 1.4rem; margin-bottom: 1rem; }
   h2 { font-size: 1rem; color: var(--muted); margin: 1.25rem 0 0.5rem; }
@@ -1950,8 +3136,261 @@
   .crumb-current { color: var(--muted); padding: 0.15rem 0.1rem; }
   .sep { color: var(--muted); user-select: none; }
 
+  /* ---- Library sub-tabs ---- */
+  .subtabs {
+    display: flex;
+    gap: 0.25rem;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .subtab {
+    flex: none;
+    padding: 0.5rem 0.85rem;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.92rem;
+    cursor: pointer;
+  }
+  .subtab:hover { color: var(--text); }
+  .subtab.on { color: var(--text); border-bottom-color: var(--accent); }
+
+  /* ---- A–Z sections and the index rail ---- */
+  /* The rail is fixed to the viewport, so it is out of flow — the grid
+     reserves the gutter itself. */
+  .azwrap { padding-right: 2rem; }
+  .azsec { scroll-margin-top: 0.5rem; }
+  /* Not sticky: the filter bar above it already holds the top of the
+     viewport, and the rail shows which letter you are in. Two stacked
+     sticky bars would just eat the grid. */
+  .azhead {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin: 0 0 0.7rem;
+    padding: 0.45rem 0 0.35rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+    background: var(--bg);
+  }
+  /* A rule running out from the letter marks the band without a heavy bar. */
+  .azhead::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+  .azsec + .azsec { margin-top: 1.5rem; }
+  /* Sticks beside the grid and spans the viewport, so a drag covers the
+     whole alphabet whatever the library size. touch-action keeps that drag
+     from scrolling the page instead. */
+  /* Pinned to the viewport between the top bar and the bottom edge, so it
+     spans the full height and stays put while the grid scrolls under it. */
+  .azrail {
+    position: fixed;
+    right: 0.3rem;
+    top: var(--topbar-h);
+    bottom: 0;
+    z-index: 5;
+    width: 1.6rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-evenly;
+    align-items: center;
+    padding: 0.6rem 0;
+    touch-action: none;
+    user-select: none;
+  }
+  /* Clears the playback bar when one is up. */
+  :global(main.withbar) .azrail { bottom: 6.5rem; }
+  .azl {
+    display: grid;
+    place-items: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    flex: none;
+    border: 0;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    border-radius: 999px;
+  }
+  .azl.on { color: var(--bg); background: var(--accent); }
+  /* The rail is a single tab stop with arrow-key movement, so the focus ring
+     is the only thing telling a keyboard user which letter is live. The
+     letters are small and sit over the grid, hence an offset outline rather
+     than a border that would shift the layout. */
+  .azl:focus-visible {
+    outline: 2px solid var(--accent-2);
+    outline-offset: 1px;
+    color: var(--text);
+  }
+  @media (hover: hover) {
+    .azl:hover { color: var(--text); }
+  }
+  /* Phones get a slimmer gutter so the grid keeps its width. */
+  @media (max-width: 34rem) {
+    .azwrap { padding-right: 1.5rem; }
+    .azrail { width: 1.25rem; right: 0.1rem; }
+    .azl { width: 1.2rem; height: 1.2rem; font-size: 0.62rem; }
+  }
+
+  /* ---- Library filter bar ---- */
+  .libhead {
+    position: sticky;
+    top: var(--topbar-h);
+    z-index: 4;
+    background: var(--bg);
+    padding: 0 2rem 0.6rem 0;
+    margin-bottom: 0.5rem;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+  }
+  /* Slid up behind the top bar rather than removed from the flow: taking it
+     out would reflow the grid under the pointer mid-scroll. */
+  .libhead.hidden {
+    transform: translateY(calc(-100% - var(--topbar-h)));
+    opacity: 0;
+    pointer-events: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .libhead { transition: none; }
+  }
+  .filters { display: flex; flex-direction: column; gap: 0.5rem; padding-top: 0.7rem; }
+  .fbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+  .ffield {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    /* Keeps a usable width, then takes its own row and lets the two pickers
+       share the next one. */
+    flex: 1 1 11rem;
+    min-width: 0;
+    padding: 0.45rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--muted);
+  }
+  .ffield input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+  }
+  .ffield input::-webkit-search-cancel-button { filter: invert(0.5); }
+  .fsel {
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+    flex: none;
+  }
+  .fcount { font-size: 0.8rem; }
+  .linkish {
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 0.4rem;
+  }
+
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr)); gap: 0.9rem; }
-  .cell { display: flex; flex-direction: column; gap: 0.35rem; text-align: left; }
+  .cell { display: flex; flex-direction: column; gap: 0.35rem; text-align: left; min-width: 0; }
+  /* Carries the watched tick and the resume bar over the artwork. */
+  .posterwrap { position: relative; display: block; }
+  .seen {
+    position: absolute;
+    top: 0.35rem;
+    right: 0.35rem;
+    display: grid;
+    place-items: center;
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    /* The tick sits on artwork of any colour, so it carries its own edge
+       rather than relying on contrast with the poster behind it. */
+    box-shadow: 0 0 0 2px var(--bg);
+  }
+  .resume {
+    position: absolute;
+    left: 0.4rem;
+    right: 0.4rem;
+    bottom: 0.4rem;
+    height: 3px;
+    border-radius: 2px;
+    background: rgb(0 0 0 / 0.55);
+    overflow: hidden;
+  }
+  .resume span { display: block; height: 100%; background: var(--accent); }
+
+  /* The tile's watched control. Visible when set, or on hover/focus — an
+     always-on empty circle over every unwatched poster would be noise. */
+  .seentoggle {
+    position: absolute;
+    top: 0.35rem;
+    right: 0.35rem;
+    display: grid;
+    place-items: center;
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 50%;
+    cursor: pointer;
+    background: rgb(0 0 0 / 0.6);
+    color: rgb(255 255 255 / 0.85);
+    box-shadow: 0 0 0 2px var(--bg);
+    opacity: 0;
+    transition: opacity 0.12s ease, background 0.12s ease;
+  }
+  .seentoggle.on {
+    opacity: 1;
+    background: var(--accent);
+    color: #fff;
+  }
+  .cell:hover .seentoggle,
+  .seentoggle:focus-visible {
+    opacity: 1;
+  }
+  .seentoggle:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+  .seentoggle:hover { background: var(--accent); color: #fff; }
+  /* No hover on touch, so the control is always visible there. */
+  @media (hover: none) {
+    .seentoggle { opacity: 0.85; }
+  }
+  /* How many of the set this library holds, over the stand-in poster. */
+  .collcount {
+    position: absolute;
+    top: 0.35rem;
+    right: 0.35rem;
+    min-width: 1.35rem;
+    height: 1.35rem;
+    padding: 0 0.35rem;
+    display: grid;
+    place-items: center;
+    border-radius: 999px;
+    background: rgb(0 0 0 / 0.72);
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 600;
+    box-shadow: 0 0 0 1px rgb(255 255 255 / 0.18);
+  }
   .poster {
     width: 100%;
     aspect-ratio: 2 / 3;
@@ -1963,9 +3402,8 @@
   .poster.placeholder {
     display: grid;
     place-items: center;
-    font-size: 2.2rem;
-    font-weight: 700;
     color: var(--muted);
+    opacity: 0.45;
   }
   .poster.square { aspect-ratio: 1 / 1; }
 
@@ -2239,8 +3677,250 @@
     .apanel-cover { width: 8rem; height: 8rem; }
   }
   .cell:hover .poster { border-color: var(--accent); }
-  .cell-title { font-size: 0.86rem; line-height: 1.25; }
-  .cell-sub { font-size: 0.75rem; color: var(--muted); }
+  /* Titles can be long and, for an unmatched release name, a single
+     unbreakable word — break anywhere and clamp so one cell cannot push its
+     neighbours out of line. */
+  .attrib { margin: 0.4rem 0 0; }
+  /* ---- Cast ---- */
+  .castsec { margin-top: 1.5rem; }
+  /* Wraps into as many rows as the width allows, like the poster grid, so
+     the whole cast is visible at once rather than hidden behind a sideways
+     scroll. Narrower tracks than posters because a headshot needs less. */
+  .castrow {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+    gap: 0.9rem 0.75rem;
+  }
+  .castcard {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 0;
+    text-align: left;
+    background: none;
+    border: 0;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+  .headshot {
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    display: block;
+  }
+  .headshot.ph { display: grid; place-items: center; color: var(--muted); opacity: 0.5; }
+  .headshot.lg { width: 4.5rem; aspect-ratio: 2 / 3; }
+  /* Long names break rather than pushing their track wide; two lines each
+     keeps rows aligned. */
+  .castname {
+    font-size: 0.82rem;
+    font-weight: 600;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .castrole {
+    font-size: 0.75rem;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .castcard:hover .castname { color: var(--accent); }
+  /* Same two-column shape as the technical details below it, so the page
+     reads as one block rather than two unrelated lists. */
+  .crew { margin: 0 0 0.7rem; font-size: 0.88rem; }
+  .crew div { display: flex; gap: 0.6rem; }
+  .crew dt { color: var(--muted); min-width: 10rem; flex: none; }
+  .crew dd { margin: 0; }
+
+  /* Person overlay */
+  .pback { position: fixed; inset: 0; background: rgb(0 0 0 / 0.6); z-index: 40; }
+  .ppanel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(52rem, calc(100vw - 2rem));
+    max-height: min(44rem, calc(100vh - 3rem));
+    overflow-y: auto;
+    padding: 1.1rem 1.25rem;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    z-index: 41;
+  }
+  .phead { display: flex; align-items: flex-start; gap: 0.9rem; margin-bottom: 1rem; }
+  .phead h2 { margin: 0; font-size: 1.1rem; }
+  .ctlx { margin-left: auto; border: 0; background: none; color: var(--muted); cursor: pointer; }
+  .ctlx:hover { color: var(--text); }
+
+  .tagline { font-style: italic; color: var(--muted); margin: 0.2rem 0 0.5rem; }
+  /* Boxed like a classification card so it reads as a certificate rather
+     than another piece of prose. */
+  .cert {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 0.35rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+  }
+  .facts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0 0 0.6rem; font-size: 0.88rem; }
+  .score { color: var(--ok); font-weight: 600; }
+  /* Genre tiles: a wrapping set of chips sized to their label. */
+  .genres { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .genre {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.55rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .genre:hover { border-color: var(--accent); }
+  .genre-name { font-weight: 600; }
+  .genre-n { font-size: 0.82rem; }
+  /* ---- Play queue ---- */
+  .queue {
+    margin: -0.5rem 0 1.5rem;
+    border: 1px solid var(--border);
+    border-top: 0;
+    border-radius: 0 0 12px 12px;
+    background: var(--panel);
+    padding: 0.6rem 0.9rem 0.7rem;
+  }
+  .queue header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+  }
+  .qspacer { flex: 1; }
+  .queue ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    /* Long queues scroll rather than pushing the page down. */
+    max-height: 12rem;
+    overflow-y: auto;
+  }
+  .queue li {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.25rem 0.3rem;
+    border-radius: 6px;
+  }
+  .queue li:hover { background: var(--bg); }
+  .qpos { font-variant-numeric: tabular-nums; min-width: 1.2rem; }
+  .qtitle {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .qtitle:hover { color: var(--accent-2); }
+  /* A margin rather than a literal space: whitespace between Svelte
+     elements is not reliably preserved. */
+  .qyear { margin-left: 0.4rem; }
+  .qdrop { color: var(--muted); display: flex; flex: none; }
+  .qdrop:hover { color: var(--err); }
+
+  .collacts { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+
+  /* A row heading that is also a link into the full listing. Inherits the
+     h2's size rather than looking like a button in a heading. */
+  .h2link { font: inherit; color: inherit; padding: 0; }
+  .h2link:hover { color: var(--accent-2); }
+
+  /* ---- Person page ---- */
+  .psec {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 1.25rem 0 0.6rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+  .psec:first-of-type { margin-top: 0.5rem; }
+  /* The role sits under the year on its own line: character names run long
+     and would otherwise push the year out of the tile. */
+  .prole {
+    display: block;
+    color: var(--text);
+    opacity: 0.8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The breadcrumb names where you are now, so this is just the count. */
+  .gcount { font-size: 0.85rem; }
+  .collhead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.9rem;
+  }
+  /* .play already supplies the accent fill and flex layout. */
+  /* The film's name is context for the button, not its label. */
+  .nextname { opacity: 0.75; font-weight: 400; }
+  @media (max-width: 30rem) {
+    .nextname { display: none; }
+  }
+
+  .versions { margin: 0.6rem 0 0.9rem; }
+  .vchips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.35rem; }
+
+  .cell-title {
+    font-size: 0.86rem;
+    line-height: 1.25;
+    /* Always two lines tall: without this a one-line title sits its year
+       higher than its neighbours and every row reads as ragged. */
+    min-height: 2.5em;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .cell-sub {
+    font-size: 0.75rem;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .detail { display: flex; gap: 1.25rem; align-items: flex-start; }
   .detail .poster { width: 9rem; flex: none; }
