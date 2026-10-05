@@ -816,3 +816,64 @@ func TestItemsByLibrarySinceReturnsOnlyChanges(t *testing.T) {
 		}
 	}
 }
+
+func TestPruneHistory(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	u, err := st.CreateUser(ctx, "viewer", "Viewer", "hash", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib, err := st.CreateLibrary(ctx, "Movies", MediaMovies, []string{"/m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := st.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindMovie, Title: "F", Path: "/m/f.mkv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two of each: one recent, one aged past any sane retention window.
+	for i := 0; i < 2; i++ {
+		if err := st.RecordPlay(ctx, u.ID, it.ID, KindMovie); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RecordAudit(ctx, AuditEntry{UserID: u.ID, Action: "test"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{
+		`UPDATE play_events SET started_at = datetime('now','-100 days') WHERE rowid = (SELECT MIN(rowid) FROM play_events)`,
+		`UPDATE audit_log SET at = datetime('now','-100 days') WHERE id = (SELECT MIN(id) FROM audit_log)`,
+	} {
+		if _, err := st.db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Zero disables pruning entirely — an operator may want the lot.
+	if a, p, err := st.PruneHistory(ctx, 0); err != nil || a != 0 || p != 0 {
+		t.Fatalf("PruneHistory(0) = (%d, %d, %v), want nothing pruned", a, p, err)
+	}
+
+	a, p, err := st.PruneHistory(ctx, 30)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if a != 1 || p != 1 {
+		t.Errorf("pruned %d audit and %d play rows, want 1 each", a, p)
+	}
+	// The recent rows survive.
+	var n int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("%d audit rows left, want 1", n)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM play_events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("%d play rows left, want 1", n)
+	}
+}

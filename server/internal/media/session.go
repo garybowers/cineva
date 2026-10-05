@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,7 @@ type Session struct {
 	hw           *HWContext // device this session encodes on, nil for software
 	audioTrack   int        // stream index to play, -1 for the best stream
 	hdr          string     // Info.HDRFormat, so a restart-at-offset job tone maps too
+	segSecsReal  float64    // true segment length; see realSegmentSecs
 	cancel       context.CancelFunc
 	startSegment int
 	lastReq      int // highest segment index a client asked for
@@ -118,6 +120,11 @@ type StartOpts struct {
 	// HDR is Info.HDRFormat ("pq", "hlg" or ""), used to tone map when the
 	// video is re-encoded. See HLSJob.HDR.
 	HDR string
+	// FrameRateNum/Den is the source's exact average frame rate, used to
+	// state real segment durations in the playlist. Zero falls back to the
+	// nominal segment length.
+	FrameRateNum int
+	FrameRateDen int
 }
 
 func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
@@ -152,9 +159,10 @@ func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
 	// unusable and it falls back to software.
 	hw := sm.hardware()
 	s := &Session{
-		hdr:        o.HDR,
-		audioTrack: audioTrack,
-		ID:         id, ItemID: itemID, Title: title, InputPath: inputPath,
+		hdr:         o.HDR,
+		segSecsReal: realSegmentSecs(sm.SegmentSecs, o.FrameRateNum, o.FrameRateDen),
+		audioTrack:  audioTrack,
+		ID:          id, ItemID: itemID, Title: title, InputPath: inputPath,
 		Dir: dir, SegmentSecs: sm.SegmentSecs, NumSegments: numSeg,
 		Quality:    q,
 		Accel:      hw.Name(),
@@ -273,6 +281,32 @@ func (s *Session) touch() {
 // it is actually watched.
 const throttleAheadSecs = 120
 
+// A viewer who has gone stops asking for segments. Until the janitor reaps
+// the session minutes later, the transcoder would otherwise keep working all
+// the way to throttleAheadSecs past the last segment anyone wanted — on a 4K
+// source that is a real burst of CPU for a stream nobody is watching.
+//
+// So the look-ahead collapses once requests dry up. A viewer who merely
+// paused loses nothing but buffer depth, which refills the moment they ask
+// for the next segment; a viewer who closed the tab stops costing anything
+// within idleAheadAfter rather than within sessionIdleTimeout.
+const (
+	idleAheadAfter = 20 * time.Second
+	idleAheadSecs  = 15
+)
+
+// aheadSecs is how far past the last requested segment the transcoder may
+// run right now.
+func (s *Session) aheadSecs() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ahead := int64(throttleAheadSecs)
+	if time.Since(s.lastAccess) > idleAheadAfter {
+		ahead = idleAheadSecs
+	}
+	return int64(s.lastReq*s.SegmentSecs) + ahead
+}
+
 // restartLocked (re)launches the transcode goroutine at the given segment.
 func (s *Session) restartLocked(base context.Context, startSegment int) {
 	if s.cancel != nil {
@@ -298,10 +332,7 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 		},
 		Throttle: func(ctx context.Context, posSecs int64) error {
 			for {
-				s.mu.Lock()
-				allowed := int64(s.lastReq*s.SegmentSecs + throttleAheadSecs)
-				s.mu.Unlock()
-				if posSecs <= allowed {
+				if posSecs <= s.aheadSecs() {
 					return nil
 				}
 				select {
@@ -334,17 +365,60 @@ func (s *Session) segmentFile(idx int) string {
 	return filepath.Join(s.Dir, fmt.Sprintf("seg%05d.m4s", idx))
 }
 
-// Playlist renders the VOD playlist covering the full item duration. Segment
-// durations are the target duration (boundaries land on keyframes, so real
-// durations drift slightly); hls.js tolerates the variance.
+// realSegmentSecs is how long a segment actually lasts.
+//
+// The encoder's GOP is a whole number of frames — `round(segmentSecs * fps)`
+// — so at 23.976 fps a nominal six-second segment is really 144 frames, or
+// 6.006 seconds. Writing the nominal 6.0 into every EXTINF loses six
+// milliseconds a segment, which over a two-hour film is about seven seconds
+// of drift between the player's idea of the time and the stream's. Stating
+// the true duration costs nothing and removes the drift entirely.
+//
+// A frame rate we do not know falls back to the nominal length.
+func realSegmentSecs(segmentSecs, frNum, frDen int) float64 {
+	frames := gopFrames(segmentSecs, frNum, frDen)
+	if frames <= 0 || frNum <= 0 || frDen <= 0 {
+		return float64(segmentSecs)
+	}
+	fps := float64(frNum) / float64(frDen)
+	return float64(frames) / fps
+}
+
+// gopFrames is how many frames make up one segment: the encoder's GOP, and
+// the number realSegmentSecs converts back into a duration. One definition,
+// used by both, so the keyframe interval and the playlist cannot disagree
+// about how long a segment is.
+func gopFrames(segmentSecs, frNum, frDen int) int {
+	if segmentSecs <= 0 || frNum <= 0 || frDen <= 0 {
+		return 0
+	}
+	fps := float64(frNum) / float64(frDen)
+	n := int(math.Round(float64(segmentSecs) * fps))
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// Playlist renders the VOD playlist covering the full item duration.
+//
+// EXTINF is the real segment duration (see realSegmentSecs) rather than the
+// nominal one. On the re-encode path that is exact, because the GOP is
+// forced to that length. On a remux the boundaries land on the source's own
+// keyframes, which we do not control, so it remains the best estimate
+// available — hls.js tolerates the variance.
 func (s *Session) Playlist() string {
 	var b strings.Builder
+	dur := s.segSecsReal
+	if dur <= 0 {
+		dur = float64(s.SegmentSecs)
+	}
 	b.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n")
-	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", s.SegmentSecs+1)
+	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(dur))+1)
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n")
 	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 	for i := 0; i < s.NumSegments; i++ {
-		fmt.Fprintf(&b, "#EXTINF:%d.0,\nseg%05d.m4s\n", s.SegmentSecs, i)
+		fmt.Fprintf(&b, "#EXTINF:%.6f,\nseg%05d.m4s\n", dur, i)
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return b.String()

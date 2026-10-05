@@ -89,6 +89,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const getHealth = () => req<Health>('/health')
 export const listLibraries = () => req<Library[]>('/libraries')
+/** Rename a library or change which paths it covers. Media type is immutable. */
+export const updateLibrary = (id: string, patch: { name?: string; paths?: string[] }) =>
+  req<Library>(`/libraries/${id}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+
 export const createLibrary = (name: string, mediaType: string, paths: string[]) =>
   req<Library>('/libraries', {
     method: 'POST',

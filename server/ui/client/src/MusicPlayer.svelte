@@ -5,6 +5,7 @@
   // A silent <audio> element holds the browser's media session so lock
   // screens and hardware keys work while Web Audio does the actual playing.
   import { onDestroy, onMount } from 'svelte'
+  import { pref } from './lib/prefs'
   import { playItem, postProgress, stopPlayback, beaconStop, type Item } from './lib/api'
   import {
     Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
@@ -51,7 +52,7 @@
   export type MusicQuality = 'original' | 'opus-128' | 'opus-64'
   function readMusicQuality(): MusicQuality {
     try {
-      return (localStorage.getItem('cineva-music-quality') as MusicQuality) || 'original'
+      return (pref('music-quality', 'original') as MusicQuality)
     } catch {
       return 'original'
     }

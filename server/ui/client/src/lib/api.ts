@@ -11,6 +11,8 @@ export interface Library {
   name: string
   mediaType: string
   itemCount: number
+  /** A scan is running. One bit, with none of the admin-only progress detail. */
+  scanning?: boolean
 }
 
 export interface Item {

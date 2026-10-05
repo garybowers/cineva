@@ -71,6 +71,8 @@ func initConfig() {
 	viper.SetDefault("transcode.segment_secs", 6)
 	viper.SetDefault("transcode.hwaccel", "auto")
 	viper.SetDefault("metadata.cert_region", "GB")
+	viper.SetDefault("libraries.scan_interval", "0")
+	viper.SetDefault("libraries.history_retention_days", 90)
 	viper.SetDefault("transcode.max_bytes", int64(media.DefaultTranscodeMaxBytes))
 	viper.SetDefault("stats.sample_secs", 5)
 	viper.SetDefault("auth.session_days", 30)

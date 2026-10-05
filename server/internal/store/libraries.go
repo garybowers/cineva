@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -150,4 +151,63 @@ func (s *Store) libraryPaths(ctx context.Context, libraryID string) ([]string, e
 		paths = append(paths, p)
 	}
 	return paths, rows.Err()
+}
+
+// UpdateLibrary changes a library's name and/or its paths.
+//
+// The media type is deliberately not changeable: a library is created with
+// one and the scanners, item kinds and per-user state all key off it, so
+// changing it would orphan everything already scanned. Delete and recreate
+// is the honest way to do that.
+//
+// Paths are replaced wholesale, which is how the caller sends them. Removing
+// a path does not delete the items under it here — the next scan prunes
+// anything it no longer finds, which keeps one rule for "the files went
+// away" rather than two.
+func (s *Store) UpdateLibrary(ctx context.Context, id, name string, paths []string) (Library, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Library{}, fmt.Errorf("library name is required")
+	}
+	clean := make([]string, 0, len(paths))
+	seen := map[string]bool{}
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		clean = append(clean, p)
+	}
+	if len(clean) == 0 {
+		return Library{}, fmt.Errorf("a local library needs at least one path")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Library{}, fmt.Errorf("update library: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE libraries SET name = ?, updated_at = datetime('now') WHERE id = ?`, name, id)
+	if err != nil {
+		return Library{}, fmt.Errorf("update library: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Library{}, ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM library_paths WHERE library_id = ?`, id); err != nil {
+		return Library{}, fmt.Errorf("clear library paths: %w", err)
+	}
+	for _, p := range clean {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO library_paths (library_id, path) VALUES (?, ?)`, id, p); err != nil {
+			return Library{}, fmt.Errorf("add path %q: %w", p, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Library{}, fmt.Errorf("update library: %w", err)
+	}
+	return s.Library(ctx, id)
 }

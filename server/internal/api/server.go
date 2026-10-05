@@ -44,6 +44,11 @@ type Config struct {
 	// CertRegion is the ISO 3166-1 country whose content rating is stored.
 	// Config supplies the default; the admin setting overrides it.
 	CertRegion string
+	// ScanInterval rescans every library on a timer; zero disables it.
+	ScanInterval time.Duration
+	// RetainDays caps how much audit and play history is kept; zero keeps
+	// everything.
+	RetainDays int
 }
 
 type server struct {
@@ -127,6 +132,14 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s.sampler.OnSample = func(smp stats.Sample) { s.events.Publish(events.Event{Type: "stats", Data: smp}) }
 	go s.sampler.Run(samplerCtx)
 
+	// Periodic rescans and history pruning. Both are off by default: a
+	// server nobody has configured should not start rewriting rows on a
+	// timer. Shares the sampler's context, so shutdown stops it too.
+	go (&library.Scheduler{
+		Manager: manager, Store: st,
+		Interval: cfg.ScanInterval, Retain: cfg.RetainDays,
+	}).Run(samplerCtx)
+
 	// Active playbacks: any change (start, heartbeat, stop, idle reap) tells
 	// the UIs to refetch the sessions list.
 	s.playbacks.OnChange = func() { s.events.Publish(events.Event{Type: "sessions"}) }
@@ -153,6 +166,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.GET("/auth/me", s.authMe)
 	v1.POST("/auth/password", s.authPassword)
 	v1.POST("/auth/pin/set", s.authSetPIN)
+	v1.GET("/auth/prefs", s.getPrefs)
+	v1.PUT("/auth/prefs", s.putPrefs)
 	v1.GET("/auth/keys", s.listAPIKeys)
 	v1.POST("/auth/keys", s.createAPIKey)
 	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)
@@ -187,6 +202,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// Admin only.
 	adm := v1.Group("", requireAdmin)
 	adm.POST("/libraries", s.createLibrary)
+	adm.PATCH("/libraries/:id", s.updateLibrary)
 	adm.DELETE("/libraries/:id", s.deleteLibrary)
 	adm.POST("/libraries/:id/scan", s.scanLibrary)
 	adm.GET("/scans", s.listScans)

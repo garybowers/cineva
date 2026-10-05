@@ -4,6 +4,7 @@
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
     cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats, diskStats, auditLog,
     libraryItems, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
+    updateLibrary,
     refreshLibrary, cancelRefresh, refreshStatus, type RefreshProgress,
     libraryCollections, collectionDetail, createCollection, renameCollection,
     setCollectionItems, deleteCollection, updateItem, clearItemLocks,
@@ -15,6 +16,15 @@
   import LineChart from './LineChart.svelte'
   import BarChart from './BarChart.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+
+  /** Write a browsed path back into whichever row opened the browser. */
+  function setBrowsePath(p: string) {
+    const list = editLib ? editPaths : newPaths
+    const next = [...list]
+    next[browseTarget] = p
+    if (editLib) editPaths = next
+    else newPaths = next
+  }
 
   type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'logs' | 'settings'
   const pages: { id: Page; label: string }[] = [
@@ -174,7 +184,41 @@
   let showAdd = $state(false)
   let newName = $state('')
   let newType = $state('movies')
-  let newPath = $state('')
+  // A library may cover several paths; the form holds a list with at least
+  // one row rather than a single field.
+  let newPaths: string[] = $state([''])
+  // Which path row the folder browser is filling, so Browse… on the third
+  // row does not overwrite the first.
+  let browseTarget = $state(0)
+
+  // Editing an existing library: same shape, so one set of controls serves
+  // both. Null when nothing is being edited.
+  let editLib: Library | null = $state(null)
+  let editName = $state('')
+  let editPaths: string[] = $state([])
+  let libEditBusy = $state(false)
+
+  function startEditLibrary(lib: Library) {
+    editLib = lib
+    editName = lib.name
+    editPaths = lib.paths.length > 0 ? [...lib.paths] : ['']
+  }
+
+  async function saveLibraryEdit() {
+    if (!editLib) return
+    libEditBusy = true
+    try {
+      const paths = editPaths.map((p) => p.trim()).filter(Boolean)
+      if (paths.length === 0) throw new Error('a library needs at least one path')
+      const updated = await updateLibrary(editLib.id, { name: editName.trim(), paths })
+      libraries = libraries.map((l) => (l.id === updated.id ? { ...l, ...updated } : l))
+      editLib = null
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    } finally {
+      libEditBusy = false
+    }
+  }
   let saving = $state(false)
 
   function setTheme(id: string) {
@@ -204,10 +248,12 @@
     saving = true
     error = ''
     try {
-      const lib = await createLibrary(newName, newType, [newPath])
+      const paths = newPaths.map((p) => p.trim()).filter(Boolean)
+      const lib = await createLibrary(newName, newType, paths)
       libraries = [...libraries, lib] // the "libraries" event settles the order
       showAdd = false
-      newName = newPath = ''
+      newName = ''
+      newPaths = ['']
     } catch (e) {
       error = String(e instanceof Error ? e.message : e)
     } finally {
@@ -675,14 +721,16 @@
     }
   }
 
-  function openBrowser() {
+  function openBrowser(row = 0) {
+    browseTarget = row
     browsing = true
-    const start = newPath.trim() && newPath.startsWith('/') ? newPath.trim() : '/'
+    const cur = (editLib ? editPaths : newPaths)[browseTarget] ?? ''
+    const start = cur.trim() && cur.startsWith('/') ? cur.trim() : '/'
     browse(start)
   }
 
   function chooseFolder() {
-    if (listing) newPath = listing.path
+    if (listing) setBrowsePath(listing.path)
     browsing = false
   }
 
@@ -1291,15 +1339,53 @@
               {#each mediaTypes as t (t)}<option value={t}>{t}</option>{/each}
             </select>
           </label>
-          <label>Path
-            <span class="pathrow">
-              <input bind:value={newPath} placeholder="/media/movies" required />
-              <button type="button" onclick={openBrowser}>Browse…</button>
-            </span>
+          <label>
+            Paths
+            {#each newPaths as _, i (i)}
+              <span class="pathrow">
+                <input bind:value={newPaths[i]} placeholder="/media/movies" required={i === 0} />
+                <button type="button" onclick={() => openBrowser(i)}>Browse…</button>
+                {#if newPaths.length > 1}
+                  <button type="button" class="danger" onclick={() => (newPaths = newPaths.filter((_, j) => j !== i))} aria-label="Remove this path">✕</button>
+                {/if}
+              </span>
+            {/each}
+            <button type="button" class="addpath" onclick={() => (newPaths = [...newPaths, ''])}>+ Add another path</button>
           </label>
           <button class="primary" disabled={saving} type="submit">{saving ? 'Creating…' : 'Create'}</button>
-          <p class="hint">One media type per library, chosen now and immutable. Add more paths later.</p>
+          <p class="hint">One media type per library, chosen now and immutable. Paths can be changed later.</p>
         </form>
+      {/if}
+      {#if editLib}
+        <div class="lib-modal-back" role="presentation" onclick={() => (editLib = null)}></div>
+        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Edit library">
+          <h2>Edit “{editLib.name}”</h2>
+          <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveLibraryEdit() }}>
+            <label>Name <input bind:value={editName} required /></label>
+            <label>
+              Paths
+              {#each editPaths as _, i (i)}
+                <span class="pathrow">
+                  <input bind:value={editPaths[i]} placeholder="/media/movies" />
+                  <button type="button" onclick={() => openBrowser(i)}>Browse…</button>
+                  {#if editPaths.length > 1}
+                    <button type="button" class="danger" onclick={() => (editPaths = editPaths.filter((_, j) => j !== i))} aria-label="Remove this path">✕</button>
+                  {/if}
+                </span>
+              {/each}
+              <button type="button" class="addpath" onclick={() => (editPaths = [...editPaths, ''])}>+ Add another path</button>
+            </label>
+            <p class="hint">
+              The media type cannot be changed — everything already scanned is keyed to it.
+              Removing a path does not delete its items here; the next scan prunes whatever it
+              no longer finds.
+            </p>
+            <div class="formrow">
+              <button class="primary" type="submit" disabled={libEditBusy}>{libEditBusy ? 'Saving…' : 'Save'}</button>
+              <button type="button" onclick={() => (editLib = null)}>Cancel</button>
+            </div>
+          </form>
+        </div>
       {/if}
       {#if libraries.length === 0}
         <div class="empty">No libraries yet.</div>
@@ -1316,6 +1402,7 @@
                   <td>{lib.itemCount}</td>
                   <td class="actions">
                     <button onclick={() => { openManage(lib); syncURL() }}>Manage</button>
+                    <button onclick={() => startEditLibrary(lib)}>Edit…</button>
                     <button onclick={() => startScan(lib)}>Scan</button>
                     <button class="danger" onclick={() => removeLibrary(lib)}>Delete</button>
                   </td>
@@ -1591,14 +1678,18 @@
     color: transparent;
   }
   .logo span { font-weight: 400; }
-  nav { display: flex; gap: 0.25rem; overflow-x: auto; }
-  nav button {
+  /* Scoped to the sidebar. A bare `nav` here reaches the breadcrumbs and
+     the library tab bar too, silently giving them this one's flex layout,
+     gap and button padding — which is how the media-query version of this
+     rule broke the breadcrumbs once already. */
+  aside nav { display: flex; gap: 0.25rem; overflow-x: auto; }
+  aside nav button {
     padding: 0.45rem 0.8rem;
     border-radius: 8px;
     color: var(--muted);
     white-space: nowrap;
   }
-  nav button.active { background: var(--bg); color: var(--text); }
+  aside nav button.active { background: var(--bg); color: var(--text); }
   .back { margin-left: auto; color: var(--muted); font-size: 0.85rem; text-decoration: none; }
   .back:hover { color: var(--text); }
 
@@ -1962,6 +2053,17 @@
 
   /* A tag that is also a button, for clearing an item's manual locks. */
   .tag.lock { cursor: pointer; border-color: var(--accent); color: var(--accent-2); }
+
+  /* A path row: field, Browse…, and a remove button when there is more
+     than one. */
+  .pathrow { display: flex; gap: 0.4rem; align-items: center; }
+  .pathrow input { flex: 1; min-width: 0; }
+  .addpath {
+    align-self: flex-start;
+    color: var(--accent-2);
+    font-size: 0.85rem;
+    padding: 0.2rem 0;
+  }
 
   .setting-select {
     background: var(--bg);

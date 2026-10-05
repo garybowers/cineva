@@ -5,6 +5,8 @@
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
   } from './lib/api'
+  import { onDismiss } from './lib/dismiss'
+  import { pref } from './lib/prefs'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize,
     Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge,
@@ -83,7 +85,7 @@
 
   const autoplayNext = () => {
     try {
-      return localStorage.getItem('cineva-autoplay') !== 'off'
+      return pref('autoplay', 'on') !== 'off'
     } catch {
       return true
     }
@@ -357,19 +359,16 @@
 
   $effect(() => {
     if (openMenu === null) return
-    const close = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest('.menuwrap')) openMenu = null
-    }
-    const esc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') openMenu = null
-    }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', esc)
-    return () => {
-      window.removeEventListener('click', close)
-      window.removeEventListener('keydown', esc)
-    }
+    return onDismiss('.menuwrap', () => (openMenu = null))
   })
+
+  // The info overlay is a panel over the picture, so it dismisses like the
+  // menus rather than only via its own close button.
+  $effect(() => {
+    if (!showInfo) return
+    return onDismiss('.info, .ctl', () => (showInfo = false))
+  })
+
 
   // "English · 5.1 · EAC3", skipping whatever the file does not say.
   function audioLabel(a: AudioTrack): string {

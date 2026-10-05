@@ -263,6 +263,14 @@ func (s *server) playItem(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	// A library scanned before migration 0011 has no audio_tracks rows, so
+	// the picker would silently offer nothing on a file with several
+	// languages. The file is open here anyway, so read them now and store
+	// them — the viewer gets a working picker without being told to rescan,
+	// and the next play takes the cheap path.
+	if len(audio) == 0 {
+		audio = s.backfillAudioTracks(c, item)
+	}
 	// The requested track, defaulting to the file's own default.
 	chosen := defaultAudioTrack(audio)
 	if body.AudioTrack != nil {
@@ -349,6 +357,10 @@ func (s *server) playItem(c echo.Context) error {
 		// Only consulted when the video is re-encoded; a remux keeps the
 		// HDR stream untouched.
 		HDR: vinfo.HDRFormat,
+		// Exact, so the playlist can state real segment durations rather
+		// than accumulating rounding error across a long film.
+		FrameRateNum: vinfo.FrameRateNum,
+		FrameRateDen: vinfo.FrameRateDen,
 	})
 	if err != nil {
 		return err
@@ -730,4 +742,25 @@ func (s *server) continueWatching(c echo.Context) error {
 		return err
 	}
 	return c.JSON(http.StatusOK, items)
+}
+
+// backfillAudioTracks reads an item's audio streams from the file and saves
+// them, for items scanned before they were catalogued. Best effort: a
+// failure just means the picker stays empty, which is where it already was.
+func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.AudioTrack {
+	streams, err := media.ProbeAudioTracks(item.Path)
+	if err != nil || len(streams) == 0 {
+		return nil
+	}
+	tracks := make([]store.AudioTrack, 0, len(streams))
+	for _, a := range streams {
+		tracks = append(tracks, store.AudioTrack{
+			StreamIndex: a.Index, Codec: a.Codec, Language: a.Language,
+			Title: a.Title, Channels: a.Channels, BitRate: a.BitRate, Default: a.Default,
+		})
+	}
+	if err := s.store.ReplaceAudioTracks(c.Request().Context(), item.ID, tracks); err != nil {
+		log.Printf("backfill audio tracks for %s: %v", item.Title, err)
+	}
+	return tracks
 }

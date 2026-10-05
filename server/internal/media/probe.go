@@ -38,6 +38,13 @@ type Info struct {
 	// Re-encoding HDR without tone mapping produces the washed-out, flat
 	// picture you get from showing PQ-coded pixels as if they were SDR.
 	HDRFormat string
+	// FrameRateNum/Den is the video's average frame rate as the exact
+	// rational the container stores (24000/1001, not 23.976). Kept exact
+	// because the HLS segment duration is derived from it, and rounding
+	// here is what makes a playlist's timings drift over a long film.
+	FrameRateNum int
+	FrameRateDen int
+
 	// Chapters are the container's own chapter marks, in order. Empty for
 	// the many files that carry none. Read here rather than stored, because
 	// the play handler already probes the file and chapters are a property
@@ -87,6 +94,9 @@ func Probe(path string) (Info, error) {
 			info.HDRFormat = "hlg"
 		}
 		info.DVProfile, info.DVBLCompat = dolbyVision(par)
+		if fr := vs.AvgFrameRate(); fr != nil && fr.Num() > 0 && fr.Den() > 0 {
+			info.FrameRateNum, info.FrameRateDen = fr.Num(), fr.Den()
+		}
 	}
 	if as, err := in.BestStream(ffmpeg.AVMediaTypeAudio); err == nil && as != nil {
 		info.AudioCodec = ffmpeg.AVCodecGetName(as.Codecpar().CodecId()).String()

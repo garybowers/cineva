@@ -687,3 +687,47 @@ func (s *server) deleteUser(c echo.Context) error {
 	s.events.Publish(events.Event{Type: "users"})
 	return c.NoContent(http.StatusNoContent)
 }
+
+// GET /auth/prefs — this user's own UI preferences.
+//
+// Theme, quality, autoplay and the like. Kept server-side so the same
+// account agrees across a phone, a laptop and a future native client,
+// instead of each browser holding its own copy in localStorage.
+func (s *server) getPrefs(c echo.Context) error {
+	prefs, err := s.store.Prefs(c.Request().Context(), userID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, prefs)
+}
+
+// PUT /auth/prefs — merge preferences into this user's set.
+//
+// Only the keys sent are touched, and an empty value clears one. Values are
+// opaque to the server: the client owns what they mean.
+func (s *server) putPrefs(c echo.Context) error {
+	var prefs map[string]string
+	if err := c.Bind(&prefs); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	// A bound on what one account can store, so a buggy or hostile client
+	// cannot use preferences as free storage.
+	if len(prefs) > maxPrefKeys {
+		return echo.NewHTTPError(http.StatusBadRequest, "too many preferences")
+	}
+	for k, v := range prefs {
+		if len(k) > maxPrefKeyLen || len(v) > maxPrefValueLen {
+			return echo.NewHTTPError(http.StatusBadRequest, "preference key or value too long")
+		}
+	}
+	if err := s.store.SetPrefs(c.Request().Context(), userID(c), prefs); err != nil {
+		return err
+	}
+	return s.getPrefs(c)
+}
+
+const (
+	maxPrefKeys     = 50
+	maxPrefKeyLen   = 64
+	maxPrefValueLen = 512
+)

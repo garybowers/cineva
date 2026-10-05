@@ -21,6 +21,17 @@ database:
   path: cineva.db
 
 libraries:
+  # Rescan every library on this interval, so files added outside Cineva
+  # turn up without anyone pressing a button. A duration ("6h", "30m"); "0"
+  # disables it. A timer rather than a filesystem watch deliberately: a
+  # watch needs a descriptor per directory, misses anything changed while
+  # the server was down, and sees nothing on a network mount.
+  # (CINEVA_LIBRARIES_SCAN_INTERVAL)
+  scan_interval: "0"
+  # Days of audit log and play history to keep; pruned alongside each
+  # scheduled rescan. 0 keeps everything, which grows without limit.
+  # (CINEVA_LIBRARIES_HISTORY_RETENTION_DAYS)
+  history_retention_days: 90
   # Where downloaded poster/artwork files are cached, served at /artwork.
   # (CINEVA_LIBRARIES_ARTWORK_DIR)
   artwork_dir: artwork

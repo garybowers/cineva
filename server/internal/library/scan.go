@@ -159,6 +159,11 @@ type scanEvent struct {
 // receives it and a grid fills in live as a scan runs.
 type itemsEvent struct {
 	LibraryID string `json:"libraryId"`
+	// Scanning says a scan is in progress, with no detail about it. That one
+	// bit is not sensitive — a user can see items appearing anyway — and
+	// without it a first scan of an empty library tells a non-admin to "run
+	// a scan from the admin UI" while one is already running.
+	Scanning bool `json:"scanning"`
 }
 
 func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library) {
@@ -190,7 +195,7 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: snap, FilesTotal: total}})
 		if created > itemsSent {
 			itemsSent = created
-			m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID}})
+			m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID, Scanning: true}})
 		}
 	}
 
@@ -250,8 +255,11 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
 	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
 	// The throttle means the last upserts (and any prune) came after the
-	// final report, so close with an unconditional refetch hint.
-	m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID}})
+	// final report, so close with an unconditional refetch hint. Scanning is
+	// false here: this fires once the scan is over, and a client left
+	// believing one is still running would show the wrong empty state for
+	// good.
+	m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID, Scanning: false}})
 	m.Events.Publish(events.Event{Type: "libraries"})
 }
 
@@ -674,4 +682,15 @@ func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r meta
 			log.Printf("artwork for %s: %v", item.Title, err)
 		}
 	}
+}
+
+// Scanning reports whether a scan of this library is running in this
+// process. Used to tell a client that a library is filling up rather than
+// empty — one bit, with none of the progress detail the "scan" events carry,
+// so it is safe to show any signed-in user.
+func (m *Manager) Scanning(libraryID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.running[libraryID]
+	return ok
 }

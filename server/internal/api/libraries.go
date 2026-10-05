@@ -22,6 +22,45 @@ type createLibraryRequest struct {
 type libraryResponse struct {
 	store.Library
 	ItemCount int `json:"itemCount"`
+	// Scanning says a scan is running, with no detail about it — enough for
+	// a client to say "scanning…" instead of telling a non-admin to start
+	// one, and not enough to leak anything the scan events withhold.
+	Scanning bool `json:"scanning"`
+}
+
+// PATCH /libraries/:id (admin) — rename, or change which paths it covers.
+//
+// The media type is not changeable: everything already scanned keys off it.
+func (s *server) updateLibrary(c echo.Context) error {
+	var req struct {
+		Name  *string   `json:"name"`
+		Paths *[]string `json:"paths"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	ctx := c.Request().Context()
+	cur, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	name, paths := cur.Name, cur.Paths
+	if req.Name != nil {
+		name = *req.Name
+	}
+	if req.Paths != nil {
+		paths = *req.Paths
+	}
+	lib, err := s.store.UpdateLibrary(ctx, cur.ID, name, paths)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, "library not found")
+		}
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	s.audit(c, "library.update", "library", lib.ID, lib.Name, strings.Join(lib.Paths, ", "))
+	s.events.Publish(events.Event{Type: "libraries"})
+	return c.JSON(http.StatusOK, libraryResponse{Library: lib})
 }
 
 func (s *server) createLibrary(c echo.Context) error {
@@ -51,6 +90,9 @@ func (s *server) listLibraries(c echo.Context) error {
 			continue
 		}
 		resp := libraryResponse{Library: lib}
+		// Whether a scan is running, so a client that loads mid-scan shows
+		// the right empty state without waiting for the next event.
+		resp.Scanning = s.manager.Scanning(lib.ID)
 		for _, kind := range []store.ItemKind{store.KindMovie, store.KindEpisode, store.KindTrack} {
 			n, err := s.store.CountItems(ctx, lib.ID, kind)
 			if err != nil {

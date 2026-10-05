@@ -47,6 +47,8 @@ var serveCmd = &cobra.Command{
 			SegmentSecs:  viper.GetInt("transcode.segment_secs"),
 			HWAccel:      viper.GetString("transcode.hwaccel"),
 			CertRegion:   viper.GetString("metadata.cert_region"),
+			ScanInterval: viper.GetDuration("libraries.scan_interval"),
+			RetainDays:   viper.GetInt("libraries.history_retention_days"),
 			TranscodeMax: viper.GetInt64("transcode.max_bytes"),
 			SampleSecs:   viper.GetInt("stats.sample_secs"),
 			SessionDays:  viper.GetInt("auth.session_days"),

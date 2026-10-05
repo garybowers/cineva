@@ -218,11 +218,18 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		defer vfilter.Close()
 
 		// Keyframe every segment so the HLS muxer can cut clean boundaries.
-		fps := 25
-		frameRate := vStream.AvgFrameRate()
-		if frameRate != nil && frameRate.Den() > 0 && frameRate.Num() > 0 {
-			fps = (frameRate.Num() + frameRate.Den() - 1) / frameRate.Den()
+		//
+		// The GOP is a whole number of frames, and it must be the same whole
+		// number the playlist's EXTINF is derived from — see
+		// realSegmentSecs. Computed from the exact rational frame rate for
+		// that reason: rounding the rate first and multiplying second gives
+		// a different answer for anything that is not a broadcast rate, and
+		// the two would then disagree about how long a segment is.
+		frNum, frDen := 25, 1
+		if fr := vStream.AvgFrameRate(); fr != nil && fr.Den() > 0 && fr.Num() > 0 {
+			frNum, frDen = fr.Num(), fr.Den()
 		}
+		gop := gopFrames(job.SegmentSecs, frNum, frDen)
 		// Shared encoder settings; the hardware path differs only in the
 		// pixel format it consumes and the frame pool it draws from.
 		configure := func(cc *ffmpeg.AVCodecContext) {
@@ -230,7 +237,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 			cc.SetHeight(outH)
 			cc.SetTimeBase(vStream.TimeBase())
 			cc.SetBitRate(int64(job.VideoBitrateKbps) * 1000)
-			cc.SetGopSize(fps * job.SegmentSecs)
+			cc.SetGopSize(gop)
 			cc.SetFlags(cc.Flags() | ffmpeg.AVCodecFlagGlobalHeader)
 		}
 		if hwFrames != nil {
@@ -288,12 +295,10 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		if err != nil {
 			return fmt.Errorf("hls add video stream: %w", err)
 		}
-		if frameRate != nil && frameRate.Num() > 0 {
-			// One frame = 1/frame_rate seconds, expressed in the output
-			// stream's timebase.
-			videoFrameDur = ffmpeg.AVRescaleQ(1,
-				ffmpeg.AVMakeQ(frameRate.Den(), frameRate.Num()), vOut.TimeBase())
-		}
+		// One frame = 1/frame_rate seconds, expressed in the output
+		// stream's timebase.
+		videoFrameDur = ffmpeg.AVRescaleQ(1,
+			ffmpeg.AVMakeQ(frDen, frNum), vOut.TimeBase())
 	} else {
 		vOut = ffmpeg.AVFormatNewStream(out.Raw(), nil)
 		if vOut == nil {

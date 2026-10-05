@@ -8,7 +8,9 @@
     authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
-  import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+  import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+  import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
+  import { onDismiss } from './lib/dismiss'
   import Player from './Player.svelte'
   import MusicPlayer from './MusicPlayer.svelte'
   import {
@@ -33,6 +35,13 @@
   let authErr = $state('')
   let authBusy = $state(false)
   let showUserMenu = $state(false)
+
+  // Every floating panel closes on a click away or Escape; see onDismiss.
+  $effect(() => {
+    if (!showUserMenu) return
+    return onDismiss('.userwrap', () => (showUserMenu = false))
+  })
+
   // Household profile picker: users with a PIN get a name tile and a
   // numeric pad; anyone can switch to username + password.
   let profiles: Profile[] = $state([])
@@ -127,6 +136,8 @@
   }
   async function signOut() {
     showUserMenu = false
+    // The next person to sign in on this browser must not inherit these.
+    clearPrefs()
     try { await logout() } catch { /* already gone */ }
     me = null
     playing = null
@@ -377,10 +388,10 @@
   const musicQualities: { id: MusicQuality; label: string }[] = [
     { id: 'original', label: 'Original' }, { id: 'opus-128', label: 'High (Opus 128k)' }, { id: 'opus-64', label: 'Data saver (Opus 64k)' },
   ]
-  let musicQuality: MusicQuality = $state((() => { try { return (localStorage.getItem('cineva-music-quality') as MusicQuality) || 'original' } catch { return 'original' } })())
+  let musicQuality: MusicQuality = $state(pref('music-quality', 'original') as MusicQuality)
   function setMusicQuality(q: MusicQuality) {
     musicQuality = q
-    try { localStorage.setItem('cineva-music-quality', q) } catch { /* private browsing */ }
+    setPref('music-quality', q)
   }
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
@@ -389,6 +400,10 @@
   type DownloadEntry = { id: string; title: string; status: 'queued' | 'sent' }
   let downloads: DownloadEntry[] = $state([])
   let showDownloads = $state(false)
+  $effect(() => {
+    if (!showDownloads) return
+    return onDismiss('.dlwrap', () => (showDownloads = false))
+  })
   let dispatching = false
 
   function queueDownloads(items: Item[]) {
@@ -1085,6 +1100,14 @@
     searchResults = []
   }
 
+  // Results hang over the page like any other popup, so they dismiss like
+  // one. Only the list is cleared, not the query: clicking away should not
+  // also wipe what was typed.
+  $effect(() => {
+    if (searchResults.length === 0) return
+    return onDismiss('.search', () => (searchResults = []))
+  })
+
   // The full player shows on the playing item's own page; anywhere else it
   // collapses to the bottom now-playing bar (Plex-style).
   const playerCompact = $derived(
@@ -1109,7 +1132,7 @@
 
   function readQuality(): PlayQuality {
     try {
-      return (localStorage.getItem('cineva-quality') as PlayQuality) || 'auto'
+      return (pref('quality', 'auto') as PlayQuality)
     } catch {
       return 'auto'
     }
@@ -1117,7 +1140,7 @@
 
   function readAutoplay(): boolean {
     try {
-      return localStorage.getItem('cineva-autoplay') !== 'off'
+      return pref('autoplay', 'on') !== 'off'
     } catch {
       return true
     }
@@ -1126,7 +1149,7 @@
   function setAutoplay(on: boolean) {
     autoplay = on
     try {
-      localStorage.setItem('cineva-autoplay', on ? 'on' : 'off')
+      setPref('autoplay', on ? 'on' : 'off')
     } catch {
       /* private browsing */
     }
@@ -1134,7 +1157,7 @@
 
   function setTheme(id: string) {
     theme = id
-    applyTheme(id)
+    chooseTheme(id) // a deliberate choice, so it is remembered
   }
 
   async function poll() {
@@ -1235,7 +1258,7 @@
 
   function changeQuality(q: PlayQuality) {
     try {
-      localStorage.setItem('cineva-quality', q)
+      setPref('quality', q)
     } catch {
       /* private browsing */
     }
@@ -1481,6 +1504,12 @@
   // scan asks only for what changed. Reset whenever the library changes.
   let itemsMark = $state('')
 
+  // Whether the open library is being scanned. Seeded from the libraries
+  // list (so a client loading mid-scan knows) and kept current by the
+  // "items" event, which carries the same one bit for every user.
+  let scanningNow = $state(false)
+  const libraryScanning = $derived(scanningNow || (currentLib?.scanning ?? false))
+
   async function refreshLibraryItems(full = false) {
     if (!currentLib) return
     if (refreshing) {
@@ -1523,6 +1552,27 @@
   function boot() {
     if (booted) return
     booted = true
+    // The account's own preferences, which may differ from this browser's
+    // mirror — adopt them and re-apply anything already painted from the
+    // local copy.
+    // Playback quality is read through pref() each time it is needed, so it
+    // picks the server's value up on its own; theme and music quality were
+    // already painted from the local mirror and need re-applying.
+    //
+    // The comparison is against what is *painted*, not against
+    // currentTheme(): once loadPrefs has populated the cache that function
+    // already returns the new value, so comparing with it always looks
+    // equal and the stylesheet is never swapped — which is exactly what
+    // happened on a browser whose local mirror had been cleared.
+    const painted = () =>
+      document.getElementById('theme-css')?.getAttribute('href')?.match(/themes\/([^/]+)/)?.[1]
+    loadPrefs().then((p) => {
+      if (p.theme && p.theme !== painted()) {
+        applyTheme(p.theme) // adopt, not re-choose
+        theme = p.theme
+      }
+      if (p['music-quality']) musicQuality = p['music-quality'] as MusicQuality
+    }).catch(() => {})
     poll()
     applyRoute(location.pathname)
     if (tab === 'settings') loadKeys()
@@ -1542,8 +1592,9 @@
         },
         // Fired throughout a scan as items land, so the grid fills in live.
         items: (data) => {
-          const e = data as { libraryId?: string } | null
+          const e = data as { libraryId?: string; scanning?: boolean } | null
           if (e?.libraryId && currentLib?.id === e.libraryId) {
+            scanningNow = e.scanning ?? false
             refreshLibraryItems().catch(() => {})
           }
         },
@@ -1644,6 +1695,22 @@
       </button>
     {/each}
   </div>
+{/snippet}
+
+<!-- An empty library means one of two quite different things, and telling a
+     viewer to go and start a scan while one is already running is the
+     unhelpful one. -->
+{#snippet emptyLibrary()}
+  {#if libraryScanning}
+    <div class="empty tall">
+      <p><strong>Scanning…</strong></p>
+      <p>Titles appear here as they are found.</p>
+    </div>
+  {:else if me?.role === 'admin'}
+    <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
+  {:else}
+    <div class="empty">Nothing here yet. Ask an administrator to scan this library.</div>
+  {/if}
 {/snippet}
 
 {#snippet cell(item: Item)}
@@ -1801,11 +1868,17 @@
     <span class="status" class:offline title={offline ? 'Server unreachable' : `Connected · ${health?.version ?? ''}`}></span>
     <button class="topbtn" class:active={tab === 'settings'} onclick={() => setTab('settings')} title="Settings"><SettingsIcon size={17} /></button>
     <div class="userwrap">
-      <button class="avatar" title={me ? `${me.displayName} (${me.username})` : 'Account'} onclick={() => (showUserMenu = !showUserMenu)}>
+      <button
+        class="avatar"
+        title={me ? `${me.displayName} (${me.username})` : 'Account'}
+        aria-haspopup="menu"
+        aria-expanded={showUserMenu}
+        onclick={() => (showUserMenu = !showUserMenu)}
+      >
         {#if me}<span class="initial">{me.displayName.slice(0, 1).toUpperCase()}</span>{:else}<User size={17} />{/if}
       </button>
       {#if showUserMenu && me}
-        <div class="usermenu">
+        <div class="usermenu" role="menu">
           <div class="um-name">{me.displayName}</div>
           <div class="um-sub">{me.username} · {me.role}</div>
           {#if me.role === 'admin'}<a class="um-item" href="/admin/">Admin</a>{/if}
@@ -2267,7 +2340,7 @@
       {:else if currentLib && currentLib.mediaType === 'music'}
         <h1>{currentLib.name}</h1>
         {#if musicAll.length === 0}
-          <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
+          {@render emptyLibrary()}
         {:else}
           <div class="music">
             <aside class="mrail">
@@ -2413,7 +2486,7 @@
       {:else if currentLib}
         <h1>{currentLib.name}</h1>
         {#if gridItems.length === 0}
-          <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
+          {@render emptyLibrary()}
         {:else}
           <div class="libhead" class:hidden={headHidden}>
           <nav class="subtabs" aria-label="{currentLib.name} views">
