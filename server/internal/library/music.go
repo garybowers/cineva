@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,10 +13,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var musicLog = logging.For("music")
 
 var audioExts = map[string]bool{
 	".flac": true, ".mp3": true, ".m4a": true, ".aac": true,
@@ -68,7 +70,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 		report(skipped+i, created, len(files))
 		info, err := media.ProbeAudio(path)
 		if err != nil {
-			log.Printf("probe audio %s: %v", path, err)
+			musicLog.Warn("audio probe failed", "path", path, "err", err)
 			continue
 		}
 		albumDir := filepath.Dir(path)
@@ -169,7 +171,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 							album.Poster = m.cacheArtwork("mb", albumDir, img)
 						}
 					}
-					log.Printf("musicbrainz: matched %q / %q -> %s", artistName, albumName, rel.MBID)
+					musicLog.Debug("musicbrainz match", "artist", artistName, "album", albumName, "mbid", rel.MBID)
 				} else {
 					mbData[albumDir] = nil
 				}
@@ -219,7 +221,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 		if album, err := m.Store.Item(ctx, albumID); err == nil && album.Poster != "" && saved.Poster != album.Poster {
 			saved.Poster = album.Poster
 			if _, err := m.Store.UpsertItem(ctx, saved); err != nil {
-				log.Printf("track poster %s: %v", path, err)
+				musicLog.Error("saving track poster failed", "path", path, "err", err)
 			}
 		}
 		created++
@@ -244,7 +246,7 @@ func (m *Manager) cacheArtwork(prefix, key string, img []byte) string {
 		return ""
 	}
 	if err := os.WriteFile(dest, img, 0o644); err != nil {
-		log.Printf("cache artwork %s: %v", key, err)
+		artworkLog.Warn("caching artwork failed", "key", key, "err", err)
 		return ""
 	}
 	return "/artwork/" + name

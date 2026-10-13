@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -13,8 +12,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/google/uuid"
 )
+
+// logger reports transcode sessions and hardware acceleration.
+var logger = logging.For("transcode")
 
 // Quality selects the video treatment for a session. Zero value = copy the
 // video stream (remux). Height > 0 = re-encode at that height/bitrate.
@@ -218,7 +221,7 @@ func (sm *SessionManager) Restore(states []SessionState) []string {
 		kept = append(kept, st.Dir)
 	}
 	if len(kept) > 0 {
-		log.Printf("transcode: restored %d session(s) from the previous run", len(kept))
+		logger.Info("restored sessions from the previous run", "count", len(kept))
 	}
 	return kept
 }
@@ -352,7 +355,7 @@ func (sm *SessionManager) janitor() {
 					if sm.Forget != nil {
 						sm.Forget(id)
 					}
-					log.Printf("session %s: idle, cleaned up", id)
+					logger.Debug("idle session cleaned up", "session", id)
 				}
 			}
 			// Live session directories, which must survive eviction even if
@@ -363,8 +366,8 @@ func (sm *SessionManager) janitor() {
 			}
 			sm.mu.Unlock()
 			if n, freed := enforceCap(sm.Root, sm.MaxBytes, live); n > 0 {
-				log.Printf("transcode cache over %s: evicted %d session(s), freed %s",
-					humanBytes(sm.MaxBytes), n, humanBytes(freed))
+				logger.Info("transcode cache over its limit, evicted sessions",
+					"limit", humanBytes(sm.MaxBytes), "count", n, "freed", humanBytes(freed))
 			}
 		}
 	}
@@ -463,7 +466,7 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 	go func() {
 		defer close(done)
 		if err := RunHLS(ctx, job); err != nil && ctx.Err() == nil {
-			log.Printf("session %s: transcode: %v", s.ID, err)
+			logger.Error("transcode failed", "session", s.ID, "err", err)
 		}
 	}()
 }
@@ -500,7 +503,7 @@ func (s *Session) stopTranscode() {
 	select {
 	case <-done:
 	case <-time.After(transcodeStopTimeout):
-		log.Printf("session %s: transcoder did not stop within %s", s.ID, transcodeStopTimeout)
+		logger.Warn("transcoder did not stop in time", "session", s.ID, "timeout", transcodeStopTimeout)
 	}
 }
 
@@ -676,7 +679,7 @@ func (s *Session) maybeRestart(segIdx int) {
 	// always starts a transcoder.
 	if s.restored {
 		s.restored = false
-		log.Printf("session %s: resuming after restart at segment %d", s.ID, segIdx)
+		logger.Debug("resuming restored session", "session", s.ID, "segment", segIdx)
 		s.restartLocked(context.Background(), segIdx)
 		return
 	}
@@ -689,7 +692,7 @@ func (s *Session) maybeRestart(segIdx int) {
 	}
 	const lookahead = 4 // segments we're willing to wait for instead of seeking
 	if segIdx < s.startSegment || segIdx > head+lookahead {
-		log.Printf("session %s: seek to segment %d (head %d)", s.ID, segIdx, head)
+		logger.Debug("seek restarts transcode", "session", s.ID, "segment", segIdx, "head", head)
 		s.restartLocked(context.Background(), segIdx)
 	}
 }

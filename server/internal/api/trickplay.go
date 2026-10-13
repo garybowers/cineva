@@ -1,15 +1,17 @@
 package api
 
 import (
-	"log"
 	"net/http"
 	"os"
 	"sync"
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 )
+
+var trickplayLog = logging.For("trickplay")
 
 // Seek-preview thumbnails are generated on demand, once per item, and cached
 // on disk beside the transcode scratch.
@@ -90,7 +92,7 @@ func (s *server) startTrickplay(itemID, path string, runtimeSecs int) {
 	go func() {
 		defer s.trickplay.release(itemID)
 		if err := media.GenerateTrickplay(path, s.trickplayDir, itemID, runtimeSecs); err != nil {
-			log.Printf("trickplay %s: %v", itemID, err)
+			trickplayLog.Warn("preview generation failed", "item", itemID, "err", err)
 		}
 	}()
 }

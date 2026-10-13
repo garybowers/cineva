@@ -33,6 +33,8 @@ func (s *server) eventStream(c echo.Context) error {
 	sessionID, _ := c.Get(ctxSessionID).(string)
 	if sessionID != "" {
 		s.presence.connect(sessionID)
+		authLog.Debug("device connected", "user", me.Username, "client", clientLabel(c), "ip", c.RealIP())
+		defer authLog.Debug("device disconnected", "user", me.Username, "client", clientLabel(c), "ip", c.RealIP())
 		s.events.Publish(events.Event{Type: "devices", User: me.ID})
 		// Deferred in this order so the device is offline before the others
 		// are told to look.

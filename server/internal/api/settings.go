@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/segments"
 )
 
 // Runtime settings (admin UI). Each has a config-file default and a
@@ -39,7 +41,66 @@ const (
 	// link to a NAS and starve anything else using it.
 	settingDetectionPaused = "segments.paused"
 	settingDetectionRate   = "segments.rate_mb"
+	// settingDetectionMode says when detection may read: "window" (only
+	// between the times in settingDetectionWindow, "HH:MM-HH:MM"), "idle"
+	// (whenever nothing is playing or scanning) or "manual" (only when an
+	// admin starts it). The overnight window is the default: playback comes
+	// first, and analysis is never urgent.
+	settingDetectionMode   = "segments.mode"
+	settingDetectionWindow = "segments.window"
 )
+
+// defaultDetectionRateMB caps detection's reads unless an admin chooses
+// otherwise: fast enough to get through a backlog overnight, slow enough
+// that nothing else on the share notices.
+const defaultDetectionRateMB = 10
+
+const defaultDetectionWindow = "02:00-06:00"
+
+var detectionModes = []string{segments.ModeWindow, segments.ModeIdle, segments.ModeManual}
+
+// parseWindow reads "HH:MM-HH:MM" into minutes after midnight.
+func parseWindow(v string) (start, end int, err error) {
+	from, to, ok := strings.Cut(v, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("window %q: want HH:MM-HH:MM", v)
+	}
+	if start, err = parseClock(from); err != nil {
+		return 0, 0, err
+	}
+	if end, err = parseClock(to); err != nil {
+		return 0, 0, err
+	}
+	return start, end, nil
+}
+
+func parseClock(v string) (int, error) {
+	t, err := time.Parse("15:04", strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("time %q: want HH:MM", v)
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+func formatClock(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
+
+// detectionSchedule reads when detection may run, falling back to the
+// overnight window for anything missing or malformed.
+func (s *server) detectionSchedule(ctx context.Context) segments.Schedule {
+	mode, err := s.store.Setting(ctx, settingDetectionMode, segments.ModeWindow)
+	if err != nil || !slices.Contains(detectionModes, mode) {
+		mode = segments.ModeWindow
+	}
+	window, err := s.store.Setting(ctx, settingDetectionWindow, defaultDetectionWindow)
+	if err != nil {
+		window = defaultDetectionWindow
+	}
+	start, end, err := parseWindow(window)
+	if err != nil {
+		start, end, _ = parseWindow(defaultDetectionWindow)
+	}
+	return segments.Schedule{Mode: mode, Start: start, End: end}
+}
 
 // certRegions are the regions offered in the admin UI. TMDB carries ratings
 // for many more; these are the ones with good coverage and a board whose
@@ -66,6 +127,11 @@ type settingsResponse struct {
 	// DetectionRateMB caps intro detection's reads, in MB/s; 0 is no cap.
 	DetectionRateMB      int   `json:"detectionRateMB"`
 	DetectionRateOptions []int `json:"detectionRateOptions"`
+	// DetectionMode is when detection may read — "window", "idle" or
+	// "manual" — and the window, local time, applies to "window".
+	DetectionMode        string `json:"detectionMode"`
+	DetectionWindowStart string `json:"detectionWindowStart"`
+	DetectionWindowEnd   string `json:"detectionWindowEnd"`
 	// HWCodecs is what the detected device can encode, h264 first. Shown so
 	// an operator can see what their hardware offers; h264 remains the
 	// output, being the one codec every browser decodes.
@@ -94,13 +160,13 @@ func (s *server) hwAccelEnabled(c echo.Context) bool {
 var detectionRates = []int{0, 50, 25, 10}
 
 func (s *server) detectionRateMB(ctx context.Context) int {
-	v, err := s.store.Setting(ctx, settingDetectionRate, "0")
+	v, err := s.store.Setting(ctx, settingDetectionRate, strconv.Itoa(defaultDetectionRateMB))
 	if err != nil {
-		return 0
+		return defaultDetectionRateMB
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || !slices.Contains(detectionRates, n) {
-		return 0
+		return defaultDetectionRateMB
 	}
 	return n
 }
@@ -115,6 +181,7 @@ func (s *server) loginMode(c echo.Context) string {
 
 // GET /settings (admin)
 func (s *server) getSettings(c echo.Context) error {
+	sched := s.detectionSchedule(c.Request().Context())
 	return c.JSON(http.StatusOK, settingsResponse{
 		LoginMode:     s.loginMode(c),
 		HWAccel:       s.hwAccelEnabled(c),
@@ -125,6 +192,9 @@ func (s *server) getSettings(c echo.Context) error {
 
 		DetectionRateMB:      s.detectionRateMB(c.Request().Context()),
 		DetectionRateOptions: detectionRates,
+		DetectionMode:        sched.Mode,
+		DetectionWindowStart: formatClock(sched.Start),
+		DetectionWindowEnd:   formatClock(sched.End),
 	})
 }
 
@@ -136,6 +206,10 @@ func (s *server) putSettings(c echo.Context) error {
 		CertRegion *string `json:"certRegion"`
 		// MB/s, one of detectionRates; 0 removes the cap.
 		DetectionRateMB *int `json:"detectionRateMB"`
+		// "window", "idle" or "manual", and the window as "HH:MM".
+		DetectionMode        *string `json:"detectionMode"`
+		DetectionWindowStart *string `json:"detectionWindowStart"`
+		DetectionWindowEnd   *string `json:"detectionWindowEnd"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -192,6 +266,40 @@ func (s *server) putSettings(c echo.Context) error {
 			label = strconv.Itoa(mb) + " MB/s"
 		}
 		s.audit(c, "settings.update", "settings", settingDetectionRate, "Detection read speed", label)
+	}
+	if req.DetectionMode != nil || req.DetectionWindowStart != nil || req.DetectionWindowEnd != nil {
+		ctx := c.Request().Context()
+		sched := s.detectionSchedule(ctx)
+		if req.DetectionMode != nil {
+			if !slices.Contains(detectionModes, *req.DetectionMode) {
+				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("detectionMode must be one of %v", detectionModes))
+			}
+			sched.Mode = *req.DetectionMode
+		}
+		for _, f := range []struct {
+			v   *string
+			dst *int
+		}{{req.DetectionWindowStart, &sched.Start}, {req.DetectionWindowEnd, &sched.End}} {
+			if f.v == nil {
+				continue
+			}
+			m, err := parseClock(*f.v)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			}
+			*f.dst = m
+		}
+		window := formatClock(sched.Start) + "-" + formatClock(sched.End)
+		if err := s.store.SetSetting(ctx, settingDetectionMode, sched.Mode); err != nil {
+			return err
+		}
+		if err := s.store.SetSetting(ctx, settingDetectionWindow, window); err != nil {
+			return err
+		}
+		if s.segments != nil {
+			s.segments.SetSchedule(sched)
+		}
+		s.audit(c, "settings.update", "settings", settingDetectionMode, "Detection schedule", sched.Mode+" "+window)
 	}
 	s.events.Publish(events.Event{Type: "settings"})
 	return s.getSettings(c)

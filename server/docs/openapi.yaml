@@ -980,8 +980,8 @@ paths:
                   paused: { type: boolean }
                   pauseReason:
                     type: string
-                    enum: [manual, playing, scanning]
-                    description: manual = paused by an admin until resumed; playing / scanning = giving way, resuming a minute after they stop
+                    enum: [manual, playing, scanning, schedule, on-demand]
+                    description: manual = paused by an admin until resumed; playing / scanning = giving way, resuming a minute after they stop; schedule = outside the detection window; on-demand = detectionMode is manual and nobody has pressed Analyse now
                   current:
                     type: object
                     description: The season being worked on
@@ -1036,6 +1036,19 @@ paths:
       tags: [Administration]
       responses:
         "200": { description: The detection status }
+        "409": { description: Detection is turned off (libraries.intro_detection) }
+  /segments/run:
+    post:
+      summary: Analyse now (admin)
+      description: >
+        Starts detection on every TV library straight away, whatever the
+        schedule (detectionMode) says, until everything waiting has been
+        analysed; the schedule applies again after that. A manual pause still
+        holds it.
+      operationId: runSegments
+      tags: [Administration]
+      responses:
+        "202": { description: Started; the detection status }
         "409": { description: Detection is turned off (libraries.intro_detection) }
 
   /search:
@@ -2319,8 +2332,23 @@ components:
           enum: [0, 50, 25, 10]
           description: >
             Cap on how fast intro and credits detection reads media, in MB/s;
-            0 is no cap. With a cap, files are read one at a time. Detection
-            also always pauses while anything plays or a scan runs.
+            0 is no cap. Default 10. With a cap, files are read one at a
+            time. Detection also always pauses while anything plays or a scan
+            runs, and stops as soon as a library's storage stops answering.
+        detectionMode:
+          type: string
+          enum: [window, idle, manual]
+          description: >
+            When detection may read media. window (the default): only between
+            detectionWindowStart and detectionWindowEnd. idle: whenever
+            nothing is playing or scanning. manual: only after POST
+            /segments/run.
+        detectionWindowStart:
+          type: string
+          description: '"HH:MM", server local time; default 02:00. The window may run past midnight.'
+        detectionWindowEnd:
+          type: string
+          description: '"HH:MM", server local time; default 06:00.'
         detectionRateOptions:
           type: array
           items: { type: integer }

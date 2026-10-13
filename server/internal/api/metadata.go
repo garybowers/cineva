@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,9 +11,12 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var metadataLog = logging.For("metadata")
 
 // Metadata management for the admin UI: see what a title matched, search for
 // the right one, apply it, or re-run matching.
@@ -169,7 +171,7 @@ func (s *server) refreshLibrary(c echo.Context) error {
 			s.events.Publish(events.Event{Type: "refresh", Data: p})
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("refresh %s: %v", lib.Name, err)
+			metadataLog.Error("metadata refresh failed", "library", lib.Name, "err", err)
 		}
 		s.refreshMu.Lock()
 		delete(s.refreshes, lib.ID)

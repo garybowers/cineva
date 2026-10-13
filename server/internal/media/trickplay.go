@@ -5,16 +5,19 @@ import (
 	"image"
 	"image/draw"
 	"image/jpeg"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 	"unsafe"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
 	"github.com/linuxmatters/ffmpeg-statigo/av"
 )
+
+// trickplayLog reports preview-sheet generation.
+var trickplayLog = logging.For("trickplay")
 
 // Seek-preview thumbnails ("trickplay"): the strip of small frames a player
 // shows when you drag the scrub bar.
@@ -171,8 +174,8 @@ func GenerateTrickplay(path, outDir, itemID string, runtimeSecs int) error {
 	if err := os.WriteFile(vttPath, []byte(cues.String()), 0o644); err != nil {
 		return fmt.Errorf("trickplay vtt: %w", err)
 	}
-	log.Printf("trickplay %s: %d previews every %ds in %s", itemID, made, interval,
-		time.Since(started).Round(time.Second))
+	trickplayLog.Debug("previews generated", "item", itemID, "count", made,
+		"interval", time.Duration(interval)*time.Second, "took", time.Since(started).Round(time.Second))
 	return nil
 }
 

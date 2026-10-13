@@ -3,12 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
 	"github.com/garybowers/cineva/server/internal/library"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
 )
@@ -20,8 +20,8 @@ func newManager(st *store.Store, artworkDir string) *library.Manager {
 	if key, ok := metadata.APIKey(viper.GetString("metadata.tmdb.api_key")); ok {
 		video = metadata.NewTMDB(key)
 	} else {
-		log.Printf("metadata: no TMDB key — titles will carry only what the files themselves hold. " +
-			"Set metadata.tmdb.api_key, CINEVA_METADATA_TMDB_API_KEY, or --tmdb-key.")
+		logging.For("metadata").Warn("no TMDB key: titles carry only what the files themselves hold",
+			"fix", "set metadata.tmdb.api_key, CINEVA_METADATA_TMDB_API_KEY or --tmdb-key")
 	}
 	mgr := library.NewManager(st, video, artworkDir)
 	if viper.GetBool("metadata.musicbrainz.enabled") {

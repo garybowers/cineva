@@ -3,6 +3,7 @@ package segments
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -273,6 +274,136 @@ func TestDetectorPace(t *testing.T) {
 		got := time.Since(start)
 		if got < tc.want || got > tc.want+80*time.Millisecond {
 			t.Errorf("%s: paced %v, want about %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestScheduleAllows(t *testing.T) {
+	at := func(h, m int) time.Time { return time.Date(2026, 10, 13, h, m, 0, 0, time.Local) }
+	overnight := Schedule{Mode: ModeWindow, Start: 2 * 60, End: 6 * 60}
+	lateNight := Schedule{Mode: ModeWindow, Start: 22 * 60, End: 6 * 60}
+	for _, tc := range []struct {
+		name string
+		sc   Schedule
+		now  time.Time
+		want bool
+	}{
+		{"inside the window", overnight, at(3, 0), true},
+		{"window opens", overnight, at(2, 0), true},
+		{"window has closed", overnight, at(6, 0), false},
+		{"daytime", overnight, at(14, 30), false},
+		{"past midnight, before it", lateNight, at(23, 15), true},
+		{"past midnight, after it", lateNight, at(4, 0), true},
+		{"past midnight, daytime", lateNight, at(12, 0), false},
+		{"start equals end: all day", Schedule{Mode: ModeWindow, Start: 60, End: 60}, at(12, 0), true},
+		{"idle: any time", Schedule{Mode: ModeIdle}, at(12, 0), true},
+		{"manual: never by itself", Schedule{Mode: ModeManual}, at(3, 0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.sc.allows(tc.now); got != tc.want {
+				t.Fatalf("allows = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Outside its window, or in manual mode, detection holds before reading and
+// says why; "Analyse now" lets it through; storage gone ends it outright.
+func TestDetectorScheduleAndStorage(t *testing.T) {
+	d := NewDetector(nil)
+	d.Now = func() time.Time { return time.Date(2026, 10, 13, 14, 0, 0, 0, time.Local) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, tc := range []struct {
+		sc     Schedule
+		reason string
+	}{
+		{Schedule{Mode: ModeWindow, Start: 2 * 60, End: 6 * 60}, "schedule"},
+		{Schedule{Mode: ModeManual}, "on-demand"},
+	} {
+		d.SetSchedule(tc.sc)
+		done := make(chan error, 1)
+		go func() { done <- d.gate(ctx) }()
+		select {
+		case err := <-done:
+			t.Fatalf("%s: gate opened (%v) while the schedule forbids reading", tc.sc.Mode, err)
+		case <-time.After(1200 * time.Millisecond):
+		}
+		if st := d.Status(); !st.Paused || st.PauseReason != tc.reason {
+			t.Fatalf("%s: status %+v, want paused for %q", tc.sc.Mode, st, tc.reason)
+		}
+		d.RunNow()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: after Analyse now: %v", tc.sc.Mode, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: Analyse now did not open the gate", tc.sc.Mode)
+		}
+		d.runNow.Store(false)
+	}
+
+	// The library's share going away ends the run rather than waiting.
+	d.SetSchedule(Schedule{Mode: ModeIdle})
+	d.setStatus(true, func(s *Status) { s.LibraryID = "lib" })
+	d.Available = func(string) bool { return false }
+	if err := d.gate(ctx); !errors.Is(err, errStorageGone) {
+		t.Fatalf("gate with storage gone = %v, want errStorageGone", err)
+	}
+}
+
+// A read that stalls stops the run there: no further file is opened on a
+// share that has gone quiet, and nothing from the season is saved.
+func TestDetectorStopsOnStalledRead(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lib, _ := st.CreateLibrary(ctx, "TV", store.MediaTV, []string{"/tv"})
+	save := func(it store.Item) store.Item {
+		t.Helper()
+		it.LibraryID = lib.ID
+		saved, err := st.UpsertItem(ctx, it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	series := save(store.Item{Kind: store.KindSeries, Title: "Show", Path: "/tv/Show"})
+	season := save(store.Item{Kind: store.KindSeason, ParentID: series.ID, Path: "/tv/Show/S1"})
+	for i := 1; i <= 6; i++ {
+		save(store.Item{Kind: store.KindEpisode, ParentID: season.ID, EpisodeNum: i,
+			Path: fmt.Sprintf("/e%d.mkv", i), FileMtime: 1, RuntimeSecs: 2400})
+	}
+
+	d := NewDetector(st)
+	d.DecodeTimeout = 50 * time.Millisecond
+	d.SetRateLimit(1) // one reader at a time, so the count below is exact
+	var opened atomic.Int32
+	release := make(chan struct{})
+	defer close(release)
+	d.Fingerprint = func(context.Context, string, float64, float64) (media.Fingerprint, error) {
+		opened.Add(1)
+		<-release // a share that never answers
+		return media.Fingerprint{}, nil
+	}
+	err = d.analyseLibrary(ctx, lib.ID)
+	if !errors.Is(err, errStorageGone) {
+		t.Fatalf("run = %v, want it stopped with errStorageGone", err)
+	}
+	if n := opened.Load(); n != 1 {
+		t.Fatalf("%d files opened, want 1: nothing more after the first stalled", n)
+	}
+	for _, sp := range specs {
+		if seasons, _ := st.SeasonsNeedingSegments(ctx, lib.ID, sp.kind); len(seasons) != 1 {
+			t.Fatalf("%s: season saved as analysed after a stalled read", sp.kind)
 		}
 	}
 }

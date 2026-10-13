@@ -3780,7 +3780,9 @@
   .keyreveal code { user-select: all; word-break: break-all; color: var(--accent-2); }
 
   /* ---- Persistent top bar: logo, universal search, profile ---- */
-  :root { --topbar-h: 3.4rem; }
+  /* --surface-radius rounds the big floating surfaces alike: the sidebar
+     and the player. */
+  :root { --topbar-h: 3.4rem; --surface-radius: 16px; }
   .topbar {
     position: sticky;
     top: 0;
@@ -3924,7 +3926,10 @@
     .body {
       --rail-w: 3.5rem;
       --panel-w: 15rem;
-      --side-gap: 0.75rem;
+      /* One gutter for the whole frame: window to sidebar, sidebar to
+         content, top bar to both, and the page's right edge — so the
+         sidebar and the page line up as one layout. */
+      --side-gap: 1rem;
     }
     .side {
       display: flex;
@@ -3943,7 +3948,7 @@
       -webkit-backdrop-filter: blur(18px) saturate(1.4);
       backdrop-filter: blur(18px) saturate(1.4);
       border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
-      border-radius: 18px;
+      border-radius: var(--surface-radius);
       box-shadow: 0 8px 28px color-mix(in srgb, var(--bg) 55%, transparent);
       transition: width 0.18s ease, box-shadow 0.18s ease;
     }
@@ -3954,11 +3959,13 @@
     .side.expanded:not(.pinned) {
       box-shadow: 0 18px 48px color-mix(in srgb, var(--bg) 75%, transparent);
     }
+    /* Where the page starts: past the rail, or past the pinned panel. */
+    .body { --content-left: calc(var(--rail-w) + var(--side-gap)); }
+    .body.sidepinned { --content-left: calc(var(--panel-w) + var(--side-gap)); }
     .content {
-      margin-left: calc(var(--rail-w) + var(--side-gap));
+      margin-left: var(--content-left);
       transition: margin-left 0.18s ease;
     }
-    .body.sidepinned .content { margin-left: calc(var(--panel-w) + var(--side-gap)); }
     .tabbar { display: none !important; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -4134,6 +4141,20 @@
     -webkit-mask-image: linear-gradient(to bottom, rgb(0 0 0 / 1) 0%, rgb(0 0 0 / 0.6) 40%, rgb(0 0 0 / 0.2) 72%, rgb(0 0 0 / 0) 100%);
     mask-image: linear-gradient(to bottom, rgb(0 0 0 / 1) 0%, rgb(0 0 0 / 0.6) 40%, rgb(0 0 0 / 0.2) 72%, rgb(0 0 0 / 0) 100%);
   }
+  /* Desktop: the gutter is main's own padding, so the page's top and left
+     edges meet the sidebar's — the same distance below the top bar, one
+     gutter apart. After the base rules above, which it overrides. */
+  @media (min-width: 768px) {
+    main { padding: var(--side-gap) var(--side-gap) 5rem; }
+    /* The backdrop runs on under the sidebar to the window's edge, so the
+       glass panel sits over the same picture as the page rather than ending
+       it in a hard seam. The clip that keeps it from widening the page moves
+       out to .body, which spans the window, so main no longer cuts it off. */
+    main { overflow-x: visible; }
+    .body { overflow-x: clip; }
+    .pagebg { left: calc(-1 * var(--content-left)); right: 0; margin: 0; }
+  }
+
   .pagebg.from-poster { filter: saturate(0.7) blur(16px); opacity: 0.24; }
 
   @media (prefers-reduced-motion: reduce) {

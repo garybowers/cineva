@@ -12,14 +12,17 @@ package stats
 import (
 	"bufio"
 	"context"
-	"log"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/garybowers/cineva/server/internal/logging"
 )
+
+var logger = logging.For("stats")
 
 // Sample is one point of host + process resource usage.
 type Sample struct {
@@ -96,7 +99,7 @@ func (s *Sampler) Run(ctx context.Context) {
 		case now := <-prune.C:
 			if s.Store != nil {
 				if _, err := s.Store.PruneStatsSamples(ctx, now.Add(-s.retain())); err != nil {
-					log.Printf("stats: pruning samples: %v", err)
+					logger.Warn("pruning samples failed", "err", err)
 				}
 			}
 		}
@@ -150,7 +153,7 @@ func (s *Sampler) take(now time.Time) {
 	if coarseTick && s.Store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := s.Store.AppendStatsSample(ctx, stored(smp)); err != nil {
-			log.Printf("stats: persisting sample: %v", err)
+			logger.Warn("persisting sample failed", "err", err)
 		}
 		cancel()
 	}
@@ -266,7 +269,7 @@ func (s *Sampler) restore(ctx context.Context) {
 	}
 	rows, err := s.Store.StatsSamplesSince(ctx, time.Now().Add(-s.retain()))
 	if err != nil {
-		log.Printf("stats: restoring history: %v", err)
+		logger.Warn("restoring history failed", "err", err)
 		return
 	}
 	if len(rows) == 0 {
@@ -283,6 +286,6 @@ func (s *Sampler) restore(ctx context.Context) {
 	// resumes on the minute boundary rather than immediately duplicating it.
 	s.lastMinute = rows[len(rows)-1].At
 	s.mu.Unlock()
-	log.Printf("stats: restored %d samples covering %s", len(rows),
-		time.Since(rows[0].At).Round(time.Minute))
+	logger.Debug("restored history", "count", len(rows),
+		"covering", time.Since(rows[0].At).Round(time.Minute))
 }

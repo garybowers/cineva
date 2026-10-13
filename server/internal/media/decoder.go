@@ -3,7 +3,6 @@ package media
 import (
 	"errors"
 	"fmt"
-	"log"
 	"runtime"
 
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
@@ -97,7 +96,7 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 	if hw != nil {
 		if c, name := standaloneHWDecoder(codecID, hw); c != nil {
 			codec, standalone = c, true
-			log.Printf("hwdec: using %s", name)
+			logger.Debug("using hardware decoder", "decoder", name)
 		}
 	}
 	ctx := ffmpeg.AVCodecAllocContext3(codec)
@@ -152,7 +151,7 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 				// The device cannot take this stream — an unsupported
 				// profile or bit depth. Fall back to whatever libavcodec
 				// offered first, which is the software format.
-				log.Printf("hwdec: device cannot decode this stream, using the CPU")
+				logger.Debug("device cannot decode this stream, decoding on the CPU")
 				d.hwPixFmt = ffmpeg.AVPixFmtNone
 				if len(formats) > 0 {
 					return formats[0]
@@ -166,7 +165,7 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 		// A device that refuses the stream can fail the open outright, so
 		// retry in software rather than failing the playback.
 		if d.hwPixFmt != ffmpeg.AVPixFmtNone || standalone {
-			log.Printf("hwdec: %s open failed (%v), retrying on the CPU", codec.Name().String(), err)
+			logger.Warn("hardware decoder open failed, retrying on the CPU", "decoder", codec.Name().String(), "err", err)
 			_ = d.Close()
 			return newDecoder(stream, nil)
 		}

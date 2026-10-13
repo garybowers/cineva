@@ -35,13 +35,61 @@ music are in daily use; audiobooks, podcasts and books are on the way.
 ## Requirements
 
 - Linux on amd64 (x86-64) or arm64.
-- glibc 2.39 or newer — Ubuntu 24.04, Debian 13, Fedora 40 or later. The
-  release binaries carry FFmpeg inside them but use the system's C and C++
-  runtime libraries.
+- Either Docker, or for the plain binary: glibc 2.39 or newer — Ubuntu 24.04,
+  Debian 13, Fedora 40 or later. The binary carries FFmpeg inside it but uses
+  the system's C and C++ runtime libraries; the container image brings its
+  own, so with Docker the host's versions do not matter.
 - For hardware transcoding: a GPU with a VA-API driver (`mesa-va-drivers` or
-  `intel-media-va-driver`). Without one, Cineva transcodes in software.
+  `intel-media-va-driver`; the container image includes both). Without one,
+  Cineva transcodes in software.
 
-## Installing
+## Running with Docker
+
+The image is the easiest way in: it runs on any distribution, and includes
+the GPU drivers for hardware transcoding.
+
+```sh
+docker run -d --name cineva \
+  -p 4747:4747 \
+  -v cineva-data:/data \
+  -v /path/to/media:/media:ro \
+  --device /dev/dri \
+  --group-add "$(stat -c %g /dev/dri/renderD128)" \
+  --restart unless-stopped \
+  <dockerhub-user>/cineva:latest
+```
+
+- `/data` holds the database, the artwork cache and, if you want one, a
+  `cineva.yaml`. Keep it on a volume or a host folder so it survives
+  upgrades.
+- Mount your media read-only and point libraries at the paths inside the
+  container (`/media/Movies`, `/media/TV`).
+- `--device /dev/dri` and `--group-add` (the host's `render` group) let it
+  use the GPU; leave both out to transcode in software.
+- Settings can also be passed as environment variables, for example
+  `-e CINEVA_LOG_LEVEL=debug`.
+
+With Compose:
+
+```yaml
+services:
+  cineva:
+    image: <dockerhub-user>/cineva:latest
+    ports: ["4747:4747"]
+    volumes:
+      - cineva-data:/data
+      - /path/to/media:/media:ro
+    devices: ["/dev/dri:/dev/dri"]
+    group_add: ["989"]  # the host's render group: stat -c %g /dev/dri/renderD128
+    restart: unless-stopped
+volumes:
+  cineva-data:
+```
+
+Upgrade with `docker pull` and recreating the container; the database
+migrates itself on start.
+
+## Installing the binary
 
 Download the binary for your machine from the
 [Releases](https://github.com/garybowers/cineva/releases) page, along with
@@ -133,6 +181,8 @@ with its environment variable; the ones most often changed:
 | `transcode.hwaccel` | `auto` | `CINEVA_TRANSCODE_HWACCEL` |
 | `metadata.tmdb.api_key` | built in to releases | `CINEVA_METADATA_TMDB_API_KEY` |
 | `auth.secure_cookies` | `false` — set `true` behind HTTPS | `CINEVA_AUTH_SECURE_COOKIES` |
+| `log.level` | `info` (`debug`, `warn`, `error`; or `--log-level`) | `CINEVA_LOG_LEVEL` |
+| `log.format` | `auto` — readable in a terminal, JSON otherwise | `CINEVA_LOG_FORMAT` |
 
 `cineva config validate` prints the effective configuration.
 
@@ -191,11 +241,27 @@ git push origin v0.2.0
 ```
 
 The release carries `cineva-linux-amd64`, `cineva-linux-arm64` and
-`SHA256SUMS`, with the version stamped into the binary. A tag with a hyphen
-(`v0.2.0-rc.1`) is published as a pre-release. The workflow uses a `TMDB_KEY`
-repository secret for the built-in key, and an optional `ARM64_RUNNER`
-repository variable to build arm64 somewhere other than GitHub's arm64
-runners.
+`SHA256SUMS`, with the version stamped into the binary, and the same binaries
+go to Docker Hub as a two-architecture image tagged `0.2.0`, `0.2`, `0` and
+`latest`. A tag with a hyphen (`v0.2.0-rc.1`) is published as a pre-release,
+and its image gets only its own tag, never `latest`.
+
+To build the image locally, put a binary in `dist/` and build:
+
+```sh
+make build OUT=dist/cineva-linux-amd64
+docker build -t cineva .
+```
+
+A binary built on a recent rolling distribution may need a newer glibc than
+the image's Debian 13 provides; release binaries are built on Ubuntu 24.04
+for that reason.
+
+The workflow uses repository settings: a `TMDB_KEY` secret for the built-in
+key; `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets and a
+`DOCKERHUB_REPOSITORY` variable (for example `garybowers/cineva`) to publish
+the image; and an optional `ARM64_RUNNER` variable to build arm64 somewhere
+other than GitHub's arm64 runners.
 
 ## Contributing
 

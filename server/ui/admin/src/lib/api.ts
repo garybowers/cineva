@@ -158,6 +158,11 @@ export interface ServerSettings {
   detectionRateMB: number
   /** Read-only: the caps offered. */
   detectionRateOptions: number[]
+  /** When detection may read: only in the window, whenever idle, or only when started by hand. */
+  detectionMode: 'window' | 'idle' | 'manual'
+  /** "HH:MM", server local time; the window may run past midnight. */
+  detectionWindowStart: string
+  detectionWindowEnd: string
 }
 export const getSettings = () => req<ServerSettings>('/settings')
 export const putSettings = (s: Partial<ServerSettings>) =>
@@ -214,7 +219,7 @@ export interface IntroStatus {
   unreadable: number
   /** Waiting: "manual" (paused here), or giving way to "playing" / "scanning". */
   paused?: boolean
-  pauseReason?: 'manual' | 'playing' | 'scanning'
+  pauseReason?: 'manual' | 'playing' | 'scanning' | 'schedule' | 'on-demand'
   current?: { series: string; season: number; kind: 'intro' | 'credits'; phase: 'reading' | 'comparing' | 'saving'; done: number; total: number }
   recent?: IntroResult[]
   last?: {
@@ -242,6 +247,8 @@ export interface IntroResult {
 export const segmentStatus = () => req<IntroStatus>('/segments/status')
 export const pauseSegments = () => req<IntroStatus>('/segments/pause', { method: 'POST' })
 export const resumeSegments = () => req<IntroStatus>('/segments/resume', { method: 'POST' })
+/** "Analyse now": run straight away, whatever the schedule, until the backlog is done. */
+export const runSegments = () => req<IntroStatus>('/segments/run', { method: 'POST' })
 export const cancelScan = (id: string) => req<void>(`/scans/${id}/cancel`, { method: 'POST' })
 
 export interface PlaySession {

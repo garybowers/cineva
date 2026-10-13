@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var storageLog = logging.For("storage")
 
 // Media usually lives on a network share, and a share that stops answering
 // does not fail: a read or a stat on a hung mount blocks, sometimes for as
@@ -107,7 +109,7 @@ func (m *StorageMonitor) Run(ctx context.Context) {
 	for {
 		libs, err := m.Store.Libraries(ctx)
 		if err != nil && ctx.Err() == nil {
-			log.Printf("storage check: %v", err)
+			storageLog.Warn("listing libraries for the storage check failed", "err", err)
 		}
 		for _, lib := range libs {
 			m.Check(lib)
@@ -184,9 +186,9 @@ func (m *StorageMonitor) record(lib store.Library, st StorageStatus) {
 		return
 	}
 	if st.Available {
-		log.Printf("storage: %q reachable again", lib.Name)
+		storageLog.Info("library storage reachable again", "library", lib.Name)
 	} else {
-		log.Printf("storage: %q unreachable: %s: %s", lib.Name, st.Path, st.Error)
+		storageLog.Warn("library storage unreachable", "library", lib.Name, "path", st.Path, "err", st.Error)
 	}
 	if m.OnChange != nil {
 		m.OnChange(lib, st)

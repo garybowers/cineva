@@ -94,3 +94,12 @@ stats:
   # charts restore from these after a restart; raise it for a longer view.
   #                                           CINEVA_STATS_RETENTION_HOURS
   retention_hours: 24
+
+log:
+  # How much to log: debug, info, warn or error. Also the --log-level flag.
+  #                                                       CINEVA_LOG_LEVEL
+  level: info
+  # auto: aligned, coloured lines in a terminal; one JSON object per line
+  # anywhere else (systemd, Docker, a pipe). Or force pretty or json.
+  # NO_COLOR turns the colours off.                      CINEVA_LOG_FORMAT
+  format: auto

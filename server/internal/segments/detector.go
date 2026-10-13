@@ -3,16 +3,18 @@ package segments
 import (
 	"context"
 	"errors"
-	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/garybowers/cineva/server/internal/library"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var logger = logging.For("segments")
 
 // spec is what distinguishes one kind of segment from another: where in an
 // episode it is looked for, and how long it may be.
@@ -50,6 +52,48 @@ var specs = []spec{
 // decodeTimeout bounds one file's fingerprinting. Reading fifteen minutes of
 // audio takes a few seconds from local disk and under ten from a NAS.
 const decodeTimeout = 3 * time.Minute
+
+// Schedule modes: when detection may read.
+const (
+	// ModeWindow reads only between Schedule.Start and Schedule.End.
+	ModeWindow = "window"
+	// ModeIdle reads whenever nothing else needs the storage.
+	ModeIdle = "idle"
+	// ModeManual reads only after an admin asks (RunNow).
+	ModeManual = "manual"
+)
+
+// Schedule says when detection may read. Start and End are minutes after
+// midnight, local time; a window may run past midnight (22:00 to 06:00).
+type Schedule struct {
+	Mode       string
+	Start, End int
+}
+
+// allows reports whether the schedule lets detection read at now.
+func (sc Schedule) allows(now time.Time) bool {
+	switch sc.Mode {
+	case ModeManual:
+		return false
+	case ModeWindow:
+		m := now.Hour()*60 + now.Minute()
+		switch {
+		case sc.Start == sc.End:
+			return true // a window of the whole day
+		case sc.Start < sc.End:
+			return m >= sc.Start && m < sc.End
+		default:
+			return m >= sc.Start || m < sc.End
+		}
+	}
+	return true
+}
+
+// errStorageGone ends a run whose share has stopped answering. Carrying on
+// would only add reads to the ones already stuck on it — and on a network
+// share they all queue on one connection, so every other use of that share,
+// playback included, stalls behind them.
+var errStorageGone = errors.New("storage stopped responding")
 
 // How many other episodes each one is compared with. More than one, so a
 // stretch only two episodes happen to share is outvoted (see pick); a few,
@@ -174,8 +218,16 @@ type Detector struct {
 	// it does not dart in between one episode ending and the next starting.
 	Cooldown time.Duration
 
+	// DecodeTimeout bounds one file's fingerprinting; decodeTimeout
+	// outside tests.
+	DecodeTimeout time.Duration
+	// Now is the clock the schedule is read against; time.Now outside tests.
+	Now func() time.Time
+
 	paused    atomic.Bool  // by an admin
 	rateLimit atomic.Int64 // bytes per second; 0 = as fast as it can
+	schedule  atomic.Pointer[Schedule]
+	runNow    atomic.Bool // "Analyse now": overrides the schedule until the queue is done
 
 	mu       sync.Mutex
 	queue    []string
@@ -185,7 +237,44 @@ type Detector struct {
 }
 
 func NewDetector(st *store.Store) *Detector {
-	return &Detector{Store: st, Fingerprint: media.FingerprintFile, Cooldown: time.Minute, wake: make(chan struct{}, 1)}
+	return &Detector{Store: st, Fingerprint: media.FingerprintFile, Cooldown: time.Minute,
+		DecodeTimeout: decodeTimeout, Now: time.Now, wake: make(chan struct{}, 1)}
+}
+
+// SetSchedule changes when detection may read. A run in progress obeys it
+// from the next file.
+func (d *Detector) SetSchedule(sc Schedule) {
+	d.schedule.Store(&sc)
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
+// RunNow lets detection read straight away, whatever the schedule says,
+// until everything queued is done. A manual pause still holds it.
+func (d *Detector) RunNow() {
+	d.runNow.Store(true)
+}
+
+// scheduleWait names why the schedule holds detection — "schedule" outside
+// the window, "on-demand" until an admin starts it — or returns "".
+func (d *Detector) scheduleWait() string {
+	sc := d.schedule.Load()
+	if sc == nil || d.runNow.Load() {
+		return ""
+	}
+	now := time.Now
+	if d.Now != nil {
+		now = d.Now
+	}
+	if sc.allows(now()) {
+		return ""
+	}
+	if sc.Mode == ModeManual {
+		return "on-demand"
+	}
+	return "schedule"
 }
 
 // SetPaused pauses or resumes detection. A pause holds before the next file;
@@ -205,14 +294,23 @@ func (d *Detector) SetPaused(p bool) {
 // 0 removes the cap. Takes effect from the next file.
 func (d *Detector) SetRateLimit(bytesPerSec int64) { d.rateLimit.Store(max(0, bytesPerSec)) }
 
-// gate holds before each file while detection is paused or something else
-// needs the storage, and returns when it may read.
+// gate holds before each file while detection is paused, outside its
+// schedule, or while something else needs the storage, and returns when it
+// may read — or errStorageGone once the library's share stops answering.
 func (d *Detector) gate(ctx context.Context) error {
 	var lastBusy time.Time
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if lib := d.Status().LibraryID; lib != "" && d.Available != nil && !d.Available(lib) {
+			return errStorageGone
+		}
 		reason := ""
 		if d.paused.Load() {
 			reason = "manual"
+		} else if r := d.scheduleWait(); r != "" {
+			reason = r
 		} else if d.Busy != nil {
 			if r := d.Busy(); r != "" {
 				reason, lastBusy = r, time.Now()
@@ -313,11 +411,16 @@ func (d *Detector) Run(ctx context.Context) {
 			}
 		}
 		if err := d.analyseLibrary(ctx, lib); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("intro detection %s: %v", lib, err)
+			logger.Error("detection failed", "library_id", lib, "err", err)
 		}
 		if ctx.Err() != nil {
 			return
 		}
+		d.mu.Lock()
+		if len(d.queue) == 0 {
+			d.runNow.Store(false) // "Analyse now" lasts until the work it asked for is done
+		}
+		d.mu.Unlock()
 	}
 }
 
@@ -340,7 +443,8 @@ func (d *Detector) setStatus(force bool, fn func(*Status)) {
 
 func (d *Detector) analyseLibrary(ctx context.Context, libraryID string) error {
 	if d.Available != nil && !d.Available(libraryID) {
-		log.Printf("segment detection %s: storage unreachable, skipped until it is back", libraryID)
+		// Debug: the storage monitor has already warned once that the share is down.
+		logger.Debug("storage unreachable, detection skipped until it is back", "library_id", libraryID)
 		return nil
 	}
 	// Every season needing either kind, each once and in the order first
@@ -401,7 +505,7 @@ seasons:
 	if runErr != nil {
 		return runErr
 	}
-	log.Printf("intro detection %s: %d season(s) in %s", libraryID, len(seasons), time.Since(started).Round(time.Second))
+	logger.Info("detection finished", "library_id", libraryID, "seasons", len(seasons), "took", time.Since(started).Round(time.Second))
 	return nil
 }
 
@@ -458,8 +562,32 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 	if d.rateLimit.Load() > 0 {
 		readers = 1
 	}
+	// The first file to find the share gone, or to stall on it, stops the
+	// rest: no other reader starts, and nothing from this season is saved.
+	var stopMu sync.Mutex
+	var stopErr error
+	stop := func(err error) {
+		stopMu.Lock()
+		if stopErr == nil {
+			stopErr = err
+		}
+		stopMu.Unlock()
+	}
+	stopped := func() error {
+		stopMu.Lock()
+		defer stopMu.Unlock()
+		return stopErr
+	}
+	timeout := d.DecodeTimeout
+	if timeout <= 0 {
+		timeout = decodeTimeout
+	}
 	parallelN(len(idx), readers, func(k int) {
-		if d.gate(ctx) != nil {
+		if stopped() != nil {
+			return
+		}
+		if err := d.gate(ctx); err != nil {
+			stop(err)
 			return
 		}
 		i := idx[k]
@@ -467,18 +595,23 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 		// A file with no known length has no end to count back from, and
 		// is simply not compared.
 		if start, dur, ok := sp.window(eps[i].RuntimeSecs); ok {
-			// A decode that stalls on a share gone quiet is given up on, so
-			// one stuck file cannot hold the whole run; the file counts as
-			// unreadable this time and is tried again on the next pass.
+			// A decode that stalls is a share gone quiet: the run stops
+			// there rather than moving on to the next file, which would
+			// only stall alongside it. The file is tried again next time.
 			began := time.Now()
-			fp, err := library.Within(decodeTimeout, func() (media.Fingerprint, error) {
+			fp, err := library.Within(timeout, func() (media.Fingerprint, error) {
 				return d.Fingerprint(ctx, eps[i].Path, start, dur)
 			})
+			if errors.Is(err, library.ErrNotResponding) {
+				logger.Warn("file not responding, stopping until the share is back", "path", eps[i].Path)
+				stop(errStorageGone)
+				return
+			}
 			d.pace(ctx, eps[i], dur, time.Since(began))
 			if err == nil {
 				fps[i] = &fp
 			} else if ctx.Err() == nil {
-				log.Printf("segment detection: %s: %v", eps[i].Path, err)
+				logger.Warn("fingerprint failed", "path", eps[i].Path, "err", err)
 				unreadable = 1
 			}
 		}
@@ -490,6 +623,9 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 		})
 	})
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := stopped(); err != nil {
 		return err
 	}
 

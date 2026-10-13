@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +23,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/auth"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/segments"
@@ -55,7 +56,23 @@ type Config struct {
 	RetainDays int
 	// IntroDetect runs intro detection over TV libraries in the background.
 	IntroDetect bool
+	// Ready, when set, is called once the server is listening — where the
+	// command prints its startup card.
+	Ready func(Startup)
 }
+
+// Startup is what the server knows once it is listening, for the startup
+// card.
+type Startup struct {
+	Addr      string // the address actually bound, "[::]:4747"
+	HWAccel   string // the transcode backend found, or "none"
+	Libraries int
+}
+
+var (
+	serverLog    = logging.For("server")
+	transcodeLog = logging.For("transcode")
+)
 
 type server struct {
 	store             *store.Store
@@ -110,17 +127,17 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// session transcodes nothing until a segment is asked for.
 	s.sessions.Persist = func(state media.SessionState) {
 		if err := st.SaveTranscodeSession(context.Background(), toStoreSession(state)); err != nil {
-			log.Printf("persist session: %v", err)
+			transcodeLog.Error("persisting transcode session failed", "session", state.ID, "err", err)
 		}
 	}
 	s.sessions.Forget = func(id string) {
 		if err := st.DeleteTranscodeSession(context.Background(), id); err != nil {
-			log.Printf("forget session: %v", err)
+			transcodeLog.Warn("forgetting transcode session failed", "session", id, "err", err)
 		}
 	}
 	var keep []string
 	if stored, err := st.TranscodeSessions(context.Background()); err != nil {
-		log.Printf("restore sessions: %v", err)
+		transcodeLog.Warn("restoring transcode sessions failed", "err", err)
 	} else {
 		states := make([]media.SessionState, 0, len(stored))
 		for _, t := range stored {
@@ -132,9 +149,9 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// Everything else in the transcode directory is an orphan from a
 	// previous run: sessions died with the process, their segments did not.
 	if n, freed, err := media.SweepOrphans(cfg.TranscodeDir, keep...); err != nil {
-		log.Printf("transcode sweep: %v", err)
+		transcodeLog.Warn("transcode sweep failed", "err", err)
 	} else if n > 0 {
-		log.Printf("transcode: removed %d orphaned session directory(ies), freed %d MiB", n, freed>>20)
+		transcodeLog.Info("removed orphaned session directories", "count", n, "freed_mib", freed>>20)
 	}
 
 	// Probe for a hardware transcoder once at startup rather than per
@@ -218,6 +235,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 			s.segments.SetPaused(v == "true")
 		}
 		s.segments.SetRateLimit(int64(s.detectionRateMB(context.Background())) * 1_000_000)
+		s.segments.SetSchedule(s.detectionSchedule(context.Background()))
 		s.segments.OnProgress = func(status segments.Status) {
 			s.events.Publish(events.Event{Type: "segments", Data: status})
 		}
@@ -246,7 +264,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 
 	e := echo.New()
 	e.HideBanner = true
-	e.Use(middleware.Recover(), middleware.Logger())
+	e.HidePort = true // the startup card says where it is listening
+	e.Use(middleware.Recover(), requestLog)
 
 	// Compression. JSON and the UI bundles are the bulk of what a browser
 	// fetches and they shrink by roughly three quarters; a library's item
@@ -286,6 +305,11 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// or a reload anywhere but the root 404s.
 	e.HTTPErrorHandler = func(err error, c echo.Context) {
 		he, ok := err.(*echo.HTTPError)
+		if ok {
+			c.Set(errKey, fmt.Sprint(he.Message))
+		} else if err != nil {
+			c.Set(errKey, err.Error())
+		}
 		p := c.Request().URL.Path
 		if ok && he.Code == http.StatusNotFound && c.Request().Method == http.MethodGet &&
 			!looksLikeAsset(p) &&
@@ -298,7 +322,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 				_ = c.HTMLBlob(http.StatusOK, data)
 				return
 			}
-			log.Printf("spa fallback: %s index.html unreadable", name)
+			serverLog.Error("spa fallback: index.html unreadable", "app", name)
 		}
 		e.DefaultHTTPErrorHandler(err, c)
 	}
@@ -314,37 +338,46 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		if got == os.Interrupt {
 			name = "Ctrl-C"
 		}
-		fmt.Printf("\n%s received — shutting down… (press Ctrl-C again to force)\n", name)
+		serverLog.Info("shutting down — press Ctrl-C again to force", "signal", name)
 		// A second signal skips the graceful path.
 		go func() {
 			<-sig
-			fmt.Println("forced exit")
+			serverLog.Warn("forced exit")
 			os.Exit(1)
 		}()
 		if n := len(s.playbacks.List()); n > 0 {
-			fmt.Printf("  %d active playback(s) will be cut off\n", n)
+			serverLog.Warn("active playbacks will be cut off", "count", n)
 		}
-		fmt.Print("  stopping HTTP server (waiting up to 10 s for requests)… ")
+		serverLog.Info("stopping HTTP server", "wait", 10*time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := e.Shutdown(ctx); err != nil {
-			fmt.Printf("%v\n", err)
-		} else {
-			fmt.Println("done")
+			serverLog.Warn("HTTP server did not stop cleanly", "err", err)
 		}
 		stopSampler()
 		if n := len(s.sessions.Sessions()); n > 0 {
-			fmt.Printf("  stopping %d transcode session(s) and removing temp files… ", n)
-			s.sessions.Close()
-			fmt.Println("done")
-		} else {
-			s.sessions.Close()
+			serverLog.Info("stopping transcode sessions", "count", n)
 		}
-		fmt.Println("bye")
+		s.sessions.Close()
+		serverLog.Info("stopped")
 		close(shutdownDone)
 	}()
 
-	err := e.Start(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
+	// Bound before Start so a port already in use fails here, plainly, and
+	// the startup card is only printed for a server that is really up.
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
+	if err != nil {
+		return fmt.Errorf("listen on %s:%d: %w", cfg.Host, cfg.Port, err)
+	}
+	e.Listener = ln
+	if cfg.Ready != nil {
+		libs, lerr := st.Libraries(context.Background())
+		if lerr != nil {
+			serverLog.Warn("counting libraries for the startup card", "err", lerr)
+		}
+		cfg.Ready(Startup{Addr: ln.Addr().String(), HWAccel: s.sessions.HW.Name(), Libraries: len(libs)})
+	}
+	err = e.Start("")
 	if err == http.ErrServerClosed {
 		<-shutdownDone
 		return nil
@@ -442,6 +475,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.GET("/segments/status", s.segmentStatus)
 	adm.POST("/segments/pause", s.pauseSegments)
 	adm.POST("/segments/resume", s.resumeSegments)
+	adm.POST("/segments/run", s.runSegments)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)
 	adm.GET("/integrations", s.listIntegrations)
@@ -539,7 +573,7 @@ func fromStoreSession(t store.TranscodeSession) media.SessionState {
 // to simply not offer to install.
 func init() {
 	if err := mime.AddExtensionType(".webmanifest", "application/manifest+json"); err != nil {
-		log.Printf("register .webmanifest mime type: %v", err)
+		serverLog.Warn("registering the .webmanifest mime type failed", "err", err)
 	}
 }
 

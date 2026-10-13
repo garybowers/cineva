@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strconv"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
 	"github.com/linuxmatters/ffmpeg-statigo/av"
 )
+
+// subtitleLog reports subtitle burn-in during a transcode.
+var subtitleLog = logging.For("subtitles")
 
 // HLSJob transcodes a file into HLS fMP4 segments. Audio is always
 // transcoded to AAC (browsers can't decode the ac3/eac3 common in media
@@ -90,7 +94,7 @@ func setPrivOpt(cc *ffmpeg.AVCodecContext, key, value string) {
 	defer name.Free()
 	defer val.Free()
 	if _, err := ffmpeg.AVOptSet(priv, name, val, 0); err != nil {
-		log.Printf("hls: encoder option %s=%s ignored: %v", key, value, err)
+		logger.Debug("encoder option ignored", "option", key, "value", value, "err", err)
 	}
 }
 
@@ -245,7 +249,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		if job.HW != nil {
 			hwFrames, err = job.HW.NewFrames(outW, outH)
 			if err != nil {
-				log.Printf("hls: %s unusable (%v) — encoding on the CPU", job.HW.Kind, err)
+				logger.Warn("hardware frames unusable, encoding on the CPU", "kind", job.HW.Kind, "err", err)
 				hwFrames = nil
 			}
 		}
@@ -266,7 +270,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 			// encoder from a device surface would download every frame for
 			// no gain over decoding on the CPU in the first place. Reopen
 			// on the CPU rather than fail.
-			log.Printf("hls: %s cannot encode here — decoding on the CPU too", job.HW.Kind)
+			logger.Warn("device cannot encode here, decoding on the CPU too", "kind", job.HW.Kind)
 			vdec.Close()
 			vdec, err = newDecoder(vStream, nil)
 			if err != nil {
@@ -295,9 +299,9 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 				if b, err := newSubBurner(st, srcW, srcH, outW, outH); err == nil {
 					burner = b
 					defer burner.Close()
-					log.Printf("hls: burning in subtitle stream %d", job.BurnSubtitle)
+					subtitleLog.Debug("burning in subtitle", "stream", job.BurnSubtitle)
 				} else {
-					log.Printf("hls: subtitle burn-in unavailable: %v", err)
+					subtitleLog.Warn("subtitle burn-in unavailable", "stream", job.BurnSubtitle, "err", err)
 				}
 			}
 		}
@@ -348,7 +352,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 			if err != nil {
 				return fmt.Errorf("hls %s encoder: %w", job.HW.Encoder, err)
 			}
-			log.Printf("hls: encoding on %s (%s, %dx%d)", job.HW.Name(), job.HW.Encoder, outW, outH)
+			logger.Debug("encoding on hardware", "device", job.HW.Name(), "encoder", job.HW.Encoder, "width", outW, "height", outH)
 			if job.OnAccel != nil {
 				job.OnAccel(job.HW.Name())
 			}
@@ -494,6 +498,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 
 	oneSecond := ffmpeg.AVMakeQ(1, 1)
 
+	burnWarned := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err // cancelled: session stopped or seeking elsewhere
@@ -507,8 +512,14 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		}
 
 		if burner != nil && pkt.StreamIndex() == job.BurnSubtitle {
+			// Once per session at warn: a broken subtitle stream fails on
+			// every packet, and one line says as much as a thousand.
 			if err := burner.Feed(pkt); err != nil {
-				log.Printf("hls: subtitle: %v", err)
+				level := slog.LevelDebug
+				if !burnWarned {
+					level, burnWarned = slog.LevelWarn, true
+				}
+				subtitleLog.Log(ctx, level, "subtitle packet could not be burned in", "stream", job.BurnSubtitle, "err", err)
 			}
 			continue
 		}
@@ -536,7 +547,7 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 							if derr != nil {
 								return fmt.Errorf("hls download filter: %w", derr)
 							}
-							log.Printf("hls: decoding on %s, scaling on the CPU", job.HW.Kind)
+							logger.Debug("decoding on the GPU, scaling on the CPU", "kind", job.HW.Kind)
 						}
 						if err := dlGraph.Push(frame); err != nil {
 							return err

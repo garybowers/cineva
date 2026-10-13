@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,9 +17,15 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/store"
+)
+
+var (
+	playbackLog = logging.For("playback")
+	downloadLog = logging.For("downloads")
 )
 
 // capabilities are what the requesting device claims it can decode/demux.
@@ -230,7 +235,7 @@ func (s *server) playItem(c echo.Context) error {
 	// means the row was never opened, and ending is then a no-op.
 	eventID, err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind)
 	if err != nil {
-		log.Printf("record play: %v", err)
+		playbackLog.Error("recording play history failed", "item", item.ID, "err", err)
 	} else {
 		s.events.Publish(events.Event{Type: "plays"})
 	}
@@ -276,7 +281,7 @@ func (s *server) playItem(c echo.Context) error {
 		return s.storageFailed(c.Request().Context(), item, err)
 	}
 	if err != nil {
-		log.Printf("play %s: probe: %v", item.Title, err)
+		playbackLog.Warn("probe failed", "title", item.Title, "err", err)
 	}
 
 	audio, err := s.store.AudioTracksForItem(c.Request().Context(), item.ID)
@@ -295,7 +300,7 @@ func (s *server) playItem(c echo.Context) error {
 	// offers no skip.
 	segs, err := s.store.Segments(c.Request().Context(), item.ID)
 	if err != nil {
-		log.Printf("play %s: segments: %v", item.Title, err)
+		playbackLog.Warn("loading segments failed", "title", item.Title, "err", err)
 	}
 	// The requested track, defaulting to the file's own default.
 	chosen := defaultAudioTrack(audio)
@@ -581,7 +586,7 @@ func (s *server) downloadArchive(c echo.Context, root store.Item, format string,
 		}
 		src, err := os.Open(f.path)
 		if err != nil {
-			log.Printf("archive %s: %v", f.path, err)
+			downloadLog.Warn("archive entry unreadable, skipped", "path", f.path, "err", err)
 			continue
 		}
 		_, err = io.Copy(w, src)
@@ -688,6 +693,19 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 		}
 	}
 	s.playbacks.Start(p)
+	if p.EventID != 0 { // a new play, not a heartbeat finding its entry gone
+		playbackLog.Info("playback started", "user", currentUser(c).Username, "title", playTitle(p),
+			"mode", p.Mode, "quality", p.Quality, "client", clientLabel(c), "ip", p.Client.IP)
+	}
+}
+
+// playTitle names what is playing: "The Celebrity Traitors · S02E03 ·
+// Episode 3" rather than just "Episode 3".
+func playTitle(p playback.Playback) string {
+	if p.Subtitle != "" {
+		return p.Subtitle + " · " + p.Title
+	}
+	return p.Title
 }
 
 // activeSession is an active playback plus its transcode's live numbers.
@@ -767,7 +785,7 @@ func (s *server) postProgress(c echo.Context) error {
 	if s.playbacks.Stopped(userID(c), item.ID) {
 		if item.Kind != store.KindTrack {
 			if _, err := s.store.SetProgress(c.Request().Context(), userID(c), item.ID, req.PositionSecs, item.RuntimeSecs); err != nil {
-				log.Printf("progress on admin stop: %v", err)
+				playbackLog.Error("saving progress on admin stop failed", "item", item.ID, "err", err)
 			}
 		}
 		return echo.NewHTTPError(http.StatusConflict, "playback was stopped by an administrator")
@@ -847,7 +865,7 @@ func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.Au
 		})
 	}
 	if err := s.store.ReplaceAudioTracks(c.Request().Context(), item.ID, tracks); err != nil {
-		log.Printf("backfill audio tracks for %s: %v", item.Title, err)
+		playbackLog.Error("backfilling audio tracks failed", "title", item.Title, "err", err)
 	}
 	return tracks
 }
@@ -872,8 +890,17 @@ func (s *server) onPlaybackEnd(p playback.Playback) {
 		float64(p.PositionSecs) >= float64(p.DurationSecs)*playCompleteFraction
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	user := p.UserID
+	if u, err := s.store.UserByID(ctx, p.UserID); err == nil {
+		user = u.Username
+	}
+	attrs := []any{"user", user, "title", playTitle(p), "watched", time.Duration(secs) * time.Second, "finished", completed}
+	if p.DurationSecs > 0 {
+		attrs = append(attrs, "reached", fmt.Sprintf("%d%%", min(100, p.PositionSecs*100/p.DurationSecs)))
+	}
+	playbackLog.Info("playback ended", attrs...)
 	if err := s.store.FinishPlay(ctx, p.EventID, secs, completed); err != nil {
-		log.Printf("finish play %d: %v", p.EventID, err)
+		playbackLog.Error("closing play history row failed", "event", p.EventID, "err", err)
 	}
 	s.events.Publish(events.Event{Type: "plays"})
 }

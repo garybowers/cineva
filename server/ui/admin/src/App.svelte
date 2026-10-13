@@ -6,7 +6,7 @@
     type UserGroup, type LibraryAccess,
     listIntegrations, createIntegration, updateIntegration, deleteIntegration,
     type Integration, type IntegrationKind, type IntegrationRequest,
-    pauseSegments, resumeSegments,
+    pauseSegments, resumeSegments, runSegments,
     cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
     libraryManage, type ManageFilter, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
     updateLibrary,
@@ -153,6 +153,26 @@
     }
   }
 
+  // When detection may run. The window's times are saved when a field is
+  // left, not on every keystroke.
+  async function setDetectionSchedule(patch: Partial<ServerSettings>) {
+    const before = settings
+    if (settings) settings = { ...settings, ...patch } // optimistic
+    try {
+      settings = await putSettings(patch)
+    } catch (err) {
+      settings = before
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
+  async function analyseNow() {
+    try {
+      intro = await runSegments()
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
+
   async function toggleDetectionPause() {
     try {
       intro = intro?.paused && intro.pauseReason === 'manual' ? await resumeSegments() : await pauseSegments()
@@ -164,6 +184,8 @@
     manual: 'Paused — resume when you are ready.',
     playing: 'Paused while something is playing; carries on a minute after it stops.',
     scanning: 'Paused while a library scans; carries on a minute after it finishes.',
+    schedule: 'Waiting for its window — it only reads between the times set in Settings. "Analyse now" starts it anyway.',
+    'on-demand': 'Set to run only when started — press "Analyse now" to begin.',
   }
 
   async function setLoginMode(mode: 'picker' | 'form') {
@@ -2167,7 +2189,12 @@
       <div class="titlerow grouphead">
         <h2>Intro &amp; credits detection</h2>
         {#if intro && intro.enabled !== false}
-          <button onclick={toggleDetectionPause}>{intro.paused && intro.pauseReason === 'manual' ? 'Resume' : 'Pause'}</button>
+          <div class="formrow">
+            {#if intro.paused && (intro.pauseReason === 'schedule' || intro.pauseReason === 'on-demand')}
+              <button onclick={analyseNow}>Analyse now</button>
+            {/if}
+            <button onclick={toggleDetectionPause}>{intro.paused && intro.pauseReason === 'manual' ? 'Resume' : 'Pause'}</button>
+          </div>
         {/if}
       </div>
       <div class="introjob">
@@ -2342,6 +2369,38 @@
         </div>
         <div class="setting">
           <span>
+            Intro &amp; credits detection schedule
+            <span class="muted small">
+              — when detection may read your media. Playback always comes
+              first: detection gives way to anything playing or scanning, and
+              stops as soon as a share stops answering.
+            </span>
+          </span>
+          <div class="schedule">
+            <select
+              class="setting-select"
+              value={settings?.detectionMode ?? 'window'}
+              onchange={(e) => setDetectionSchedule({ detectionMode: (e.currentTarget as HTMLSelectElement).value as ServerSettings['detectionMode'] })}
+              aria-label="When detection runs"
+            >
+              <option value="window">Only between set times</option>
+              <option value="idle">Whenever nothing is playing</option>
+              <option value="manual">Only when I start it</option>
+            </select>
+            {#if (settings?.detectionMode ?? 'window') === 'window'}
+              <label class="clock">From
+                <input type="time" value={settings?.detectionWindowStart ?? '02:00'}
+                  onchange={(e) => setDetectionSchedule({ detectionWindowStart: (e.currentTarget as HTMLInputElement).value })} />
+              </label>
+              <label class="clock">to
+                <input type="time" value={settings?.detectionWindowEnd ?? '06:00'}
+                  onchange={(e) => setDetectionSchedule({ detectionWindowEnd: (e.currentTarget as HTMLInputElement).value })} />
+              </label>
+            {/if}
+          </div>
+        </div>
+        <div class="setting">
+          <span>
             Intro &amp; credits detection speed
             <span class="muted small">
               — how fast detection may read from your media storage. It reads
@@ -2352,7 +2411,7 @@
           </span>
           <select
             class="setting-select"
-            value={String(settings?.detectionRateMB ?? 0)}
+            value={String(settings?.detectionRateMB ?? 10)}
             onchange={(e) => setDetectionRate(Number((e.currentTarget as HTMLSelectElement).value))}
             aria-label="Detection read speed"
           >
@@ -2505,6 +2564,9 @@
   .grants legend { color: var(--muted); font-size: 0.8rem; padding: 0 0.3rem; }
   .check { flex-direction: row !important; align-items: center; gap: 0.5rem !important; color: var(--text) !important; }
   .formrow { display: flex; gap: 0.6rem; }
+  .schedule { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .clock { display: flex; align-items: center; gap: 0.4rem; color: var(--muted); font-size: 0.9rem; }
+  .clock input { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.35rem 0.5rem; font: inherit; color-scheme: dark light; }
   .formrow.wrap { flex-wrap: wrap; }
   .face {
     width: 2rem; height: 2rem; flex: none; border-radius: 50%; display: grid; place-items: center;

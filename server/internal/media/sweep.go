@@ -2,7 +2,6 @@ package media
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -63,7 +62,7 @@ func SweepOrphans(root string, keep ...string) (int, int64, error) {
 		p := filepath.Join(root, e.Name())
 		size := dirSize(p)
 		if err := os.RemoveAll(p); err != nil {
-			log.Printf("transcode sweep: %s: %v", p, err)
+			logger.Warn("could not remove orphaned session directory", "path", p, "err", err)
 			continue
 		}
 		n++
@@ -119,7 +118,7 @@ func enforceCap(root string, maxBytes int64, keep map[string]bool) (int, int64) 
 			break
 		}
 		if err := os.RemoveAll(c.path); err != nil {
-			log.Printf("transcode cap: %s: %v", c.path, err)
+			logger.Warn("could not evict session directory", "path", c.path, "err", err)
 			continue
 		}
 		n++

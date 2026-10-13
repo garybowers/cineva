@@ -2,22 +2,39 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/garybowers/cineva/server/internal/media"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	"github.com/garybowers/cineva/server/internal/logging"
+	"github.com/garybowers/cineva/server/internal/media"
 )
 
 var cfgFile string
+
+// prettyLogs says whether logs are going to a person (a terminal) rather
+// than a log collector; the serve command prints its startup card then.
+var prettyLogs bool
 
 var rootCmd = &cobra.Command{
 	Use:           "cineva",
 	Short:         "Cineva — self-hosted media suite for movies, TV, music, audiobooks, podcasts, and books",
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	// Logging is set up once the configuration is read, before any command
+	// runs, so every command logs the same way.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		pretty, err := logging.Setup(viper.GetString("log.level"), viper.GetString("log.format"), os.Stderr)
+		if err != nil {
+			return err
+		}
+		prettyLogs = pretty
+		media.RouteFFmpegLogs()
+		return nil
+	},
 }
 
 func Execute() {
@@ -30,6 +47,8 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ./cineva.yaml, then /etc/cineva/cineva.yaml)")
+	rootCmd.PersistentFlags().String("log-level", "", "log level: debug, info, warn or error (default info)")
+	_ = viper.BindPFlag("log.level", rootCmd.PersistentFlags().Lookup("log-level"))
 }
 
 // loadDotEnv reads KEY=VALUE lines from a git-ignored ./.env file into the
@@ -80,6 +99,8 @@ func initConfig() {
 	viper.SetDefault("auth.session_days", 30)
 	viper.SetDefault("auth.secure_cookies", false)
 	viper.SetDefault("auth.login_mode", "picker")
+	viper.SetDefault("log.level", "info")
+	viper.SetDefault("log.format", "auto")
 
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)

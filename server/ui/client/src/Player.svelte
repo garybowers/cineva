@@ -228,8 +228,24 @@
   }
 
   function togglePlay() {
-    if (video.paused) video.play().catch(() => {})
-    else video.pause()
+    if (video.paused) {
+      video.play().catch(() => {})
+      showFlash()
+    } else {
+      video.pause()
+    }
+  }
+
+  // A brief play icon in the middle of the picture as playback resumes —
+  // pausing needs none, since the paused button appears in the same place.
+  // Keyed, so pressing again restarts the animation.
+  let flash = $state(0)
+  let flashTimer: ReturnType<typeof setTimeout> | undefined
+  function showFlash() {
+    if (compact) return
+    clearTimeout(flashTimer)
+    flash++
+    flashTimer = setTimeout(() => (flash = 0), 700)
   }
 
   // ---- Skip intro ----
@@ -703,7 +719,12 @@
     </video>
 
     {#if paused && !compact}
-      <button class="bigplay" onclick={togglePlay} aria-label="Play"><Play size={30} /></button>
+      <button class="bigplay" onclick={togglePlay} aria-label="Play"><Play size={34} fill="currentColor" strokeWidth={1.5} /></button>
+    {/if}
+    {#if flash && !paused}
+      {#key flash}
+        <div class="flash" aria-hidden="true"><Play size={30} fill="currentColor" strokeWidth={1.5} /></div>
+      {/key}
     {/if}
 
     {#if showInfo}
@@ -1102,7 +1123,7 @@
   .nowplaying {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--surface-radius, 16px); /* as the sidebar's */
     overflow: hidden;
     margin-bottom: 1.5rem;
   }
@@ -1268,20 +1289,62 @@
     cursor: pointer;
   }
 
-  .bigplay {
+  /* The paused button and the play/pause flash share the controls' glass:
+     a dark frosted disc with a hairline edge, the icon solid white. Fixed
+     tints rather than theme tokens, as everywhere over the picture. */
+  .bigplay, .flash {
     position: absolute;
     inset: 0;
     margin: auto;
-    width: 4.5rem;
-    height: 4.5rem;
+    display: grid;
+    place-items: center;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--accent) 85%, black);
     color: #fff;
-    font-size: 1.6rem;
-    padding-left: 0.3rem;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+    background: rgb(12 14 20 / 0.42);
+    -webkit-backdrop-filter: blur(16px) saturate(1.4);
+    backdrop-filter: blur(16px) saturate(1.4);
+    border: 1px solid rgb(255 255 255 / 0.18);
+    box-shadow: 0 10px 34px rgb(0 0 0 / 0.35);
   }
-  .bigplay:hover { background: var(--accent); }
+  .bigplay {
+    width: 5.25rem;
+    height: 5.25rem;
+    z-index: 2;
+    padding-left: 0.3rem; /* the triangle's weight sits left of its box */
+    animation: bigplay-in 0.2s ease-out;
+    transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+  .bigplay:hover {
+    transform: scale(1.06);
+    background: rgb(12 14 20 / 0.55);
+    border-color: rgb(255 255 255 / 0.32);
+  }
+  .bigplay:active { transform: scale(0.97); }
+  .bigplay:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .flash {
+    width: 4.25rem;
+    height: 4.25rem;
+    z-index: 2;
+    pointer-events: none;
+    animation: flash 0.7s ease-out forwards;
+  }
+  .flash :global(svg) { margin-left: 0.15rem; }
+  @keyframes bigplay-in {
+    from { opacity: 0; transform: scale(0.88); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes flash {
+    0% { opacity: 0; transform: scale(0.8); }
+    20% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(1.25); }
+  }
+  @media (max-width: 40rem) {
+    .bigplay { width: 4.25rem; height: 4.25rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bigplay, .flash { animation: none; transition: none; }
+    .flash { display: none; }
+  }
 
   .controls { padding: 0.35rem 0.9rem 0.55rem; }
   .seekwrap { position: relative; height: 14px; display: flex; align-items: center; }

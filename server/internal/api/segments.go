@@ -6,6 +6,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/segments"
+	"github.com/garybowers/cineva/server/internal/store"
 )
 
 // GET /segments/status — what intro detection is doing, for the admin's
@@ -46,4 +47,26 @@ func (s *server) setSegmentsPaused(c echo.Context, paused bool) error {
 type segmentStatusResponse struct {
 	Enabled bool `json:"enabled"`
 	segments.Status
+}
+
+// POST /segments/run — "Analyse now": start detection straight away,
+// whatever its schedule says, until everything waiting is done. A manual
+// pause still holds it.
+func (s *server) runSegments(c echo.Context) error {
+	if s.segments == nil {
+		return echo.NewHTTPError(http.StatusConflict, "intro detection is turned off (libraries.intro_detection)")
+	}
+	ctx := c.Request().Context()
+	libs, err := s.store.Libraries(ctx)
+	if err != nil {
+		return err
+	}
+	s.segments.RunNow()
+	for _, lib := range libs {
+		if lib.MediaType == store.MediaTV {
+			s.segments.Enqueue(lib.ID)
+		}
+	}
+	s.audit(c, "segments.run", "segments", "", "Intro detection", "started by hand")
+	return c.JSON(http.StatusAccepted, segmentStatusResponse{Enabled: true, Status: s.segments.Status()})
 }

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -15,9 +15,16 @@ import (
 	"time"
 
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
+)
+
+var (
+	logger      = logging.For("scan")
+	artworkLog  = logging.For("artwork")
+	metadataLog = logging.For("metadata")
 )
 
 // Manager orchestrates library scans. Scans run in managed goroutines; the
@@ -159,11 +166,11 @@ func (m *Manager) rescanIfRequested(libID string) {
 	ctx := context.Background()
 	lib, err := m.Store.Library(ctx, libID)
 	if err != nil {
-		log.Printf("queued rescan: %v", err)
+		logger.Warn("queued rescan: library lookup failed", "library_id", libID, "err", err)
 		return
 	}
 	if _, err := m.StartScan(ctx, lib, false); err != nil {
-		log.Printf("queued rescan %s: %v", lib.Name, err)
+		logger.Error("queued rescan failed", "library", lib.Name, "err", err)
 	}
 }
 
@@ -223,6 +230,7 @@ type itemsEvent struct {
 func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library, full bool) {
 	var filesSeen, itemsCreated int
 	var scanErr error
+	started := time.Now()
 
 	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: scan}})
 
@@ -240,7 +248,7 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		snap := scan
 		snap.FilesSeen, snap.ItemsCreated = seen, created
 		if err := m.Store.UpdateScanProgress(context.WithoutCancel(ctx), scan.ID, seen, created); err != nil {
-			log.Printf("scan progress %s: %v", lib.Name, err)
+			logger.Warn("saving scan progress failed", "library", lib.Name, "err", err)
 		}
 		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: snap, FilesTotal: total}})
 		if created > itemsSent {
@@ -273,17 +281,17 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 
 	if scanErr == nil && filesSeen > 0 {
 		if pruned, err := m.Store.PruneExcept(context.WithoutCancel(ctx), lib.ID, plan.keep); err != nil {
-			log.Printf("prune %s: %v", lib.Name, err)
+			logger.Error("pruning stale items failed", "library", lib.Name, "err", err)
 		} else if pruned > 0 {
-			log.Printf("scan %s: pruned %d stale item(s)", lib.Name, pruned)
+			logger.Info("pruned stale items", "library", lib.Name, "count", pruned)
 		}
 		// After pruning, so a removed file cannot leave an item pointing at
 		// a primary that no longer exists.
 		if lib.MediaType == store.MediaMovies {
 			if linked, err := m.Store.GroupVersions(context.WithoutCancel(ctx), lib.ID); err != nil {
-				log.Printf("group versions %s: %v", lib.Name, err)
+				logger.Error("grouping alternative versions failed", "library", lib.Name, "err", err)
 			} else if linked > 0 {
-				log.Printf("scan %s: grouped %d alternative version(s)", lib.Name, linked)
+				logger.Debug("grouped alternative versions", "library", lib.Name, "count", linked)
 			}
 		}
 	}
@@ -291,14 +299,24 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	status, errMsg := "completed", ""
 	if errors.Is(scanErr, context.Canceled) {
 		status, errMsg = "failed", "cancelled"
-		log.Printf("scan %s (%s): cancelled", lib.Name, scan.ID)
+		logger.Info("scan cancelled", "library", lib.Name, "scan", scan.ID)
 	} else if scanErr != nil {
 		status, errMsg = "failed", scanErr.Error()
-		log.Printf("scan %s (%s): %v", lib.Name, scan.ID, scanErr)
+		logger.Error("scan failed", "library", lib.Name, "scan", scan.ID, "err", scanErr)
+	} else {
+		// Worth a line by default only when it found something, or was asked
+		// for in full: an unchanged library rescanned every 15 minutes is
+		// not news.
+		level := slog.LevelDebug
+		if itemsCreated > 0 || full {
+			level = slog.LevelInfo
+		}
+		logger.Log(ctx, level, "scan finished", "library", lib.Name, "files", filesSeen,
+			"items", itemsCreated, "full", full, "took", time.Since(started))
 	}
 	// The scan's own context may be cancelled; finish the row regardless.
 	if err := m.Store.FinishScan(context.WithoutCancel(ctx), scan.ID, status, errMsg, filesSeen, itemsCreated); err != nil {
-		log.Printf("finish scan %s: %v", scan.ID, err)
+		logger.Error("saving scan result failed", "scan", scan.ID, "err", err)
 	}
 	detail := fmt.Sprintf("%d files, %d items", filesSeen, itemsCreated)
 	if errMsg != "" {
@@ -308,7 +326,7 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		UserID: "system", Action: "scan." + status, TargetKind: "library",
 		TargetID: lib.ID, TargetTitle: lib.Name, Detail: detail,
 	}); err != nil {
-		log.Printf("audit scan: %v", err)
+		logger.Error("recording scan audit entry failed", "library", lib.Name, "err", err)
 	}
 	m.Events.Publish(events.Event{Type: "logs"})
 	if status == "completed" && m.OnScanDone != nil {
@@ -394,7 +412,7 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, plan *scanP
 			// search entirely.
 			nfo, hasNFO, nerr := ReadNFO(path)
 			if nerr != nil {
-				log.Printf("scan: %s: %v", filepath.Base(path), nerr)
+				logger.Warn("nfo unreadable", "path", path, "err", nerr)
 			}
 			if hasNFO {
 				if t := strings.TrimSpace(nfo.Title); t != "" {
@@ -424,7 +442,7 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, plan *scanP
 					if err != nil {
 						// A bad hint must not silently become a wrong match, so
 						// fall back to searching rather than to nothing.
-						log.Printf("scan: %s: tmdbid=%d hint failed (%v), searching instead", filepath.Base(path), info.TmdbID, err)
+						metadataLog.Warn("tmdb id hint failed, searching instead", "path", path, "tmdb_id", info.TmdbID, "err", err)
 						r, err = m.Video.SearchMovie(ctx, item.Title, item.Year)
 					}
 				} else {
@@ -485,7 +503,7 @@ func (m *Manager) saveCredits(ctx context.Context, itemID string, r metadata.Vid
 	cast := convert(r.Cast, func(p metadata.Person) string { return p.Character })
 	crew := convert(r.Crew, func(p metadata.Person) string { return p.Job })
 	if err := m.Store.ReplaceCredits(ctx, itemID, cast, crew); err != nil {
-		log.Printf("save credits for %s: %v", itemID, err)
+		logger.Error("saving credits failed", "item", itemID, "err", err)
 	}
 }
 
@@ -501,7 +519,7 @@ func (m *Manager) saveGenres(ctx context.Context, itemID string, genres []string
 		return
 	}
 	if err := m.Store.ReplaceGenres(ctx, itemID, genres); err != nil {
-		log.Printf("save genres for %s: %v", itemID, err)
+		logger.Error("saving genres failed", "item", itemID, "err", err)
 	}
 }
 
@@ -535,7 +553,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 		report(skipped+i, created, len(files))
 		ep, ok := ParseEpisode(path)
 		if !ok {
-			log.Printf("scan: no SxxEyy marker, skipping %s", path)
+			logger.Debug("no SxxEyy marker, skipping", "path", path)
 			continue
 		}
 		showDir := seriesDirFor(lib.Paths, path)
@@ -543,7 +561,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 			// A video sitting loose in the library root has no series
 			// folder, and guessing one from the filename is how a stray
 			// file becomes a series of its own.
-			log.Printf("scan: no series folder for %s, skipping", path)
+			logger.Debug("no series folder, skipping", "path", path)
 			continue
 		}
 		seasonDir := seasonDirFor(showDir, path)
@@ -737,7 +755,7 @@ func (m *Manager) saveSeries(ctx context.Context, lib store.Library, showDir, fa
 func (m *Manager) applyProbe(item *store.Item, r probed) {
 	item.SizeBytes = r.SizeBytes
 	if r.Err != nil {
-		log.Printf("probe %s: %v", r.Path, r.Err)
+		logger.Warn("probe failed", "path", r.Path, "err", r.Err)
 		return
 	}
 	info := r.Info
@@ -792,7 +810,7 @@ func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
 	tracks := []store.SubtitleTrack{}
 	embedded, err := media.ProbeSubtitles(path)
 	if err != nil {
-		log.Printf("probe subtitles %s: %v", path, err)
+		logger.Warn("subtitle probe failed", "path", path, "err", err)
 	}
 	for _, s := range embedded {
 		tracks = append(tracks, store.SubtitleTrack{
@@ -807,7 +825,7 @@ func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
 		})
 	}
 	if err := m.Store.ReplaceSubtitles(ctx, itemID, tracks); err != nil {
-		log.Printf("save subtitles for %s: %v", path, err)
+		logger.Error("saving subtitles failed", "path", path, "err", err)
 	}
 }
 
@@ -816,7 +834,7 @@ func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
 func (m *Manager) syncAudioTracks(ctx context.Context, itemID, path string) {
 	streams, err := media.ProbeAudioTracks(path)
 	if err != nil {
-		log.Printf("probe audio %s: %v", path, err)
+		logger.Warn("audio track probe failed", "path", path, "err", err)
 		return
 	}
 	tracks := make([]store.AudioTrack, 0, len(streams))
@@ -827,7 +845,7 @@ func (m *Manager) syncAudioTracks(ctx context.Context, itemID, path string) {
 		})
 	}
 	if err := m.Store.ReplaceAudioTracks(ctx, itemID, tracks); err != nil {
-		log.Printf("save audio tracks for %s: %v", path, err)
+		logger.Error("saving audio tracks failed", "path", path, "err", err)
 	}
 }
 
@@ -857,7 +875,7 @@ func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r meta
 		if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, r.BackdropURL, m.ArtworkDir, name); err == nil {
 			item.Backdrop = "/artwork/" + file
 		} else {
-			log.Printf("backdrop for %s: %v", item.Title, err)
+			artworkLog.Warn("backdrop download failed", "title", item.Title, "err", err)
 		}
 	}
 	if r.PosterURL != "" && m.ArtworkDir != "" {
@@ -865,7 +883,7 @@ func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r meta
 		if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, r.PosterURL, m.ArtworkDir, name); err == nil {
 			item.Poster = "/artwork/" + file
 		} else {
-			log.Printf("artwork for %s: %v", item.Title, err)
+			artworkLog.Warn("poster download failed", "title", item.Title, "err", err)
 		}
 	}
 }

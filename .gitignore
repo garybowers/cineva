@@ -25,3 +25,6 @@ server/cineva.yaml
 .env
 # Local build settings (TMDB_KEY and the like), pulled in by the Makefile.
 local.mk
+
+# Binaries staged for the container image (see Dockerfile)
+/dist/

@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -252,14 +251,14 @@ func (m *Manager) applyLocalArtwork(item *store.Item, videoPath string) {
 		if f, err := copyLocalArtwork(src, m.ArtworkDir, artworkKey(src)); err == nil {
 			item.Poster = "/artwork/" + f
 		} else {
-			log.Printf("local poster %s: %v", src, err)
+			artworkLog.Warn("copying local poster failed", "path", src, "err", err)
 		}
 	}
 	if src := LocalBackdrop(videoPath); src != "" {
 		if f, err := copyLocalArtwork(src, m.ArtworkDir, artworkKey(src)); err == nil {
 			item.Backdrop = "/artwork/" + f
 		} else {
-			log.Printf("local backdrop %s: %v", src, err)
+			artworkLog.Warn("copying local backdrop failed", "path", src, "err", err)
 		}
 	}
 }

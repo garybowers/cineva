@@ -3,7 +3,6 @@ package media
 import (
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
@@ -200,7 +199,7 @@ func DetectHW(pref string) *HWContext {
 		pref = "auto"
 	}
 	if pref == string(HWNone) || pref == "off" || pref == "false" {
-		log.Printf("transcode: hardware acceleration disabled by config — encoding on the CPU")
+		logger.Info("hardware acceleration disabled by config, encoding on the CPU")
 		return nil
 	}
 
@@ -240,21 +239,21 @@ func DetectHW(pref string) *HWContext {
 		// Naming the other codecs the device can encode makes it obvious
 		// why h264 was chosen anyway: it is the compatible one, not the
 		// only one available.
-		extra := ""
+		attrs := []any{"probe", summary, "encoder", found.Encoder}
 		if codecs := found.Codecs(); len(codecs) > 1 {
-			extra = " (device also encodes " + strings.Join(codecs[1:], ", ") + ")"
+			attrs = append(attrs, "also_encodes", strings.Join(codecs[1:], ", "))
 		}
-		log.Printf("transcode: %s — using %s%s", summary, found.Encoder, extra)
+		logger.Info("hardware acceleration detected", attrs...)
 		// Decode is the larger half of the cost, so whether it is on the
 		// GPU is worth saying plainly rather than leaving someone to wonder
 		// why a "hardware" transcode still pegs the CPU.
 		if codecs := hwDecodableCodecs(found); len(codecs) > 0 {
-			log.Printf("transcode: decoding on the GPU for %s", strings.Join(codecs, ", "))
+			logger.Info("decoding on the GPU", "codecs", strings.Join(codecs, ", "))
 		} else {
-			log.Printf("transcode: decoding on the CPU — this ffmpeg has no %s decoder or hwaccel built in", found.Kind)
+			logger.Warn("decoding on the CPU: this ffmpeg has no decoder or hwaccel built in for the device", "kind", found.Kind)
 		}
 	} else {
-		log.Printf("transcode: %s — no hardware acceleration, encoding on the CPU", summary)
+		logger.Info("no hardware acceleration, encoding on the CPU", "probe", summary)
 	}
 	return found
 }

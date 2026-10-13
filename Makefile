@@ -34,7 +34,7 @@ build: $(LIB)
 	@cd server && go build -ldflags "$(LDFLAGS)" -o $(abspath $(OUT)) .
 
 run: $(LIB)
-	@cd server && go run -ldflags "$(LDFLAGS)" . serve
+	@cd server && go run -ldflags "$(LDFLAGS)" . serve --log-level debug
 
 test: $(LIB)
 	cd server && go test ./...

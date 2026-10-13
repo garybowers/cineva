@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,8 +13,11 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/arr"
 	"github.com/garybowers/cineva/server/internal/auth"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var integrationsLog = logging.For("integrations")
 
 // webhookUser is the username Cineva's webhooks authenticate with; the
 // password is each connection's own secret.
@@ -75,7 +77,7 @@ func (s *server) createIntegration(c echo.Context) error {
 	id, err := client.RegisterWebhook(ctx, 0, s.webhookFor(conn, secret))
 	if err != nil {
 		if derr := s.store.DeleteArrConnection(context.WithoutCancel(ctx), conn.ID); derr != nil {
-			log.Printf("integrations: undo %s: %v", conn.Name, derr)
+			integrationsLog.Error("undoing connection after a failed webhook registration failed", "connection", conn.Name, "err", derr)
 		}
 		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
 	}
@@ -131,7 +133,7 @@ func (s *server) updateIntegration(c echo.Context) error {
 	id, err := client.RegisterWebhook(ctx, conn.NotificationID, s.webhookFor(conn, secret))
 	if err != nil {
 		if _, rerr := s.store.UpdateArrConnection(context.WithoutCancel(ctx), old); rerr != nil {
-			log.Printf("integrations: restore %s: %v", old.Name, rerr)
+			integrationsLog.Error("restoring connection after a failed webhook registration failed", "connection", old.Name, "err", rerr)
 		}
 		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
 	}
@@ -143,7 +145,7 @@ func (s *server) updateIntegration(c echo.Context) error {
 		// Best effort: the old instance may be gone for good, which is often
 		// why the URL changed. Its webhook fails our check from now on.
 		if err := arr.New(old.Kind, old.URL, old.APIKey).DeleteWebhook(ctx, old.NotificationID); err != nil {
-			log.Printf("integrations: remove webhook from %s: %v", old.URL, err)
+			integrationsLog.Warn("removing webhook from the old instance failed", "url", old.URL, "err", err)
 		}
 	}
 	s.audit(c, "integration.update", "integration", conn.ID, conn.Name, conn.URL)
@@ -210,7 +212,7 @@ func (s *server) integrationWebhook(c echo.Context) error {
 	rescanning := []string{}
 	for _, lib := range arr.Libraries(libs, conn.Kind, ev.Paths) {
 		if err := s.manager.RequestScan(ctx, lib); err != nil {
-			log.Printf("integrations: %s %s: rescan %s: %v", conn.Name, ev.Type, lib.Name, err)
+			integrationsLog.Error("rescan request failed", "connection", conn.Name, "event", ev.Type, "library", lib.Name, "err", err)
 			continue
 		}
 		rescanning = append(rescanning, lib.Name)

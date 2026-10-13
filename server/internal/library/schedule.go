@@ -2,10 +2,15 @@ package library
 
 import (
 	"context"
-	"log"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
+)
+
+var (
+	libraryLog      = logging.For("library")
+	housekeepingLog = logging.For("housekeeping")
 )
 
 // Scheduler rescans libraries on an interval, so files added outside Cineva
@@ -32,7 +37,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	if s.Interval <= 0 {
 		return
 	}
-	log.Printf("libraries: rescanning every %s", s.Interval)
+	libraryLog.Info("scheduled rescans enabled", "interval", s.Interval)
 	t := time.NewTicker(s.Interval)
 	defer t.Stop()
 	for {
@@ -48,7 +53,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 func (s *Scheduler) sweep(ctx context.Context) {
 	libs, err := s.Store.Libraries(ctx)
 	if err != nil {
-		log.Printf("scheduled rescan: %v", err)
+		libraryLog.Error("scheduled rescan failed", "err", err)
 		return
 	}
 	for _, lib := range libs {
@@ -62,17 +67,17 @@ func (s *Scheduler) sweep(ctx context.Context) {
 			continue
 		}
 		if _, err := s.Manager.StartScan(ctx, lib, false); err != nil {
-			log.Printf("scheduled rescan %s: %v", lib.Name, err)
+			libraryLog.Error("scheduled rescan failed", "library", lib.Name, "err", err)
 		}
 	}
 	if n, err := s.Store.PruneSessions(ctx); err != nil {
-		log.Printf("session pruning: %v", err)
+		housekeepingLog.Error("session pruning failed", "err", err)
 	} else if n > 0 {
-		log.Printf("session pruning: removed %d expired sessions", n)
+		housekeepingLog.Info("expired sessions removed", "count", n)
 	}
 	if audit, plays, err := s.Store.PruneHistory(ctx, s.Retain); err != nil {
-		log.Printf("history retention: %v", err)
+		housekeepingLog.Error("history retention failed", "err", err)
 	} else if audit > 0 || plays > 0 {
-		log.Printf("history retention: removed %d audit and %d play rows older than %d days", audit, plays, s.Retain)
+		housekeepingLog.Info("old history removed", "audit_rows", audit, "play_rows", plays, "retain_days", s.Retain)
 	}
 }

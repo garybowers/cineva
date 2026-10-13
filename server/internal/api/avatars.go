@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,8 +14,11 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/avatar"
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
 )
+
+var avatarLog = logging.For("avatar")
 
 // avatarPrefix marks avatar files in the artwork directory, so replacing
 // one never deletes anything else.
@@ -127,7 +129,7 @@ func (s *server) removeAvatarFile(path string) {
 	}
 	file := filepath.Join(s.manager.ArtworkDir, filepath.Base(path))
 	if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("avatar: remove %s: %v", file, err)
+		avatarLog.Warn("removing old avatar failed", "path", file, "err", err)
 	}
 }
 
