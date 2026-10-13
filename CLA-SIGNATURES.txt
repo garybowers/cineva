@@ -1,0 +1,11 @@
+# People who have agreed to the Cineva Contributor Licence Agreement (CLA.md).
+#
+# One line each, added in your first contribution:
+#   Your Name <you@example.com> | YYYY-MM-DD | CLA 1.0
+# The email must be the one your commits are authored with. The commit that
+# adds your line is the record of your agreement.
+#
+# A line ending "| maintainer" marks the Project's maintainer, who holds the
+# rights the agreement grants and so does not sign it.
+
+Gary Bowers <gary@bowers1.com> | maintainer

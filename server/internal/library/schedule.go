@@ -65,6 +65,11 @@ func (s *Scheduler) sweep(ctx context.Context) {
 			log.Printf("scheduled rescan %s: %v", lib.Name, err)
 		}
 	}
+	if n, err := s.Store.PruneSessions(ctx); err != nil {
+		log.Printf("session pruning: %v", err)
+	} else if n > 0 {
+		log.Printf("session pruning: removed %d expired sessions", n)
+	}
 	if audit, plays, err := s.Store.PruneHistory(ctx, s.Retain); err != nil {
 		log.Printf("history retention: %v", err)
 	} else if audit > 0 || plays > 0 {

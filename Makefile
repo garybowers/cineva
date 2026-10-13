@@ -18,14 +18,20 @@ PATCH := $(abspath third_party/patches/ffmpeg-statigo-hwaccel.patch)
 # file, which is committed.
 -include local.mk
 TMDB_KEY ?=
-LDFLAGS := -X github.com/garybowers/cineva/server/internal/metadata.defaultAPIKey=$(TMDB_KEY)
+# What `cineva version` prints: the tag being built (v0.2.0), or the nearest
+# tag plus commits and a dirty marker between releases. CI passes the tag.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X github.com/garybowers/cineva/server/internal/metadata.defaultAPIKey=$(TMDB_KEY) \
+	-X github.com/garybowers/cineva/server/internal/version.Version=$(VERSION)
+# CI builds one binary per architecture and names them apart.
+OUT ?= bin/cineva
 
 # The recipe is silenced with @ because $(LDFLAGS) carries the TMDB key:
 # make echoes every command it runs, which puts the key in the terminal, in
 # scrollback, and in any CI log that ever builds this.
 build: $(LIB)
-	@echo "building bin/cineva"
-	@cd server && go build -ldflags "$(LDFLAGS)" -o ../bin/cineva .
+	@echo "building $(OUT) $(VERSION)"
+	@cd server && go build -ldflags "$(LDFLAGS)" -o $(abspath $(OUT)) .
 
 run: $(LIB)
 	@cd server && go run -ldflags "$(LDFLAGS)" . serve
@@ -40,10 +46,12 @@ lint: $(LIB)
 ui:
 	npm --prefix server/ui/client run build
 	npm --prefix server/ui/admin run build
+	npm --prefix server/ui/apidocs run build
 
 setup: $(LIB)
 	npm --prefix server/ui/client ci
 	npm --prefix server/ui/admin ci
+	npm --prefix server/ui/apidocs ci
 
 # Built from source rather than downloaded: upstream enables no hwaccels on
 # Linux, so its prebuilt library cannot hardware-decode on VAAPI (AMD, and

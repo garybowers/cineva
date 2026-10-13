@@ -122,12 +122,28 @@ func (s *server) refreshLibrary(c echo.Context) error {
 	if !s.manager.HasVideoProvider() {
 		return metadataUnavailable(library.ErrNoProvider)
 	}
-	// The admin sends the ids its filter is showing, so "refresh" means the
-	// rows on screen. An absent or empty list means the whole library.
+	// The admin either sends ids, or the Manage list's filter (q and
+	// unmatched, as GET /libraries/:id/manage takes them) so "refresh" means
+	// everything the filter matches across all its pages. Neither means the
+	// whole library.
 	var req struct {
-		ItemIDs []string `json:"itemIds"`
+		ItemIDs   []string `json:"itemIds"`
+		Query     string   `json:"q"`
+		Unmatched bool     `json:"unmatched"`
 	}
 	_ = c.Bind(&req)
+	if f := manageFilter(req.Query, req.Unmatched); len(req.ItemIDs) == 0 && (f.Query != "" || f.Unmatched) {
+		ids, err := s.store.ManageItemIDs(c.Request().Context(), lib.ID, f)
+		if err != nil {
+			return err
+		}
+		// An empty list would otherwise mean the whole library — the
+		// opposite of what a filter that matches nothing asked for.
+		if len(ids) == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "nothing matches that filter")
+		}
+		req.ItemIDs = ids
+	}
 
 	s.refreshMu.Lock()
 	if _, running := s.refreshes[lib.ID]; running {

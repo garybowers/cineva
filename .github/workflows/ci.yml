@@ -1,0 +1,174 @@
+# Build and test on every push and pull request; on a v* tag, also publish a
+# GitHub Release with a Linux binary per architecture.
+#
+# Releasing: tag a commit on main and push the tag.
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The slow part is the static ffmpeg library (third_party/ffmpeg-statigo,
+# built from source with our hwaccel patch; see CLAUDE.md). It is cached on
+# the submodule commit and the patch, so only a run that changes either
+# rebuilds it — expect most of an hour when it does.
+#
+# Repository settings this uses:
+#   secret   TMDB_KEY       compiled into release binaries as the default
+#                           TMDB key; builds without it work, but the server
+#                           then needs a key in its config
+#   variable ARM64_RUNNER   runner label for arm64 builds; defaults to
+#                           GitHub's ubuntu-24.04-arm, which private
+#                           repositories only get on a paid plan — set it to
+#                           a self-hosted runner's label otherwise
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  # Every commit in a pull request must be covered by the Contributor Licence
+  # Agreement (CLA.md). The check is a plain script, not a hosted service, so
+  # it runs the same anywhere: scripts/check-cla.sh.
+  cla:
+    name: Contributor licence agreement
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Check every commit is signed off by a signatory
+        run: scripts/check-cla.sh "origin/${{ github.base_ref }}"
+
+  build:
+    name: Build linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ${{ vars.ARM64_RUNNER || 'ubuntu-24.04-arm' }}
+    env:
+      LIB_DIR: third_party/ffmpeg-statigo/lib/linux_${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0 # tags, for the version `git describe` stamps in
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/ui/*/package-lock.json
+
+      - name: Key the ffmpeg library
+        id: libkey
+        run: |
+          sub=$(git -C third_party/ffmpeg-statigo rev-parse HEAD)
+          patch=$(sha256sum third_party/patches/ffmpeg-statigo-hwaccel.patch | cut -c1-16)
+          echo "key=ffmpeg-linux-${{ matrix.arch }}-$sub-$patch" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the ffmpeg library
+        id: libcache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.LIB_DIR }}
+          key: ${{ steps.libkey.outputs.key }}
+
+      # Only on a cache miss: the toolchain the builder needs, then the build.
+      - name: Install ffmpeg build dependencies
+        if: steps.libcache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y yasm nasm meson gperf python3
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.libcache.outputs.cache-hit != 'true'
+
+      - uses: taiki-e/cache-cargo-install-action@v3
+        if: steps.libcache.outputs.cache-hit != 'true'
+        with:
+          tool: cargo-c
+
+      - name: Build the ffmpeg library
+        if: steps.libcache.outputs.cache-hit != 'true'
+        run: make "$LIB_DIR/libffmpeg.a"
+
+      # Saved straight away rather than at the end of the job, so a failing
+      # test does not throw away an hour of compiling.
+      - name: Save the ffmpeg library
+        if: steps.libcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.LIB_DIR }}
+          key: ${{ steps.libkey.outputs.key }}
+
+      - name: Build the web client, admin UI and API reference
+        run: |
+          npm ci --prefix server/ui/client
+          npm ci --prefix server/ui/admin
+          npm ci --prefix server/ui/apidocs
+          make ui
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+      - name: Build the binary
+        env:
+          TMDB_KEY: ${{ secrets.TMDB_KEY }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="$GITHUB_REF_NAME"; else version=$(git describe --tags --always); fi
+          make build VERSION="$version" OUT="dist/cineva-linux-${{ matrix.arch }}" TMDB_KEY="$TMDB_KEY"
+          ./dist/cineva-linux-${{ matrix.arch }} version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cineva-linux-${{ matrix.arch }}
+          path: dist/cineva-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          chmod +x cineva-linux-*
+          sha256sum cineva-linux-* > SHA256SUMS
+          prerelease=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" cineva-linux-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "Cineva $GITHUB_REF_NAME" --generate-notes $prerelease

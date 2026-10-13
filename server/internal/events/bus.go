@@ -14,6 +14,11 @@ import (
 type Event struct {
 	Type string `json:"type"`
 	Data any    `json:"data,omitempty"`
+	// User, when set, addresses the event to that user's streams only;
+	// Session narrows it to one device (a session's public id). Both are
+	// routing, not payload, and are never sent.
+	User    string `json:"-"`
+	Session string `json:"-"`
 }
 
 // Bus fans events out to subscribers. Slow subscribers never block a

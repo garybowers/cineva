@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+
+	"github.com/garybowers/cineva/server/internal/events"
 )
 
 // adminEvents carry server-wide information only admins may see.
@@ -24,7 +26,19 @@ func (s *server) eventStream(c echo.Context) error {
 	res.Flush()
 
 	ctx := c.Request().Context()
-	admin := currentUser(c).IsAdmin()
+	me := currentUser(c)
+	admin := me.IsAdmin()
+	// A browser's stream is how its session counts as online: a device can
+	// be handed a queue only while it is listening for it.
+	sessionID, _ := c.Get(ctxSessionID).(string)
+	if sessionID != "" {
+		s.presence.connect(sessionID)
+		s.events.Publish(events.Event{Type: "devices", User: me.ID})
+		// Deferred in this order so the device is offline before the others
+		// are told to look.
+		defer s.events.Publish(events.Event{Type: "devices", User: me.ID})
+		defer s.presence.disconnect(sessionID)
+	}
 	sub := s.events.Subscribe(ctx)
 	for {
 		select {
@@ -36,6 +50,17 @@ func (s *server) eventStream(c echo.Context) error {
 			}
 			if !admin && adminEvents[ev.Type] {
 				continue
+			}
+			if (ev.User != "" && ev.User != me.ID) || (ev.Session != "" && ev.Session != sessionID) {
+				continue
+			}
+			// A revoked device's stream ends here rather than staying open
+			// on the credential it no longer has.
+			if ev.Type == "revoked" && ev.Session == sessionID {
+				if _, err := fmt.Fprint(res, "event: revoked\ndata: null\n\n"); err == nil {
+					res.Flush()
+				}
+				return nil
 			}
 			data, err := json.Marshal(ev.Data)
 			if err != nil {

@@ -1,0 +1,16 @@
+{
+  "name": "cineva-apidocs",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "swagger-ui-dist": "^5.33.2"
+  },
+  "scarfSettings": {
+    "enabled": false
+  }
+}

@@ -19,6 +19,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/garybowers/cineva/server/docs"
 	"github.com/garybowers/cineva/server/internal/auth"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
@@ -75,6 +76,7 @@ type server struct {
 	trickplay         *trickplayJobs
 	segments          *segments.Detector // nil when intro detection is off
 	storage           *library.StorageMonitor
+	presence          *presence // which sessions have an event stream open
 
 	// Library-wide metadata refreshes in flight, keyed by library id.
 	refreshMu sync.Mutex
@@ -87,6 +89,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		manager:           manager,
 		sessions:          media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
 		events:            events.NewBus(),
+		presence:          newPresence(),
 		sampler:           stats.New(time.Duration(cfg.SampleSecs) * time.Second),
 		cfgStatsHours:     cfg.StatsHours,
 		playbacks:         playback.NewRegistry(45 * time.Second),
@@ -259,120 +262,17 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		Skipper:   incompressible,
 	}))
 
-	// Public: liveness, themes, and the sign-in / first-run endpoints.
-	pub := e.Group("/api/v1")
-	pub.GET("/health", health)
-	pub.GET("/themes", listThemes)
-	pub.GET("/auth/status", s.authStatusHandler)
-	pub.POST("/auth/login", s.authLogin)
-	pub.POST("/auth/setup", s.authSetup)
-	pub.GET("/auth/profiles", s.authProfiles)
-	pub.POST("/auth/pin", s.authPINLogin)
-	// Sonarr and Radarr deliver here, signing in with the connection's own
-	// webhook secret rather than as a user.
-	pub.POST("/integrations/:id/webhook", s.integrationWebhook)
-
-	// Signed in (session cookie or API key). Library-scoped handlers also
-	// check the caller's grants.
-	v1 := e.Group("/api/v1", s.authenticate)
-	v1.POST("/auth/logout", s.authLogout)
-	v1.GET("/auth/me", s.authMe)
-	v1.POST("/auth/password", s.authPassword)
-	v1.POST("/auth/pin/set", s.authSetPIN)
-	v1.GET("/auth/prefs", s.getPrefs)
-	v1.PUT("/auth/prefs", s.putPrefs)
-	v1.GET("/auth/keys", s.listAPIKeys)
-	v1.POST("/auth/keys", s.createAPIKey)
-	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)
-	v1.GET("/libraries", s.listLibraries)
-	v1.GET("/libraries/:id", s.getLibrary)
-	v1.GET("/libraries/:id/items", s.libraryItems)
-	v1.GET("/libraries/:id/genres", s.libraryGenres)
-	v1.GET("/libraries/:id/recommended", s.libraryRecommended)
-	v1.GET("/libraries/:id/collections", s.libraryCollections)
-	v1.GET("/libraries/:id/collections/:key", s.collectionItems)
-	v1.GET("/people/:id", s.getPerson)
-	v1.GET("/items/:id", s.getItem)
-	v1.GET("/search", s.search)
-	v1.GET("/events", s.eventStream)
-
-	// Playback (milestone 3)
-	v1.POST("/items/:id/play", s.playItem)
-	v1.GET("/items/:id/stream", s.streamItem)
-	v1.GET("/items/:id/download", s.downloadItem)
-	v1.POST("/items/:id/progress", s.postProgress)
-	v1.PUT("/items/:id/watched", s.putWatched)
-	v1.DELETE("/items/:id/playback", s.stopPlayback)
-	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
-	v1.GET("/items/:id/next", s.nextUp)
-	v1.GET("/items/:id/next-up", s.nextUpFor)
-	v1.GET("/items/:id/prev", s.prevEpisode)
-	v1.GET("/items/:id/subtitles", s.itemSubtitles)
-	v1.GET("/items/:id/trickplay.vtt", s.trickplayVTT)
-	v1.GET("/items/:id/trickplay.jpg", s.trickplaySheet)
-	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
-	v1.GET("/continue-watching", s.continueWatching)
-	v1.GET("/home", s.home)
-	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
-	v1.GET("/play/:sid/:file", s.hlsFile)
-
-	// Admin only.
-	adm := v1.Group("", requireAdmin)
-	adm.POST("/libraries", s.createLibrary)
-	adm.PATCH("/libraries/:id", s.updateLibrary)
-	adm.DELETE("/libraries/:id", s.deleteLibrary)
-	adm.POST("/libraries/:id/scan", s.scanLibrary)
-	adm.GET("/scans", s.listScans)
-	adm.GET("/segments/status", s.segmentStatus)
-	adm.POST("/segments/pause", s.pauseSegments)
-	adm.POST("/segments/resume", s.resumeSegments)
-	adm.POST("/scans/:id/cancel", s.cancelScan)
-	adm.GET("/fs/dirs", s.listDirs)
-	adm.GET("/integrations", s.listIntegrations)
-	adm.POST("/integrations", s.createIntegration)
-	adm.PATCH("/integrations/:id", s.updateIntegration)
-	adm.DELETE("/integrations/:id", s.deleteIntegration)
-	// Metadata management: inspect a match, search for the right title,
-	// apply it, or re-run matching.
-	// Collection management: override the provider's grouping — rename,
-	// add/remove films, reorder, or create one outright.
-	adm.POST("/libraries/:id/collections", s.createCollection)
-	adm.PATCH("/libraries/:id/collections/:key", s.renameCollection)
-	adm.PUT("/libraries/:id/collections/:key/items", s.setCollectionItems)
-	adm.DELETE("/libraries/:id/collections/:key", s.deleteCollection)
-	adm.GET("/items/:id/matches", s.itemMatches)
-	adm.PUT("/items/:id/match", s.putItemMatch)
-	adm.POST("/items/:id/refresh", s.refreshItem)
-	adm.PATCH("/items/:id", s.updateItemMetadata)
-	adm.DELETE("/items/:id/locks", s.clearItemLocks)
-	adm.POST("/libraries/:id/refresh", s.refreshLibrary)
-	adm.DELETE("/libraries/:id/refresh", s.cancelRefresh)
-	adm.GET("/libraries/:id/refresh", s.refreshStatus)
-	adm.GET("/stats/system", s.systemStats)
-	adm.GET("/stats/plays", s.playStats)
-	adm.GET("/stats/plays/totals", s.playTotals)
-	adm.GET("/stats/disks", s.diskStats)
-	adm.GET("/logs", s.auditLog)
-	adm.GET("/play/sessions", s.listSessions)
-	adm.DELETE("/play/:sid", s.stopSession)
-	adm.DELETE("/playbacks/:userId/:itemId", s.stopPlaybackAdmin)
-	adm.GET("/settings", s.getSettings)
-	adm.PUT("/settings", s.putSettings)
-	adm.GET("/users", s.listUsers)
-	adm.POST("/users", s.createUser)
-	adm.PATCH("/users/:id", s.updateUser)
-	adm.DELETE("/users/:id", s.deleteUser)
-	adm.GET("/groups", s.listGroups)
-	adm.POST("/groups", s.createGroup)
-	adm.PUT("/groups/:id", s.updateGroup)
-	adm.DELETE("/groups/:id", s.deleteGroup)
-	adm.GET("/libraries/:id/access", s.getLibraryAccess)
-	adm.PUT("/libraries/:id/access", s.setLibraryAccess)
+	s.apiRoutes(e)
 
 	e.StaticFS("/themes", ui.Themes())
 	if cfg.ArtworkDir != "" {
 		e.Static("/artwork", cfg.ArtworkDir) // posters only; the UI needs them before sign-in resolves
 	}
+
+	// The API reference: Swagger UI over the embedded spec. Public, like the
+	// spec itself — it describes the API and exposes no data.
+	e.GET("/api/docs", func(c echo.Context) error { return c.Redirect(http.StatusMovedPermanently, "/api/docs/") })
+	e.StaticFS("/api/docs", ui.APIDocs())
 
 	// Admin UI shares the main port at /admin. Do not alias /settings here —
 	// that path belongs to the client app's own settings page.
@@ -461,12 +361,151 @@ func hasAnyPrefix(s string, prefixes ...string) bool {
 	return false
 }
 
+// apiRoutes registers /api/v1. Kept apart from Serve so tests can compare
+// what is registered with what the spec documents.
+func (s *server) apiRoutes(e *echo.Echo) {
+	// Public: liveness, themes, and the sign-in / first-run endpoints.
+	pub := e.Group("/api/v1")
+	pub.GET("/health", health)
+	pub.GET("/openapi.yaml", openAPISpec)
+	pub.GET("/themes", listThemes)
+	pub.GET("/auth/status", s.authStatusHandler)
+	pub.POST("/auth/login", s.authLogin)
+	pub.POST("/auth/setup", s.authSetup)
+	pub.GET("/auth/profiles", s.authProfiles)
+	pub.POST("/auth/pin", s.authPINLogin)
+	// Sonarr and Radarr deliver here, signing in with the connection's own
+	// webhook secret rather than as a user.
+	pub.POST("/integrations/:id/webhook", s.integrationWebhook)
+
+	// Signed in (session cookie or API key). Library-scoped handlers also
+	// check the caller's grants.
+	v1 := e.Group("/api/v1", s.authenticate)
+	v1.POST("/auth/logout", s.authLogout)
+	v1.GET("/auth/me", s.authMe)
+	v1.POST("/auth/password", s.authPassword)
+	v1.POST("/auth/pin/set", s.authSetPIN)
+	v1.GET("/auth/prefs", s.getPrefs)
+	v1.PUT("/auth/prefs", s.putPrefs)
+	v1.GET("/auth/keys", s.listAPIKeys)
+	v1.POST("/auth/keys", s.createAPIKey)
+	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)
+	v1.POST("/auth/avatar", s.uploadOwnAvatar)
+	v1.DELETE("/auth/avatar", s.deleteOwnAvatar)
+	v1.PUT("/auth/avatar/colour", s.setOwnAvatarColour)
+	v1.GET("/auth/sessions", s.listDevices)
+	v1.PATCH("/auth/sessions/current", s.nameDevice)
+	v1.PUT("/auth/sessions/current/queue", s.saveDeviceQueue)
+	v1.POST("/auth/sessions/revoke-others", s.revokeOtherDevices)
+	v1.DELETE("/auth/sessions/:id", s.revokeDevice)
+	v1.GET("/auth/sessions/:id/queue", s.deviceQueue)
+	v1.POST("/auth/sessions/:id/play", s.playOnDevice)
+	v1.GET("/libraries", s.listLibraries)
+	v1.GET("/libraries/:id", s.getLibrary)
+	v1.GET("/libraries/:id/items", s.libraryItems)
+	v1.GET("/libraries/:id/genres", s.libraryGenres)
+	v1.GET("/libraries/:id/recommended", s.libraryRecommended)
+	v1.GET("/libraries/:id/collections", s.libraryCollections)
+	v1.GET("/libraries/:id/collections/:key", s.collectionItems)
+	v1.GET("/people/:id", s.getPerson)
+	v1.GET("/items/:id", s.getItem)
+	v1.GET("/search", s.search)
+	v1.GET("/events", s.eventStream)
+
+	// Playback (milestone 3)
+	v1.POST("/items/:id/play", s.playItem)
+	v1.GET("/items/:id/stream", s.streamItem)
+	v1.GET("/items/:id/download", s.downloadItem)
+	v1.POST("/items/:id/progress", s.postProgress)
+	v1.PUT("/items/:id/watched", s.putWatched)
+	v1.DELETE("/items/:id/playback", s.stopPlayback)
+	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
+	v1.GET("/items/:id/next", s.nextUp)
+	v1.GET("/items/:id/next-up", s.nextUpFor)
+	v1.GET("/items/:id/prev", s.prevEpisode)
+	v1.GET("/items/:id/subtitles", s.itemSubtitles)
+	v1.GET("/items/:id/trickplay.vtt", s.trickplayVTT)
+	v1.GET("/items/:id/trickplay.jpg", s.trickplaySheet)
+	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
+	v1.GET("/continue-watching", s.continueWatching)
+	v1.GET("/home", s.home)
+	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
+	v1.GET("/play/:sid/:file", s.hlsFile)
+
+	// Admin only.
+	adm := v1.Group("", requireAdmin)
+	adm.POST("/libraries", s.createLibrary)
+	adm.PATCH("/libraries/:id", s.updateLibrary)
+	adm.DELETE("/libraries/:id", s.deleteLibrary)
+	adm.POST("/libraries/:id/scan", s.scanLibrary)
+	adm.GET("/scans", s.listScans)
+	adm.GET("/segments/status", s.segmentStatus)
+	adm.POST("/segments/pause", s.pauseSegments)
+	adm.POST("/segments/resume", s.resumeSegments)
+	adm.POST("/scans/:id/cancel", s.cancelScan)
+	adm.GET("/fs/dirs", s.listDirs)
+	adm.GET("/integrations", s.listIntegrations)
+	adm.POST("/integrations", s.createIntegration)
+	adm.PATCH("/integrations/:id", s.updateIntegration)
+	adm.DELETE("/integrations/:id", s.deleteIntegration)
+	// Metadata management: inspect a match, search for the right title,
+	// apply it, or re-run matching.
+	// Collection management: override the provider's grouping — rename,
+	// add/remove films, reorder, or create one outright.
+	adm.POST("/libraries/:id/collections", s.createCollection)
+	adm.PATCH("/libraries/:id/collections/:key", s.renameCollection)
+	adm.PUT("/libraries/:id/collections/:key/items", s.setCollectionItems)
+	adm.DELETE("/libraries/:id/collections/:key", s.deleteCollection)
+	adm.GET("/items/:id/matches", s.itemMatches)
+	adm.PUT("/items/:id/match", s.putItemMatch)
+	adm.POST("/items/:id/refresh", s.refreshItem)
+	adm.PATCH("/items/:id", s.updateItemMetadata)
+	adm.DELETE("/items/:id/locks", s.clearItemLocks)
+	adm.POST("/libraries/:id/refresh", s.refreshLibrary)
+	adm.DELETE("/libraries/:id/refresh", s.cancelRefresh)
+	adm.GET("/libraries/:id/manage", s.libraryManage)
+	adm.GET("/libraries/:id/refresh", s.refreshStatus)
+	adm.GET("/stats/system", s.systemStats)
+	adm.GET("/stats/plays", s.playStats)
+	adm.GET("/stats/plays/totals", s.playTotals)
+	adm.GET("/stats/disks", s.diskStats)
+	adm.GET("/logs", s.auditLog)
+	adm.GET("/play/sessions", s.listSessions)
+	adm.DELETE("/play/:sid", s.stopSession)
+	adm.DELETE("/playbacks/:userId/:itemId", s.stopPlaybackAdmin)
+	adm.GET("/settings", s.getSettings)
+	adm.PUT("/settings", s.putSettings)
+	adm.GET("/users", s.listUsers)
+	adm.POST("/users", s.createUser)
+	adm.PATCH("/users/:id", s.updateUser)
+	adm.DELETE("/users/:id", s.deleteUser)
+	adm.POST("/users/:id/avatar", s.uploadUserAvatar)
+	adm.DELETE("/users/:id/avatar", s.deleteUserAvatar)
+	adm.GET("/users/:id/sessions", s.userDevices)
+	adm.DELETE("/users/:id/sessions/:sid", s.revokeUserDevice)
+	adm.GET("/groups", s.listGroups)
+	adm.POST("/groups", s.createGroup)
+	adm.PUT("/groups/:id", s.updateGroup)
+	adm.DELETE("/groups/:id", s.deleteGroup)
+	adm.GET("/libraries/:id/access", s.getLibraryAccess)
+	adm.PUT("/libraries/:id/access", s.setLibraryAccess)
+}
+
 func health(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"status":  "ok",
 		"service": "cineva",
 		"version": version.Version,
 	})
+}
+
+// GET /openapi.yaml — the API's own specification, for the reference page
+// at /api/docs and for generating client SDKs.
+func openAPISpec(c echo.Context) error {
+	// Revalidated every time: a browser holding the old spec after an
+	// upgrade would document an API the server no longer has.
+	c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
+	return c.Blob(http.StatusOK, "application/yaml; charset=utf-8", docs.OpenAPI)
 }
 
 // toStoreSession / fromStoreSession translate between the media package's

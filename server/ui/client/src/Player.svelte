@@ -1126,10 +1126,23 @@
     padding-bottom: 1.6rem;
     background: linear-gradient(to bottom, rgb(0 0 0 / 0.72), transparent);
   }
+  /* The controls float in a rounded glass box clear of the picture's edges.
+     Fixed dark tints rather than theme tokens, as everywhere over the video:
+     the picture behind is any colour, whatever the theme. */
   .nowplaying:not(.compact) .controls {
-    bottom: 0;
-    padding-top: 1.8rem;
-    background: linear-gradient(to top, rgb(0 0 0 / 0.82), rgb(0 0 0 / 0.45) 60%, transparent);
+    left: 1rem;
+    right: 1rem;
+    bottom: 1rem;
+    padding: 0.55rem 1rem 0.6rem;
+    border-radius: 16px;
+    background: rgb(12 14 20 / 0.5);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    backdrop-filter: blur(18px) saturate(1.4);
+    border: 1px solid rgb(255 255 255 / 0.12);
+    box-shadow: 0 10px 34px rgb(0 0 0 / 0.35);
+  }
+  @media (max-width: 40rem) {
+    .nowplaying:not(.compact) .controls { left: 0.5rem; right: 0.5rem; bottom: 0.5rem; padding: 0.4rem 0.6rem 0.5rem; border-radius: 12px; }
   }
   .nowplaying:not(.compact) .ctl { color: rgb(255 255 255 / 0.88); }
   .nowplaying:not(.compact) .ctl:hover { background: rgb(255 255 255 / 0.14); color: #fff; }
@@ -1333,7 +1346,7 @@
   .upnext {
     position: absolute;
     right: 1rem;
-    bottom: 5.5rem; /* clear of the controls */
+    bottom: 6.5rem; /* clear of the floating controls */
     background: rgba(16, 18, 24, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 12px;
@@ -1346,7 +1359,7 @@
   .skipintro {
     position: absolute;
     right: 1rem;
-    bottom: 5.5rem; /* clear of the controls */
+    bottom: 6.5rem; /* clear of the floating controls */
     padding: 0.6rem 1.2rem;
     border-radius: 10px;
     border: 1px solid var(--border);

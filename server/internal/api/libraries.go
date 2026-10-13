@@ -205,6 +205,58 @@ func (s *server) libraryItems(c echo.Context) error {
 	return c.JSON(http.StatusOK, s.withPlayState(c, c.Param("id"), items))
 }
 
+// Page sizes for the admin's Manage list: big enough to work through, small
+// enough that a library of tens of thousands never arrives in one response.
+const (
+	manageDefaultSize = 100
+	manageMaxSize     = 500
+)
+
+type managePageResponse struct {
+	Items []store.Item `json:"items"`
+	// Total is how many items match the filter; Matched and All are the
+	// whole library's, for the "X of N matched" line.
+	Total   int `json:"total"`
+	Matched int `json:"matched"`
+	All     int `json:"all"`
+	Page    int `json:"page"`
+	Size    int `json:"size"`
+}
+
+// manageFilter reads the Manage list's filter from a request, shared by the
+// listing and by a filtered refresh so both mean the same items.
+func manageFilter(q string, unmatched bool) store.ManageFilter {
+	return store.ManageFilter{Query: strings.TrimSpace(q), Unmatched: unmatched}
+}
+
+// GET /libraries/:id/manage (admin) — one page of the Manage list, filtered
+// by ?q= (title or path) and ?unmatched=true on the server.
+func (s *server) libraryManage(c echo.Context) error {
+	ctx := c.Request().Context()
+	lib, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	page = max(page, 1)
+	size, err := strconv.Atoi(c.QueryParam("size"))
+	if err != nil {
+		size = manageDefaultSize
+	}
+	size = min(max(size, 1), manageMaxSize)
+	unmatched, _ := strconv.ParseBool(c.QueryParam("unmatched"))
+
+	res, err := s.store.ManageItems(ctx, lib.ID,
+		manageFilter(c.QueryParam("q"), unmatched), (page-1)*size, size)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, managePageResponse{
+		Items: res.Items, Total: res.Total, Matched: res.Matched, All: res.All,
+		Page: page, Size: size,
+	})
+}
+
 // withPlayState stamps the viewer's own watched flag and resume position onto
 // a list of items, so the grid can mark what has been seen and how far in
 // without a request per tile. One query covers the whole library.

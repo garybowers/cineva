@@ -40,8 +40,26 @@ export interface User {
   hasPassword: boolean
   hasPin: boolean
   createdAt: string
+  /** An uploaded picture's /artwork/ path. */
+  avatar?: string
+  /** The theme token their initial is drawn on; absent for the default. */
+  avatarColour?: AvatarColour
   /** Every library this user can see, computed from library access. */
   libraryIds: string[]
+}
+/** Theme tokens, not colours, so every theme draws an avatar in its own palette. */
+export const AVATAR_COLOURS = ['accent-2', 'chart-1', 'chart-2', 'chart-3', 'ok', 'err'] as const
+export type AvatarColour = (typeof AVATAR_COLOURS)[number]
+/** A signed-in browser session. */
+export interface Device {
+  id: string
+  name: string
+  client: string
+  clientIp: string
+  createdAt: string
+  lastSeenAt: string
+  current: boolean
+  online: boolean
 }
 export interface UserRequest {
   username?: string
@@ -50,6 +68,7 @@ export interface UserRequest {
   role?: 'admin' | 'user'
   disabled?: boolean
   pin?: string // set, or '' to clear
+  avatarColour?: AvatarColour | '' // '' back to the default
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
 export const authStatus = () => req<{ setupRequired: boolean; user?: User }>('/auth/status')
@@ -62,6 +81,14 @@ export const createUser = (u: UserRequest) =>
 export const updateUser = (id: string, u: UserRequest) =>
   req<User>(`/users/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
 export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
+export const uploadUserAvatar = (id: string, file: File) => {
+  const form = new FormData()
+  form.append('image', file)
+  return req<User>(`/users/${id}/avatar`, { method: 'POST', body: form })
+}
+export const deleteUserAvatar = (id: string) => req<User>(`/users/${id}/avatar`, { method: 'DELETE' })
+export const userDevices = (id: string) => req<Device[]>(`/users/${id}/sessions`)
+export const revokeUserDevice = (id: string, sid: string) => req<void>(`/users/${id}/sessions/${sid}`, { method: 'DELETE' })
 
 // Library access: open to everyone unless restricted to users and groups.
 export interface UserGroup {
@@ -270,7 +297,31 @@ export interface MatchCandidate {
   poster?: string
 }
 
-export const libraryItems = (libraryId: string) => req<Item[]>(`/libraries/${libraryId}/items`)
+/** The Manage list's filter, applied on the server. */
+export interface ManageFilter {
+  /** Case-insensitive substring of the title or the path. */
+  q?: string
+  /** Only items with no TMDB match. */
+  unmatched?: boolean
+}
+
+/** One page of the Manage list. total counts what the filter matches;
+ *  matched and all describe the whole library. */
+export interface ManagePage {
+  items: Item[]
+  total: number
+  matched: number
+  all: number
+  page: number
+  size: number
+}
+
+export const libraryManage = (libraryId: string, f: ManageFilter, page = 1, size = 100) => {
+  const p = new URLSearchParams({ page: String(page), size: String(size) })
+  if (f.q?.trim()) p.set('q', f.q.trim())
+  if (f.unmatched) p.set('unmatched', 'true')
+  return req<ManagePage>(`/libraries/${libraryId}/manage?${p}`)
+}
 
 /** Candidate matches for an item; q and year default to the item's own. */
 export const itemMatches = (id: string, q?: string, year?: number) => {
@@ -302,11 +353,13 @@ export interface RefreshProgress {
 }
 
 /** itemIds limits the run to those items; omit for the whole library. */
-export const refreshLibrary = (id: string, itemIds?: string[]) =>
+/** Refresh every film the filter matches, across all pages; no filter
+ *  means the whole library. */
+export const refreshLibrary = (id: string, f: ManageFilter = {}) =>
   req<RefreshProgress>(`/libraries/${id}/refresh`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ itemIds: itemIds ?? [] }),
+    body: JSON.stringify({ q: f.q?.trim() ?? '', unmatched: !!f.unmatched }),
   })
 export const cancelRefresh = (id: string) =>
   req<void>(`/libraries/${id}/refresh`, { method: 'DELETE' })

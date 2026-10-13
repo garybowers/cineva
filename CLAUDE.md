@@ -1,6 +1,6 @@
 # Cineva
 
-Cineva is a modern, self-hosted media suite written in Go — a replacement for Plex, Jellyfin, Audiobookshelf, and Calibre-Web in one server. It manages **movies, TV, music, audiobooks, podcasts, ebooks, and comics** as first-class media domains: it scans libraries on disk, enriches them with metadata, and streams or serves to clients with on-the-fly transcoding when needed. It ships as a single static binary with the web client and admin UI embedded.
+Cineva is a modern, self-hosted media suite written in Go — a replacement for Plex, Jellyfin, Audiobookshelf, and Calibre-Web in one server. It manages **movies, TV, music, audiobooks, podcasts, ebooks, and comics** as first-class media domains: it scans libraries on disk, enriches them with metadata, and streams or serves to clients with on-the-fly transcoding when needed. It ships as a single binary with the web client and admin UI embedded and FFmpeg statically linked; only the system's C and C++ runtime libraries come from the host.
 
 ## Product requirements
 
@@ -9,10 +9,12 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 ### Common to all domains
 - **Library management**: libraries follow the Jellyfin/Plex model. A library is created with exactly one media type (Movies, TV, Music, Audiobooks, Podcasts, Books) chosen at creation time and immutable afterwards; it points at one or more filesystem paths. You can have any number of libraries per type (e.g. "Kids Movies" and "Movies"), but a library never spans multiple media types. A scanner walks the paths, identifies files, extracts technical info via ffprobe (or format parsing for books), and matches against the domain's metadata provider for artwork and details.
 - **Per-user state**: resume positions (video playback, audio listen position, book reading position), finished flags, and continue-watching/listening/reading rows — same model everywhere.
-- **Users & auth**: local accounts with argon2id-hashed passwords, session tokens for browsers, API keys for clients. One admin role, regular user role. Libraries are open to every user by default; an admin can restrict one to chosen users and groups (groups are per server: "Kids", "Grown-ups"). Admins see everything.
+- **Devices**: every signed-in browser session is a device the user can see, name ("Living-room TV") and sign out remotely; an admin can do the same for any user. A device keeps its play queue on its session, so another device can take it over ("Continue from…"), and a queue can be sent to a device that has the app open ("Play on…"). Positions never travel with a queue: resume points are per user and item already.
+- **Users & auth**: local accounts with argon2id-hashed passwords (or a quick PIN on the "Who's watching?" profile picker), session tokens for browsers, API keys for clients. One admin role, regular user role. Each user has an avatar: an uploaded photo, or their initial on a colour they choose (a theme token, never a colour value). Libraries are open to every user by default; an admin can restrict one to chosen users and groups (groups are per server: "Kids", "Grown-ups"). Admins see everything.
 - **Downloads**: any item can be downloaded from the web client — the original file, or a portable transcode prepared server-side — so laptops can carry media offline while travelling.
 - **Built-in web client**: mobile-first responsive layout, installable as a PWA — until the native apps exist, a phone browser is the mobile interface, so every screen must work at phone width.
-- **Admin UI**: manage libraries, trigger/monitor scans, manage users, view active streams/transcodes, server settings.
+- **Admin UI**: manage libraries (with a server-paged Manage list for very large ones), trigger/monitor scans, manage users and their devices, view active streams/transcodes, integrations, server settings.
+- **Integrations**: Sonarr and Radarr are connected from the admin UI (`internal/arr`). Cineva registers its own webhook in each, authenticated by a per-connection secret, so an import rescans the affected library within seconds; the scheduled rescan (`libraries.scan_interval`, 15 minutes by default) is the fallback.
 
 ### Video — movies & TV (stage 1, v1)
 - Metadata from TMDB: artwork, synopsis, cast, episode data.
@@ -63,6 +65,9 @@ Native mobile/laptop apps (planned, will live in `clients/`) need true offline m
 - Remote access relay for *clients* away from home (members of a federation nebula reach each other through the nebula's rendezvous; this is the phone-on-a-train case)
 - PostgreSQL backend for very large libraries
 
+### Licence
+Cineva is AGPL-3.0-or-later (`LICENSE`); the bundled FFmpeg build is GPLv3 (`--enable-gpl --enable-version3`, with x264/x265). Every dependency must be compatible with AGPLv3: MIT, BSD, Apache-2.0, LGPL, GPLv3 and AGPLv3 are; GPLv2-only and anything with non-commercial or field-of-use restrictions are not. Check a new dependency's licence before adding it. Outside contributions come in under the Contributor Licence Agreement (`CLA.md`): signatories are listed in `CLA-SIGNATURES.txt`, every commit is signed off (`git commit -s`), and `scripts/check-cla.sh` enforces both on pull requests; the maintainer is exempt.
+
 ### Non-goals
 - No DRM, no paid content store, no bundled "free channels"
 - No telemetry/phone-home
@@ -81,7 +86,7 @@ Native mobile/laptop apps (planned, will live in `clients/`) need true offline m
   **We build our own ffmpeg rather than using upstream's prebuilt library.** Upstream populates `HWAccels` only for VideoToolbox on macOS, so its Linux builds ship `--enable-hwaccel=` for nothing. VAAPI is the one backend with no standalone decoders — it decodes *only* through an hwaccel — so a stock library gives AMD (and Intel-via-VAAPI) hosts hardware encode but software decode. `third_party/patches/ffmpeg-statigo-hwaccel.patch` adds the six Linux VAAPI hwaccels plus the `pgssub` decoder, and the `$(LIB)` target applies it to the pinned submodule and builds from source. Re-applying the patch is a no-op, so a rebuild does not need a clean submodule. Keep the patch as the unit of change: it is also what we would raise upstream. Never replace the library with `cmd/download-lib` — hardware decode silently reverts to software and only the startup log says so.
 - **Streaming**: HLS (fMP4 segments) for video transcodes; HTTP range requests for direct play and audio; Opus/AAC for audio transcodes.
 - **Book handling**: EPUB/OPF parsed natively in Go; CBZ via `archive/zip`, CBR via a pure-Go RAR reader (e.g. `nwaples/rardecode`); OPDS 1.2 for the catalogue feed.
-- **API**: REST, JSON, spec-first. The OpenAPI 3.1 spec lives at `server/docs/openapi.yaml` and is the contract — update the spec in the same change as the handlers. Third-party clients generate SDKs from it.
+- **API**: REST, JSON, spec-first. The OpenAPI 3.1 spec lives at `server/docs/openapi.yaml` and is the contract — update the spec in the same change as the handlers. Third-party clients generate SDKs from it. The server embeds it (`server/docs`), serves it at `/api/v1/openapi.yaml`, and renders it as an interactive reference with Swagger UI at `/api/docs` (`server/ui/apidocs`, public). Two tests keep it honest: `docs/docs_test.go` (it parses, every `$ref` and path parameter resolves, every operation has a unique operationId and exactly one declared tag) and `internal/api/spec_test.go` (every registered `/api/v1` route is documented, and every documented operation is a route).
 - **Web client & admin UI**: Svelte + Vite. Built to static assets and embedded in the Go binary with `go:embed`. EPUB rendering via epub.js (or foliate-js); audio playback via the Media Session API for lock-screen controls.
 - **Metadata providers**: one interface per domain — TMDB (video), MusicBrainz + Cover Art Archive (music), Open Library (books/audiobooks), RSS (podcasts) — so alternatives can be added.
 - **Federation**: Ed25519 server identity, nebulae joined by invite code, mTLS links with pinned peer keys over direct, VPN or relayed paths (outbound-only via a rendezvous), pull-based metadata sync, heartbeat-gated visibility, content-key matching for merged libraries and portable watch state (see Federation requirements above and `server/docs/federation.md`).
@@ -93,21 +98,29 @@ server/                 Go module (all backend code)
   main.go               entrypoint — calls cmd.Execute(), nothing else
   cmd/                  Cobra commands (root.go, serve.go, ...) + Viper wiring
   internal/api/         Echo handlers, middleware, request/response types
-  internal/library/     scanning framework + per-domain scanners/matchers
-  internal/media/       ffprobe inspection, transcode sessions, HLS, audio streaming
-  internal/books/       EPUB/PDF/CBZ/CBR parsing, OPDS feed
-  internal/podcast/     RSS polling, episode download/retention
+  internal/library/     scanning framework + per-domain scanners/matchers, scheduled rescans
+  internal/media/       media inspection, transcode sessions, HLS, audio streaming, hardware acceleration
+  internal/playback/    registry of active playbacks (who is watching what, on which client)
   internal/metadata/    provider interfaces + TMDB/MusicBrainz/Open Library clients
   internal/segments/    intro & credits detection: audio fingerprints compared across a season's episodes
   internal/arr/         Sonarr/Radarr connections: webhook registration and the events that trigger rescans
-  internal/federation/  nebula membership, invites, mTLS links, rendezvous/relay, sync, heartbeat, delegated sign-in
+  internal/avatar/      uploaded pictures turned into avatars (upright, square, small JPEG)
+  internal/events/      in-process event bus behind the /events stream; events can be addressed to one user or device
+  internal/stats/       host and transcode statistics for the admin dashboard
   internal/store/       repository interfaces + SQLite implementation, migrations
   internal/auth/        sessions, password hashing, API keys
+  internal/version/     the version string, stamped in at build time
+  internal/books/       (planned) EPUB/PDF/CBZ/CBR parsing, OPDS feed
+  internal/podcast/     (planned) RSS polling, episode download/retention
+  internal/federation/  (planned) nebula membership, invites, mTLS links, rendezvous/relay, sync, heartbeat, delegated sign-in
   ui/client/            built-in web client (Svelte)
   ui/admin/             admin UI (Svelte)
+  ui/apidocs/           the API reference at /api/docs: Swagger UI over docs/openapi.yaml
   ui/themes/            one folder per theme: theme.css (design tokens) + theme.json manifest
-  docs/                 openapi.yaml, design notes
+  docs/                 openapi.yaml (embedded and served), design notes
 clients/                standalone client apps — our planned native mobile/laptop apps and third-party clients — separate from server/ui
+third_party/            ffmpeg-statigo submodule and the patch we build it with
+.github/workflows/      CI: build and test on every push, release on a v* tag
 ```
 
 Rules:
@@ -117,10 +130,24 @@ Rules:
 - All configuration goes through Viper (config file + `CINEVA_*` env bindings + flags); nothing reads `os.Getenv` directly. `server/cineva.example.yaml` is committed and is the living reference for what is configurable: when a feature adds a config key, add it there with a comment naming its `CINEVA_*` env equivalent, in the same change. `server/cineva.yaml` is the local-dev copy and stays gitignored — it holds the TMDB key.
 - New media domains reuse the shared item/library/user-state schema and scanner framework — a domain is a set of implementations of existing interfaces, not a parallel subsystem.
 
+## Build, test & release
+
+The Makefile at the repository root is the way in; all targets work from a fresh clone.
+
+- `make setup` — fetches the ffmpeg-statigo submodule, applies `third_party/patches/ffmpeg-statigo-hwaccel.patch`, builds the static FFmpeg library (slow — most of an hour — and needed once per submodule bump), and installs the UIs' npm dependencies. Building FFmpeg needs `yasm nasm meson gperf python3` and a Rust toolchain with `cargo-c`.
+- `make ui` — builds both UIs into `server/ui/*/dist`. The dist folders are committed (go:embed needs them for a plain `go build`), so rebuild and commit them with UI changes.
+- `make run` — `go run . serve` from `server/`; `make test`, `make lint` (gofmt + go vet); `make build` writes `bin/cineva`.
+- `make build` stamps `VERSION` (default: `git describe`) into `internal/version` and `TMDB_KEY` into `internal/metadata` via ldflags; `OUT` changes the output path. `TMDB_KEY` lives in the gitignored `local.mk` — never in a committed file, and the build recipes are silenced so make never echoes it.
+- Never put a binary called `cineva` in a working directory the server runs from: Viper probes the extensionless name `cineva` as a config file and fails parsing the binary. That is why the binary goes to `bin/`, and why the README tells users to run it from its own data directory.
+- The server needs the host's glibc and libstdc++; release binaries are built on Ubuntu 24.04, so they need glibc 2.39 or newer.
+
+CI (`.github/workflows/ci.yml`) builds, lints and tests linux/amd64 and linux/arm64 on every push and pull request, caching the FFmpeg library on the submodule commit plus the patch's hash. Pushing a `v*` tag (`git tag v0.2.0 && git push origin v0.2.0`) also publishes a GitHub Release with `cineva-linux-amd64`, `cineva-linux-arm64` and `SHA256SUMS`; a tag containing a hyphen is a pre-release. Repository settings: secret `TMDB_KEY` (the key compiled into release binaries) and variable `ARM64_RUNNER` (the runner label for arm64, when GitHub's own arm64 runners are not available to the repository).
+
 ## Conventions
 
+- **No emoji** in documentation, code comments, UI copy or CI step names — words, and Lucide icons in the UIs.
 - **British English everywhere prose appears**: UI copy, documentation, code comments, commit messages, API descriptions (colour, catalogue, honours, -ise endings, licence as noun). Exceptions only where syntax or an external API dictates American spellings — CSS properties (`color:`), DOM/web APIs (`behavior: 'smooth'`), library identifiers (`Maximize` icon imports), and established wire-format field names.
-- Standard Go style: `gofmt`, `go vet`, and `golangci-lint` must pass. Errors are wrapped with `fmt.Errorf("...: %w", err)` and handled, never discarded.
+- Standard Go style: `gofmt`, `go vet`, and `golangci-lint` must pass (CI enforces the first two; golangci-lint is not in CI yet). Errors are wrapped with `fmt.Errorf("...: %w", err)` and handled, never discarded.
 - Table-driven tests alongside the code (`_test.go`); the store gets tested against a real temp SQLite file, not mocks.
 - API routes are versioned under `/api/v1/`. Breaking the API means a new version, not a changed response shape.
 - Database schema changes always come as a new migration file — never edit an applied migration.

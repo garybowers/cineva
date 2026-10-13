@@ -7,6 +7,8 @@
     personDetail, type PersonProfile, type PersonCredit, type Person as PersonT, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents, setWatched,
     seriesNextUp, type NextUpInfo,
     authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
+    uploadAvatar, removeAvatar, setAvatarColour, AVATAR_COLOURS, type AvatarColour,
+    listDevices, nameDevice, revokeDevice, revokeOtherDevices, saveDeviceQueue, deviceQueue, playOnDevice, type Device,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -20,7 +22,7 @@
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
     RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
-    Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut,
+    Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone, Upload,
   } from '@lucide/svelte'
 
   type Tab = 'home' | 'libraries' | 'queue' | 'settings'
@@ -264,6 +266,95 @@
     } catch (err) {
       apiKeys = before
       pwMsg = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+  // ---- Picture ----
+  // An uploaded photo, or the initial on a colour of the user's choosing.
+  let avatarMsg = $state('')
+  let avatarBusy = $state(false)
+  async function pickAvatar(e: Event) {
+    const input = e.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = '' // choosing the same file again should still upload it
+    if (!file) return
+    avatarBusy = true
+    avatarMsg = ''
+    try {
+      me = await uploadAvatar(file)
+    } catch (err) {
+      avatarMsg = errText(err)
+    } finally {
+      avatarBusy = false
+    }
+  }
+  async function dropAvatar() {
+    try {
+      me = await removeAvatar()
+    } catch (err) {
+      avatarMsg = errText(err)
+    }
+  }
+  async function chooseColour(c: AvatarColour | '') {
+    try {
+      me = await setAvatarColour(c)
+    } catch (err) {
+      avatarMsg = errText(err)
+    }
+  }
+
+  // ---- Devices ----
+  // Every signed-in browser, this one included: named, signed out from
+  // here, and the targets and sources of a handed-over queue.
+  let devices: Device[] = $state([])
+  let deviceMsg = $state('')
+  let deviceName = $state('')
+  let renaming = false // the name field has focus: a refresh must not overwrite what is being typed
+  let confirmSignOutOthers = $state(false)
+  const deviceTitle = (d: Device) => d.name || d.client || 'Unknown browser'
+  const otherDevices = $derived(devices.filter((d) => !d.current))
+  async function loadDevices() {
+    try {
+      devices = await listDevices()
+      if (!renaming) deviceName = devices.find((d) => d.current)?.name ?? ''
+    } catch {
+      /* the list stays as it was */
+    }
+  }
+  async function renameDevice(e: Event) {
+    e.preventDefault()
+    try {
+      await nameDevice(deviceName)
+      deviceMsg = deviceName ? `This device is now called ${deviceName}.` : 'Name cleared.'
+      loadDevices()
+    } catch (err) {
+      deviceMsg = errText(err)
+    }
+  }
+  async function signOutDevice(d: Device) {
+    const before = devices
+    devices = devices.filter((x) => x.id !== d.id)
+    try {
+      await revokeDevice(d.id)
+    } catch (err) {
+      devices = before
+      deviceMsg = errText(err)
+    }
+  }
+  async function signOutOthers() {
+    if (!confirmSignOutOthers) {
+      confirmSignOutOthers = true
+      return
+    }
+    confirmSignOutOthers = false
+    try {
+      const { revoked } = await revokeOtherDevices()
+      deviceMsg = revoked === 1 ? 'Signed out 1 other device.' : `Signed out ${revoked} other devices.`
+      loadDevices()
+    } catch (err) {
+      deviceMsg = errText(err)
     }
   }
 
@@ -1308,6 +1399,60 @@
     saveQueue(queue, queueIndex)
   })
 
+  // ---- Handing the queue between devices ----
+  // This device keeps the server told what its queue is, so another device
+  // can take it over; and it can send its queue to another, which plays it.
+  // Positions travel by themselves: resume points are per user and item.
+  let queueSync: ReturnType<typeof setTimeout> | undefined
+  $effect(() => {
+    const ids = queue.map((q) => q.id)
+    const at = queueIndex
+    if (!me) return
+    clearTimeout(queueSync)
+    queueSync = setTimeout(() => saveDeviceQueue(ids, at).catch(() => {}), 1000)
+  })
+  let devMenu = $state<'send' | 'take' | null>(null)
+  $effect(() => {
+    if (!devMenu) return
+    return onDismiss('.devwrap', () => (devMenu = null))
+  })
+  // The device lists are only needed where they are shown.
+  $effect(() => {
+    if (me && (tab === 'settings' || tab === 'queue')) loadDevices()
+  })
+  const takeable = $derived(otherDevices.filter((d) => d.queue?.current))
+
+  async function sendQueueTo(d: Device) {
+    devMenu = null
+    try {
+      await playOnDevice(d.id, queue.map((q) => q.id), queueIndex)
+      if (playing) closePlayer()
+      notify('info', `Playing on ${deviceTitle(d)}.`)
+    } catch (err) {
+      notify('error', errText(err))
+    }
+  }
+  async function takeQueueFrom(d: Device) {
+    devMenu = null
+    try {
+      const q = await deviceQueue(d.id)
+      if (q.items.length === 0) {
+        notify('info', `Nothing on ${deviceTitle(d)}'s queue can be played here.`)
+        return
+      }
+      playList(q.items, q.index)
+    } catch (err) {
+      notify('error', errText(err))
+    }
+  }
+  // Another device sent its queue here.
+  function receiveHandoff(data: unknown) {
+    const h = data as { from?: string; items?: Item[]; index?: number } | null
+    if (!h?.items?.length) return
+    notify('info', `Playing from ${h.from ?? 'another device'}.`)
+    playList(h.items, h.index ?? 0)
+  }
+
   /** Queue a collection (or any list) and start at the given position. */
   function playList(items: Item[], startIndex = 0) {
     if (items.length === 0) return
@@ -1877,6 +2022,14 @@
             loadRecommended(currentLib)
           }
         },
+        // This user's devices changed: one signed in or out, opened or
+        // closed the app, or saved a queue.
+        devices: () => {
+          if (tab === 'settings' || tab === 'queue') loadDevices()
+        },
+        handoff: receiveHandoff,
+        // This device was signed out from another: back to the sign-in screen.
+        revoked: () => window.dispatchEvent(new Event(UNAUTHORISED)),
         // Fired throughout a scan as items land, so the grid fills in live.
         items: (data) => {
           const e = data as { libraryId?: string; scanning?: boolean } | null
@@ -1927,6 +2080,24 @@
       </span>
     </div>
   {/if}
+{/snippet}
+
+<!-- Small artwork beside a title in a list (queue, up next, search). An
+     episode shows its still, so it is landscape like the season's episode
+     list; anything else keeps its poster's shape. -->
+{#snippet thumb(item: Item)}
+  {@const musical = item.kind === 'album' || item.kind === 'track' || item.kind === 'artist'}
+  <span class="thumb" class:wide={item.kind === 'episode'} class:square={musical}>
+    {#if item.poster}
+      <img src={item.poster} alt="" loading="lazy" />
+    {:else if musical}
+      <MusicIcon size={16} />
+    {:else if item.kind === 'series' || item.kind === 'season' || item.kind === 'episode'}
+      <Tv size={16} />
+    {:else}
+      <Clapperboard size={16} />
+    {/if}
+  </span>
 {/snippet}
 
 {#snippet personPanel()}
@@ -2024,6 +2195,32 @@
   </div>
 {/snippet}
 
+<!-- A person's face: their picture, or their initial on the colour they
+     chose (a theme token, so each theme draws it in its own palette). -->
+{#snippet face(p: { displayName: string; avatar?: string; avatarColour?: string }, cls: string)}
+  {#if p.avatar}
+    <img class="{cls} face-img" src={p.avatar} alt="" />
+  {:else}
+    <span class={cls} class:tinted={!!p.avatarColour} style:--face={p.avatarColour ? `var(--${p.avatarColour})` : undefined}>{p.displayName.slice(0, 1).toUpperCase()}</span>
+  {/if}
+{/snippet}
+
+<!-- Another device's queue, offered to take over: which device, and what
+     it is on. -->
+{#snippet takeRow(d: Device)}
+  {@const cur = d.queue?.current}
+  <button class="um-item takerow" role="menuitem" onclick={() => takeQueueFrom(d)}>
+    {#if cur}{@render thumb(cur)}{/if}
+    <span class="takebody">
+      <span class="devmenu-name">{deviceTitle(d)}{#if d.online}<span class="tag on">open now</span>{/if}</span>
+      <span class="muted small">
+        {#if cur}{d.queue?.seriesTitle ? `${d.queue.seriesTitle} · ` : ''}{cur.kind === 'episode' ? `S${String(cur.seasonNum).padStart(2, '0')}E${String(cur.episodeNum).padStart(2, '0')} · ` : ''}{cur.title}{/if}
+        {#if (d.queue?.count ?? 0) > 1} · {d.queue?.count} queued{/if}
+      </span>
+    </span>
+  </button>
+{/snippet}
+
 <!-- An in-progress item: an episode leads with its series, since "Episode
      1" or "The Big Bran Hypothesis" alone does not say which show it is. -->
 {#snippet resumeBody(r: ResumeItem)}
@@ -2084,7 +2281,7 @@
         <div class="tiles">
           {#each profiles as p (p.id)}
             <button class="tile" onclick={() => pickProfile(p)}>
-              <span class="tile-avatar">{p.displayName.slice(0, 1).toUpperCase()}</span>
+              {@render face(p, 'tile-avatar')}
               <span>{p.displayName}</span>
             </button>
           {/each}
@@ -2093,7 +2290,7 @@
       </div>
     {:else if gate === 'login' && picked}
       <form class="pinpad" onsubmit={picked.hasPin ? submitPIN : submitPickedPassword}>
-        <span class="tile-avatar big">{picked.displayName.slice(0, 1).toUpperCase()}</span>
+        {@render face(picked, 'tile-avatar big')}
         <h1>{picked.displayName}</h1>
         {#if picked.hasPin}
           <p>Enter your PIN</p>
@@ -2142,11 +2339,7 @@
           {#each searchResults as r (r.id)}
             {@const open = () => { if (r.kind === 'track') playTrackResult(r); else showItem(r); clearSearch() }}
             <div class="sr" role="button" tabindex="0" onclick={open} onkeydown={(e) => e.key === 'Enter' && open()}>
-              {#if r.poster}
-                <img src={r.poster} alt="" />
-              {:else}
-                <span class="sr-ph">{r.title.slice(0, 1)}</span>
-              {/if}
+              {@render thumb(r)}
               <span class="sr-text">
                 <span class="sr-title">{r.title}</span>
                 <span class="sr-sub">
@@ -2202,7 +2395,7 @@
         aria-expanded={showUserMenu}
         onclick={() => (showUserMenu = !showUserMenu)}
       >
-        {#if me}<span class="initial">{me.displayName.slice(0, 1).toUpperCase()}</span>{:else}<User size={17} />{/if}
+        {#if me}{@render face(me, 'initial')}{:else}<User size={17} />{/if}
       </button>
       {#if showUserMenu && me}
         <div class="usermenu" role="menu">
@@ -2362,6 +2555,7 @@
             {#each upNext as q, i (q.id)}
               <li>
                 <span class="qpos muted">{i + 1}</span>
+                {@render thumb(q)}
                 <button class="qtitle" onclick={() => playList(queue, queueIndex + 1 + i)}>
                   {q.title}{#if q.year}<span class="qyear muted">{q.year}</span>{/if}
                 </button>
@@ -2443,6 +2637,14 @@
             <strong>Add to queue</strong> to line things up — the queue plays
             straight through, and you can come back here to reorder it.
           </div>
+          {#if takeable.length > 0}
+            <h2 class="qhead">Continue from another device</h2>
+            <div class="takelist">
+              {#each takeable as d (d.id)}
+                {@render takeRow(d)}
+              {/each}
+            </div>
+          {/if}
         {:else}
           <div class="qbar">
             <span class="muted small">
@@ -2454,12 +2656,44 @@
               <Play size={15} /> {playing ? 'Restart' : 'Play'}
             </button>
             <button class="ghost" onclick={emptyQueue}>Clear</button>
+            <div class="devwrap">
+              <button class="ghost" aria-haspopup="menu" aria-expanded={devMenu === 'send'} onclick={() => (devMenu = devMenu === 'send' ? null : 'send')}>
+                <Cast size={15} /> Play on…
+              </button>
+              {#if devMenu === 'send'}
+                <div class="devmenu" role="menu">
+                  {#each otherDevices.filter((d) => d.online) as d (d.id)}
+                    <button class="um-item" role="menuitem" onclick={() => sendQueueTo(d)}>
+                      <MonitorSmartphone size={15} /> <span class="devmenu-name">{deviceTitle(d)}</span>
+                    </button>
+                  {:else}
+                    <p class="devmenu-note muted small">No other device has Cineva open. Open it on the TV or phone you want to watch on, signed in as you.</p>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+            {#if takeable.length > 0}
+              <div class="devwrap">
+                <button class="ghost" aria-haspopup="menu" aria-expanded={devMenu === 'take'} onclick={() => (devMenu = devMenu === 'take' ? null : 'take')}>
+                  <MonitorSmartphone size={15} /> Continue from…
+                </button>
+                {#if devMenu === 'take'}
+                  <div class="devmenu wide" role="menu">
+                    <p class="devmenu-note muted small">Replaces this queue with the other device's, and plays from where it got to.</p>
+                    {#each takeable as d (d.id)}
+                      {@render takeRow(d)}
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
           <ol class="qlist">
             {#each queue as q, i (q.id + ':' + i)}
               {@const isNow = !!playing && i === queueIndex}
               <li class:qnow={isNow}>
                 <span class="qpos muted">{i + 1}</span>
+                {@render thumb(q)}
                 <!-- The row that is playing expands the player rather than
                      starting it again: clicking "what I am watching" to be
                      sent back to the beginning of it is a trap. -->
@@ -3300,6 +3534,32 @@
           <span class="muted">{offline ? 'unreachable' : `${health?.service} ${health?.version}`}</span>
         </div>
         <div class="row col">
+          <span>Picture <span class="muted small">— on the profile picker and in the top bar</span></span>
+          {#if me}
+            <div class="facerow">
+              {@render face(me, 'tile-avatar')}
+              <div class="faceside">
+                <div class="inline">
+                  <label class="chip upload" class:busy={avatarBusy}>
+                    <Upload size={14} /> {avatarBusy ? 'Uploading…' : me.avatar ? 'Change photo' : 'Upload a photo'}
+                    <input type="file" accept="image/jpeg,image/png,image/gif,image/webp" onchange={pickAvatar} disabled={avatarBusy} />
+                  </label>
+                  {#if me.avatar}<button class="chip" onclick={dropAvatar}>Remove photo</button>{/if}
+                </div>
+                {#if !me.avatar}
+                  <div class="swatches" role="radiogroup" aria-label="Colour behind your initial">
+                    <button class="swatch" class:sel={!me.avatarColour} role="radio" aria-checked={!me.avatarColour} aria-label="Default" title="Default" onclick={() => chooseColour('')}></button>
+                    {#each AVATAR_COLOURS as c (c)}
+                      <button class="swatch" class:sel={me.avatarColour === c} role="radio" aria-checked={me.avatarColour === c} aria-label={c} title={c} style:--face="var(--{c})" onclick={() => chooseColour(c)}></button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+          {#if avatarMsg}<span class="muted small">{avatarMsg}</span>{/if}
+        </div>
+        <div class="row col">
           <span>Password</span>
           <form class="inline" onsubmit={submitPassword}>
             <input type="password" placeholder="Current password" bind:value={pwCurrent} autocomplete="current-password" required />
@@ -3319,7 +3579,7 @@
           {#if pinMsg}<span class="muted small">{pinMsg}</span>{/if}
         </div>
         <div class="row col">
-          <span>API keys <span class="muted small">— for apps and scripts; send as <code>Authorization: Bearer</code></span></span>
+          <span>API keys <span class="muted small">— for apps and scripts; send as <code>Authorization: Bearer</code> · <a href="/api/docs/" target="_blank" rel="noopener">API reference</a></span></span>
           {#if revealedKey}
             <div class="keyreveal">
               <span>New key — copy it now, it will not be shown again:</span>
@@ -3338,6 +3598,42 @@
             <input placeholder="Key name (e.g. Phone)" bind:value={newKeyName} />
             <button class="chip" type="submit">Create key</button>
           </form>
+        </div>
+        <div class="row col">
+          <span>Signed-in devices <span class="muted small">— sign one out if it is lost or not yours</span></span>
+          <form class="inline" onsubmit={renameDevice}>
+            <input
+              placeholder="Name this device (e.g. Living-room TV)"
+              maxlength="40"
+              bind:value={deviceName}
+              onfocus={() => (renaming = true)}
+              onblur={() => (renaming = false)}
+            />
+            <button class="chip" type="submit">Save name</button>
+          </form>
+          {#each devices as d (d.id)}
+            <div class="devrow">
+              <MonitorSmartphone size={18} />
+              <div class="devtext">
+                <span class="devname">
+                  {deviceTitle(d)}
+                  {#if d.current}<span class="tag">this device</span>{:else if d.online}<span class="tag on">open now</span>{/if}
+                </span>
+                <span class="muted small">
+                  {[d.name ? d.client : '', d.clientIp, `signed in ${d.createdAt.slice(0, 10)}`, `last active ${d.lastSeenAt.slice(0, 16)}`].filter(Boolean).join(' · ')}
+                </span>
+              </div>
+              {#if !d.current}<button class="chip" onclick={() => signOutDevice(d)}>Sign out</button>{/if}
+            </div>
+          {/each}
+          {#if otherDevices.length > 0}
+            <div class="inline">
+              <button class="chip" class:danger={confirmSignOutOthers} onclick={signOutOthers} onblur={() => (confirmSignOutOthers = false)}>
+                {confirmSignOutOthers ? `Sign out ${otherDevices.length} ${otherDevices.length === 1 ? 'device' : 'devices'}?` : 'Sign out all other devices'}
+              </button>
+            </div>
+          {/if}
+          {#if deviceMsg}<span class="muted small">{deviceMsg}</span>{/if}
         </div>
         <div class="row">
           <span>Music streaming quality</span>
@@ -3421,6 +3717,46 @@
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
   }
   .tile-avatar.big { align-self: center; }
+  /* A chosen colour replaces the default gradient; the initial takes the
+     page background so it reads on any of the palette's colours. */
+  .tile-avatar.tinted { background: var(--face); color: var(--bg); }
+  .face-img { object-fit: cover; padding: 0; }
+  .avatar { overflow: hidden; padding: 0; }
+  .avatar .initial.tinted { background: var(--face); color: var(--bg); width: 100%; height: 100%; display: grid; place-items: center; }
+  .avatar img.initial { width: 100%; height: 100%; }
+  .facerow { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .faceside { display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; }
+  .upload { position: relative; display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+  .upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .upload.busy { opacity: 0.6; cursor: progress; }
+  .swatches { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .swatch {
+    width: 1.9rem; height: 1.9rem; border-radius: 50%;
+    background: var(--face, linear-gradient(135deg, var(--accent), var(--accent-2)));
+    border: 2px solid transparent; outline: 1px solid var(--border);
+  }
+  .swatch.sel { border-color: var(--bg); outline: 2px solid var(--text); }
+  .devrow { display: flex; align-items: center; gap: 0.75rem; padding: 0.35rem 0; color: var(--muted); }
+  .devtext { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .devname { color: var(--text); font-weight: 500; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .devtext .small { overflow-wrap: anywhere; }
+  .tag { font-size: 0.7rem; padding: 0.05rem 0.45rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-weight: 400; }
+  .tag.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+  .chip.danger { color: var(--err); border-color: var(--err); }
+  .devwrap { position: relative; }
+  .devmenu {
+    position: absolute; right: 0; top: calc(100% + 0.4rem); z-index: 60; width: min(20rem, calc(100vw - 2rem));
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.4rem;
+    display: flex; flex-direction: column; box-shadow: 0 8px 24px color-mix(in srgb, var(--bg) 70%, transparent);
+  }
+  .devmenu.wide { width: min(26rem, calc(100vw - 2rem)); }
+  .devmenu-note { padding: 0.4rem 0.6rem; margin: 0; }
+  .devmenu-name { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 500; }
+  .takerow { align-items: center; }
+  .takebody { display: flex; flex-direction: column; min-width: 0; }
+  .takebody .small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .takelist { display: flex; flex-direction: column; max-width: 32rem; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 0.4rem; }
+  .qhead { font-size: 1rem; margin: 1.2rem 0 0.5rem; }
   .pinpad { align-items: center; text-align: center; }
   .pinpad input { text-align: center; font-size: 1.6rem; letter-spacing: 0.6rem; width: 12rem; }
   .pinpad input.pw { font-size: 1rem; letter-spacing: normal; width: 16rem; }
@@ -3504,20 +3840,24 @@
     white-space: nowrap;
   }
   .sr-act:hover { color: var(--text); border-color: var(--accent); }
-  .sr img, .sr-ph {
-    width: 2rem;
-    height: 3rem;
-    border-radius: 4px;
-    object-fit: cover;
+  /* List artwork (the thumb snippet). Each list sets one --thumb-h so its
+     rows line up whatever the shape: a poster is 2:3, an episode's still
+     16:9 like the season's episode list, music square. Every list it sits
+     in is on --panel, so the empty box is --bg. */
+  .thumb {
+    height: var(--thumb-h, 3rem);
+    width: calc(var(--thumb-h, 3rem) * 2 / 3);
     flex: none;
-  }
-  .sr-ph {
     display: grid;
     place-items: center;
+    overflow: hidden;
+    border-radius: 4px;
     background: var(--bg);
     color: var(--muted);
-    font-weight: 700;
   }
+  .thumb.wide { width: calc(var(--thumb-h, 3rem) * 16 / 9); }
+  .thumb.square { width: var(--thumb-h, 3rem); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .sr-text { display: flex; flex-direction: column; min-width: 0; }
   .sr-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sr-sub { font-size: 0.76rem; color: var(--muted); }
@@ -4601,6 +4941,9 @@
     border-radius: 0 0 12px 12px;
     background: var(--panel);
     padding: 0.6rem 0.9rem 0.7rem;
+    /* Smaller artwork than the queue page: this is a glance under the
+       player, not the place to browse. */
+    --thumb-h: 2rem;
   }
   .queue header {
     display: flex;
@@ -4722,13 +5065,24 @@
   .qmove button:hover:not(:disabled) { color: var(--text); background: var(--bg); }
   .qmove button:disabled { opacity: 0.3; cursor: default; }
   /* At phone width the reorder controls would crowd the title off the row,
-     so they sit under it instead of beside it. */
+     so they sit under it instead of beside it, with the artwork spanning
+     both lines on the left. */
   @media (max-width: 30rem) {
-    .qlist .qtitle { flex: 1 1 100%; order: 1; }
-    .qlist .qpos { order: 0; }
-    .qlist .qmove { order: 2; margin-left: auto; }
-    .qlist .qdrop { order: 3; }
-    .qlist .qprogress { order: 4; }
+    .qlist li {
+      display: grid;
+      grid-template-columns: auto auto 1fr auto auto;
+      grid-template-areas:
+        'pos thumb title title title'
+        'pos thumb . move drop'
+        'prog prog prog prog prog';
+      row-gap: 0.15rem;
+    }
+    .qlist .qpos { grid-area: pos; }
+    .qlist .thumb { grid-area: thumb; }
+    .qlist .qtitle { grid-area: title; }
+    .qlist .qmove { grid-area: move; }
+    .qlist .qdrop { grid-area: drop; }
+    .qlist .qprogress { grid-area: prog; }
   }
 
   /* Count beside the sidebar's Queue entry: the feedback that "Add all to

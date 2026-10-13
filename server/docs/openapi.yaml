@@ -8,11 +8,60 @@ info:
 servers:
   - url: /api/v1
 
+# Signed in by default: a browser's session cookie, or an API key (created
+# under Account settings) sent as a bearer token or in X-Api-Key. Operations
+# open to everyone say so with an empty security list.
+security:
+  - sessionCookie: []
+  - bearerKey: []
+  - apiKeyHeader: []
+
+tags:
+  - name: Account
+    description: "Signing in, your profile, preferences, picture and API keys"
+  - name: Devices
+    description: "Your signed-in browsers: list, name, sign out, and hand play queues between them"
+  - name: Browse
+    description: "Home screen rows, search and people"
+  - name: Libraries
+    description: "Libraries and their contents"
+  - name: Collections
+    description: "Film collections, from the metadata provider or made by an admin"
+  - name: Items
+    description: "Films, series, seasons, episodes and music"
+  - name: Playback
+    description: "Playing, streaming, downloading, subtitles and watch state"
+  - name: Users
+    description: "Accounts and groups (admin)"
+  - name: Integrations
+    description: "Sonarr and Radarr"
+  - name: Administration
+    description: "Scans, metadata, settings, statistics and logs (admin)"
+  - name: System
+    description: "Health, themes, the live event stream and this specification"
+
 paths:
+  /openapi.yaml:
+    get:
+      summary: This API's specification (public)
+      description: >
+        The document you are reading, as OpenAPI 3.1 YAML — for generating
+        client SDKs. /api/docs renders it as an interactive reference.
+      operationId: getOpenAPI
+      tags: [System]
+      security: []
+      responses:
+        "200":
+          description: The specification
+          content:
+            application/yaml:
+              schema: { type: string }
   /health:
     get:
       summary: Liveness check
       operationId: getHealth
+      tags: [System]
+      security: []
       responses:
         "200":
           description: Server is up
@@ -29,6 +78,8 @@ paths:
     get:
       summary: List UI themes
       operationId: listThemes
+      tags: [System]
+      security: []
       responses:
         "200":
           description: Available themes (folders under /themes)
@@ -49,6 +100,8 @@ paths:
     get:
       summary: Setup state and the caller's identity (public)
       operationId: authStatus
+      tags: [Account]
+      security: []
       responses:
         "200":
           description: setupRequired is true until the first admin exists
@@ -64,6 +117,8 @@ paths:
     post:
       summary: Create the first admin (public; 409 once any user exists)
       operationId: authSetup
+      tags: [Account]
+      security: []
       requestBody:
         required: true
         content:
@@ -78,6 +133,8 @@ paths:
       summary: Sign in (sets the session cookie)
       description: The password field also accepts the user's PIN, when they have one.
       operationId: authLogin
+      tags: [Account]
+      security: []
       requestBody:
         required: true
         content:
@@ -93,6 +150,8 @@ paths:
         Every enabled user, for the "Who's watching?" tiles. Empty when the
         sign-in screen is in form mode, so no names are revealed then.
       operationId: authProfiles
+      tags: [Account]
+      security: []
       responses:
         "200":
           description: Profiles
@@ -108,6 +167,8 @@ paths:
                     displayName: { type: string }
                     hasPassword: { type: boolean, description: The user may switch to password sign-in }
                     hasPin: { type: boolean, description: Ask for a PIN; otherwise ask for the password }
+                    avatar: { type: string, description: The user's picture (an /artwork/ path), when they have one }
+                    avatarColour: { type: string, description: The theme token their initial is drawn on, when they chose one }
   /auth/pin:
     post:
       summary: Quick sign-in with a PIN (public)
@@ -116,6 +177,8 @@ paths:
         further failure up to 15 minutes (429 with Retry-After). Password
         sign-in is throttled the same way per username.
       operationId: authPINLogin
+      tags: [Account]
+      security: []
       requestBody:
         required: true
         content:
@@ -138,6 +201,7 @@ paths:
         current PIN) in `password`. pin "" removes the PIN, which is refused
         for accounts that have no password.
       operationId: authSetPIN
+      tags: [Account]
       requestBody:
         required: true
         content:
@@ -157,18 +221,21 @@ paths:
     post:
       summary: Sign out this session
       operationId: authLogout
+      tags: [Account]
       responses:
         "204": { description: Signed out }
   /auth/me:
     get:
       summary: The signed-in user
       operationId: authMe
+      tags: [Account]
       responses:
         "200": { description: User, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
   /auth/password:
     post:
       summary: Change own password (other sessions are signed out)
       operationId: authPassword
+      tags: [Account]
       requestBody:
         required: true
         content:
@@ -182,15 +249,52 @@ paths:
       responses:
         "204": { description: Changed }
         "403": { description: Current password incorrect }
+  /auth/prefs:
+    get:
+      summary: Your own interface preferences
+      description: >
+        Theme, quality, autoplay and the like, kept on the server so every
+        device you sign in on agrees. Keys and values are strings the client
+        defines; the server does not interpret them.
+      operationId: getPrefs
+      tags: [Account]
+      responses:
+        "200":
+          description: Preferences
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { type: string } }
+    put:
+      summary: Change some of your preferences
+      description: >
+        Merged into what is stored: only the keys sent change, and an empty
+        value removes one. At most 50 keys, keys up to 64 characters and
+        values up to 512.
+      operationId: putPrefs
+      tags: [Account]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: { type: string } }
+      responses:
+        "200":
+          description: All your preferences, after the change
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { type: string } }
+        "400": { $ref: "#/components/responses/BadRequest" }
   /auth/keys:
     get:
       summary: List own API keys
       operationId: listAPIKeys
+      tags: [Account]
       responses:
         "200": { description: Keys (never the secret), content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } }
     post:
       summary: Create an API key — the secret is returned exactly once
       operationId: createAPIKey
+      tags: [Account]
       requestBody:
         content:
           application/json:
@@ -210,20 +314,185 @@ paths:
     delete:
       summary: Revoke an API key
       operationId: deleteAPIKey
+      tags: [Account]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         "204": { description: Revoked }
         "404": { $ref: "#/components/responses/NotFound" }
+  /auth/avatar:
+    post:
+      summary: Upload your own picture
+      description: >
+        A JPEG, PNG, GIF or WebP of at most 15 MB, as the multipart field
+        "image". It is turned upright by its EXIF orientation, cropped to its
+        centre square and stored as a 256-pixel JPEG under /artwork/, which
+        is served without sign-in so the profile picker can show it.
+      operationId: uploadOwnAvatar
+      tags: [Account]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        "200": { description: The updated user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    delete:
+      summary: Remove your own picture, going back to your initial
+      operationId: deleteOwnAvatar
+      tags: [Account]
+      responses:
+        "200": { description: The updated user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+  /auth/avatar/colour:
+    put:
+      summary: Choose the colour behind your initial
+      operationId: setOwnAvatarColour
+      tags: [Account]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [colour]
+              properties:
+                colour: { $ref: "#/components/schemas/AvatarColour" }
+      responses:
+        "200": { description: The updated user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/sessions:
+    get:
+      summary: Your signed-in devices
+      description: >
+        Each browser sign-in is a device. Listed most recently active first,
+        marking this one (current) and those with the app open right now
+        (online — the ones a queue can be sent to). A device's play queue is
+        summarised so another can take it over.
+      operationId: listDevices
+      tags: [Devices]
+      responses:
+        "200":
+          description: Devices
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Device" } }
+  /auth/sessions/current:
+    patch:
+      summary: Name this device ("Living-room TV")
+      description: Only for a browser session; a request made with an API key belongs to no device (400).
+      operationId: nameDevice
+      tags: [Devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 40, description: Empty to go back to the browser's name }
+      responses:
+        "204": { description: Named }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/sessions/current/queue:
+    put:
+      summary: Record this device's play queue, so another device can take it over
+      description: >
+        Positions are not part of it: resume positions are kept per user and
+        item, so whichever device plays next resumes where the last stopped.
+        An empty list clears it.
+      operationId: saveDeviceQueue
+      tags: [Devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueueRequest" }
+      responses:
+        "204": { description: Saved }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/sessions/revoke-others:
+    post:
+      summary: Sign out every device but this one
+      operationId: revokeOtherDevices
+      tags: [Devices]
+      responses:
+        "200":
+          description: How many devices were signed out
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/sessions/{id}:
+    delete:
+      summary: Sign one of your other devices out
+      description: >
+        It is signed out at once: its event stream receives "revoked" and
+        closes, and its next request is refused. This device is signed out
+        with POST /auth/logout instead (400 here).
+      operationId: revokeDevice
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Signed out }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /auth/sessions/{id}/queue:
+    get:
+      summary: Another device's play queue, to take over
+      description: >
+        Its items as they stand now: any the caller may no longer see, or a
+        rescan has removed, are left out, with index kept on the same item.
+        Each carries the caller's watch state.
+      operationId: deviceQueue
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The queue, content: { application/json: { schema: { $ref: "#/components/schemas/HandoffQueue" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /auth/sessions/{id}/play:
+    post:
+      summary: Send a queue to another of your devices, which starts playing it
+      description: >
+        The device must be online — have the app open — or this answers 409.
+        It receives a "handoff" event (see /events) with the items it may
+        play resolved, and begins at index, resuming from the caller's saved
+        position. The sending client stops its own playback when this
+        succeeds.
+      operationId: playOnDevice
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueueRequest" }
+      responses:
+        "202": { description: Sent }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: The device is not connected }
   /settings:
     get:
       summary: Runtime settings (admin)
       operationId: getSettings
+      tags: [Administration]
       responses:
         "200": { description: Settings, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
     put:
       summary: Change runtime settings (admin) — only the fields sent change
       operationId: putSettings
+      tags: [Administration]
       requestBody:
         required: true
         content:
@@ -237,12 +506,14 @@ paths:
     get:
       summary: List users (admin)
       operationId: listUsers
+      tags: [Users]
       responses:
         "200": { description: Users, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/User" } } } } }
         "403": { description: Admin only }
     post:
       summary: Create a user (admin)
       operationId: createUser
+      tags: [Users]
       requestBody:
         required: true
         content:
@@ -251,6 +522,61 @@ paths:
       responses:
         "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /users/{id}/avatar:
+    post:
+      summary: Set a user's picture (admin)
+      description: As POST /auth/avatar, for any user.
+      operationId: uploadUserAvatar
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        "200": { description: The updated user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Remove a user's picture (admin)
+      operationId: deleteUserAvatar
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The updated user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /users/{id}/sessions:
+    get:
+      summary: A user's signed-in devices (admin)
+      operationId: userDevices
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Devices
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Device" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /users/{id}/sessions/{sid}:
+    delete:
+      summary: Sign one of a user's devices out (admin)
+      operationId: revokeUserDevice
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: sid, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Signed out }
+        "404": { $ref: "#/components/responses/NotFound" }
   /users/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -258,6 +584,7 @@ paths:
       summary: Update a user — display name, role, disabled, library grants, optional password reset (admin)
       description: Resetting the password or disabling signs the user out everywhere. Admins cannot demote, disable or delete themselves.
       operationId: updateUser
+      tags: [Users]
       requestBody:
         required: true
         content:
@@ -270,6 +597,7 @@ paths:
     delete:
       summary: Delete a user and everything of theirs (admin)
       operationId: deleteUser
+      tags: [Users]
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -279,6 +607,7 @@ paths:
       summary: List user groups (admin)
       description: Named sets of this server's users ("Kids", "Grown-ups"), for restricting libraries without listing every account.
       operationId: listGroups
+      tags: [Users]
       responses:
         "200":
           description: Groups, by name
@@ -288,6 +617,7 @@ paths:
     post:
       summary: Create a group (admin)
       operationId: createGroup
+      tags: [Users]
       requestBody:
         required: true
         content:
@@ -305,6 +635,7 @@ paths:
     put:
       summary: Rename a group and replace its members (admin)
       operationId: updateGroup
+      tags: [Users]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -322,6 +653,7 @@ paths:
     delete:
       summary: Delete a group (admin); it is also removed from every library's access list
       operationId: deleteGroup
+      tags: [Users]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -332,6 +664,7 @@ paths:
     get:
       summary: Who may see a library (admin)
       operationId: getLibraryAccess
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -349,6 +682,7 @@ paths:
         restricted library with empty lists is admin-only. The lists are kept
         when a library is reopened, so restricting it again restores them.
       operationId: setLibraryAccess
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -369,6 +703,7 @@ paths:
     get:
       summary: List libraries
       operationId: listLibraries
+      tags: [Libraries]
       responses:
         "200":
           description: All libraries with playable-item counts
@@ -384,6 +719,7 @@ paths:
         afterwards. Multiple libraries per type are allowed; a library never
         spans types.
       operationId: createLibrary
+      tags: [Libraries]
       requestBody:
         required: true
         content:
@@ -412,6 +748,7 @@ paths:
     get:
       summary: Get a library
       operationId: getLibrary
+      tags: [Libraries]
       responses:
         "200":
           description: The library
@@ -419,9 +756,31 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Library" }
         "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Rename a library or change its folders (admin)
+      description: >
+        Only the fields sent change. The media type cannot: everything already
+        scanned keys off it, so a library of the wrong type is deleted and
+        made again. A removed folder's items are pruned by the next scan.
+      operationId: updateLibrary
+      tags: [Libraries]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                paths: { type: array, items: { type: string } }
+      responses:
+        "200": { description: The updated library, content: { application/json: { schema: { $ref: "#/components/schemas/Library" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
       summary: Delete a library and its scanned items (files on disk untouched)
       operationId: deleteLibrary
+      tags: [Libraries]
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -436,6 +795,7 @@ paths:
         way. Pass full=true to reread and rematch everything, which picks up
         new provider data and recovers from a bad match.
       operationId: scanLibrary
+      tags: [Libraries]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - name: full
@@ -456,6 +816,7 @@ paths:
     get:
       summary: List all items in a library
       operationId: libraryItems
+      tags: [Libraries]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -467,10 +828,64 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
 
+  /libraries/{id}/manage:
+    get:
+      summary: One page of a library's items for the Manage list (admin)
+      description: >
+        The same items as /libraries/{id}/items — every kind, alternative
+        versions left out, ordered by kind then title — but filtered and paged
+        on the server, so a library of tens of thousands of items is fetched a
+        page at a time. total counts the items matching the filter across
+        every page; matched and all describe the whole library regardless of
+        the filter.
+      operationId: libraryManage
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: Case-insensitive substring of the title or the file path
+        - name: unmatched
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Only items with no TMDB match
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+          description: 1-based page number; a page past the end returns no items
+        - name: size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+          description: Items per page, clamped to 1–500
+      responses:
+        "200":
+          description: The page, with its counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total, matched, all, page, size]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Item" }
+                  total: { type: integer, description: Items matching the filter, across every page }
+                  matched: { type: integer, description: Items in the library matched to TMDB }
+                  all: { type: integer, description: Items in the library }
+                  page: { type: integer, description: The page returned }
+                  size: { type: integer, description: The page size applied after clamping }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /items/{id}:
     get:
       summary: Get an item with its direct children
       operationId: getItem
+      tags: [Items]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -486,11 +901,43 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Item" }
         "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Edit an item's metadata by hand (admin)
+      description: >
+        Only the fields sent change, and each one sent is locked: scans and
+        metadata refreshes leave it alone until the locks are cleared
+        (DELETE /items/{id}/locks). poster and backdrop take a path under
+        /artwork/ or an image URL.
+      operationId: updateItemMetadata
+      tags: [Items]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                year: { type: integer }
+                overview: { type: string }
+                tagline: { type: string }
+                certification: { type: string }
+                rating: { type: number }
+                poster: { type: string }
+                backdrop: { type: string }
+                genres: { type: array, items: { type: string } }
+      responses:
+        "200": { description: The updated item, content: { application/json: { schema: { $ref: "#/components/schemas/Item" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /scans:
     get:
       summary: List recent scans, newest first
       operationId: listScans
+      tags: [Administration]
       responses:
         "200":
           description: Recent scan runs
@@ -510,6 +957,7 @@ paths:
         once for its credits. The same status is pushed over /events as
         "segments" while it runs.
       operationId: segmentStatus
+      tags: [Administration]
       responses:
         "200":
           description: Current state
@@ -576,6 +1024,7 @@ paths:
     post:
       summary: Pause intro and credits detection until resumed (admin); kept across restarts
       operationId: pauseSegments
+      tags: [Administration]
       responses:
         "200": { description: The detection status, now paused }
         "409": { description: Detection is turned off (libraries.intro_detection) }
@@ -584,6 +1033,7 @@ paths:
     post:
       summary: Resume intro and credits detection (admin)
       operationId: resumeSegments
+      tags: [Administration]
       responses:
         "200": { description: The detection status }
         "409": { description: Detection is turned off (libraries.intro_detection) }
@@ -592,6 +1042,7 @@ paths:
     get:
       summary: Universal title search over movies, series, and episodes
       operationId: search
+      tags: [Browse]
       parameters:
         - { name: q, in: query, required: true, schema: { type: string, minLength: 2 } }
       responses:
@@ -612,17 +1063,61 @@ paths:
         while running — the scanner's upfront file count; admin-only),
         "items" (data: {libraryId} — that library's contents changed,
         published repeatedly during a scan as items land so open views fill
-        in live) and "libraries" (no data — an invalidation hint: refetch
-        library lists and counts). Events are advisory; clients refetch what
+        in live), "libraries" (no data — an invalidation hint: refetch
+        library lists and counts), and, sent only to the user concerned,
+        "devices" (no data — refetch /auth/sessions), "handoff" (to one
+        device: {from, items, index} — a queue sent by POST
+        /auth/sessions/{id}/play; start playing it) and "revoked" (to one
+        device, which is signed out; the stream closes after it). Events are advisory; clients refetch what
         they display on receipt, and a dropped event costs staleness until
         the next one, not correctness.
       operationId: eventStream
+      tags: [System]
       responses:
         "200":
           description: SSE stream (text/event-stream)
           content:
             text/event-stream:
               schema: { type: string }
+
+  /items/{id}/locks:
+    delete:
+      summary: Clear an item's manual edits' locks (admin)
+      description: >
+        Hands every edited field back to the metadata provider. The values
+        stay as they are until the next refresh replaces them.
+      operationId: clearItemLocks
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Cleared }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /items/{id}/trickplay.vtt:
+    get:
+      summary: Seek-bar preview cues for a video
+      description: >
+        WebVTT cues pointing into the sprite sheet at trickplay.jpg. Previews
+        are made in the background on first request: until they exist this
+        answers 202 with no body, and the player simply shows none.
+      operationId: trickplayVTT
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The cues, content: { text/vtt: {} } }
+        "202": { description: Being generated; ask again on the next play }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /items/{id}/trickplay.jpg:
+    get:
+      summary: Seek-bar preview sprite sheet for a video
+      operationId: trickplaySheet
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The sprite sheet, content: { image/jpeg: {} } }
+        "404": { description: Not generated yet, or no such item }
 
   /items/{id}/matches:
     get:
@@ -634,6 +1129,7 @@ paths:
         relevance rather than filtering, so the top hit is regularly wrong for
         a common title.
       operationId: itemMatches
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
         - { name: q, in: query, required: false, schema: { type: string }, description: Title to search for (default the item's own) }
@@ -663,6 +1159,7 @@ paths:
         film it is, so keeping what the wrong match left behind would defeat
         the point.
       operationId: applyMatch
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       requestBody:
@@ -687,6 +1184,7 @@ paths:
         so a refresh also recovers from an earlier bad match having
         overwritten it.
       operationId: refreshItem
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -702,6 +1200,7 @@ paths:
         returned, so a person credited on a library this user has no grant
         for does not leak its contents.
       operationId: getPerson
+      tags: [Browse]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -726,6 +1225,7 @@ paths:
         never offers a genre nothing is tagged with. Alternative versions are
         excluded, so a film held twice counts once.
       operationId: libraryGenres
+      tags: [Libraries]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -741,6 +1241,53 @@ paths:
                     genre: { type: string }
                     count: { type: integer }
 
+  /libraries/{id}/refresh:
+    post:
+      summary: Re-match a library's metadata in the background (admin)
+      description: >
+        Looks every item up with the metadata provider again, paced so it
+        never crowds out playback. With itemIds, only those items; with q or
+        unmatched, only what the Manage list's filter matches (q is a
+        case-insensitive substring of title or path; unmatched means no
+        provider match) — and a filter that matches nothing is refused rather
+        than falling back to the whole library. Progress arrives as
+        "refresh" events and from GET.
+      operationId: refreshLibrary
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                itemIds: { type: array, items: { type: string } }
+                q: { type: string }
+                unmatched: { type: boolean }
+      responses:
+        "202": { description: Started, content: { application/json: { schema: { $ref: "#/components/schemas/RefreshProgress" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: A refresh is already running for this library }
+    get:
+      summary: Progress of a library's refresh (admin)
+      operationId: refreshStatus
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Progress; running is false when none is under way, content: { application/json: { schema: { $ref: "#/components/schemas/RefreshProgress" } } } }
+    delete:
+      summary: Cancel a library's refresh (admin)
+      operationId: cancelRefresh
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Cancelled }
+        "404": { description: No refresh is running for this library }
+
   /libraries/{id}/recommended:
     get:
       summary: The library's Recommended tab, as rows of items
@@ -752,6 +1299,7 @@ paths:
         rated and unseen, genre rows and unwatched. Every item carries the
         viewer's own watch state.
       operationId: libraryRecommended
+      tags: [Libraries]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -774,6 +1322,25 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
 
   /libraries/{id}/collections:
+    post:
+      summary: Create a collection of your own (admin)
+      operationId: createCollection
+      tags: [Collections]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                itemIds: { type: array, items: { type: string }, description: Its films, in order; may be empty }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Collection" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
     get:
       summary: The collections this library holds more than one film from
       description: >
@@ -785,6 +1352,7 @@ paths:
         noise rather than grouping. Alternative versions are excluded, so a
         film held twice counts once.
       operationId: libraryCollections
+      tags: [Collections]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
@@ -797,24 +1365,78 @@ paths:
                 items: { $ref: "#/components/schemas/Collection" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /libraries/{id}/collections/{cid}:
+  /libraries/{id}/collections/{key}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - name: key
+        in: path
+        required: true
+        schema: { type: string }
+        description: '"tmdb:<id>" for a provider collection, the row id for a managed one'
     get:
-      summary: One collection's films, in release order
+      summary: One collection and its films, in the collection's order
       operationId: collectionItems
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
-        - { name: cid, in: path, required: true, schema: { type: integer }, description: Provider collection id }
+      tags: [Collections]
       responses:
-        "200":
-          description: Films in release order, which is how a series is watched
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Item" }
+        "200": { description: The collection, content: { application/json: { schema: { $ref: "#/components/schemas/CollectionDetail" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Rename a collection (admin)
+      description: >
+        Editing a provider collection adopts it: its membership and order are
+        copied into Cineva and are managed there from then on, so a later scan
+        cannot undo the edit.
+      operationId: renameCollection
+      tags: [Collections]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "200": { description: The collection, content: { application/json: { schema: { $ref: "#/components/schemas/CollectionDetail" } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
-
+    delete:
+      summary: Delete a managed collection (admin)
+      description: >
+        Where it overrode a provider collection, the provider's grouping
+        reappears — so this doubles as "revert to the provider's answer". A
+        provider collection that was never edited cannot be deleted (400).
+      operationId: deleteCollection
+      tags: [Collections]
+      responses:
+        "204": { description: Deleted }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /libraries/{id}/collections/{key}/items:
+    put:
+      summary: Set a collection's films and their order (admin)
+      description: >
+        The body is the list wanted, so adding, removing and reordering are
+        one call. Adopts a provider collection first, as PATCH does.
+      operationId: setCollectionItems
+      tags: [Collections]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [itemIds]
+              properties:
+                itemIds: { type: array, items: { type: string }, description: In the order to play them }
+      responses:
+        "200": { description: The collection, content: { application/json: { schema: { $ref: "#/components/schemas/CollectionDetail" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /integrations:
     get:
       summary: List connected Sonarr and Radarr instances (admin)
@@ -823,6 +1445,7 @@ paths:
         within seconds rather than at the next scheduled rescan. API keys are
         never returned.
       operationId: listIntegrations
+      tags: [Integrations]
       responses:
         "200":
           description: Connections, by kind then name
@@ -840,6 +1463,7 @@ paths:
         instance reaches it; it defaults to the address this request was
         made to. Nothing is kept when any step fails.
       operationId: createIntegration
+      tags: [Integrations]
       requestBody:
         required: true
         content:
@@ -864,6 +1488,7 @@ paths:
         webhook are left as they were. When the URL changes, the webhook is
         removed from the old instance where it can still be reached.
       operationId: updateIntegration
+      tags: [Integrations]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -883,6 +1508,7 @@ paths:
     delete:
       summary: Disconnect, removing Cineva's webhook from the instance (admin)
       operationId: deleteIntegration
+      tags: [Integrations]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -914,6 +1540,7 @@ paths:
         one is running follows it. Other events, including Test, are
         acknowledged and ignored.
       operationId: integrationWebhook
+      tags: [Integrations]
       security: []
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
@@ -954,6 +1581,7 @@ paths:
         (dot) directories are omitted unless hidden=1. Symlinked directories
         are followed so linked media mounts are browsable.
       operationId: listDirs
+      tags: [Administration]
       parameters:
         - { name: path, in: query, required: false, schema: { type: string }, description: Absolute path (default "/") }
         - { name: hidden, in: query, required: false, schema: { type: string, enum: ["1"] } }
@@ -987,6 +1615,7 @@ paths:
         last day. Live samples are also pushed on the /events stream as
         "stats" events.
       operationId: systemStats
+      tags: [Administration]
       parameters:
         - { name: range, in: query, required: false, schema: { type: string, enum: [1h, 24h], default: 1h } }
       responses:
@@ -1014,6 +1643,7 @@ paths:
         Every POST /items/{id}/play is recorded; a "plays" event is pushed on
         the /events stream when the history changes.
       operationId: playStats
+      tags: [Administration]
       parameters:
         - { name: days, in: query, required: false, schema: { type: integer, default: 30, maximum: 365 } }
       responses:
@@ -1044,6 +1674,7 @@ paths:
         them. Separate from /stats/plays because that endpoint returns a bare
         array and response shapes do not change within a version.
       operationId: playTotals
+      tags: [Administration]
       parameters:
         - { name: days, in: query, required: false, schema: { type: integer, default: 30, maximum: 365 } }
       responses:
@@ -1072,6 +1703,7 @@ paths:
         expires after 90 seconds, so the viewer can start the item again by
         hand — this ends a stream, it does not revoke access.
       operationId: stopPlaybackAdmin
+      tags: [Playback]
       parameters:
         - { name: userId, in: path, required: true, schema: { type: string } }
         - { name: itemId, in: path, required: true, schema: { type: string } }
@@ -1087,6 +1719,7 @@ paths:
         down its transcode session, if any). Without this, an entry lingers
         until the client misses its progress heartbeats (45 s).
       operationId: stopPlayback
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1097,6 +1730,7 @@ paths:
       summary: Beacon-friendly alias of DELETE /items/{id}/playback
       description: navigator.sendBeacon can only POST; used on page unload.
       operationId: stopPlaybackBeacon
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1110,6 +1744,7 @@ paths:
         freeBytes is what an unprivileged writer could use. Paths that cannot
         be stat'ed are listed last with an error.
       operationId: diskStats
+      tags: [Administration]
       responses:
         "200":
           description: Volumes
@@ -1137,6 +1772,7 @@ paths:
         Scan completions are recorded by user "system". A "logs" event is
         pushed on /events whenever an entry is added.
       operationId: auditLog
+      tags: [Administration]
       parameters:
         - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 500 } }
         - { name: offset, in: query, required: false, schema: { type: integer, default: 0 } }
@@ -1171,6 +1807,7 @@ paths:
         scan while one is running for the same library is rejected with 409
         (the scans table is the cross-process lock).
       operationId: cancelScan
+      tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1191,6 +1828,7 @@ paths:
         them. The music hierarchy (artist -> album -> ordered tracks) is
         served by the same /libraries/{id}/items and /items/{id} endpoints.
       operationId: playItem
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -1223,6 +1861,7 @@ paths:
     get:
       summary: Direct play the original file (supports HTTP range requests)
       operationId: streamItem
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: format, in: query, required: false, schema: { type: string, enum: [original, opus, aac, mp3, ogg] }, description: Music only — stream a cached transcode instead of the file (Opus for bandwidth, AAC as the universal browser fallback) }
@@ -1242,6 +1881,7 @@ paths:
         (uncompressed) ZIP of every descendant file, one folder level per
         container ("Season 02/...").
       operationId: downloadItem
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: format, in: query, required: false, schema: { type: string, enum: [original, mp3, ogg] }, description: Music only — transcode tracks (or every track in an album/artist ZIP) }
@@ -1260,6 +1900,7 @@ paths:
         position: marking watched should stop offering a resume, and marking
         unwatched should start from the beginning.
       operationId: setWatched
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       requestBody:
@@ -1280,6 +1921,7 @@ paths:
     post:
       summary: Report playback position (crossing ~90% marks the item watched)
       operationId: postProgress
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -1321,6 +1963,7 @@ paths:
         up to. 204 when the item is not a series or season, or has no
         episodes.
       operationId: nextUpFor
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1346,6 +1989,7 @@ paths:
     get:
       summary: Server-side next-up decision — the episode after this one
       operationId: nextUp
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1360,6 +2004,7 @@ paths:
     get:
       summary: The episode before this one (player back button)
       operationId: prevEpisode
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1374,6 +2019,7 @@ paths:
     get:
       summary: List an item's subtitle tracks (embedded and sidecar)
       operationId: itemSubtitles
+      tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1385,12 +2031,13 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/SubtitleTrack" }
 
-  /subtitles/{id}.vtt:
+  /subtitles/{file}:
     get:
       summary: A text subtitle track extracted/converted to WebVTT (cached server-side)
       operationId: subtitleVTT
+      tags: [Playback]
       parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: file, in: path, required: true, schema: { type: string }, description: 'The track id with ".vtt" on the end, as /items/{id}/subtitles lists it' }
       responses:
         "200":
           description: WebVTT content
@@ -1404,6 +2051,7 @@ paths:
       summary: In-progress items for the home screen, most recent first
       description: Limited to the libraries the viewer may see; at most 20.
       operationId: continueWatching
+      tags: [Browse]
       responses:
         "200":
           description: Items with resume positions
@@ -1424,6 +2072,7 @@ paths:
         (series ordered by their newest episode for TV) followed by the first
         two recommendation rows of each film and TV library.
       operationId: home
+      tags: [Browse]
       responses:
         "200":
           description: The home screen's rows
@@ -1463,6 +2112,7 @@ paths:
         session when there is one. Entries expire 45 s after the last
         heartbeat. A "sessions" event is pushed on /events on every change.
       operationId: listSessions
+      tags: [Playback]
       responses:
         "200":
           description: Active sessions
@@ -1476,6 +2126,7 @@ paths:
     get:
       summary: HLS VOD playlist for a session
       operationId: hlsPlaylist
+      tags: [Playback]
       parameters:
         - { name: sid, in: path, required: true, schema: { type: string } }
       responses:
@@ -1489,6 +2140,7 @@ paths:
     get:
       summary: HLS session asset (init.mp4 or segNNNNN.m4s); blocks until produced, seeking restarts the transcoder
       operationId: hlsFile
+      tags: [Playback]
       parameters:
         - { name: sid, in: path, required: true, schema: { type: string } }
         - { name: file, in: path, required: true, schema: { type: string } }
@@ -1501,12 +2153,28 @@ paths:
     delete:
       summary: Stop a playback session and delete its temp files
       operationId: stopSession
+      tags: [Playback]
       parameters:
         - { name: sid, in: path, required: true, schema: { type: string } }
       responses:
         "204": { description: Stopped }
 
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: cineva_session
+      description: Set by POST /auth/login (or /auth/pin, /auth/setup); what browsers use.
+    bearerKey:
+      type: http
+      scheme: bearer
+      description: An API key (cnv_...), for apps and scripts.
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: The same API key, for clients that cannot set Authorization.
   schemas:
     User:
       type: object
@@ -1519,6 +2187,8 @@ components:
         hasPassword: { type: boolean }
         hasPin: { type: boolean }
         createdAt: { type: string }
+        avatar: { type: string, description: The user's picture (an /artwork/ path); absent when they have none }
+        avatarColour: { $ref: "#/components/schemas/AvatarColour" }
         libraryIds:
           type: array
           items: { type: string }
@@ -1561,6 +2231,55 @@ components:
       properties:
         event: { type: string }
         rescanning: { type: array, items: { type: string }, description: Names of the libraries rescanning }
+    AvatarColour:
+      type: string
+      enum: ["", accent-2, chart-1, chart-2, chart-3, ok, err]
+      description: >
+        The theme token a user's initial is drawn on, so each theme supplies
+        its own colour; "" is the default.
+    Device:
+      type: object
+      description: A signed-in browser session.
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        name: { type: string, description: Chosen by the user; "" when unnamed }
+        client: { type: string, description: 'Browser and system, from the User-Agent: "Chrome · Android"' }
+        clientIp: { type: string }
+        createdAt: { type: string }
+        lastSeenAt: { type: string }
+        expiresAt: { type: string }
+        current: { type: boolean, description: The device making this request }
+        online: { type: boolean, description: Has the app open now, so can be sent a queue }
+        queue:
+          type: object
+          description: Its play queue, when it has one
+          properties:
+            count: { type: integer }
+            index: { type: integer }
+            current: { $ref: "#/components/schemas/Item" }
+            seriesTitle: { type: string, description: The current item's series, for an episode }
+            updatedAt: { type: string }
+    QueueRequest:
+      type: object
+      required: [itemIds]
+      properties:
+        itemIds: { type: array, maxItems: 500, items: { type: string } }
+        index: { type: integer, minimum: 0, description: The item playing (or to play first) }
+    HandoffQueue:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        index: { type: integer }
+    RefreshProgress:
+      type: object
+      properties:
+        libraryId: { type: string }
+        done: { type: integer }
+        total: { type: integer }
+        matched: { type: integer }
+        failed: { type: integer }
+        running: { type: boolean }
     UserGroup:
       type: object
       required: [id, name, memberIds]
@@ -1591,6 +2310,7 @@ components:
         role: { type: string, enum: [admin, user] }
         disabled: { type: boolean }
         pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
+        avatarColour: { $ref: "#/components/schemas/AvatarColour" }
     Settings:
       type: object
       properties:
@@ -1653,17 +2373,23 @@ components:
     Collection:
       type: object
       description: >
-        A set of films grouped by the metadata provider — "The Matrix
-        Collection", "Harry Potter Collection".
+        A set of films — grouped by the metadata provider ("The Matrix
+        Collection"), or made and edited by an admin.
       properties:
-        id: { type: integer, description: Provider collection id }
+        key: { type: string, description: '"tmdb:<id>" for a provider collection, the row id for a managed one' }
+        tmdbId: { type: integer }
         name: { type: string }
         count: { type: integer, description: How many of the set this library holds }
-        poster:
-          type: string
-          description: >
-            Artwork standing in for the set — the earliest film's poster, so
-            the row is recognisable rather than arbitrary.
+        poster: { type: string, description: The earliest film's poster, so the row is recognisable }
+        managed: { type: boolean, description: An admin has edited it; membership and order are Cineva's own }
+        watched: { type: integer, description: How many of its films the viewer has finished }
+        nextUpId: { type: string, description: The first film the viewer has not finished, in order; absent once all are }
+        nextUpName: { type: string }
+    CollectionDetail:
+      type: object
+      properties:
+        collection: { $ref: "#/components/schemas/Collection" }
+        items: { type: array, items: { $ref: "#/components/schemas/Item" } }
 
     Theme:
       type: object

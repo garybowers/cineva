@@ -216,6 +216,10 @@ export interface User {
   disabled: boolean
   hasPassword: boolean
   hasPin: boolean
+  /** An uploaded picture's /artwork/ path. */
+  avatar?: string
+  /** The theme token the initial is drawn on; absent for the default. */
+  avatarColour?: AvatarColour
   libraryIds: string[]
 }
 export interface Profile {
@@ -224,6 +228,32 @@ export interface Profile {
   displayName: string
   hasPassword: boolean
   hasPin: boolean
+  avatar?: string
+  avatarColour?: AvatarColour
+}
+/** Theme tokens, not colours, so every theme draws an avatar in its own palette. */
+export const AVATAR_COLOURS = ['accent-2', 'chart-1', 'chart-2', 'chart-3', 'ok', 'err'] as const
+export type AvatarColour = (typeof AVATAR_COLOURS)[number]
+
+/** A signed-in browser: listed, named, signed out, and handed queues. */
+export interface Device {
+  id: string
+  name: string
+  /** Browser and system from the User-Agent: "Chrome · Android". */
+  client: string
+  clientIp: string
+  createdAt: string
+  lastSeenAt: string
+  /** The device making the request. */
+  current: boolean
+  /** Has the app open now, so can be sent a queue. */
+  online: boolean
+  queue?: { count: number; index: number; current?: Item; seriesTitle?: string; updatedAt: string }
+}
+/** A queue on its way between devices. */
+export interface HandoffQueue {
+  items: Item[]
+  index: number
 }
 export interface APIKey {
   id: string
@@ -267,6 +297,27 @@ export const changePassword = (current: string, next: string) => post<void>('/au
 export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
 export const createAPIKey = (name: string) => post<APIKey & { key: string }>('/auth/keys', { name })
 export const deleteAPIKey = (id: string) => req<void>(`/auth/keys/${id}`, { method: 'DELETE' })
+
+export const uploadAvatar = (file: File) => {
+  const form = new FormData()
+  form.append('image', file)
+  return req<User>('/auth/avatar', { method: 'POST', body: form })
+}
+export const removeAvatar = () => req<User>('/auth/avatar', { method: 'DELETE' })
+export const setAvatarColour = (colour: AvatarColour | '') =>
+  req<User>('/auth/avatar/colour', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ colour }) })
+
+export const listDevices = () => get<Device[]>('/auth/sessions')
+export const nameDevice = (name: string) =>
+  req<void>('/auth/sessions/current', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+export const revokeDevice = (id: string) => req<void>(`/auth/sessions/${id}`, { method: 'DELETE' })
+export const revokeOtherDevices = () => post<{ revoked: number }>('/auth/sessions/revoke-others')
+/** Records this device's queue so another can take it over. */
+export const saveDeviceQueue = (itemIds: string[], index: number) =>
+  req<void>('/auth/sessions/current/queue', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ itemIds, index }) })
+export const deviceQueue = (id: string) => get<HandoffQueue>(`/auth/sessions/${id}/queue`)
+export const playOnDevice = (id: string, itemIds: string[], index: number) =>
+  post<void>(`/auth/sessions/${id}/play`, { itemIds, index })
 
 const get = <T>(path: string) => req<T>(path)
 const post = <T>(path: string, body?: unknown) =>

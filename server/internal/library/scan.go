@@ -29,6 +29,9 @@ type Manager struct {
 	ArtworkDir string
 	Probe      func(path string) (media.Info, error)
 	Events     *events.Bus // nil outside the server (CLI scans)
+	// CoverArt reads a file's embedded cover art; nil uses
+	// media.ExtractCoverArt.
+	CoverArt func(path string) []byte
 	// CertRegion is the ISO 3166-1 country whose content rating is stored
 	// ("GB", "US", "DE"). Certification is regional — a BBFC 15 and an FSK
 	// 16 are different boards' judgements, not two spellings — so which one
@@ -620,7 +623,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 				if item.Title == fmt.Sprintf("Episode %d", ep.Episode) && te.Title != "" {
 					item.Title = te.Title
 				}
-				if item.Poster == "" && te.StillURL != "" && m.ArtworkDir != "" {
+				if te.StillURL != "" && m.ArtworkDir != "" {
 					name := fmt.Sprintf("tmdb-s%d-e%dx%d", seriesTmdb[showDir], ep.Season, ep.Episode)
 					if file, err := metadata.DownloadArtwork(ctx, http.DefaultClient, te.StillURL, m.ArtworkDir, name); err == nil {
 						item.Poster = "/artwork/" + file
@@ -639,6 +642,14 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 				}
 				break
 			}
+		}
+		// The TMDB still is the episode's image: a landscape frame from this
+		// episode, which is what an episode list shows. Embedded cover art is
+		// only the fallback, read when there is no still, because in an
+		// episode it is nearly always the series' or season's portrait cover
+		// and would make every row of a season look the same.
+		if item.Poster == "" {
+			item.Poster = m.embeddedArt(probes[i-batchStart])
 		}
 		guests := episodeGuests(seasonData[seasonDir], ep.Episode)
 		plan.stamp(&item, path)
@@ -718,7 +729,8 @@ func (m *Manager) saveSeries(ctx context.Context, lib store.Library, showDir, fa
 // applyProbe copies an already-read probe onto an item: technical info plus
 // embedded metadata. Tags refine filename parsing (they carry correct
 // punctuation, years, and synopses in iTunes-style files) and attached cover
-// art becomes the item's poster. The title tag is only taken when
+// art becomes the item's poster — except for an episode, whose poster is
+// decided by scanTV once it knows whether TMDB has a still. The title tag is only taken when
 // PreferTagTitle accepts it — scene releases stamp their own release name
 // there, which would otherwise overwrite a perfectly good title parsed from
 // a clean path.
@@ -752,13 +764,26 @@ func (m *Manager) applyProbe(item *store.Item, r probed) {
 	if t.EpisodeNum != 0 && item.Kind == store.KindEpisode {
 		item.EpisodeNum = t.EpisodeNum
 	}
-	if info.HasCoverArt && item.Poster == "" {
-		if img := media.ExtractCoverArt(r.Path); img != nil {
-			if p := m.cacheArtwork("embed", r.Path, img); p != "" {
-				item.Poster = p
-			}
-		}
+	if item.Kind != store.KindEpisode && item.Poster == "" {
+		item.Poster = m.embeddedArt(r)
 	}
+}
+
+// embeddedArt caches a probed file's attached cover art and returns its
+// serve path, or "" when it has none.
+func (m *Manager) embeddedArt(r probed) string {
+	if r.Err != nil || !r.Info.HasCoverArt {
+		return ""
+	}
+	extract := m.CoverArt
+	if extract == nil {
+		extract = media.ExtractCoverArt
+	}
+	img := extract(r.Path)
+	if img == nil {
+		return ""
+	}
+	return m.cacheArtwork("embed", r.Path, img)
 }
 
 // syncSubtitles records an item's subtitle tracks: embedded streams plus

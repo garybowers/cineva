@@ -8,13 +8,14 @@
     type Integration, type IntegrationKind, type IntegrationRequest,
     pauseSegments, resumeSegments,
     cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
-    libraryItems, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
+    libraryManage, type ManageFilter, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
     updateLibrary,
     refreshLibrary, cancelRefresh, refreshStatus, type RefreshProgress,
     libraryCollections, collectionDetail, createCollection, renameCollection,
     setCollectionItems, deleteCollection, updateItem, clearItemLocks,
     type Collection, type ItemEdit,
     authStatus, login, logout, listUsers, createUser, updateUser, deleteUser, UNAUTHORISED, getSettings, putSettings,
+    uploadUserAvatar, deleteUserAvatar, userDevices, revokeUserDevice, AVATAR_COLOURS, type AvatarColour, type Device,
     type ServerSettings,
     type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type PlayTotals, type DiskVolume, type AuditEntry, type User, type UserRequest,
   } from './lib/api'
@@ -186,6 +187,55 @@
   function editUser(u: User) {
     editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled }
     userErr = ''
+    editDevices = []
+    userDevices(u.id).then((d) => (editDevices = d)).catch(() => {})
+  }
+  // The user being edited as it stands, for the picture, which changes at
+  // once rather than waiting for Save.
+  const editingUser = $derived(editing?.id ? users.find((u) => u.id === editing?.id) : undefined)
+  let editDevices: Device[] = $state([])
+  let avatarBusy = $state(false)
+  function replaceUser(u: User) {
+    users = users.map((x) => (x.id === u.id ? u : x))
+  }
+  async function pickUserAvatar(e: Event, u: User) {
+    const input = e.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file) return
+    avatarBusy = true
+    userErr = ''
+    try {
+      replaceUser(await uploadUserAvatar(u.id, file))
+    } catch (err) {
+      userErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      avatarBusy = false
+    }
+  }
+  async function dropUserAvatar(u: User) {
+    try {
+      replaceUser(await deleteUserAvatar(u.id))
+    } catch (err) {
+      userErr = String(err instanceof Error ? err.message : err)
+    }
+  }
+  async function chooseUserColour(u: User, colour: AvatarColour | '') {
+    try {
+      replaceUser(await updateUser(u.id, { avatarColour: colour }))
+    } catch (err) {
+      userErr = String(err instanceof Error ? err.message : err)
+    }
+  }
+  async function signOutUserDevice(u: User, d: Device) {
+    const before = editDevices
+    editDevices = editDevices.filter((x) => x.id !== d.id)
+    try {
+      await revokeUserDevice(u.id, d.id)
+    } catch (err) {
+      editDevices = before
+      userErr = String(err instanceof Error ? err.message : err)
+    }
   }
   // ---- Groups ----
   // Named sets of users, for restricting a library without listing every
@@ -512,10 +562,22 @@
 
   // ---- Library contents: browse what was scanned, fix what mismatched ----
   let manage: Library | null = $state(null)   // library being managed, null = list
-  let items: Item[] = $state([])
+  // The Manage list is paged and filtered on the server: a library can hold
+  // tens of thousands of items, far too many to send or render at once.
+  const ITEM_PAGE_SIZE = 100
+  let items: Item[] = $state([])              // the page on screen
   let itemsLoading = $state(false)
   let itemFilter = $state('')
   let onlyUnmatched = $state(false)
+  let itemPage = $state(1)
+  let itemTotal = $state(0)                   // items matching the filter, every page
+  let matchedCount = $state(0)                // the whole library's, for "X of N matched"
+  let allCount = $state(0)
+  // The filter the rows on screen were loaded with. The box may hold text
+  // still waiting out its debounce, and refresh must act on what the count
+  // beside it describes.
+  let shownFilter: ManageFilter = $state({})
+  let itemsTop: HTMLElement | undefined = $state()
   let busyItem: string | null = $state(null)  // id of the item being refreshed
   let matchFor: Item | null = $state(null)    // item whose match dialogue is open
   let matchQuery = $state('')
@@ -548,12 +610,17 @@
     manageTab = 'films'
     itemFilter = ''
     onlyUnmatched = false
+    clearTimeout(filterTimer)
+    itemPage = 1
+    items = []
+    itemTotal = matchedCount = allCount = 0
+    shownFilter = {}
     itemsLoading = true
     metaRefresh = null
     editingColl = null
     collections = []
     try {
-      items = await libraryItems(lib.id)
+      await loadItems()
       const st = await refreshStatus(lib.id)
       if (st.running) metaRefresh = st
     } catch (e) {
@@ -562,6 +629,62 @@
       itemsLoading = false
     }
     loadCollections()
+  }
+
+  // Each load is numbered so a slow response for an old filter or page
+  // cannot land on top of a newer one.
+  let itemsSeq = 0
+
+  /** Load the current page for the current filter. quiet keeps a background
+   *  reload (an event) from putting up an error over the admin's work. */
+  async function loadItems(quiet = false) {
+    if (!manage) return
+    const lib = manage
+    const seq = ++itemsSeq
+    const f: ManageFilter = { q: itemFilter.trim(), unmatched: onlyUnmatched }
+    try {
+      let r = await libraryManage(lib.id, f, itemPage, ITEM_PAGE_SIZE)
+      // The page emptied under us — items pruned by a scan, or the last
+      // unmatched ones on it fixed — so step back to the last page there is.
+      if (r.items.length === 0 && r.total > 0 && itemPage > 1) {
+        r = await libraryManage(lib.id, f, Math.ceil(r.total / r.size), ITEM_PAGE_SIZE)
+      }
+      if (seq !== itemsSeq || manage?.id !== lib.id) return
+      items = r.items
+      itemPage = r.page
+      itemTotal = r.total
+      matchedCount = r.matched
+      allCount = r.all
+      shownFilter = f
+    } catch (e) {
+      if (!quiet && seq === itemsSeq) error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  // Typing narrows the list once the typist pauses, rather than a request
+  // per keystroke; any change of filter starts again from the first page.
+  let filterTimer: ReturnType<typeof setTimeout> | undefined
+  function onItemFilterInput() {
+    clearTimeout(filterTimer)
+    filterTimer = setTimeout(() => {
+      itemPage = 1
+      loadItems()
+    }, 250)
+  }
+
+  function onUnmatchedChange() {
+    clearTimeout(filterTimer)
+    itemPage = 1
+    loadItems()
+  }
+
+  const pageCount = $derived(Math.max(1, Math.ceil(itemTotal / ITEM_PAGE_SIZE)))
+
+  async function goItemPage(n: number) {
+    itemPage = Math.min(Math.max(n, 1), pageCount)
+    await loadItems()
+    // From the pager under the table, bring the new page's first row into view.
+    itemsTop?.scrollIntoView({ block: 'nearest' })
   }
 
   async function loadCollections() {
@@ -620,14 +743,33 @@
   const removeFilm = (id: string) => saveCollFilms(collFilms.filter((i) => i.id !== id))
   const addFilm = (it: Item) => saveCollFilms([...collFilms, it])
 
+  // Search results for the add-a-film box. The Manage list holds only one
+  // page, so the search goes to the server rather than through `items`.
+  let addResults: Item[] = $state([])
+  let addTimer: ReturnType<typeof setTimeout> | undefined
+  function onAddFilmInput() {
+    clearTimeout(addTimer)
+    const q = addFilmQuery.trim()
+    if (!q || !manage) {
+      addResults = []
+      return
+    }
+    const lib = manage
+    addTimer = setTimeout(async () => {
+      try {
+        const r = await libraryManage(lib.id, { q }, 1, 50)
+        if (addFilmQuery.trim() === q) addResults = r.items
+      } catch (e) {
+        error = String(e instanceof Error ? e.message : e)
+      }
+    }, 250)
+  }
+
   /** Films not already in the collection, narrowed by the search box. */
   const addCandidates = $derived.by(() => {
-    const q = addFilmQuery.trim().toLowerCase()
-    if (!q) return []
+    if (!addFilmQuery.trim()) return []
     const have = new Set(collFilms.map((i) => i.id))
-    return items
-      .filter((i) => !have.has(i.id) && !i.versionOf && i.title.toLowerCase().includes(q))
-      .slice(0, 8)
+    return addResults.filter((i) => !have.has(i.id) && !i.versionOf).slice(0, 8)
   })
 
   async function renameColl(name: string) {
@@ -697,6 +839,8 @@
       const updated = await updateItem(editItem.id, editForm)
       items = items.map((i) => (i.id === updated.id ? { ...i, ...updated } : i))
       editItem = null
+      // A new title can move the row to another page, or out of the filter.
+      loadItems()
     } catch (e) {
       error = String(e instanceof Error ? e.message : e)
     } finally {
@@ -714,25 +858,25 @@
     }
   }
 
-  // True when the list is narrowed, in which case refresh acts on what is
-  // on screen rather than the whole library.
-  const filtered = $derived(onlyUnmatched || itemFilter.trim() !== '')
+  // True when the list is narrowed, in which case refresh acts on everything
+  // the filter matches — every page of it — rather than the whole library.
+  const filtered = $derived(!!shownFilter.unmatched || !!shownFilter.q)
 
   const refreshLabel = $derived(
     !filtered
       ? 'Refresh all metadata'
-      : `Refresh ${shownItems.length} ${onlyUnmatched && !itemFilter.trim() ? 'unmatched' : 'shown'}`,
+      : `Refresh ${itemTotal} ${shownFilter.unmatched && !shownFilter.q ? 'unmatched' : 'matching'}`,
   )
 
   async function startRefreshAll() {
     if (!manage) return
     error = ''
     const lib = manage
-    // Send the visible ids when filtered, so the button does exactly what it
-    // says; otherwise let the server walk the whole library.
-    const only = filtered ? shownItems.map((i) => i.id) : undefined
+    // Send the filter rather than ids, so the server resolves every page of
+    // matches and the button does exactly what it says; no filter lets the
+    // server walk the whole library.
     try {
-      metaRefresh = await refreshLibrary(lib.id, only)
+      metaRefresh = await refreshLibrary(lib.id, filtered ? shownFilter : {})
     } catch (e) {
       metaRefresh = null
       error = String(e instanceof Error ? e.message : e)
@@ -751,17 +895,6 @@
   const refreshPct = $derived(
     metaRefresh && metaRefresh.total > 0 ? Math.round((metaRefresh.done / metaRefresh.total) * 100) : 0,
   )
-
-  const matchedCount = $derived(items.filter((i) => i.tmdbId).length)
-
-  const shownItems = $derived.by(() => {
-    const q = itemFilter.trim().toLowerCase()
-    return items.filter((i) => {
-      if (onlyUnmatched && i.tmdbId) return false
-      if (!q) return true
-      return i.title.toLowerCase().includes(q) || i.path.toLowerCase().includes(q)
-    })
-  })
 
   // Replaces the row in place so the table does not jump while working
   // through a list of corrections.
@@ -813,6 +946,8 @@
     try {
       replaceItem(await applyMatch(matchFor.id, c.tmdbId))
       matchFor = null
+      // The new title may sort elsewhere, and a fixed row leaves "only unmatched".
+      loadItems()
     } catch (e) {
       matchErr = String(e instanceof Error ? e.message : e)
     } finally {
@@ -1070,7 +1205,7 @@
           if (!p || !manage || p.libraryId !== manage.id) return
           metaRefresh = p.running ? p : null
           // The run is over: pick up every title it rewrote.
-          if (!p.running) libraryItems(manage.id).then((i) => (items = i)).catch(() => {})
+          if (!p.running) loadItems(true)
         },
         libraries: () => {
           listLibraries().then((l) => (libraries = l)).catch(() => {})
@@ -1083,7 +1218,7 @@
         // admin watching a scan sees titles arrive rather than a stale list.
         items: () => {
           if (!manage || itemsLoading) return
-          libraryItems(manage.id).then((i) => (items = i)).catch(() => {})
+          loadItems(true)
           if (manageTab === 'collections' && !editingColl) loadCollections()
         },
         stats: onSample,
@@ -1170,6 +1305,16 @@
   })
 </script>
 
+<!-- A user's face: their picture, or their initial on the colour they chose
+     (a theme token, so each theme draws it in its own palette). -->
+{#snippet face(u: User, cls: string)}
+  {#if u.avatar}
+    <img class={cls} src={u.avatar} alt="" />
+  {:else}
+    <span class={cls} class:tinted={!!u.avatarColour} style:--face={u.avatarColour ? `var(--${u.avatarColour})` : undefined}>{u.displayName.slice(0, 1).toUpperCase()}</span>
+  {/if}
+{/snippet}
+
 {#if gate !== 'in'}
   <div class="gate">
     {#if gate === 'checking'}
@@ -1203,6 +1348,7 @@
       {/each}
     </nav>
     {#if me}<div class="who">{me.displayName} <button onclick={signOut}>Sign out</button></div>{/if}
+    <a class="back" href="/api/docs/" target="_blank" rel="noopener">API reference</a>
     <a class="back" href="/">← Back to Cineva</a>
   </aside>
 
@@ -1402,7 +1548,7 @@
           </div>
           <div class="lib-toolbar">
             <label class="lib-srch">
-              <input placeholder="Add a film — search by title…" bind:value={addFilmQuery} />
+              <input placeholder="Add a film — search by title…" bind:value={addFilmQuery} oninput={onAddFilmInput} />
             </label>
           </div>
           {#if addCandidates.length > 0}
@@ -1459,23 +1605,23 @@
           {/if}
         {/if}
       {:else}
-      <div class="lib-toolbar">
+      <div class="lib-toolbar" bind:this={itemsTop}>
         <label class="lib-srch">
-          <input placeholder="Filter by title or path…" bind:value={itemFilter} />
+          <input placeholder="Filter by title or path…" bind:value={itemFilter} oninput={onItemFilterInput} />
         </label>
         <label class="lib-chk">
-          <input type="checkbox" bind:checked={onlyUnmatched} />
+          <input type="checkbox" bind:checked={onlyUnmatched} onchange={onUnmatchedChange} />
           Only unmatched
         </label>
         <span class="muted small">
-          {matchedCount} of {items.length} matched to TMDB
-          {#if items.length - matchedCount > 0}· {items.length - matchedCount} without metadata{/if}
+          {matchedCount} of {allCount} matched to TMDB
+          {#if allCount - matchedCount > 0}· {allCount - matchedCount} without metadata{/if}
         </span>
         <span class="lib-spacer"></span>
         {#if metaRefresh}
           <button class="lib-btn danger" onclick={stopRefreshAll}>Stop</button>
         {:else}
-          <button class="primary" disabled={shownItems.length === 0} onclick={startRefreshAll}>{refreshLabel}</button>
+          <button class="primary" disabled={itemTotal === 0} onclick={startRefreshAll}>{refreshLabel}</button>
         {/if}
       </div>
       {#if metaRefresh}
@@ -1490,14 +1636,24 @@
       {/if}
       {#if itemsLoading}
         <div class="empty">Loading…</div>
-      {:else if shownItems.length === 0}
-        <div class="empty">{items.length === 0 ? 'Nothing scanned yet.' : 'Nothing matches that filter.'}</div>
+      {:else if items.length === 0}
+        <div class="empty">{allCount === 0 ? 'Nothing scanned yet.' : 'Nothing matches that filter.'}</div>
       {:else}
+        {#snippet pager()}
+          {#if pageCount > 1}
+            <nav class="lib-pager" aria-label="Pages">
+              <button class="lib-btn" disabled={itemPage <= 1} onclick={() => goItemPage(itemPage - 1)}>‹ Prev</button>
+              <span class="muted small">Page {itemPage} of {pageCount}</span>
+              <button class="lib-btn" disabled={itemPage >= pageCount} onclick={() => goItemPage(itemPage + 1)}>Next ›</button>
+            </nav>
+          {/if}
+        {/snippet}
+        {@render pager()}
         <div class="tablewrap">
           <table class="lib-table">
             <thead><tr><th></th><th>Title</th><th>Year</th><th>Metadata</th><th>File</th><th></th></tr></thead>
             <tbody>
-              {#each shownItems as it (it.id)}
+              {#each items as it (it.id)}
                 <tr>
                   <td class="lib-pcell">
                     {#if it.poster}<img class="lib-poster" src={it.poster} alt="" loading="lazy" />{:else}<span class="lib-poster ph"></span>{/if}
@@ -1530,6 +1686,7 @@
             </tbody>
           </table>
         </div>
+        {@render pager()}
       {/if}
 
       {/if}
@@ -1762,6 +1919,32 @@
             <label>Username <input bind:value={editing.username} required autocomplete="off" /></label>
           {/if}
           <label>Display name <input bind:value={editing.displayName} placeholder={editing.username || ''} /></label>
+          {#if editingUser}
+            {@const u = editingUser}
+            <div class="facefield">
+              <span class="facelabel">Picture <span class="muted small">— changes straight away</span></span>
+              <div class="facerow">
+                {@render face(u, 'face big')}
+                <div class="faceside">
+                  <div class="formrow wrap">
+                    <label class="lib-btn upload" class:busy={avatarBusy}>
+                      {avatarBusy ? 'Uploading…' : u.avatar ? 'Change photo' : 'Upload a photo'}
+                      <input type="file" accept="image/jpeg,image/png,image/gif,image/webp" onchange={(e) => pickUserAvatar(e, u)} disabled={avatarBusy} />
+                    </label>
+                    {#if u.avatar}<button type="button" class="lib-btn" onclick={() => dropUserAvatar(u)}>Remove photo</button>{/if}
+                  </div>
+                  {#if !u.avatar}
+                    <div class="swatches" role="radiogroup" aria-label="Colour behind the initial">
+                      <button type="button" class="swatch" class:sel={!u.avatarColour} role="radio" aria-checked={!u.avatarColour} aria-label="Default" title="Default" onclick={() => chooseUserColour(u, '')}></button>
+                      {#each AVATAR_COLOURS as c (c)}
+                        <button type="button" class="swatch" class:sel={u.avatarColour === c} role="radio" aria-checked={u.avatarColour === c} aria-label={c} title={c} style:--face="var(--{c})" onclick={() => chooseUserColour(u, c)}></button>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          {/if}
           <label>{editing.id ? 'New password (leave blank to keep)' : editing.role === 'admin' ? 'Password' : 'Password (optional when a PIN is set)'}
             <input type="password" bind:value={editing.password} minlength="8" required={!editing.id && (editing.role === 'admin' || !editing.pin)} autocomplete="new-password" />
           </label>
@@ -1782,6 +1965,23 @@
           {#if editing.id && editing.id !== me?.id}
             <label class="check"><input type="checkbox" bind:checked={editing.disabled} /> Disabled (cannot sign in)</label>
           {/if}
+          {#if editingUser}
+            {@const u = editingUser}
+            <div class="facefield">
+              <span class="facelabel">Signed-in devices <span class="muted small">— sign one out if it is lost or not theirs</span></span>
+              {#each editDevices as d (d.id)}
+                <div class="devrow">
+                  <div class="devtext">
+                    <span>{d.name || d.client || 'Unknown browser'}{#if d.current} <span class="tag">you, here</span>{:else if d.online} <span class="tag ok">open now</span>{/if}</span>
+                    <span class="muted small">{[d.name ? d.client : '', d.clientIp, `last active ${d.lastSeenAt.slice(0, 16)}`].filter(Boolean).join(' · ')}</span>
+                  </div>
+                  <button type="button" class="lib-btn" onclick={() => signOutUserDevice(u, d)}>Sign out</button>
+                </div>
+              {:else}
+                <span class="muted small">Not signed in anywhere.</span>
+              {/each}
+            </div>
+          {/if}
           {#if userErr}<div class="error slim">{userErr}</div>{/if}
           <div class="formrow">
             <button class="primary" type="submit" disabled={userSaving}>{userSaving ? 'Saving…' : editing.id ? 'Save' : 'Create'}</button>
@@ -1796,8 +1996,13 @@
             {#each users as u (u.id)}
               <tr>
                 <td>
-                  <div>{u.displayName}{u.disabled ? ' · disabled' : ''}</div>
-                  <div class="muted small">{u.username}{u.id === me?.id ? ' (you)' : ''}</div>
+                  <div class="userCell">
+                    {@render face(u, 'face')}
+                    <div>
+                      <div>{u.displayName}{u.disabled ? ' · disabled' : ''}</div>
+                      <div class="muted small">{u.username}{u.id === me?.id ? ' (you)' : ''}</div>
+                    </div>
+                  </div>
                 </td>
                 <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span>{#if u.hasPin}<span class="tag pin">PIN</span>{/if}{#if !u.hasPassword}<span class="muted small"> no password</span>{/if}</td>
                 <td class="muted">{u.role === 'admin' ? 'all' : u.libraryIds.map(libName).join(', ') || 'none'}</td>
@@ -2300,6 +2505,31 @@
   .grants legend { color: var(--muted); font-size: 0.8rem; padding: 0 0.3rem; }
   .check { flex-direction: row !important; align-items: center; gap: 0.5rem !important; color: var(--text) !important; }
   .formrow { display: flex; gap: 0.6rem; }
+  .formrow.wrap { flex-wrap: wrap; }
+  .face {
+    width: 2rem; height: 2rem; flex: none; border-radius: 50%; display: grid; place-items: center;
+    font-weight: 600; font-size: 0.85rem; object-fit: cover;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: var(--bg);
+  }
+  .face.tinted { background: var(--face); }
+  .face.big { width: 4rem; height: 4rem; border-radius: 14px; font-size: 1.6rem; }
+  .userCell { display: flex; align-items: center; gap: 0.6rem; }
+  .facefield { display: flex; flex-direction: column; gap: 0.45rem; font-size: 0.9rem; color: var(--muted); }
+  .facerow { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; }
+  .faceside { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+  .upload { position: relative; cursor: pointer; }
+  .upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .upload.busy { opacity: 0.6; cursor: progress; }
+  .swatches { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+  .swatch {
+    width: 1.7rem; height: 1.7rem; border-radius: 50%; cursor: pointer;
+    background: var(--face, linear-gradient(135deg, var(--accent), var(--accent-2)));
+    border: 2px solid transparent; outline: 1px solid var(--border);
+  }
+  .swatch.sel { border-color: var(--bg); outline: 2px solid var(--text); }
+  .devrow { display: flex; align-items: center; gap: 0.6rem; justify-content: space-between; }
+  .devtext { display: flex; flex-direction: column; min-width: 0; color: var(--text); }
+  .devtext .small { overflow-wrap: anywhere; }
   .addrow { flex-wrap: wrap; justify-content: flex-end; }
   .intro { margin-bottom: 1rem; }
   .intgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); gap: 1rem; }
@@ -2403,7 +2633,9 @@
   }
   .lib-btn:hover { border-color: var(--accent); }
   .lib-btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+  .lib-btn:disabled { opacity: 0.5; }
   .lib-modal-foot { display: flex; justify-content: flex-end; margin-top: 0.8rem; }
+  .lib-pager { display: flex; align-items: center; justify-content: center; gap: 0.8rem; margin: 0.6rem 0; }
   .lib-spacer { flex: 1; }
   .lib-progress { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.7rem; }
   .lib-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--bg); overflow: hidden; }
@@ -2650,6 +2882,7 @@
     aside nav { flex-direction: column; overflow: visible; margin-top: 1rem; }
     aside nav button { text-align: left; }
     .back { margin: auto 0 0; padding-top: 1rem; }
+    .back + .back { margin-top: 0; padding-top: 0.5rem; }
   }
   .introjob {
     display: flex; flex-direction: column; gap: 0.4rem;

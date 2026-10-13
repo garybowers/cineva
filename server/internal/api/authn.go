@@ -19,7 +19,8 @@ import (
 const (
 	sessionCookie = "cineva_session"
 	ctxUser       = "cineva.user"
-	ctxSession    = "cineva.session" // token hash, when authenticated by cookie
+	ctxSession    = "cineva.session"   // token hash, when authenticated by cookie
+	ctxSessionID  = "cineva.sessionID" // the same session's public id
 )
 
 // authenticate resolves the caller from the session cookie or an API key
@@ -41,7 +42,7 @@ func (s *server) authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 		if ck, err := c.Cookie(sessionCookie); err == nil && ck.Value != "" {
 			hash := auth.HashToken(ck.Value)
-			_, u, err := s.store.SessionByHash(ctx, hash)
+			sess, u, err := s.store.SessionByHash(ctx, hash)
 			if err != nil || u.Disabled {
 				clearSessionCookie(c)
 				return echo.NewHTTPError(http.StatusUnauthorized, "session expired")
@@ -49,6 +50,7 @@ func (s *server) authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 			_ = s.store.TouchSession(ctx, hash)
 			c.Set(ctxUser, u)
 			c.Set(ctxSession, hash)
+			c.Set(ctxSessionID, sess.ID)
 			return next(c)
 		}
 		if n, err := s.store.CountUsers(ctx); err == nil && n == 0 {
@@ -246,7 +248,7 @@ func (s *server) authSetup(c echo.Context) error {
 	if err := s.store.AdoptLocalState(ctx, u.ID); err != nil {
 		return err
 	}
-	if err := s.startSession(c, u); err != nil {
+	if err := s.startSession(c, u, ""); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -291,7 +293,7 @@ func (s *server) authLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect username or password")
 	}
 	s.throttle.Reset(key)
-	if err := s.startSession(c, u); err != nil {
+	if err := s.startSession(c, u, ""); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -321,11 +323,13 @@ func lockDetail(wait time.Duration) string {
 }
 
 type profile struct {
-	ID          string `json:"id"`
-	Username    string `json:"username"`
-	DisplayName string `json:"displayName"`
-	HasPassword bool   `json:"hasPassword"`
-	HasPin      bool   `json:"hasPin"`
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"displayName"`
+	HasPassword  bool   `json:"hasPassword"`
+	HasPin       bool   `json:"hasPin"`
+	Avatar       string `json:"avatar,omitempty"`
+	AvatarColour string `json:"avatarColour,omitempty"`
 }
 
 // GET /auth/profiles — public: every enabled user, for the "Who's
@@ -343,7 +347,8 @@ func (s *server) authProfiles(c echo.Context) error {
 		if u.Disabled {
 			continue
 		}
-		out = append(out, profile{ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, HasPassword: u.HasPassword, HasPin: u.HasPin})
+		out = append(out, profile{ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, HasPassword: u.HasPassword,
+			HasPin: u.HasPin, Avatar: u.Avatar, AvatarColour: u.AvatarColour})
 	}
 	return c.JSON(http.StatusOK, out)
 }
@@ -385,7 +390,7 @@ func (s *server) authPINLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect PIN")
 	}
 	s.throttle.Reset(key)
-	if err := s.startSession(c, u); err != nil {
+	if err := s.startSession(c, u, ""); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -441,14 +446,16 @@ func pinHash(pin string) (string, error) {
 	return auth.HashPassword(pin)
 }
 
-func (s *server) startSession(c echo.Context, u store.User) error {
+// startSession signs the browser in as u. name is the device name to carry
+// over when this replaces one of the caller's own sessions, ” otherwise.
+func (s *server) startSession(c echo.Context, u store.User, name string) error {
 	token, hash, err := auth.NewToken()
 	if err != nil {
 		return err
 	}
 	expires := time.Now().UTC().Add(s.sessionTTL)
-	if err := s.store.CreateSession(c.Request().Context(), hash, u.ID,
-		expires.Format("2006-01-02 15:04:05"), clientLabel(c), c.RealIP()); err != nil {
+	if _, err := s.store.CreateSession(c.Request().Context(), hash, u.ID,
+		expires.Format("2006-01-02 15:04:05"), clientLabel(c), c.RealIP(), name); err != nil {
 		return err
 	}
 	s.setSessionCookie(c, token, expires)
@@ -495,8 +502,14 @@ func (s *server) authPassword(c echo.Context) error {
 	if err := s.store.SetPasswordHash(ctx, u.ID, hash); err != nil {
 		return err
 	}
+	name := ""
+	if hash, ok := c.Get(ctxSession).(string); ok {
+		if sess, _, err := s.store.SessionByHash(ctx, hash); err == nil {
+			name = sess.Name
+		}
+	}
 	_ = s.store.DeleteUserSessions(ctx, u.ID)
-	if err := s.startSession(c, u); err != nil {
+	if err := s.startSession(c, u, name); err != nil {
 		return err
 	}
 	s.audit(c, "user.password", "user", u.ID, u.Username, "changed own password")
@@ -554,6 +567,9 @@ type userRequest struct {
 	Role        string  `json:"role"`
 	Disabled    bool    `json:"disabled"`
 	PIN         *string `json:"pin,omitempty"` // set ("1234") or clear ("") on update; optional on create
+	// AvatarColour, when present, sets the colour behind the initial
+	// (a token from store.AvatarColours, or "" for the default).
+	AvatarColour *string `json:"avatarColour,omitempty"`
 }
 
 func (s *server) listUsers(c echo.Context) error {
@@ -650,6 +666,11 @@ func (s *server) updateUser(c echo.Context) error {
 	if req.Disabled {
 		_ = s.store.DeleteUserSessions(ctx, u.ID)
 		detail += " · disabled"
+	}
+	if req.AvatarColour != nil {
+		if err := s.store.SetAvatarColour(ctx, u.ID, *req.AvatarColour); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
 	}
 	if req.PIN != nil {
 		ph, err := pinHash(*req.PIN)
