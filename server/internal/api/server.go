@@ -26,7 +26,9 @@ import (
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/playback"
+	"github.com/garybowers/cineva/server/internal/requests"
 	"github.com/garybowers/cineva/server/internal/segments"
 	"github.com/garybowers/cineva/server/internal/stats"
 	"github.com/garybowers/cineva/server/internal/store"
@@ -102,6 +104,7 @@ type server struct {
 	segments          *segments.Detector // nil when intro detection is off
 	storage           *library.StorageMonitor
 	presence          *presence // which sessions have an event stream open
+	requests          *requests.Service
 
 	// Library-wide metadata refreshes in flight, keyed by library id.
 	refreshMu sync.Mutex
@@ -252,6 +255,25 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		return ""
 	}
 
+	// A full rescan queued for later starts in the same window background
+	// reading uses, once nothing is playing; pausing background work holds
+	// it too. The "on-demand" mode has no window, so there it waits only
+	// for playback to stop.
+	quietGate := background.NewGate(s.background)
+	manager.Quiet = func() string {
+		if s.background.Paused() {
+			return "paused"
+		}
+		if r := quietGate.ScheduleWait(); r == "schedule" {
+			return r
+		}
+		if playing() {
+			return "playing"
+		}
+		return ""
+	}
+	go manager.RunQueuedScans(samplerCtx)
+
 	// Intro detection follows every completed TV scan, and runs once at
 	// startup so a library scanned before it existed (or while the server
 	// was down) is caught up. Incremental either way: only episodes not
@@ -288,7 +310,23 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		s.events.Publish(events.Event{Type: "previews", Data: status})
 	}
 
-	manager.OnScanDone = s.enqueueBackground
+	// Requests: titles outside the library looked up on TMDB (when there
+	// is a key), sent to Sonarr and Radarr, and followed until a scan finds
+	// them — so every completed scan of a video library checks them.
+	var discover metadata.Discoverer
+	if tmdb, ok := manager.Video.(*metadata.TMDB); ok {
+		discover = metadata.NewDiscovery(tmdb)
+	}
+	s.requests = requests.New(st, discover, s.events)
+	go s.requests.Run(samplerCtx)
+	manager.OnScanDone = func(lib store.Library) {
+		s.enqueueBackground(lib)
+		if lib.MediaType == store.MediaMovies || lib.MediaType == store.MediaTV {
+			if err := s.requests.CheckAvailable(context.Background()); err != nil {
+				serverLog.Warn("checking requests after a scan failed", "library", lib.Name, "err", err)
+			}
+		}
+	}
 	if libs, err := st.Libraries(context.Background()); err == nil {
 		for _, lib := range libs {
 			s.enqueueBackground(lib)
@@ -492,6 +530,16 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/people/:id", s.getPerson)
 	v1.GET("/items/:id", s.getItem)
 	v1.GET("/search", s.search)
+	// Requests: titles outside the library, and asking for them. Each
+	// handler checks the caller's request level.
+	v1.GET("/requests/status", s.getRequestStatus)
+	v1.GET("/discover/search", s.discoverSearch)
+	v1.GET("/discover/:type/:tmdbId", s.discoverTitle)
+	v1.GET("/requests", s.listRequests)
+	v1.POST("/requests", s.createRequest)
+	v1.DELETE("/requests/:id", s.deleteRequest)
+	v1.GET("/items/:id/missing", s.itemMissing)
+	v1.POST("/items/:id/missing/search", s.searchMissing)
 	v1.GET("/events", s.eventStream)
 
 	// Playback (milestone 3)
@@ -521,6 +569,8 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.PATCH("/libraries/:id", s.updateLibrary)
 	adm.DELETE("/libraries/:id", s.deleteLibrary)
 	adm.POST("/libraries/:id/scan", s.scanLibrary)
+	adm.PUT("/libraries/:id/scan/queued", s.queueFullScan)
+	adm.DELETE("/libraries/:id/scan/queued", s.cancelQueuedFullScan)
 	adm.GET("/scans", s.listScans)
 	adm.GET("/segments/status", s.segmentStatus)
 	adm.POST("/segments/pause", s.pauseSegments)
@@ -533,6 +583,10 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.POST("/integrations", s.createIntegration)
 	adm.PATCH("/integrations/:id", s.updateIntegration)
 	adm.DELETE("/integrations/:id", s.deleteIntegration)
+	adm.GET("/integrations/:id/status", s.integrationStatus)
+	adm.PUT("/integrations/:id/options", s.setIntegrationOptions)
+	adm.POST("/requests/:id/approve", s.approveRequest)
+	adm.POST("/requests/:id/decline", s.declineRequest)
 	// Metadata management: inspect a match, search for the right title,
 	// apply it, or re-run matching.
 	// Collection management: override the provider's grouping — rename,

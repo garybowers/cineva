@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -570,6 +571,9 @@ type userRequest struct {
 	// AvatarColour, when present, sets the colour behind the initial
 	// (a token from store.AvatarColours, or "" for the default).
 	AvatarColour *string `json:"avatarColour,omitempty"`
+	// RequestLevel, when present, sets what happens to the user's requests
+	// (one of store.RequestLevels). New users default to the server's.
+	RequestLevel *string `json:"requestLevel,omitempty"`
 }
 
 func (s *server) listUsers(c echo.Context) error {
@@ -599,6 +603,9 @@ func (s *server) createUser(c echo.Context) error {
 	if req.Role == store.RoleAdmin && req.Password == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "admins must have a password")
 	}
+	if req.RequestLevel != nil && !slices.Contains(store.RequestLevels, *req.RequestLevel) {
+		return echo.NewHTTPError(http.StatusBadRequest, "requestLevel must be none, approval or auto")
+	}
 	hash := ""
 	if req.Password != "" {
 		if err := auth.CheckPasswordPolicy(req.Password); err != nil {
@@ -624,6 +631,14 @@ func (s *server) createUser(c echo.Context) error {
 		}
 		u.HasPin = true
 	}
+	level := s.requests.DefaultLevelFor(ctx)
+	if req.RequestLevel != nil {
+		level = *req.RequestLevel
+	}
+	if err := s.store.SetRequestLevel(ctx, u.ID, level); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	u.RequestLevel = level
 	s.audit(c, "user.create", "user", u.ID, u.Username, u.Role)
 	s.events.Publish(events.Event{Type: "users"})
 	return c.JSON(http.StatusCreated, u)
@@ -671,6 +686,12 @@ func (s *server) updateUser(c echo.Context) error {
 		if err := s.store.SetAvatarColour(ctx, u.ID, *req.AvatarColour); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
+	}
+	if req.RequestLevel != nil && *req.RequestLevel != u.RequestLevel {
+		if err := s.store.SetRequestLevel(ctx, u.ID, *req.RequestLevel); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+		detail += " · requests " + *req.RequestLevel
 	}
 	if req.PIN != nil {
 		ph, err := pinHash(*req.PIN)

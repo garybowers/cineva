@@ -11,7 +11,7 @@ import (
 )
 
 // adminEvents carry server-wide information only admins may see.
-var adminEvents = map[string]bool{"stats": true, "sessions": true, "logs": true, "users": true, "scan": true}
+var adminEvents = map[string]bool{"stats": true, "sessions": true, "logs": true, "users": true, "scan": true, "integrations": true}
 
 // eventStream is the /api/v1/events endpoint: a Server-Sent Events stream of
 // state changes (scan progress, library changes) so UIs update live instead

@@ -382,9 +382,20 @@
     video.muted = muted
   }
 
+  // Fullscreen is the page's, not this player's: the next episode is a new
+  // player, and a fullscreen element that leaves the page takes fullscreen
+  // with it. With the page fullscreen the player fills it (the same layout
+  // as filling the window), and a player that starts while the page is
+  // already fullscreen — the next episode — starts filling it too.
+  let fullscreen = $state(typeof document !== 'undefined' && document.fullscreenElement === document.documentElement)
+  $effect(() => {
+    const sync = () => (fullscreen = document.fullscreenElement === document.documentElement)
+    document.addEventListener('fullscreenchange', sync)
+    return () => document.removeEventListener('fullscreenchange', sync)
+  })
   function toggleFullscreen() {
-    if (document.fullscreenElement) document.exitFullscreen?.()
-    else box.requestFullscreen?.().catch(() => {})
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {})
+    else document.documentElement.requestFullscreen?.().catch(() => {})
   }
 
   // ---- Fill the window ----
@@ -397,7 +408,7 @@
     wake()
   }
   $effect(() => {
-    if (!windowed) return
+    if (!windowed && !fullscreen) return
     const before = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     document.body.classList.add('player-windowed')
@@ -768,7 +779,7 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<section class="nowplaying" class:idle class:compact class:windowed bind:this={box} onmousemove={wake} onpointerdown={wake}>
+<section class="nowplaying" class:idle class:compact class:windowed={windowed || fullscreen} bind:this={box} onmousemove={wake} onpointerdown={wake}>
   {#if compact}
     <div class="mini-progress"><div style="width: {pct(current)}%"></div></div>
   {/if}
@@ -1084,7 +1095,7 @@
         <button class="ctl" onclick={toggleWindowed} title={windowed ? 'Back to the page (t)' : 'Fill the window (t)'} aria-pressed={windowed}>
           {#if windowed}<Shrink size={16} />{:else}<Expand size={16} />{/if}
         </button>
-        <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)"><Maximize size={16} /></button>
+        <button class="ctl" onclick={toggleFullscreen} title={fullscreen ? 'Leave fullscreen (f)' : 'Fullscreen (f)'} aria-pressed={fullscreen}><Maximize size={16} /></button>
       </div>
     </div>
   {/if}

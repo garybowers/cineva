@@ -75,6 +75,16 @@ type VideoResult struct {
 	OriginalTitle string
 	// Country is the ISO 3166-1 code the series originates from.
 	Country string
+	// SeasonPremieres lists a series' seasons with the date each began,
+	// which is how an episode known only by its broadcast date is placed:
+	// in the season that began most recently before it.
+	SeasonPremieres []SeasonPremiere
+}
+
+// SeasonPremiere is one season of a series and the date it began.
+type SeasonPremiere struct {
+	Num     int
+	AirDate string // "2023-09-05"; empty when not announced
 }
 
 // Person is one credit. Character is set for cast, Job for crew.
@@ -255,6 +265,10 @@ type tmdbResult struct {
 	NextEpisodeToAir *struct {
 		AirDate string `json:"air_date"`
 	} `json:"next_episode_to_air"`
+	SeasonList []struct {
+		SeasonNumber int    `json:"season_number"`
+		AirDate      string `json:"air_date"`
+	} `json:"seasons"`
 	// created_by is television's answer to a director credit, and sits
 	// outside `credits` in TMDB's response.
 	CreatedBy []struct {
@@ -354,6 +368,9 @@ func (r tmdbResult) toVideoResult() VideoResult {
 	// helps nobody and puts it on screen for every English-language show.
 	if r.OriginalName != "" && r.OriginalName != out.Title {
 		out.OriginalTitle = r.OriginalName
+	}
+	for _, sn := range r.SeasonList {
+		out.SeasonPremieres = append(out.SeasonPremieres, SeasonPremiere{Num: sn.SeasonNumber, AirDate: sn.AirDate})
 	}
 	// Creators are crew, and join the crew list so one display path covers
 	// "Director" for a film and "Creator" for a series.

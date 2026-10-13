@@ -34,6 +34,14 @@ var auditMessages = map[string]string{
 	"user.delete":    "user deleted",
 	"scan.start":     "scan started",
 	"scan.cancel":    "scan cancelled",
+
+	"request.create":      "title requested",
+	"request.approve":     "request approved",
+	"request.failed":      "request could not be sent",
+	"request.decline":     "request declined",
+	"request.delete":      "request withdrawn",
+	"request.search":      "searched for missing episodes",
+	"integration.options": "integration options changed",
 }
 
 // logAudit puts an audit entry on the console as well as in the trail: who

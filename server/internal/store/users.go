@@ -41,9 +41,25 @@ type User struct {
 	// restricted ones naming them or a group they are in (all of them for
 	// an admin). Computed on load, not stored; access is set per library.
 	LibraryIDs []string `json:"libraryIds"`
+	// RequestLevel is what happens when this user asks for something not
+	// in the library: RequestNone, RequestApproval or RequestAuto. An
+	// admin's stored level is ignored; see EffectiveRequestLevel.
+	RequestLevel string `json:"requestLevel"`
 }
 
 func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
+
+// EffectiveRequestLevel is the level that applies: admins are always
+// trusted to send requests straight to Sonarr and Radarr.
+func (u User) EffectiveRequestLevel() string {
+	if u.IsAdmin() {
+		return RequestAuto
+	}
+	if u.RequestLevel == "" {
+		return RequestNone
+	}
+	return u.RequestLevel
+}
 
 // AvatarColours are the theme tokens a user may draw their initial on.
 // Tokens rather than colours, so each theme supplies its own.
@@ -98,6 +114,7 @@ type UserRepo interface {
 	UpdateUser(ctx context.Context, id, displayName, role string, disabled bool) error
 	SetAvatar(ctx context.Context, id, path string) error
 	SetAvatarColour(ctx context.Context, id, colour string) error
+	SetRequestLevel(ctx context.Context, id, level string) error
 	SetPasswordHash(ctx context.Context, id, hash string) error
 	SetPINHash(ctx context.Context, id, hash string) error
 	Profiles(ctx context.Context) ([]User, error)
@@ -125,13 +142,13 @@ type UserRepo interface {
 
 var _ UserRepo = (*Store)(nil)
 
-const userCols = `id, username, display_name, password_hash, pin_hash, role, disabled, created_at, avatar, avatar_colour`
+const userCols = `id, username, display_name, password_hash, pin_hash, role, disabled, created_at, avatar, avatar_colour, request_level`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var disabled int
 	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.PINHash, &u.Role, &disabled, &u.CreatedAt,
-		&u.Avatar, &u.AvatarColour)
+		&u.Avatar, &u.AvatarColour, &u.RequestLevel)
 	u.Disabled = disabled == 1
 	u.HasPassword = u.PasswordHash != ""
 	u.HasPin = u.PINHash != ""
@@ -308,6 +325,14 @@ func (s *Store) AdoptLocalState(ctx context.Context, userID string) error {
 // SetAvatar records an uploaded picture's /artwork/ path (” removes it).
 func (s *Store) SetAvatar(ctx context.Context, id, path string) error {
 	return s.setUserField(ctx, id, "avatar", path)
+}
+
+// SetRequestLevel sets what happens to the user's requests.
+func (s *Store) SetRequestLevel(ctx context.Context, id, level string) error {
+	if !slices.Contains(RequestLevels, level) {
+		return fmt.Errorf("unknown request level %q: want none, approval or auto", level)
+	}
+	return s.setUserField(ctx, id, "request_level", level)
 }
 
 // SetAvatarColour sets the token the initial is drawn on; ” is the default.

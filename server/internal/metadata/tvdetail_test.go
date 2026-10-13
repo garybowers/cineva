@@ -52,6 +52,10 @@ func TestSearchTVFetchesFullDetail(t *testing.T) {
 				"content_ratings": map[string]any{
 					"results": []map[string]any{{"iso_3166_1": "GB", "rating": "18"}, {"iso_3166_1": "US", "rating": "TV-MA"}},
 				},
+				"seasons": []map[string]any{
+					{"season_number": 0, "air_date": "2009-02-17", "episode_count": 9},
+					{"season_number": 1, "air_date": "2008-01-20", "episode_count": 7},
+				},
 			})
 		default:
 			http.NotFound(w, r)
@@ -76,6 +80,11 @@ func TestSearchTVFetchesFullDetail(t *testing.T) {
 	}
 	if got.Tagline != "All Hail the King" {
 		t.Errorf("tagline = %q", got.Tagline)
+	}
+	// The season list places an episode known only by its air date.
+	wantSeasons := []SeasonPremiere{{0, "2009-02-17"}, {1, "2008-01-20"}}
+	if len(got.SeasonPremieres) != 2 || got.SeasonPremieres[0] != wantSeasons[0] || got.SeasonPremieres[1] != wantSeasons[1] {
+		t.Errorf("season premieres = %+v, want %+v", got.SeasonPremieres, wantSeasons)
 	}
 	// A series reports runtime per episode, not for the whole run.
 	if got.RuntimeMins != 45 {

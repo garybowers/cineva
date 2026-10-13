@@ -304,3 +304,63 @@ func TestLibraryRootThatIsItselfAShow(t *testing.T) {
 		t.Errorf("a normal library root gave %q", got)
 	}
 }
+
+// A daily show's episodes are named by broadcast date, not number. The date
+// is read in the common spellings, refused where day and month could be
+// either way round, and the season and episode left for the scanner to find.
+// The show is read as for a marked episode: from the folder above a season
+// folder, else from the filename (the scanner names the series from its
+// folder either way, and uses this only when that yields nothing).
+func TestDatedEpisode(t *testing.T) {
+	const show = tvRoot + "/The Tonight Show Starring Jimmy Fallon"
+	tests := []struct {
+		name, path  string
+		ok          bool
+		date, title string
+		showName    string
+	}{
+		{"dashed", show + "/The Tonight Show Starring Jimmy Fallon - 2023-01-27 - guests.mkv", true, "2023-01-27", "guests", "The Tonight Show Starring Jimmy Fallon"},
+		{"dotted release name", show + "/the.tonight.show.2023.01.27.margot.robbie.720p.WEB.h264.mkv", true, "2023-01-27", "margot robbie", "the tonight show"},
+		{"spaced", show + "/Fallon 2023 01 27.mkv", true, "2023-01-27", "", "Fallon"},
+		{"underscored", show + "/Fallon_2023_01_27_Guests.mkv", true, "2023-01-27", "Guests", "Fallon"},
+		{"in a season folder", show + "/Season 10/Fallon - 2023-01-27 - Guests.mkv", true, "2023-01-27", "Guests", "The Tonight Show Starring Jimmy Fallon"},
+		{"date first in the name", show + "/2023-01-27 - Guests.mkv", true, "2023-01-27", "Guests", "The Tonight Show Starring Jimmy Fallon"},
+		{"day first, unambiguous", show + "/Fallon - 27.01.2023 - Guests.mkv", true, "2023-01-27", "Guests", "Fallon"},
+		{"month first, unambiguous", show + "/Fallon - 01-27-2023.mkv", true, "2023-01-27", "", "Fallon"},
+		{"same day and month", show + "/Fallon - 05.05.2023.mkv", true, "2023-05-05", "", "Fallon"},
+
+		{"ambiguous day and month", show + "/Fallon - 03.04.2023.mkv", false, "", "", ""},
+		{"no such day", show + "/Fallon - 2023-02-30.mkv", false, "", "", ""},
+		{"mixed separators", show + "/Fallon - 2023-01 27.mkv", false, "", "", ""},
+		{"year alone", show + "/Fallon 2023 Special.mkv", false, "", "", ""},
+		{"longer number is not a date", show + "/Fallon 12023-01-275.mkv", false, "", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseEpisode(tc.path)
+			if ok != tc.ok {
+				t.Fatalf("ParseEpisode(%q) ok=%v, want %v (got %+v)", tc.path, ok, tc.ok, got)
+			}
+			if !tc.ok {
+				return
+			}
+			if !got.Dated() || got.AirDate != tc.date {
+				t.Errorf("air date %q (dated %v), want %q", got.AirDate, got.Dated(), tc.date)
+			}
+			if got.Title != tc.title {
+				t.Errorf("title %q, want %q", got.Title, tc.title)
+			}
+			if got.Show != tc.showName {
+				t.Errorf("show %q, want %q", got.Show, tc.showName)
+			}
+		})
+	}
+}
+
+// A marked episode keeps its marker even when a date is in the name too.
+func TestMarkerOutranksDate(t *testing.T) {
+	got, ok := ParseEpisode(tvRoot + "/Show/Season 1/Show - S01E02 - 2023-01-27.mkv")
+	if !ok || got.Season != 1 || got.Episode != 2 || got.Dated() {
+		t.Errorf("got %+v ok=%v, want S01E02 and no date", got, ok)
+	}
+}

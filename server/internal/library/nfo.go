@@ -175,9 +175,10 @@ func copyLocalArtwork(src, artworkDir, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Re-copy when the source has changed size, so replacing a poster on
-	// disk is picked up by the next scan.
-	if d, err := os.Stat(dest); err == nil && d.Size() == srcInfo.Size() {
+	// Re-copy when the source has changed size or been modified since the
+	// copy was made, so replacing a poster on disk is picked up by the next
+	// scan even when the new one happens to be the same size.
+	if d, err := os.Stat(dest); err == nil && d.Size() == srcInfo.Size() && !d.ModTime().Before(srcInfo.ModTime()) {
 		return filename, nil
 	}
 	if err := os.MkdirAll(artworkDir, 0o755); err != nil {

@@ -2,10 +2,12 @@
 package library
 
 import (
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -118,7 +120,14 @@ type EpisodeInfo struct {
 	// a 2023 UK one — so it is kept to disambiguate the match rather than
 	// thrown away with the rest of the name.
 	Year int
+	// AirDate is the broadcast date a date-stamped episode is named by
+	// ("2023-01-27"), for a daily show with no SxxEyy marker. Season and
+	// Episode are then 0 until the scanner places it by that date.
+	AirDate string
 }
+
+// Dated reports whether the episode is known only by its broadcast date.
+func (e EpisodeInfo) Dated() bool { return e.AirDate != "" && e.Season == 0 && e.Episode == 0 }
 
 // ParseEpisode extracts show/season/episode from a file path, using the
 // SxxEyy marker in the filename and the directory layout
@@ -138,6 +147,12 @@ func ParseEpisode(path string) (EpisodeInfo, bool) {
 		// the same thing, and that layout is common enough that refusing it
 		// silently dropped 176 episodes of this library — 47 of House of
 		// Cards alone.
+		//
+		// A date is tried first: a daily show's "27.01.2023" would
+		// otherwise be read as episode 27.
+		if info, ok := parseDatedEpisode(path, base); ok {
+			return info, true
+		}
 		return parseNumberedEpisode(path, base)
 	}
 	season, _ := strconv.Atoi(base[m[2]:m[3]])
@@ -404,4 +419,85 @@ func seasonFromDir(name string) (int, bool) {
 		return 0, true
 	}
 	return 0, false
+}
+
+var (
+	// "Show - 2023-01-27 - Guests", "show.2023.01.27.guests", "2023 01 27".
+	// The separators are captured so a mixed "2023-01 27" can be refused.
+	ymdRe = regexp.MustCompile(`(?:^|[^0-9])((?:19|20)[0-9]{2})([-. _])([0-9]{2})([-. _])([0-9]{2})(?:[^0-9]|$)`)
+	// "27.01.2023" or "27-01-2023": day first, the way most of the world
+	// writes it — or month first, which only the numbers can tell apart.
+	dmyRe = regexp.MustCompile(`(?:^|[^0-9])([0-9]{2})([-.])([0-9]{2})([-.])((?:19|20)[0-9]{2})(?:[^0-9]|$)`)
+)
+
+// airDateIn finds a broadcast date in a filename, returning it as
+// "2006-01-02" with the span it occupies.
+//
+// Year first is unambiguous. With the year last, "27.01.2023" can only be
+// day first and "01.27.2023" only month first, but "03.04.2023" could be
+// either — 3 April or 4 March — so it is refused rather than guessed: a
+// wrong date places the file against the wrong episode, which is worse than
+// leaving it out.
+func airDateIn(base string) (date string, start, end int, ok bool) {
+	if m := ymdRe.FindStringSubmatchIndex(base); m != nil && base[m[4]:m[5]] == base[m[8]:m[9]] {
+		y, mo, d := base[m[2]:m[3]], base[m[6]:m[7]], base[m[10]:m[11]]
+		if date, ok := validDate(y, mo, d); ok {
+			return date, m[2], m[11], true
+		}
+	}
+	if m := dmyRe.FindStringSubmatchIndex(base); m != nil && base[m[4]:m[5]] == base[m[8]:m[9]] {
+		a, _ := strconv.Atoi(base[m[2]:m[3]])
+		b, _ := strconv.Atoi(base[m[6]:m[7]])
+		y := base[m[10]:m[11]]
+		var day, month int
+		switch {
+		case a == b:
+			day, month = a, b
+		case a > 12 && b <= 12:
+			day, month = a, b
+		case b > 12 && a <= 12:
+			day, month = b, a
+		default:
+			return "", 0, 0, false // ambiguous, or not a date at all
+		}
+		if date, ok := validDate(y, fmt.Sprintf("%02d", month), fmt.Sprintf("%02d", day)); ok {
+			return date, m[2], m[11], true
+		}
+	}
+	return "", 0, 0, false
+}
+
+// validDate joins and checks a date, so "2023-02-30" is not one.
+func validDate(y, m, d string) (string, bool) {
+	date := y + "-" + m + "-" + d
+	if _, err := time.Parse(time.DateOnly, date); err != nil {
+		return "", false
+	}
+	return date, true
+}
+
+// parseDatedEpisode reads a daily show's episode, named by its broadcast
+// date rather than a number: "The Tonight Show Starring Jimmy Fallon -
+// 2023-01-27 - Margot Robbie". The season and episode are left 0 for the
+// scanner to find by that date at the provider; the show comes from the
+// folder, as it does for a marked episode, and the text after the date is
+// the title.
+func parseDatedEpisode(path, base string) (EpisodeInfo, bool) {
+	date, start, end, ok := airDateIn(base)
+	if !ok {
+		return EpisodeInfo{}, false
+	}
+	info := EpisodeInfo{AirDate: date}
+	info.Title = cleanTitle(base[end:])
+
+	fromFile := strings.Trim(base[:start], " -._")
+	parent := filepath.Base(filepath.Dir(path))
+	show := fromFile
+	if _, isSeason := seasonFromDir(parent); isSeason {
+		show = filepath.Base(filepath.Dir(filepath.Dir(path)))
+	} else if show == "" {
+		show = parent
+	}
+	info.Show, info.Year = showName(show)
+	return info, true
 }

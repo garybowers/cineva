@@ -3,15 +3,56 @@ package arr
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	"github.com/garybowers/cineva/server/internal/store"
 )
 
-// Event is a webhook delivery, reduced to what decides a rescan.
+// Event is a webhook delivery, reduced to what decides a rescan and what
+// moves a request along.
 type Event struct {
 	Type string
 	// Paths are the folders and files the event names, as the app sees
 	// them — which may not be how Cineva sees them, when the app runs in a
 	// container with its own mount points.
 	Paths []string
+	// Title is the film or series the event is about, Year a film's year.
+	Title string
+	Year  int
+	// ArrID is the film's or series' id inside the app; TmdbID and TvdbID
+	// its ids elsewhere, where the payload carries them.
+	ArrID  int
+	TmdbID int
+	TvdbID int
+	// Episodes are the episodes a Sonarr event names.
+	Episodes []store.EpisodeRef
+}
+
+// Grab is a release sent to the download client: the title is downloading.
+func (e Event) Grab() bool { return e.Type == "Grab" }
+
+// Describe names what the event is about, for a connection's status line:
+// "Show S02E04", "Show S02E01-E03", "Film (2020)".
+func (e Event) Describe() string {
+	if e.Title == "" {
+		return ""
+	}
+	if len(e.Episodes) == 0 {
+		if e.Year > 0 {
+			return fmt.Sprintf("%s (%d)", e.Title, e.Year)
+		}
+		return e.Title
+	}
+	first, last := e.Episodes[0], e.Episodes[len(e.Episodes)-1]
+	code := fmt.Sprintf("S%02dE%02d", first.Season, first.Episode)
+	if len(e.Episodes) > 1 {
+		if last.Season == first.Season {
+			code += fmt.Sprintf("-E%02d", last.Episode)
+		} else {
+			code += fmt.Sprintf("-S%02dE%02d", last.Season, last.Episode)
+		}
+	}
+	return strings.TrimSpace(e.Title + " " + code)
 }
 
 // Test is the event an app sends when a webhook is saved or its Test button
@@ -33,6 +74,11 @@ func (e Event) ChangesFiles() bool {
 type pathed struct {
 	Path       string `json:"path"`
 	FolderPath string `json:"folderPath"`
+	ID         int    `json:"id"`
+	Title      string `json:"title"`
+	Year       int    `json:"year"`
+	TmdbID     int    `json:"tmdbId"`
+	TvdbID     int    `json:"tvdbId"`
 }
 
 // ParseEvent reads a Sonarr or Radarr webhook body.
@@ -44,6 +90,10 @@ func ParseEvent(body []byte) (Event, error) {
 		EpisodeFile  *pathed  `json:"episodeFile"`
 		EpisodeFiles []pathed `json:"episodeFiles"`
 		MovieFile    *pathed  `json:"movieFile"`
+		Episodes     []struct {
+			SeasonNumber  int `json:"seasonNumber"`
+			EpisodeNumber int `json:"episodeNumber"`
+		} `json:"episodes"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return Event{}, fmt.Errorf("webhook body: %w", err)
@@ -66,5 +116,16 @@ func ParseEvent(body []byte) (Event, error) {
 	}
 	add(raw.Series)
 	add(raw.Movie)
+	for _, t := range []*pathed{raw.Series, raw.Movie} {
+		if t != nil {
+			ev.Title, ev.Year, ev.ArrID, ev.TmdbID, ev.TvdbID = t.Title, t.Year, t.ID, t.TmdbID, t.TvdbID
+		}
+	}
+	if raw.Series != nil {
+		ev.Year = 0 // a series' year says nothing about the episode
+	}
+	for _, e := range raw.Episodes {
+		ev.Episodes = append(ev.Episodes, store.EpisodeRef{Season: e.SeasonNumber, Episode: e.EpisodeNumber})
+	}
 	return ev, nil
 }

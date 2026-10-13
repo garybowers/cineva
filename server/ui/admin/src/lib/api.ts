@@ -18,6 +18,8 @@ export interface Library {
   restricted: boolean
   /** Whether its folders can be reached, from the server's 30-second check. */
   storage?: { available: boolean; since?: string; path?: string; error?: string }
+  /** A full rescan is waiting for a quiet time (the background work window). */
+  fullScanQueued?: boolean
 }
 
 export interface Scan {
@@ -46,7 +48,11 @@ export interface User {
   avatarColour?: AvatarColour
   /** Every library this user can see, computed from library access. */
   libraryIds: string[]
+  /** What happens to their requests; admins are always auto, whatever this says. */
+  requestLevel: RequestLevel
 }
+/** none: no request screens; approval: requests wait for an admin; auto: sent straight to Sonarr/Radarr. */
+export type RequestLevel = 'none' | 'approval' | 'auto'
 /** Theme tokens, not colours, so every theme draws an avatar in its own palette. */
 export const AVATAR_COLOURS = ['accent-2', 'chart-1', 'chart-2', 'chart-3', 'ok', 'err'] as const
 export type AvatarColour = (typeof AVATAR_COLOURS)[number]
@@ -69,6 +75,7 @@ export interface UserRequest {
   disabled?: boolean
   pin?: string // set, or '' to clear
   avatarColour?: AvatarColour | '' // '' back to the default
+  requestLevel?: RequestLevel
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
 export const authStatus = () => req<{ setupRequired: boolean; user?: User }>('/auth/status')
@@ -123,10 +130,38 @@ export interface Integration {
   callbackUrl: string
   /** The webhook's id inside Sonarr/Radarr; 0 if not registered. */
   notificationId: number
-  /** The instance's version when the connection was last saved. */
+  /** The instance's version when the connection was last saved or tested. */
   version: string
   createdAt: string
   updatedAt: string
+  /** What requests are made with; 0 and '' use the instance's first. */
+  qualityProfileId: number
+  rootFolder: string
+  /** The instance's paths translated into Cineva's. */
+  pathMaps: PathMap[]
+  /** The last webhook delivery: "Download", "Show S02E04", when. */
+  lastEvent?: string
+  lastEventTitle?: string
+  lastEventAt?: string
+}
+export interface PathMap {
+  from: string
+  to: string
+}
+/** A connection checked live (the Test button). */
+export interface IntegrationStatus {
+  reachable: boolean
+  error?: string
+  version?: string
+  health: { source: string; type: 'ok' | 'notice' | 'warning' | 'error'; message: string }[]
+  qualityProfiles: { id: number; name: string }[]
+  rootFolders: { id: number; path: string; freeSpace: number; accessible: boolean }[]
+  suggestedPathMaps: PathMap[]
+}
+export interface IntegrationOptions {
+  qualityProfileId: number
+  rootFolder: string
+  pathMaps: PathMap[]
 }
 export interface IntegrationRequest {
   kind?: IntegrationKind
@@ -143,6 +178,48 @@ export const updateIntegration = (id: string, r: IntegrationRequest) =>
 /** Resolves with a warning when the webhook could not be removed from the instance. */
 export const deleteIntegration = (id: string) =>
   req<{ warning?: string } | undefined>(`/integrations/${id}`, { method: 'DELETE' })
+export const integrationStatus = (id: string) => req<IntegrationStatus>(`/integrations/${id}/status`)
+export const setIntegrationOptions = (id: string, o: IntegrationOptions) =>
+  req<Integration>(`/integrations/${id}/options`, json('PUT', o))
+
+// Requests for titles outside the library.
+export type RequestState = 'requested' | 'approved' | 'downloading' | 'available' | 'declined'
+export interface MediaRequest {
+  id: string
+  userId: string
+  userName: string
+  mediaType: 'movie' | 'tv'
+  tmdbId: number
+  tvdbId?: number
+  title: string
+  year?: number
+  poster?: string
+  backdrop?: string
+  /** Series only; both empty is the whole series. */
+  seasons: number[]
+  episodes: { season: number; episode: number }[]
+  status: RequestState
+  connectionId?: string
+  qualityProfileId?: number
+  rootFolder?: string
+  note?: string
+  /** Why the last attempt to send it failed. */
+  error?: string
+  decidedAt?: string
+  createdAt: string
+  updatedAt: string
+}
+export interface RequestOverride {
+  connectionId?: string
+  qualityProfileId?: number
+  rootFolder?: string
+  note?: string
+}
+export const listRequests = (status?: RequestState[]) =>
+  req<MediaRequest[]>(`/requests?all=1${status?.length ? `&status=${status.join(',')}` : ''}`)
+export const approveRequest = (id: string, o: RequestOverride) => req<MediaRequest>(`/requests/${id}/approve`, json('POST', o))
+export const declineRequest = (id: string, note: string) => req<MediaRequest>(`/requests/${id}/decline`, json('POST', { note }))
+export const deleteRequest = (id: string) => req<void>(`/requests/${id}`, { method: 'DELETE' })
 export const getLibraryAccess = (id: string) => req<LibraryAccess>(`/libraries/${id}/access`)
 export const setLibraryAccess = (id: string, a: LibraryAccess) => req<LibraryAccess>(`/libraries/${id}/access`, json('PUT', a))
 export interface ServerSettings {
@@ -163,6 +240,12 @@ export interface ServerSettings {
   /** "HH:MM", server local time; the window may run past midnight. */
   detectionWindowStart: string
   detectionWindowEnd: string
+  /** The request level new accounts start at. */
+  requestDefaultLevel: RequestLevel
+  /** Read-only: the levels on offer. */
+  requestLevels: RequestLevel[]
+  /** Read-only: whether TMDB can be asked about titles outside the library. */
+  tmdbConfigured: boolean
 }
 export const getSettings = () => req<ServerSettings>('/settings')
 export const putSettings = (s: Partial<ServerSettings>) =>
@@ -203,6 +286,11 @@ export const deleteLibrary = (id: string) => req<void>(`/libraries/${id}`, { met
 export const scanLibrary = (id: string, full = false) =>
   req<Scan>(`/libraries/${id}/scan${full ? '?full=true' : ''}`, { method: 'POST' })
 export const listScans = () => req<Scan[]>('/scans')
+/** Queue a full rescan for the background work window, once nothing plays. */
+export const queueFullScan = (id: string) =>
+  req<void>(`/libraries/${id}/scan/queued`, { method: 'PUT' })
+export const cancelQueuedFullScan = (id: string) =>
+  req<void>(`/libraries/${id}/scan/queued`, { method: 'DELETE' })
 
 /** Background intro detection; also pushed over /events as "segments". */
 export interface IntroStatus {

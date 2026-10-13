@@ -11,8 +11,10 @@ record it here in the same change — this file is how we find our way back.
 ## Milestone 2 — Library & scan
 - [x] **Prune deleted files**: successful scans remove items the scan neither saved nor found unchanged (the scan collects the set; `PruneExcept`), cascading to subtitles/play state. It was an `updated_at` cutoff until scans became incremental — touching unchanged items to survive the cutoff would have made every polling client refetch them.
 - [x] **Incremental scans** (migration 0024): a file whose size and mtime match its stored item is skipped — no probe, no provider lookup, no write — so a rescan of an unchanged library is a directory walk and one query. Changed files rematch their series and season too. Series still on air are re-looked-up once per scan anyway, since their next episode date moves with no file changing. "Full rescan" in the admin, `?full=true` on the API and `cineva scan --full` redo everything. The first scan after the migration is necessarily a full one, as no mtimes are recorded yet.
-- [ ] Incremental scans key on the video file alone, so editing a sidecar — an `.nfo`, local poster/fanart, an external subtitle — next to an unchanged video is not picked up until a full rescan. Folding sidecar mtimes into the stamp would fix it.
-- [ ] A film or series that failed to match is not retried by an incremental scan, because its file has not changed; a full rescan or the admin's per-item refresh retries it. Worth retrying unmatched items on a slower cadence automatically.
+- [x] Sidecar edits count as changes: the scan's own directory walk records an `.nfo`, local artwork or `.srt`/`.vtt` beside a film (subtitles only beside an episode), stored as a fingerprint in `items.sidecar_stamp` (migration 0032); adding, editing or removing one rereads the video.
+- [ ] Music sidecars (`cover.jpg`/`folder.jpg`) are not part of the change test; a replaced album cover waits for a full rescan.
+- [x] Unmatched films and series are retried after every scan on a backoff (1, 2, 4 … 32 days; migration 0033), at most 50 provider lookups per scan, with one info line when something matches. Lookups only — no file reads.
+- [ ] The unmatched retry keeps an existing overview, since it cannot tell an `.nfo` plot from a tag synopsis; recording where an overview came from would let the provider's replace a tag's.
 - [x] Episode-level TMDB metadata: titles/overviews/stills via the season endpoint (tags and filenames still take precedence where present).
 - [x] Season posters / overviews via the TMDB season endpoint.
 - [x] The TV scanner probes in parallel batches too (it read one file at a time, which made a first scan of a 10k-episode library take most of a day). The music scanner still reads tags serially.
@@ -61,7 +63,7 @@ record it here in the same change — this file is how we find our way back.
 
   Replaying the 176 paths the real scan refused: 152 now parse. The remaining 24 are bonus material in `Season N Extras` folders (which `extrasDirRe` now matches properly — it only caught a bare "Extras" before, so those files were being walked and refused one at a time, the right outcome by accident), six date-based Tonight Show episodes, and two named specials.
 
-- [ ] Date-stamped episodes — "The Tonight Show Starring Jimmy Fallon - 2023-01-27 - guests" — are still skipped. TMDB can match an episode by air date, which is how other servers handle daily shows.
+- [x] Date-stamped episodes ("Show - 2023-01-27 - guests") are matched by air date through TMDB's seasons; unmatched ones are placed as season = year, episode = month and day. Also fixed: in show folders without season folders, the season row took the show's path and overwrote the series.
 
 - [x] **Series had no genres, no cast, no tagline and no age rating.** Two independent faults, either of which alone was enough to lose them. TMDB returns genre *ids* on a search hit and the real data only on the detail endpoint; `SearchMovie` has always followed its search with a detail call, `SearchTV` never did — so `TVByID` now mirrors it, with the television-specific fields (`content_ratings` rather than `release_dates`, `episode_run_time` rather than `runtime`) and `bestMatch` ranking instead of taking TMDB's first hit. And `scanTV` never called `saveGenres` or `saveCredits` at all, which the film scanner has always done, so anything fetched was dropped on the floor. 0 of 173 series had a genre against 1178 of 1187 films.
 
@@ -83,7 +85,7 @@ record it here in the same change — this file is how we find our way back.
 
   Verified against real TMDB data on *Alone*: status "Returning Series", network "History", country US, first aired 2015-06-18, last 2026-09-09, 13 seasons / 144 episodes. `next_air_date` was correctly empty (nothing scheduled) and `original_title` correctly empty (an English title).
 
-- [ ] **The TV library needs a full rescan to benefit from the parsing fixes.** The items already in `server/cineva.db` were created by the old scanner and keep their wrong titles and parentage — nothing migrates them, because the fix changes how paths are read rather than what is stored. A full rescan rebuilds it correctly; an incremental one skips the unchanged files (though the first scan after migration 0024 is full regardless).
+- [ ] **The TV library needs one full rescan** — rows from the old scanner keep their parentage, and in show folders without season folders unchanged episodes stay under the formerly corrupted series row until reread. Queue it with "Full rescan tonight" on the admin Libraries page (runs in the background window with nothing playing); it also refreshes the ~3,200 episodes still carrying embedded posters.
 
 
 ## Milestone 3 — Playback
@@ -192,7 +194,8 @@ record it here in the same change — this file is how we find our way back.
 - [x] Every admin page is one width. `main` was capped at 70rem except the library-manage screen, which had a `wide` class at 110rem — so the page changed shape between screens. One cap now, with narrow content setting its own width. `scrollbar-gutter: stable` in both UIs stops the layout shifting sideways between a short page and a tall one.
 - [x] Audited every bare element selector in both UIs' stylesheets. None remained inside media queries, but the top-level `nav { }` and `nav button { }` rules were a live instance of the same bug — reaching the breadcrumbs and the new library tab bar as well as the sidebar they were written for. Now scoped to `aside nav`.
 - [x] The admin Manage list pages on the server: 100 rows a page with Prev/Next, the title/path filter and "only unmatched" applied in SQL (`GET /libraries/{id}/manage`), and Refresh covering everything the filter matches across pages. The Collections tab's "add a film" search uses the same endpoint.
-- [ ] The Manage filter's case-insensitivity is SQLite `LIKE`'s, which folds ASCII only: "amélie" finds "Amélie" but "AMÉLIE" does not.
+- [x] Search and the Manage filter fold case across all of Unicode ("AMÉLIE" finds "Amélie"), through a `unifold` SQL function used only when the query is not ASCII; search also escapes `%` and `_` now.
+- [ ] Search and Manage are case-insensitive but not accent-insensitive: "Amelie" does not find "Amélie".
 - [x] **Collections**: done — see the Collections entry under milestone 2.
 - [x] **Ratings**: sortable by rating, and the content rating is fetched (TMDB `release_dates`), stored (migration 0015) and shown. Certification is regional, so the region is an admin setting (`metadata.cert_region`, default GB) rather than a hardcoded choice — a BBFC "15" and an FSK "16" are different boards' judgements, not two spellings. Falls back to the US rating where a title is unclassified in the chosen region.
 - [x] **Watched/unwatched indicator and filter**: grid tiles carry a watched tick or a resume bar, and the filter bar narrows to All / Unwatched / Watched. `Store.PlayStatesByLibrary` fetches the whole library's state in one query (keyed by primary id, so it follows version grouping) rather than a request per tile.
@@ -262,9 +265,16 @@ record it here in the same change — this file is how we find our way back.
 ## Sonarr & Radarr
 - [x] **New downloads appear without a manual scan.** `libraries.scan_interval` now defaults to 15m (it was off), and an admin can connect Sonarr and Radarr on the Integrations page: Cineva registers a webhook named "Cineva" in each (`internal/arr`, migration 0028), authenticated by a per-connection secret, and an import, upgrade, rename or deletion rescans the affected library within seconds. A request arriving mid-scan queues one follow-up scan rather than being dropped, since the scan in flight may already have walked past the new file's folder.
 - [x] **Recently added ranks by arrival.** An item's `added_at` is now its file's mtime (capped at now) rather than the time a scan noticed it, and migration 0027 re-dates existing rows the same way. Before, a back catalogue imported in one long scan ranked in walk order — Z to A — and a manual scan after several downloads gave them all the same moment. TV ties fall back to the newest air date. The library page's Recently Added row is now the server's per-series ranking (`/libraries/{id}/recommended` leads with it) instead of a client-side sort of series rows by the series' own date. Caveat: Sonarr's "Change File Date" setting, if set to air date, makes mtime the air date and an old show downloaded today ranks as old.
-- [ ] **Path mapping.** Without it, an event whose paths no library contains (Sonarr in a container sees `/tv/...`) rescans every library of that media type. Cheap — scans are incremental — but a mapping (auto-suggested from Sonarr's root folders) would target the one library.
-- [ ] **Connection status.** A Test button, live health and version, and the last event received ("Download · Show S02E04 · 2 min ago") on each card. Today the card shows the version from the last save and whether the webhook is registered.
-- [ ] **Upcoming and missing episodes** from Sonarr's calendar in the web client: air dates of what is coming, and gaps in a season.
+- [x] **Requests**: search shows "Not in your library" from TMDB under the library's own results; a Plex-style title page offers Request where Play would be (whole show or chosen seasons); held shows show missing and upcoming seasons and episodes greyed, with Request or Search now. Per-user request level (none / needs approval / straight through; admins always through) on the Users page with a default in Settings; an admin Requests queue to approve (with profile/folder override) or decline; a Requests page for users. Status follows the request: approved, downloading (Grab webhook or queue polling), available (matched after a scan). Migration 0031; `internal/requests`, `/discover/*`, `/requests*`.
+- [x] **Path mapping**: each connection maps the instance's paths to Cineva's, suggested from its root folders against the library paths; webhook events then target the one library.
+- [x] **Connection status**: Test button, live reachability and health, version, last event received; default quality profile and root folder chosen from the instance.
+- [x] **Upcoming and missing episodes** per series, from Sonarr, in the season and series views.
+- [ ] A calendar of upcoming episodes across all series (Sonarr `/calendar`).
+- [ ] Missing seasons for series no connected Sonarr has, from TMDB's season list; season posters on greyed tiles.
+- [ ] Tell the requester when a request is approved, declined or available.
+- [ ] Match grabs to the requested seasons/episodes rather than the whole series.
+- [ ] Request quotas per user, and rules for choosing between several instances of one kind (a 4K Radarr).
+- [ ] Re-register webhooks automatically so existing connections receive Grab events without an admin re-saving them (queue polling covers it meanwhile).
 
 ## Milestone 10 — Federation (designed: `server/docs/federation.md`)
 Groundwork that is cheap before federation and expensive after it ("Preparing now" in the design):

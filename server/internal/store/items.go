@@ -55,6 +55,11 @@ type Item struct {
 	// file. Write-only: it is not loaded with the item, and an upsert that
 	// leaves it 0 keeps the stored value.
 	FileMtime int64 `json:"-"`
+	// SidecarStamp fingerprints the sidecar files a scan reads beside the
+	// video (.nfo, local artwork, external subtitles), so editing one is a
+	// change too. Write-only like FileMtime, and 0 likewise keeps the stored
+	// value; a recorded fingerprint is never 0.
+	SidecarStamp int64 `json:"-"`
 	// VersionOf is the id of the item this one is an alternative version of
 	// — the same film at a different quality. Empty for a primary, which is
 	// what the library grid lists.
@@ -259,8 +264,8 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			 tmdb_id, overview, poster,
 			 rating, vote_count, tagline, backdrop, collection_id, collection_name,
 			 certification, status, network, air_date, season_count, episode_count,
-			 last_air_date, next_air_date, original_title, country, file_mtime, added_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 last_air_date, next_air_date, original_title, country, file_mtime, sidecar_stamp, added_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, item.LibraryID, string(item.Kind), parent, item.Title, item.Year,
 			item.SeasonNum, item.EpisodeNum, item.DiscNum, item.TrackNum, item.Artist,
 			item.Path, item.SizeBytes, item.RuntimeSecs,
@@ -270,7 +275,7 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			item.CollectionID, item.CollectionName, item.Certification,
 			item.Status, item.Network, item.AirDate, item.SeasonCount, item.EpisodeCount,
 			item.LastAirDate, item.NextAirDate, item.OriginalTitle, item.Country, item.FileMtime,
-			addedAt(item.FileMtime, time.Now()))
+			item.SidecarStamp, addedAt(item.FileMtime, time.Now()))
 		if err != nil {
 			return Item{}, fmt.Errorf("insert item %q: %w", item.Path, err)
 		}
@@ -318,6 +323,7 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			-- Kept when not given: an item loaded and saved back (a
 			-- track picking up its album's cover) never carries it.
 			file_mtime = CASE WHEN ? != 0 THEN ? ELSE file_mtime END,
+			sidecar_stamp = CASE WHEN ? != 0 THEN ? ELSE sidecar_stamp END,
 			updated_at = datetime('now')
 			WHERE id = ?`,
 			string(item.Kind), parent, item.Title, item.Year, item.SeasonNum, item.EpisodeNum,
@@ -335,6 +341,7 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			item.LastAirDate, item.LastAirDate, item.NextAirDate,
 			item.OriginalTitle, item.OriginalTitle, item.Country, item.Country,
 			item.FileMtime, item.FileMtime,
+			item.SidecarStamp, item.SidecarStamp,
 			id)
 		if err != nil {
 			return Item{}, fmt.Errorf("update item %q: %w", item.Path, err)
@@ -412,9 +419,6 @@ func (s *Store) CountItems(ctx context.Context, libraryID string, kind ItemKind)
 	return n, nil
 }
 
-// SearchItems finds items whose title (or artist) matches q, case-insensitive
-// substring. Top-level entries (movies, series, artists, albums) rank above
-// episodes and tracks.
 // SearchItems matches a query against the title, the display artist, the
 // release year and the names of credited people — so "Scorsese", "1995" and
 // "Goodfellas" all find the same film.
@@ -431,31 +435,36 @@ func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, e
 			year = y
 		}
 	}
+	// Case-insensitive across Unicode (see unifold), with the query's own %
+	// and _ matched literally. People are matched once, in the subquery,
+	// rather than once per item.
+	contains, prefix := likeContains(q), likePrefix(q)
+	title, artist, name := foldedCol("i.title", q), foldedCol("i.artist", q), foldedCol("p.name", q)
 	return s.queryItems(ctx,
 		`SELECT `+itemCols+` FROM items i
 		 WHERE i.kind IN ('movie', 'series', 'episode', 'artist', 'album', 'track')
 		   AND i.version_of = ''
 		   AND (
-		     i.title LIKE '%' || ? || '%'
-		     OR i.artist LIKE '%' || ? || '%'
+		     `+title+` LIKE ? ESCAPE '\'
+		     OR `+artist+` LIKE ? ESCAPE '\'
 		     OR (? != 0 AND i.year = ?)
-		     OR EXISTS (
-		       SELECT 1 FROM credits c JOIN people p ON p.id = c.person_id
-		       WHERE c.item_id = i.id AND p.name LIKE '%' || ? || '%'
+		     OR i.id IN (
+		       SELECT c.item_id FROM credits c JOIN people p ON p.id = c.person_id
+		       WHERE `+name+` LIKE ? ESCAPE '\'
 		     )
 		   )
 		 ORDER BY
 		   CASE
-		     WHEN i.title LIKE ? || '%' THEN 0        -- starts with the query
-		     WHEN i.title LIKE '%' || ? || '%' THEN 1 -- contains it
-		     WHEN ? != 0 AND i.year = ? THEN 2        -- the year asked for
-		     ELSE 3                                   -- matched on a person
+		     WHEN `+title+` LIKE ? ESCAPE '\' THEN 0 -- starts with the query
+		     WHEN `+title+` LIKE ? ESCAPE '\' THEN 1 -- contains it
+		     WHEN ? != 0 AND i.year = ? THEN 2   -- the year asked for
+		     ELSE 3                              -- matched on a person
 		   END,
 		   CASE i.kind WHEN 'episode' THEN 1 WHEN 'track' THEN 1 ELSE 0 END,
 		   i.title
 		 LIMIT ?`,
-		q, q, year, year, q,
-		q, q, year, year,
+		contains, contains, year, year, contains,
+		prefix, contains, year, year,
 		limit)
 }
 
@@ -463,21 +472,25 @@ func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, e
 // enough to decide whether its file has changed, and to keep the item (and
 // the items above it) without loading or rewriting any of them.
 type FileStamp struct {
-	ID          string
-	Kind        ItemKind
-	ParentID    string
-	TmdbID      int
-	SizeBytes   int64
-	FileMtime   int64
-	RuntimeSecs int
-	Status      string
+	ID        string
+	Kind      ItemKind
+	ParentID  string
+	TmdbID    int
+	SizeBytes int64
+	FileMtime int64
+	// SidecarStamp is the sidecar fingerprint recorded with the item; 0
+	// when none has been yet.
+	SidecarStamp int64
+	RuntimeSecs  int
+	Status       string
 }
 
 // FileStamps returns every item in a library keyed by path. Paths are unique
 // within a library (UpsertItem matches on them), so the map loses nothing.
 func (s *Store) FileStamps(ctx context.Context, libraryID string) (map[string]FileStamp, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, COALESCE(parent_id, ''), path, tmdb_id, size_bytes, file_mtime, runtime_secs, status
+		`SELECT id, kind, COALESCE(parent_id, ''), path, tmdb_id, size_bytes, file_mtime, sidecar_stamp,
+		        runtime_secs, status
 		 FROM items WHERE library_id = ?`, libraryID)
 	if err != nil {
 		return nil, fmt.Errorf("file stamps %s: %w", libraryID, err)
@@ -488,7 +501,7 @@ func (s *Store) FileStamps(ctx context.Context, libraryID string) (map[string]Fi
 		var st FileStamp
 		var path string
 		if err := rows.Scan(&st.ID, &st.Kind, &st.ParentID, &path, &st.TmdbID, &st.SizeBytes,
-			&st.FileMtime, &st.RuntimeSecs, &st.Status); err != nil {
+			&st.FileMtime, &st.SidecarStamp, &st.RuntimeSecs, &st.Status); err != nil {
 			return nil, fmt.Errorf("file stamps %s: %w", libraryID, err)
 		}
 		out[path] = st

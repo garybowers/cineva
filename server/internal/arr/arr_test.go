@@ -12,13 +12,16 @@ import (
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
-// fakeArr is enough of Sonarr's API to register a webhook against.
+// fakeArr is enough of Sonarr's and Radarr's API to register a webhook
+// against and to make requests of (see catalogue_test.go).
 type fakeArr struct {
 	mu      sync.Mutex
 	app     string
 	saved   map[int]map[string]any
 	nextID  int
 	refuses string // a validation failure to answer saves with
+
+	library
 }
 
 func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +84,9 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(def)
 	default:
-		w.WriteHeader(http.StatusNotFound)
+		if !f.serveLibrary(w, r) {
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}
 }
 
@@ -120,7 +125,7 @@ func TestRegisterWebhook(t *testing.T) {
 	def := fake.saved[id]
 	for key, want := range map[string]bool{
 		"onDownload": true, "onRename": true,
-		"onGrab": false, "onHealthIssue": false,
+		"onGrab": true, "onHealthIssue": false,
 		"onMovieDelete": false, // wanted, but this app does not support it
 	} {
 		if def[key] != want {

@@ -35,6 +35,8 @@ tags:
     description: "Accounts and groups (admin)"
   - name: Integrations
     description: "Sonarr and Radarr"
+  - name: Requests
+    description: "Finding titles outside the library on TMDB, asking for them, the admin's queue, and what a series is missing"
   - name: Administration
     description: "Scans, metadata, settings, statistics and logs (admin)"
   - name: System
@@ -790,8 +792,11 @@ paths:
       summary: Start a background scan of the library
       description: >
         Incremental by default: a file whose size and modification time match
-        what the last scan recorded is skipped, and only new or changed files
-        are read and matched. Items whose files have gone are removed either
+        what the last scan recorded, and whose sidecars (.nfo, local artwork,
+        external subtitles) have not changed either, is skipped, and only new
+        or changed files are read and matched. Films and series still
+        unmatched are looked up again once a day at most, less often after
+        repeated failures. Items whose files have gone are removed either
         way. Pass full=true to reread and rematch everything, which picks up
         new provider data and recovers from a bad match.
       operationId: scanLibrary
@@ -811,6 +816,34 @@ paths:
               schema: { $ref: "#/components/schemas/Scan" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: A scan for this library is already running }
+
+  /libraries/{id}/scan/queued:
+    put:
+      summary: Queue a full rescan for a quiet time
+      description: >
+        A full rescan rereads and rematches every file, which on a large
+        library is hours of reading from the storage playback uses. Queued
+        instead of started, it begins in the background work window (the
+        intro-detection schedule), once nothing is playing and no other scan
+        is running, and not while background work is paused; with the
+        on-demand schedule it waits only for playback to stop. The queue
+        survives a restart. Queuing a library already queued changes nothing.
+      operationId: queueFullScan
+      tags: [Libraries]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Queued }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Take a queued full rescan off the queue
+      operationId: cancelQueuedFullScan
+      tags: [Libraries]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: No longer queued }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /libraries/{id}/items:
     get:
@@ -1106,6 +1139,198 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
+
+  /requests/status:
+    get:
+      summary: Whether the viewer can request titles, and which kinds
+      description: >
+        The client asks once to decide whether to show request screens at
+        all. Enabled needs a request level other than none, a TMDB key, and
+        a connected Radarr (films) or Sonarr (series).
+      operationId: getRequestStatus
+      tags: [Requests]
+      responses:
+        "200": { description: Status, content: { application/json: { schema: { $ref: "#/components/schemas/RequestStatus" } } } }
+  /discover/search:
+    get:
+      summary: Films and series not in the viewer's libraries, from TMDB
+      description: >
+        For the "Not in your library" row under the library's own results.
+        Titles held in a library the viewer can see are left out, as are
+        films when no Radarr is connected and series when no Sonarr is.
+        Each result carries the status of any open request for it. At most
+        20; empty while requests are off for the viewer's server.
+      operationId: discoverSearch
+      tags: [Requests]
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2 } }
+      responses:
+        "200":
+          description: Results, in TMDB's order
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DiscoverResult" } }
+        "403": { description: The viewer's request level is none }
+        "502": { description: TMDB could not be reached }
+  /discover/{type}/{tmdbId}:
+    get:
+      summary: A film or series page from TMDB, with its requests
+      description: >
+        Everything a detail page shows, for a title the library may not
+        have. itemId is set when the viewer can see it in a library, so the
+        client can go there instead. A series lists its seasons with how
+        many episodes of each are on disk and any request covering them.
+      operationId: discoverTitle
+      tags: [Requests]
+      parameters:
+        - { name: type, in: path, required: true, schema: { type: string, enum: [movie, tv] } }
+        - { name: tmdbId, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: The title, content: { application/json: { schema: { $ref: "#/components/schemas/DiscoverTitle" } } } }
+        "403": { description: The viewer's request level is none }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: No TMDB key is configured }
+  /requests:
+    get:
+      summary: Requests, newest first
+      description: The viewer's own; an admin passing all=1 sees everyone's.
+      operationId: listRequests
+      tags: [Requests]
+      parameters:
+        - { name: all, in: query, schema: { type: string, enum: ["1", "true"] }, description: Admins only; everyone's requests }
+        - { name: status, in: query, schema: { type: string }, description: "Comma-separated statuses to include, e.g. requested,approved" }
+      responses:
+        "200":
+          description: Requests
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/MediaRequest" } }
+        "403": { description: The viewer's request level is none }
+    post:
+      summary: Request a film, a series, some of its seasons, or episodes
+      description: >
+        For a user at level "approval" the request waits in the admin's
+        queue. At level "auto" (and for every admin) it is sent at once:
+        Radarr adds the film, or Sonarr the series with the requested
+        seasons monitored (a series it has already gets them monitored),
+        and searches. A send that fails is still recorded, waiting for an
+        admin, with the reason in error. An open request that already
+        covers this one is returned with 200 instead of a new one. Seasons
+        and episodes empty is the whole series.
+      operationId: createRequest
+      tags: [Requests]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewRequest" }
+      responses:
+        "201": { description: Requested, content: { application/json: { schema: { $ref: "#/components/schemas/MediaRequest" } } } }
+        "200": { description: Already requested, content: { application/json: { schema: { $ref: "#/components/schemas/MediaRequest" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: The viewer's request level is none }
+        "409": { description: The film is already in a library }
+        "502": { description: TMDB could not be reached }
+        "503": { description: No TMDB key is configured }
+  /requests/{id}:
+    delete:
+      summary: Withdraw a request
+      description: >
+        Its owner may while it still waits for an admin; an admin may
+        remove any. Nothing is undone in Sonarr or Radarr.
+      operationId: deleteRequest
+      tags: [Requests]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Withdrawn }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Already sent; only an admin can remove it now }
+  /requests/{id}/approve:
+    post:
+      summary: Approve and send a waiting request (admin)
+      description: >
+        Sends it with the connection's default quality profile and root
+        folder unless the body overrides them. A declined request can be
+        approved after all. When the instance refuses or cannot be reached
+        the request stays waiting, with the reason.
+      operationId: approveRequest
+      tags: [Requests]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RequestOverride" }
+      responses:
+        "200": { description: Sent, content: { application/json: { schema: { $ref: "#/components/schemas/MediaRequest" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Already sent or available }
+        "502": { $ref: "#/components/responses/UpstreamFailed" }
+  /requests/{id}/decline:
+    post:
+      summary: Decline a waiting request (admin)
+      operationId: declineRequest
+      tags: [Requests]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, description: Shown to the person who asked }
+      responses:
+        "200": { description: Declined, content: { application/json: { schema: { $ref: "#/components/schemas/MediaRequest" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Not waiting for a decision }
+  /items/{id}/missing:
+    get:
+      summary: What a series is missing, by Sonarr's account
+      description: >
+        Episodes the connected Sonarr lists for the series that are not on
+        disk — aired ("missing") or still to air ("upcoming", with the air
+        date) — by season, leaving out specials. managed is false when no
+        connected Sonarr has the series. Sonarr's answer is kept for two
+        minutes.
+      operationId: itemMissing
+      tags: [Requests]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: A series }
+      responses:
+        "200": { description: The gaps, content: { application/json: { schema: { $ref: "#/components/schemas/MissingEpisodes" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: The viewer's request level is none }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/UpstreamFailed" }
+  /items/{id}/missing/search:
+    post:
+      summary: Search Sonarr now for seasons or episodes of a series
+      description: >
+        Monitors them and starts Sonarr's season or episode search. For
+        admins and users at request level "auto"; everyone else requests
+        them (POST /requests) instead.
+      operationId: searchMissing
+      tags: [Requests]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: A series }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seasons: { type: array, items: { type: integer } }
+                episodes: { type: array, items: { $ref: "#/components/schemas/EpisodeRef" } }
+      responses:
+        "202": { description: Searching }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Only admins and users at level auto }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: No connected Sonarr has the series }
+        "502": { $ref: "#/components/responses/UpstreamFailed" }
 
   /events:
     get:
@@ -1582,20 +1807,69 @@ paths:
                   warning: { type: string }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /integrations/{id}/status:
+    get:
+      summary: Check a connection live (admin)
+      description: >
+        The Test button: whether the instance answers and its version, its
+        health warnings, the quality profiles and root folders requests can
+        use, and path mappings suggested by comparing its root folders with
+        Cineva's library folders (the same name, or the only one of each).
+        A connection that cannot be reached answers 200 with reachable
+        false and the reason.
+      operationId: integrationStatus
+      tags: [Integrations]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Status, content: { application/json: { schema: { $ref: "#/components/schemas/IntegrationStatus" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /integrations/{id}/options:
+    put:
+      summary: Set what requests use and how paths map (admin)
+      description: >
+        The quality profile and root folder requests sent to this instance
+        are made with (0 and "" use the instance's first), and path
+        mappings from the instance's paths to Cineva's, so a webhook event
+        rescans the one library holding the file rather than every library
+        of its type. Saved without contacting the instance; empty rows are
+        dropped.
+      operationId: setIntegrationOptions
+      tags: [Integrations]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                qualityProfileId: { type: integer }
+                rootFolder: { type: string }
+                pathMaps: { type: array, items: { $ref: "#/components/schemas/PathMap" } }
+      responses:
+        "200": { description: The connection, content: { application/json: { schema: { $ref: "#/components/schemas/Integration" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /integrations/{id}/webhook:
     post:
       summary: Receive a Sonarr or Radarr webhook event
       description: >
         Called by the instance, not by users: public, authenticated with HTTP
         basic auth as user "cineva" and the connection's secret, which Cineva
-        generates when it registers the webhook. Events that add, replace,
-        rename or remove files (Download, ImportComplete, Rename,
-        SeriesDelete, EpisodeFileDelete, MovieDelete, MovieFileDelete)
-        rescan the libraries of the connection's media type that contain the
-        event's paths — or all of them, when the instance sees the files at
-        different paths (as it does in a container). A rescan requested while
-        one is running follows it. Other events, including Test, are
-        acknowledged and ignored.
+        generates when it registers the webhook. Every delivery is noted as
+        the connection's last event. Events that add, replace, rename or
+        remove files (Download, ImportComplete, Rename, SeriesDelete,
+        EpisodeFileDelete, MovieDelete, MovieFileDelete) rescan the
+        libraries of the connection's media type that contain the event's
+        paths, translated by the connection's path mappings — or all of
+        them, when none does (as when the instance sees the files at
+        different paths in a container and no mapping says how). A rescan
+        requested while one is running follows it. Grab moves requests for
+        the title to downloading. Other events, including Test, are
+        acknowledged and otherwise ignored.
       operationId: integrationWebhook
       tags: [Integrations]
       security: []
@@ -1610,10 +1884,11 @@ paths:
               description: Sonarr or Radarr's webhook payload; only the fields below are read.
               properties:
                 eventType: { type: string }
-                series: { type: object, properties: { path: { type: string } } }
+                series: { type: object, properties: { id: { type: integer }, title: { type: string }, tvdbId: { type: integer }, path: { type: string } } }
+                episodes: { type: array, items: { type: object, properties: { seasonNumber: { type: integer }, episodeNumber: { type: integer } } } }
                 episodeFile: { type: object, properties: { path: { type: string } } }
                 episodeFiles: { type: array, items: { type: object, properties: { path: { type: string } } } }
-                movie: { type: object, properties: { folderPath: { type: string } } }
+                movie: { type: object, properties: { id: { type: integer }, title: { type: string }, year: { type: integer }, tmdbId: { type: integer }, folderPath: { type: string } } }
                 movieFile: { type: object, properties: { path: { type: string } } }
       responses:
         "200":
@@ -2297,6 +2572,7 @@ components:
         createdAt: { type: string }
         avatar: { type: string, description: The user's picture (an /artwork/ path); absent when they have none }
         avatarColour: { $ref: "#/components/schemas/AvatarColour" }
+        requestLevel: { $ref: "#/components/schemas/RequestLevel" }
         libraryIds:
           type: array
           items: { type: string }
@@ -2322,9 +2598,209 @@ components:
         url: { type: string, description: The instance's base URL }
         callbackUrl: { type: string, description: Cineva's address as the instance reaches it }
         notificationId: { type: integer, description: The webhook's id inside the instance; 0 if not registered }
-        version: { type: string, description: The instance's version when the connection was last saved }
+        version: { type: string, description: The instance's version when the connection was last saved or tested }
         createdAt: { type: string }
         updatedAt: { type: string }
+        qualityProfileId: { type: integer, description: What requests are made with; 0 uses the instance's first }
+        rootFolder: { type: string, description: Where requested titles go; "" uses the instance's first }
+        pathMaps: { type: array, items: { $ref: "#/components/schemas/PathMap" } }
+        lastEvent: { type: string, description: 'The last webhook delivery''s type, e.g. "Download"' }
+        lastEventTitle: { type: string, description: 'What it was about, e.g. "Show S02E04"' }
+        lastEventAt: { type: string }
+    PathMap:
+      type: object
+      description: 'One translation of an instance''s path prefix into Cineva''s: Sonarr in a container sees /tv where Cineva sees /mnt/media/TV.'
+      properties:
+        from: { type: string, description: As the instance sees it }
+        to: { type: string, description: As Cineva sees it }
+    IntegrationStatus:
+      type: object
+      properties:
+        reachable: { type: boolean }
+        error: { type: string, description: Why it could not be reached, or which of the lists failed }
+        version: { type: string }
+        health:
+          type: array
+          items:
+            type: object
+            properties:
+              source: { type: string }
+              type: { type: string, enum: [ok, notice, warning, error] }
+              message: { type: string }
+        qualityProfiles:
+          type: array
+          items: { type: object, properties: { id: { type: integer }, name: { type: string } } }
+        rootFolders:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              path: { type: string }
+              freeSpace: { type: integer, description: Bytes }
+              accessible: { type: boolean }
+        suggestedPathMaps: { type: array, items: { $ref: "#/components/schemas/PathMap" } }
+    RequestLevel:
+      type: string
+      enum: [none, approval, auto]
+      description: >
+        What happens when a user asks for a title not in the library: none
+        hides requests altogether, approval puts them in the admin's queue,
+        auto sends them straight to Sonarr or Radarr. Admins are always
+        auto, whatever is stored.
+    RequestStatus:
+      type: object
+      properties:
+        level: { $ref: "#/components/schemas/RequestLevel" }
+        movies: { type: boolean, description: A Radarr is connected }
+        tv: { type: boolean, description: A Sonarr is connected }
+        tmdb: { type: boolean, description: A TMDB key is configured }
+        enabled: { type: boolean, description: Request screens are worth showing }
+    EpisodeRef:
+      type: object
+      properties:
+        season: { type: integer }
+        episode: { type: integer }
+    NewRequest:
+      type: object
+      required: [mediaType, tmdbId]
+      properties:
+        mediaType: { type: string, enum: [movie, tv] }
+        tmdbId: { type: integer }
+        seasons: { type: array, items: { type: integer }, description: Series only; with episodes empty too, the whole series }
+        episodes: { type: array, items: { $ref: "#/components/schemas/EpisodeRef" }, description: Series only; single episodes }
+    RequestOverride:
+      type: object
+      description: Blank fields use the connection's defaults.
+      properties:
+        connectionId: { type: string, description: Another Sonarr or Radarr of the right kind }
+        qualityProfileId: { type: integer }
+        rootFolder: { type: string }
+        note: { type: string, description: Shown to the person who asked }
+    MediaRequest:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        userName: { type: string, description: The requester's display name }
+        mediaType: { type: string, enum: [movie, tv] }
+        tmdbId: { type: integer }
+        tvdbId: { type: integer }
+        title: { type: string }
+        year: { type: integer }
+        poster: { type: string, description: TMDB artwork URL }
+        backdrop: { type: string }
+        seasons: { type: array, items: { type: integer } }
+        episodes: { type: array, items: { $ref: "#/components/schemas/EpisodeRef" } }
+        status:
+          type: string
+          enum: [requested, approved, downloading, available, declined]
+          description: >
+            requested: waiting for an admin, or for an instance that could
+            not be reached (error says why). approved: sent. downloading:
+            the instance grabbed a release. available: a scan found it in a
+            library. declined: an admin said no (note may say why).
+        connectionId: { type: string }
+        qualityProfileId: { type: integer }
+        rootFolder: { type: string }
+        arrId: { type: integer, description: The title's id inside Sonarr or Radarr once sent }
+        note: { type: string }
+        error: { type: string }
+        decidedBy: { type: string }
+        decidedAt: { type: string }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    DiscoverResult:
+      type: object
+      properties:
+        mediaType: { type: string, enum: [movie, tv] }
+        tmdbId: { type: integer }
+        title: { type: string }
+        year: { type: integer }
+        overview: { type: string }
+        poster: { type: string, description: TMDB artwork URL }
+        backdrop: { type: string }
+        request: { type: string, description: Status of the newest open request for it; absent when there is none }
+    DiscoverTitle:
+      type: object
+      properties:
+        mediaType: { type: string, enum: [movie, tv] }
+        tmdbId: { type: integer }
+        title: { type: string }
+        originalTitle: { type: string }
+        year: { type: integer }
+        overview: { type: string }
+        tagline: { type: string }
+        poster: { type: string }
+        backdrop: { type: string }
+        genres: { type: array, items: { type: string } }
+        rating: { type: number }
+        voteCount: { type: integer }
+        runtimeMins: { type: integer }
+        certification: { type: string, description: In the server's certification region }
+        status: { type: string, description: 'Series only; TMDB''s wording, e.g. "Returning Series"' }
+        network: { type: string }
+        cast:
+          type: array
+          items: { $ref: "#/components/schemas/DiscoverCredit" }
+        crew:
+          type: array
+          items: { $ref: "#/components/schemas/DiscoverCredit" }
+        seasons:
+          type: array
+          description: Series only
+          items:
+            type: object
+            properties:
+              seasonNumber: { type: integer }
+              name: { type: string }
+              episodeCount: { type: integer }
+              airDate: { type: string }
+              poster: { type: string }
+              held: { type: integer, description: Episodes of it on disk }
+              request: { type: string, description: Status of an open request covering it }
+        itemId: { type: string, description: The library item, when the viewer can see one }
+        requests:
+          type: array
+          description: Open requests for the title, newest first; else the newest closed one
+          items: { $ref: "#/components/schemas/MediaRequest" }
+        canRequest: { type: boolean }
+    DiscoverCredit:
+      type: object
+      properties:
+        tmdbId: { type: integer }
+        name: { type: string }
+        role: { type: string, description: Character for cast, job for crew }
+        profile: { type: string }
+    MissingEpisodes:
+      type: object
+      properties:
+        tmdbId: { type: integer, description: "The series' TMDB id, which a request for its gaps names" }
+        managed: { type: boolean, description: A connected Sonarr has the series }
+        connection: { type: string, description: Its name }
+        seasons:
+          type: array
+          items:
+            type: object
+            properties:
+              seasonNumber: { type: integer }
+              held: { type: integer, description: Episodes on disk }
+              total: { type: integer, description: Episodes Sonarr lists }
+              episodes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    season: { type: integer }
+                    episode: { type: integer }
+                    title: { type: string }
+                    airDate: { type: string }
+                    status: { type: string, enum: [missing, upcoming] }
+                    monitored: { type: boolean }
+        requests:
+          type: array
+          description: Open requests for the series
+          items: { $ref: "#/components/schemas/MediaRequest" }
     IntegrationRequest:
       type: object
       description: On create, kind, url and apiKey are required. On update, kind is ignored and blank fields keep their values.
@@ -2419,6 +2895,7 @@ components:
         disabled: { type: boolean }
         pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
         avatarColour: { $ref: "#/components/schemas/AvatarColour" }
+        requestLevel: { $ref: "#/components/schemas/RequestLevel" }
     Settings:
       type: object
       properties:
@@ -2483,6 +2960,17 @@ components:
           readOnly: true
           items: { type: string }
           description: The regions this server offers, for the admin picker.
+        requestDefaultLevel:
+          allOf: [{ $ref: "#/components/schemas/RequestLevel" }]
+          description: The request level new accounts start at. Default approval.
+        requestLevels:
+          type: array
+          readOnly: true
+          items: { $ref: "#/components/schemas/RequestLevel" }
+        tmdbConfigured:
+          type: boolean
+          readOnly: true
+          description: Whether a TMDB key is available. Without one, titles outside the library cannot be looked up and requests are off.
     APIKey:
       type: object
       properties:
@@ -2537,6 +3025,7 @@ components:
         createdAt: { type: string }
         updatedAt: { type: string }
         restricted: { type: boolean, description: "Seen only by the users and groups in its access (GET /libraries/{id}/access); otherwise open to everyone" }
+        fullScanQueued: { type: boolean, description: "A full rescan is queued for a quiet time (PUT /libraries/{id}/scan/queued); absent when not" }
         storage:
           type: object
           description: >

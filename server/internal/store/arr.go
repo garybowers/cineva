@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -26,6 +27,27 @@ type ArrConnection struct {
 	Version        string `json:"version"`
 	CreatedAt      string `json:"createdAt"`
 	UpdatedAt      string `json:"updatedAt"`
+
+	// QualityProfileID and RootFolder are what requests sent to this
+	// instance are made with, chosen from the instance's own lists; 0 and
+	// "" until an admin picks, when the instance's first is used.
+	QualityProfileID int    `json:"qualityProfileId"`
+	RootFolder       string `json:"rootFolder"`
+	// PathMaps translate the instance's paths into Cineva's, for an
+	// instance that sees the media through other mount points.
+	PathMaps []PathMap `json:"pathMaps"`
+	// LastEvent is the type of the last webhook delivery ("Download"),
+	// LastEventTitle what it was about ("Show S02E04"), LastEventAt when.
+	LastEvent      string `json:"lastEvent,omitempty"`
+	LastEventTitle string `json:"lastEventTitle,omitempty"`
+	LastEventAt    string `json:"lastEventAt,omitempty"`
+}
+
+// PathMap is one translation from an instance's path prefix to Cineva's:
+// Sonarr in a container sees /tv where Cineva sees /mnt/media/TV.
+type PathMap struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 type ArrRepo interface {
@@ -34,16 +56,30 @@ type ArrRepo interface {
 	CreateArrConnection(ctx context.Context, c ArrConnection) (ArrConnection, error)
 	UpdateArrConnection(ctx context.Context, c ArrConnection) (ArrConnection, error)
 	DeleteArrConnection(ctx context.Context, id string) error
+	SetArrOptions(ctx context.Context, id string, qualityProfileID int, rootFolder string, maps []PathMap) error
+	RecordArrEvent(ctx context.Context, id, event, title string) error
 }
 
 const arrCols = `id, kind, name, url, api_key, callback_url, secret_hash,
-	notification_id, version, created_at, updated_at`
+	notification_id, version, created_at, updated_at,
+	quality_profile_id, root_folder, path_maps, last_event, last_event_title, last_event_at`
 
 func scanArr(row interface{ Scan(...any) error }) (ArrConnection, error) {
 	var c ArrConnection
+	var maps string
 	err := row.Scan(&c.ID, &c.Kind, &c.Name, &c.URL, &c.APIKey, &c.CallbackURL, &c.SecretHash,
-		&c.NotificationID, &c.Version, &c.CreatedAt, &c.UpdatedAt)
-	return c, err
+		&c.NotificationID, &c.Version, &c.CreatedAt, &c.UpdatedAt,
+		&c.QualityProfileID, &c.RootFolder, &maps, &c.LastEvent, &c.LastEventTitle, &c.LastEventAt)
+	if err != nil {
+		return c, err
+	}
+	c.PathMaps = []PathMap{}
+	if maps != "" {
+		if err := json.Unmarshal([]byte(maps), &c.PathMaps); err != nil {
+			return c, fmt.Errorf("path maps of %s: %w", c.ID, err)
+		}
+	}
+	return c, nil
 }
 
 func (s *Store) ArrConnections(ctx context.Context) ([]ArrConnection, error) {
@@ -117,6 +153,41 @@ func (s *Store) DeleteArrConnection(ctx context.Context, id string) error {
 		return fmt.Errorf("delete arr connection: %w", err)
 	} else if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// SetArrOptions saves what requests are made with and how the instance's
+// paths map onto Cineva's. Nothing here is sent to the instance, so it is
+// kept apart from UpdateArrConnection, which re-registers the webhook.
+func (s *Store) SetArrOptions(ctx context.Context, id string, qualityProfileID int, rootFolder string, maps []PathMap) error {
+	if maps == nil {
+		maps = []PathMap{}
+	}
+	raw, err := json.Marshal(maps)
+	if err != nil {
+		return fmt.Errorf("encode path maps: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE arr_connections SET
+		quality_profile_id = ?, root_folder = ?, path_maps = ?, updated_at = datetime('now')
+		WHERE id = ?`, qualityProfileID, rootFolder, string(raw), id)
+	if err != nil {
+		return fmt.Errorf("set arr options: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("set arr options: %w", err)
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordArrEvent notes the latest webhook delivery from an instance.
+func (s *Store) RecordArrEvent(ctx context.Context, id, event, title string) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE arr_connections SET
+		last_event = ?, last_event_title = ?, last_event_at = datetime('now') WHERE id = ?`,
+		event, title, id); err != nil {
+		return fmt.Errorf("record arr event: %w", err)
 	}
 	return nil
 }

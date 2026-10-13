@@ -1,6 +1,7 @@
 // Package arr talks to Sonarr and Radarr: enough of their v3 API to check a
-// connection and register a webhook in it, and the shape of the events that
-// webhook delivers.
+// connection and register a webhook in it, the shape of the events that
+// webhook delivers, and the calls a request needs — adding or monitoring a
+// film or series and searching for it.
 //
 // Both apps share one API surface for this — system status and the
 // notification ("Connect") providers — so one client serves either.
@@ -73,9 +74,11 @@ type Webhook struct {
 	Password string
 }
 
-// triggers are the events that change what is on disk. Grabs, health and
-// "added to the app" events do not, so they are not subscribed to.
+// triggers are the events that change what is on disk, plus grabs, which
+// tell a request it is downloading. Health and "added to the app" events
+// matter to neither, so they are not subscribed to.
 var triggers = map[string]bool{
+	"onGrab":                        true,
 	"onDownload":                    true, // includes upgrades in older versions
 	"onUpgrade":                     true,
 	"onImportComplete":              true,

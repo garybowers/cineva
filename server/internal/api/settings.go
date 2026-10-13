@@ -13,6 +13,8 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/requests"
+	"github.com/garybowers/cineva/server/internal/store"
 )
 
 // Runtime settings (admin UI). Each has a config-file default and a
@@ -140,6 +142,12 @@ type settingsResponse struct {
 	// an operator can see what their hardware offers; h264 remains the
 	// output, being the one codec every browser decodes.
 	HWCodecs []string `json:"hwCodecs,omitempty"`
+	// RequestDefaultLevel is the request level new accounts start at, one
+	// of RequestLevels. TMDBConfigured says whether titles outside the
+	// library can be looked up at all, without which requests are off.
+	RequestDefaultLevel string   `json:"requestDefaultLevel"`
+	RequestLevels       []string `json:"requestLevels"`
+	TMDBConfigured      bool     `json:"tmdbConfigured"`
 }
 
 // certRegion reads the configured region, defaulting to GB.
@@ -199,6 +207,10 @@ func (s *server) getSettings(c echo.Context) error {
 		DetectionMode:        sched.Mode,
 		DetectionWindowStart: formatClock(sched.Start),
 		DetectionWindowEnd:   formatClock(sched.End),
+
+		RequestDefaultLevel: s.requests.DefaultLevelFor(c.Request().Context()),
+		RequestLevels:       store.RequestLevels,
+		TMDBConfigured:      s.requests.Discover != nil,
 	})
 }
 
@@ -214,6 +226,8 @@ func (s *server) putSettings(c echo.Context) error {
 		DetectionMode        *string `json:"detectionMode"`
 		DetectionWindowStart *string `json:"detectionWindowStart"`
 		DetectionWindowEnd   *string `json:"detectionWindowEnd"`
+		// One of store.RequestLevels.
+		RequestDefaultLevel *string `json:"requestDefaultLevel"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -300,6 +314,16 @@ func (s *server) putSettings(c echo.Context) error {
 		}
 		s.background.SetSchedule(sched)
 		s.audit(c, "settings.update", "settings", settingDetectionMode, "Detection schedule", sched.Mode+" "+window)
+	}
+	if req.RequestDefaultLevel != nil {
+		level := *req.RequestDefaultLevel
+		if !slices.Contains(store.RequestLevels, level) {
+			return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("requestDefaultLevel must be one of %v", store.RequestLevels))
+		}
+		if err := s.store.SetSetting(c.Request().Context(), requests.SettingDefaultLevel, level); err != nil {
+			return err
+		}
+		s.audit(c, "settings.update", "settings", requests.SettingDefaultLevel, "Default request level", level)
 	}
 	s.events.Publish(events.Event{Type: "settings"})
 	return s.getSettings(c)

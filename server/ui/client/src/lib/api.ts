@@ -221,6 +221,8 @@ export interface User {
   /** The theme token the initial is drawn on; absent for the default. */
   avatarColour?: AvatarColour
   libraryIds: string[]
+  /** What happens to this user's requests (admins are always auto). */
+  requestLevel?: 'none' | 'approval' | 'auto'
 }
 export interface Profile {
   id: string
@@ -562,3 +564,125 @@ export const libraryCollections = (id: string) =>
 export const collectionDetail = (id: string, key: string) =>
   req<CollectionDetail>(`/libraries/${id}/collections/${encodeURIComponent(key)}`)
 
+
+// ---- Requests: titles outside the library, from TMDB, sent to Sonarr/Radarr ----
+export type RequestState = 'requested' | 'approved' | 'downloading' | 'available' | 'declined'
+/** Whether request screens are worth showing, and for which kinds. */
+export interface RequestStatus {
+  level: 'none' | 'approval' | 'auto'
+  movies: boolean
+  tv: boolean
+  tmdb: boolean
+  enabled: boolean
+}
+export interface EpisodeRef {
+  season: number
+  episode: number
+}
+export interface MediaRequest {
+  id: string
+  userId: string
+  userName: string
+  mediaType: 'movie' | 'tv'
+  tmdbId: number
+  title: string
+  year?: number
+  poster?: string
+  backdrop?: string
+  seasons: number[]
+  episodes: EpisodeRef[]
+  status: RequestState
+  /** The admin's word on approving or declining. */
+  note?: string
+  /** Why it could not be sent; it waits for an admin meanwhile. */
+  error?: string
+  createdAt: string
+  updatedAt: string
+}
+/** A search result outside the library. */
+export interface DiscoverResult {
+  mediaType: 'movie' | 'tv'
+  tmdbId: number
+  title: string
+  year?: number
+  overview?: string
+  poster?: string
+  backdrop?: string
+  /** Status of the newest open request for it. */
+  request?: RequestState
+}
+export interface DiscoverCredit {
+  tmdbId: number
+  name: string
+  role?: string
+  profile?: string
+}
+export interface DiscoverSeason {
+  seasonNumber: number
+  name: string
+  episodeCount: number
+  airDate?: string
+  poster?: string
+  /** Episodes of it on disk. */
+  held: number
+  request?: RequestState
+}
+/** A film or series page driven by TMDB. */
+export interface DiscoverTitle {
+  mediaType: 'movie' | 'tv'
+  tmdbId: number
+  title: string
+  originalTitle?: string
+  year?: number
+  overview?: string
+  tagline?: string
+  poster?: string
+  backdrop?: string
+  genres: string[]
+  rating?: number
+  voteCount?: number
+  runtimeMins?: number
+  certification?: string
+  status?: string
+  network?: string
+  cast: DiscoverCredit[]
+  crew: DiscoverCredit[]
+  seasons?: DiscoverSeason[]
+  /** The library item, when this viewer can see one. */
+  itemId?: string
+  requests: MediaRequest[]
+  canRequest: boolean
+}
+export interface MissingEpisode {
+  season: number
+  episode: number
+  title: string
+  airDate?: string
+  status: 'missing' | 'upcoming'
+  monitored: boolean
+}
+export interface MissingSeason {
+  seasonNumber: number
+  held: number
+  total: number
+  episodes: MissingEpisode[]
+}
+/** What a series is missing by Sonarr's account. */
+export interface MissingInfo {
+  /** The series' TMDB id, which a request for its gaps names. */
+  tmdbId: number
+  managed: boolean
+  connection?: string
+  seasons: MissingSeason[]
+  requests: MediaRequest[]
+}
+export const requestStatus = () => get<RequestStatus>('/requests/status')
+export const discoverSearch = (q: string) => get<DiscoverResult[]>(`/discover/search?q=${encodeURIComponent(q)}`)
+export const discoverTitle = (type: 'movie' | 'tv', tmdbId: number) => get<DiscoverTitle>(`/discover/${type}/${tmdbId}`)
+export const listRequests = (all = false) => get<MediaRequest[]>(`/requests${all ? '?all=1' : ''}`)
+export const createRequest = (r: { mediaType: 'movie' | 'tv'; tmdbId: number; seasons?: number[]; episodes?: EpisodeRef[] }) =>
+  post<MediaRequest>('/requests', r)
+export const withdrawRequest = (id: string) => req<void>(`/requests/${id}`, { method: 'DELETE' })
+export const itemMissing = (id: string) => get<MissingInfo>(`/items/${id}/missing`)
+export const searchMissing = (id: string, seasons: number[], episodes: EpisodeRef[]) =>
+  post<void>(`/items/${id}/missing/search`, { seasons, episodes })

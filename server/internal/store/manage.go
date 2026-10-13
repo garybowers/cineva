@@ -31,15 +31,16 @@ type ManagePage struct {
 // "matching" means. The same rows as ItemsByLibrary: every kind, primaries
 // only.
 //
-// LIKE is case-insensitive for ASCII in SQLite, which covers titles and
-// paths well enough; the query's own % and _ are escaped so a path such as
-// "the_thing" matches literally rather than as a pattern.
+// The match is case-insensitive across Unicode, not just ASCII as SQLite's
+// own LIKE is (see unifold), and the query's own % and _ are escaped so a
+// path such as "the_thing" matches literally rather than as a pattern.
 func manageWhere(libraryID string, f ManageFilter) (string, []any) {
 	where := `library_id = ? AND version_of = ''`
 	args := []any{libraryID}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		where += ` AND (title LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\')`
-		pat := "%" + likeEscaper.Replace(q) + "%"
+		where += ` AND (` + foldedCol("title", q) + ` LIKE ? ESCAPE '\' OR ` +
+			foldedCol("path", q) + ` LIKE ? ESCAPE '\')`
+		pat := likeContains(q)
 		args = append(args, pat, pat)
 	}
 	if f.Unmatched {
@@ -47,8 +48,6 @@ func manageWhere(libraryID string, f ManageFilter) (string, []any) {
 	}
 	return where, args
 }
-
-var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // ManageItems returns one page of a library's items for the admin's Manage
 // list, in the same order as ItemsByLibrary, with the counts the screen

@@ -30,6 +30,8 @@ type libraryResponse struct {
 	// Storage is whether the library's folders can be reached, so a client
 	// can say so instead of offering titles that cannot play.
 	Storage library.StorageStatus `json:"storage"`
+	// FullScanQueued says a full rescan is waiting for a quiet time.
+	FullScanQueued bool `json:"fullScanQueued,omitempty"`
 }
 
 // PATCH /libraries/:id (admin) — rename, or change which paths it covers.
@@ -97,6 +99,7 @@ func (s *server) listLibraries(c echo.Context) error {
 		// Whether a scan is running, so a client that loads mid-scan shows
 		// the right empty state without waiting for the next event.
 		resp.Scanning = s.manager.Scanning(lib.ID)
+		resp.FullScanQueued = s.manager.FullScanQueued(lib.ID)
 		if s.storage != nil {
 			resp.Storage = s.storage.Status(lib.ID)
 		}
@@ -149,6 +152,37 @@ func (s *server) scanLibrary(c echo.Context) error {
 	}
 	s.audit(c, "scan.start", "library", lib.ID, lib.Name, detail)
 	return c.JSON(http.StatusAccepted, scan)
+}
+
+// PUT /libraries/:id/scan/queued — queue a full rescan for a quiet time:
+// the background work window, once nothing is playing. A full rescan
+// rereads every file, which is hours of reading on a large library.
+func (s *server) queueFullScan(c echo.Context) error {
+	ctx := c.Request().Context()
+	lib, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	if err := s.manager.QueueFullScan(ctx, lib); err != nil {
+		return err
+	}
+	s.audit(c, "scan.queue", "library", lib.ID, lib.Name, "full rescan at a quiet time")
+	return c.NoContent(http.StatusNoContent)
+}
+
+// DELETE /libraries/:id/scan/queued — take a queued full rescan off the
+// queue.
+func (s *server) cancelQueuedFullScan(c echo.Context) error {
+	ctx := c.Request().Context()
+	lib, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	if err := s.manager.CancelQueuedFullScan(ctx, lib.ID); err != nil {
+		return err
+	}
+	s.audit(c, "scan.unqueue", "library", lib.ID, lib.Name, "")
+	return c.NoContent(http.StatusNoContent)
 }
 
 // POST /scans/:id/cancel — stop a running scan (or clear a stale one).

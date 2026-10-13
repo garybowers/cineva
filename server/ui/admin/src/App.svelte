@@ -2,10 +2,13 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
+    queueFullScan, cancelQueuedFullScan,
     listGroups, createGroup, updateGroup, deleteGroup, getLibraryAccess, setLibraryAccess,
     type UserGroup, type LibraryAccess,
     listIntegrations, createIntegration, updateIntegration, deleteIntegration,
     type Integration, type IntegrationKind, type IntegrationRequest,
+    integrationStatus, setIntegrationOptions, type IntegrationStatus, type PathMap,
+    listRequests, approveRequest, declineRequest, deleteRequest, type MediaRequest, type RequestLevel, type RequestState,
     pauseSegments, resumeSegments, runSegments, previewStatus, type PreviewStatus,
     cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
     libraryManage, type ManageFilter, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
@@ -56,11 +59,12 @@
     else newPaths = final
   }
 
-  type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'logs' | 'integrations' | 'settings'
+  type Page = 'dashboard' | 'libraries' | 'users' | 'requests' | 'activity' | 'logs' | 'integrations' | 'settings'
   const pages: { id: Page; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'libraries', label: 'Libraries' },
     { id: 'users', label: 'Users' },
+    { id: 'requests', label: 'Requests' },
     { id: 'activity', label: 'Activity' },
     { id: 'logs', label: 'Logs' },
     { id: 'integrations', label: 'Integrations' },
@@ -130,6 +134,17 @@
     DK: 'Denmark', FI: 'Finland',
   }
   const regionName = (code: string) => regionNames[code] ?? code
+
+  async function setRequestDefault(level: RequestLevel) {
+    const before = settings
+    if (settings) settings = { ...settings, requestDefaultLevel: level } // optimistic
+    try {
+      settings = await putSettings({ requestDefaultLevel: level })
+    } catch (err) {
+      settings = before
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
 
   async function setCertRegion(region: string) {
     const before = settings
@@ -204,11 +219,11 @@
   let userErr = $state('')
   let userSaving = $state(false)
   function newUser() {
-    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false }
+    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false, requestLevel: settings?.requestDefaultLevel ?? 'approval' }
     userErr = ''
   }
   function editUser(u: User) {
-    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled }
+    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled, requestLevel: u.requestLevel }
     userErr = ''
     editDevices = []
     userDevices(u.id).then((d) => (editDevices = d)).catch(() => {})
@@ -361,6 +376,152 @@
       loadIntegrations()
     } catch (err) {
       intNote = String(err instanceof Error ? err.message : err)
+    }
+  }
+
+  // A connection checked live: version, health, and what requests can be
+  // made with. Run for every card when the page opens, and by Test.
+  let intStatus: Record<string, IntegrationStatus | 'checking'> = $state({})
+  const unreachable = (error: string): IntegrationStatus => ({
+    reachable: false, error, health: [], qualityProfiles: [], rootFolders: [], suggestedPathMaps: [],
+  })
+  async function testIntegration(i: Integration) {
+    intStatus = { ...intStatus, [i.id]: 'checking' }
+    let st: IntegrationStatus
+    try {
+      st = await integrationStatus(i.id)
+    } catch (err) {
+      st = unreachable(String(err instanceof Error ? err.message : err))
+    }
+    intStatus = { ...intStatus, [i.id]: st }
+  }
+  const checked = (id: string): IntegrationStatus | null => {
+    const st = intStatus[id]
+    return st && st !== 'checking' ? st : null
+  }
+  let intTested = false
+  $effect(() => {
+    if (page !== 'integrations' || intTested || integrations.length === 0) return
+    intTested = true
+    for (const i of integrations) void testIntegration(i)
+  })
+
+  // What requests are made with, and how the instance's paths map onto
+  // Cineva's. Saved without touching the webhook.
+  let optsFor: { id: string; qualityProfileId: number; rootFolder: string; pathMaps: PathMap[] } | null = $state(null)
+  let optsErr = $state('')
+  let optsSaving = $state(false)
+  function editOptions(i: Integration) {
+    optsFor = { id: i.id, qualityProfileId: i.qualityProfileId, rootFolder: i.rootFolder, pathMaps: i.pathMaps.map((m) => ({ ...m })) }
+    optsErr = ''
+    if (!checked(i.id)) void testIntegration(i)
+  }
+  function addSuggested(maps: PathMap[]) {
+    if (!optsFor) return
+    const have = new Set(optsFor.pathMaps.map((m) => m.from))
+    optsFor.pathMaps = [...optsFor.pathMaps, ...maps.filter((m) => !have.has(m.from)).map((m) => ({ ...m }))]
+  }
+  async function saveOptions(e: Event) {
+    e.preventDefault()
+    if (!optsFor) return
+    optsSaving = true
+    optsErr = ''
+    try {
+      const { id, ...body } = optsFor
+      await setIntegrationOptions(id, body)
+      optsFor = null
+      loadIntegrations()
+    } catch (err) {
+      optsErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      optsSaving = false
+    }
+  }
+  // SQLite's datetime('now') is UTC without a zone; say so before parsing.
+  const utc = (s: string) => (s.includes('T') ? s : s.replace(' ', 'T') + 'Z')
+  const freeSpace = (bytes: number) =>
+    bytes >= 1e12 ? `${(bytes / 1e12).toFixed(1)} TB free` : `${Math.round(bytes / 1e9)} GB free`
+
+  // ---- Requests: titles users asked for ----
+  // Waiting ones lead, with Approve and Decline; the rest are history.
+  let requestsList: MediaRequest[] = $state([])
+  const pendingRequests = $derived(requestsList.filter((r) => r.status === 'requested'))
+  const pastRequests = $derived(requestsList.filter((r) => r.status !== 'requested').slice(0, 60))
+  let deciding: {
+    id: string; mode: 'approve' | 'decline'; note: string
+    connectionId: string; qualityProfileId: number; rootFolder: string
+  } | null = $state(null)
+  let reqErr = $state('')
+  let reqBusy = $state(false)
+  const requestStatusLabel: Record<RequestState, string> = {
+    requested: 'Waiting', approved: 'Approved', downloading: 'Downloading', available: 'Available', declined: 'Declined',
+  }
+  const levelLabel: Record<RequestLevel, string> = {
+    none: 'No requests', approval: 'Needs approval', auto: 'Sent straight away',
+  }
+  const connsFor = (r: MediaRequest) => integrations.filter((i) => i.kind === (r.mediaType === 'movie' ? 'radarr' : 'sonarr'))
+  function scopeLabel(r: MediaRequest): string {
+    if (r.mediaType === 'movie') return 'Film'
+    const parts: string[] = []
+    if (r.seasons.length) parts.push(`${r.seasons.length === 1 ? 'Season' : 'Seasons'} ${r.seasons.join(', ')}`)
+    if (r.episodes.length) {
+      parts.push(r.episodes.map((e) => `S${String(e.season).padStart(2, '0')}E${String(e.episode).padStart(2, '0')}`).join(', '))
+    }
+    return parts.length ? parts.join(' · ') : 'Whole series'
+  }
+  async function loadRequests() {
+    try {
+      requestsList = await listRequests()
+    } catch {
+      /* the page shows what it last had */
+    }
+  }
+  function startDecision(r: MediaRequest, mode: 'approve' | 'decline') {
+    const conn = connsFor(r).find((c) => c.id === r.connectionId) ?? connsFor(r)[0]
+    deciding = {
+      id: r.id, mode, note: '',
+      connectionId: conn?.id ?? '', qualityProfileId: conn?.qualityProfileId ?? 0, rootFolder: conn?.rootFolder ?? '',
+    }
+    reqErr = ''
+    if (mode === 'approve' && conn && !checked(conn.id)) void testIntegration(conn)
+  }
+  function pickDecisionConn(id: string) {
+    if (!deciding) return
+    const conn = integrations.find((c) => c.id === id)
+    deciding = { ...deciding, connectionId: id, qualityProfileId: conn?.qualityProfileId ?? 0, rootFolder: conn?.rootFolder ?? '' }
+    if (conn && !checked(conn.id)) void testIntegration(conn)
+  }
+  async function submitDecision(e: Event) {
+    e.preventDefault()
+    if (!deciding) return
+    reqBusy = true
+    reqErr = ''
+    try {
+      if (deciding.mode === 'approve') {
+        await approveRequest(deciding.id, {
+          connectionId: deciding.connectionId || undefined,
+          qualityProfileId: deciding.qualityProfileId || undefined,
+          rootFolder: deciding.rootFolder || undefined,
+          note: deciding.note.trim() || undefined,
+        })
+      } else {
+        await declineRequest(deciding.id, deciding.note.trim())
+      }
+      deciding = null
+    } catch (err) {
+      reqErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      reqBusy = false
+      loadRequests()
+    }
+  }
+  async function removeRequest(r: MediaRequest) {
+    if (!confirm(`Remove the request for ${r.title}? Nothing is changed in ${r.mediaType === 'movie' ? 'Radarr' : 'Sonarr'}.`)) return
+    try {
+      await deleteRequest(r.id)
+      loadRequests()
+    } catch (err) {
+      error = String(err instanceof Error ? err.message : err)
     }
   }
 
@@ -604,6 +765,19 @@
     try {
       const s = await scanLibrary(lib.id, full)
       if (!scans.some((x) => x.id === s.id)) scans = [s, ...scans]
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  // A full rescan reads every file, so it can wait for the background work
+  // window instead of starting now; the "libraries" event refreshes the flag.
+  async function toggleQueuedScan(lib: Library) {
+    error = ''
+    const queued = !lib.fullScanQueued
+    try {
+      await (queued ? queueFullScan(lib.id) : cancelQueuedFullScan(lib.id))
+      libraries = libraries.map((l) => (l.id === lib.id ? { ...l, fullScanQueued: queued } : l))
     } catch (e) {
       error = String(e instanceof Error ? e.message : e)
     }
@@ -1242,6 +1416,7 @@
     loadUsers()
     loadGroups()
     loadIntegrations()
+    loadRequests()
     loadSettings()
     segmentStatus().then((s) => (intro = s)).catch(() => {})
     previewStatus().then((p) => (previews = p)).catch(() => {})
@@ -1275,6 +1450,8 @@
         stats: onSample,
         logs: () => { if (!logsLoading) loadLogs() },
         users: () => { loadUsers(); loadGroups() },
+        requests: loadRequests,
+        integrations: loadIntegrations,
         settings: loadSettings,
         sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
@@ -1318,7 +1495,7 @@
       const rest = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
       const parts = rest.split('/').filter(Boolean).map(decodeURIComponent)
       const [first, second] = parts
-      const pages: Page[] = ['dashboard', 'libraries', 'users', 'activity', 'logs', 'integrations', 'settings']
+      const pages: Page[] = ['dashboard', 'libraries', 'users', 'requests', 'activity', 'logs', 'integrations', 'settings']
       const target = pages.includes(first as Page) ? (first as Page) : 'dashboard'
       page = target
       if (target === 'libraries' && second) {
@@ -1395,7 +1572,9 @@
     <div class="logo">Cineva <span>admin</span></div>
     <nav>
       {#each pages as p (p.id)}
-        <button class:active={page === p.id} onclick={() => go(p.id)}>{p.label}</button>
+        <button class:active={page === p.id} onclick={() => go(p.id)}>
+          {p.label}{#if p.id === 'requests' && pendingRequests.length > 0}<span class="navcount" title="{pendingRequests.length} waiting for a decision">{pendingRequests.length}</span>{/if}
+        </button>
       {/each}
     </nav>
     {#if me}<div class="who">{me.displayName} <button onclick={signOut}>Sign out</button></div>{/if}
@@ -1940,6 +2119,9 @@
                     {#if lib.storage && !lib.storage.available}
                       <div class="storage-down">Storage unreachable{#if lib.storage.since} (went down {since(lib.storage.since)}){/if}: {lib.storage.path} — {lib.storage.error}</div>
                     {/if}
+                    {#if lib.fullScanQueued}
+                      <div class="muted small">Full rescan queued for the background work window</div>
+                    {/if}
                   </td>
                   <td><span class="tag">{lib.mediaType}</span></td>
                   <td class="muted">{lib.paths.join(', ')}</td>
@@ -1951,6 +2133,12 @@
                     <button onclick={() => openAccess(lib)}>Access…</button>
                     <button onclick={() => startScan(lib)} title="Read new and changed files">Scan</button>
                     <button onclick={() => startScan(lib, true)} title="Reread and rematch every file — slow, but picks up new metadata">Full rescan</button>
+                    <button
+                      onclick={() => toggleQueuedScan(lib)}
+                      title={lib.fullScanQueued
+                        ? 'Take the queued full rescan off the queue'
+                        : 'Start a full rescan in the background work window, once nothing is playing'}
+                    >{lib.fullScanQueued ? 'Cancel tonight’s rescan' : 'Full rescan tonight'}</button>
                     <button class="danger" onclick={() => removeLibrary(lib)}>Delete</button>
                   </td>
                 </tr>
@@ -2013,6 +2201,18 @@
           {:else}
             <p class="hint">Admins see every library and can manage the server.</p>
           {/if}
+          {#if editing.role !== 'admin'}
+            <label>Requests
+              <select bind:value={editing.requestLevel}>
+                <option value="none">{levelLabel.none}</option>
+                <option value="approval">{levelLabel.approval}</option>
+                <option value="auto">{levelLabel.auto}</option>
+              </select>
+            </label>
+            <p class="hint">What happens when they ask for a film or series that is not in the library: nothing (no request screens at all), a request waiting on the Requests page for you to approve, or sent straight to Sonarr or Radarr.</p>
+          {:else}
+            <p class="hint">Admins' requests always go straight to Sonarr or Radarr.</p>
+          {/if}
           {#if editing.id && editing.id !== me?.id}
             <label class="check"><input type="checkbox" bind:checked={editing.disabled} /> Disabled (cannot sign in)</label>
           {/if}
@@ -2042,7 +2242,7 @@
       {/if}
       <div class="tablewrap">
         <table>
-          <thead><tr><th>User</th><th>Role</th><th>Libraries</th><th>Created</th><th></th></tr></thead>
+          <thead><tr><th>User</th><th>Role</th><th>Libraries</th><th>Requests</th><th>Created</th><th></th></tr></thead>
           <tbody>
             {#each users as u (u.id)}
               <tr>
@@ -2057,6 +2257,7 @@
                 </td>
                 <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span>{#if u.hasPin}<span class="tag pin">PIN</span>{/if}{#if !u.hasPassword}<span class="muted small"> no password</span>{/if}</td>
                 <td class="muted">{u.role === 'admin' ? 'all' : u.libraryIds.map(libName).join(', ') || 'none'}</td>
+                <td class="muted nowrap">{u.role === 'admin' ? levelLabel.auto : levelLabel[u.requestLevel] ?? u.requestLevel}</td>
                 <td class="muted">{u.createdAt.slice(0, 10)}</td>
                 <td class="actions">
                   <button onclick={() => editUser(u)}>Edit</button>
@@ -2108,6 +2309,97 @@
           </table>
         </div>
       {/if}
+    {:else if page === 'requests'}
+      <div class="titlerow">
+        <h1>Requests</h1>
+      </div>
+      <p class="hint intro">Films and series people asked for. Approving sends a request to Radarr or Sonarr with the connection's quality profile and folder, unless you choose others here; it then shows as downloading when they grab it, and available once a scan finds it.</p>
+      {#if settings && !settings.tmdbConfigured}
+        <div class="error slim">No TMDB key is configured, so nobody can look up titles outside the library. Set metadata.tmdb.api_key (CINEVA_METADATA_TMDB_API_KEY) and restart.</div>
+      {:else if !integrations.some((i) => i.kind === 'radarr') && !integrations.some((i) => i.kind === 'sonarr')}
+        <div class="panel muted">Connect Radarr or Sonarr on the <button class="linkbtn" onclick={() => go('integrations')}>Integrations</button> page to let people request what is not in the library.</div>
+      {/if}
+      {#if reqErr}<div class="error slim">{reqErr}</div>{/if}
+      <h2>Waiting for you ({pendingRequests.length})</h2>
+      {#if pendingRequests.length === 0}
+        <div class="panel muted">Nothing waiting.</div>
+      {/if}
+      <div class="reqlist">
+        {#each pendingRequests as r (r.id)}
+          <div class="panel reqcard">
+            {#if r.poster}<img class="reqposter" src={r.poster} alt="" loading="lazy" />{:else}<span class="reqposter ph"></span>{/if}
+            <div class="reqbody">
+              <div class="reqtitle"><strong>{r.title}</strong>{#if r.year}{' '}<span class="muted">({r.year})</span>{/if}</div>
+              <div class="muted small">{scopeLabel(r)} · asked by {r.userName || userName(r.userId)} {since(utc(r.createdAt))}</div>
+              {#if r.error}<div class="reqerr small">Could not be sent: {r.error}</div>{/if}
+              {#if deciding?.id === r.id}
+                <form class="form reqform" onsubmit={submitDecision}>
+                  {#if deciding.mode === 'approve'}
+                    {@const conns = connsFor(r)}
+                    {@const st = checked(deciding.connectionId)}
+                    {#if conns.length > 1}
+                      <label>Send to
+                        <select value={deciding.connectionId} onchange={(e) => pickDecisionConn((e.currentTarget as HTMLSelectElement).value)}>
+                          {#each conns as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
+                        </select>
+                      </label>
+                    {/if}
+                    <label>Quality profile
+                      <select bind:value={deciding.qualityProfileId}>
+                        <option value={0}>The connection's default</option>
+                        {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
+                      </select>
+                    </label>
+                    <label>Folder
+                      <select bind:value={deciding.rootFolder}>
+                        <option value="">The connection's default</option>
+                        {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path}</option>{/each}
+                      </select>
+                    </label>
+                    {#if intStatus[deciding.connectionId] === 'checking'}<span class="hint">Asking {conns.find((c) => c.id === deciding?.connectionId)?.name ?? 'the instance'} for its profiles…</span>{/if}
+                  {/if}
+                  <label>Note <span class="muted small">— optional, shown to {r.userName || 'them'}</span>
+                    <input bind:value={deciding.note} placeholder={deciding.mode === 'approve' ? 'Enjoy' : 'Already on the shelf'} />
+                  </label>
+                  <div class="formrow">
+                    <button class="primary" type="submit" disabled={reqBusy}>
+                      {reqBusy ? (deciding.mode === 'approve' ? 'Sending…' : 'Declining…') : deciding.mode === 'approve' ? 'Approve and send' : 'Decline'}
+                    </button>
+                    <button type="button" onclick={() => (deciding = null)}>Cancel</button>
+                  </div>
+                </form>
+              {:else}
+                <div class="formrow wrap">
+                  <button class="primary" onclick={() => startDecision(r, 'approve')}>{r.error ? 'Try again' : 'Approve'}</button>
+                  <button onclick={() => startDecision(r, 'decline')}>Decline</button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+      {#if pastRequests.length > 0}
+        <h2>Recent</h2>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Title</th><th>Asked by</th><th>Status</th><th>When</th><th></th></tr></thead>
+            <tbody>
+              {#each pastRequests as r (r.id)}
+                <tr>
+                  <td>
+                    <div>{r.title}{#if r.year}{' '}<span class="muted">({r.year})</span>{/if}</div>
+                    <div class="muted small">{scopeLabel(r)}{#if r.note}{' · '}“{r.note}”{/if}</div>
+                  </td>
+                  <td class="muted">{r.userName || userName(r.userId)}</td>
+                  <td><span class="tag" class:ok={r.status === 'available'} class:bad={r.status === 'declined'}>{requestStatusLabel[r.status]}</span></td>
+                  <td class="muted nowrap">{since(utc(r.updatedAt))}</td>
+                  <td class="actions"><button class="danger" onclick={() => removeRequest(r)}>Remove</button></td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     {:else if page === 'integrations'}
       <div class="titlerow">
         <h1>Integrations</h1>
@@ -2116,7 +2408,10 @@
           <button class="primary" onclick={() => newIntegration('radarr')}>+ Add Radarr</button>
         </div>
       </div>
-      <p class="hint intro">Cineva registers a webhook in each connected Sonarr or Radarr, so an episode or film they import is scanned in within seconds rather than at the next scheduled rescan.</p>
+      <p class="hint intro">Cineva registers a webhook in each connected Sonarr or Radarr, so an episode or film they import is scanned in within seconds rather than at the next scheduled rescan. They also take the requests people make for titles not in the library.</p>
+      {#if settings && !settings.tmdbConfigured}
+        <div class="error slim">No TMDB key is configured, so requests are off: titles outside the library cannot be looked up. Set metadata.tmdb.api_key (CINEVA_METADATA_TMDB_API_KEY) and restart.</div>
+      {/if}
       {#if intNote}<div class="error slim">{intNote}</div>{/if}
       {#if editingInt}
         <form class="panel form wide" onsubmit={saveIntegration}>
@@ -2156,7 +2451,73 @@
               {#if i.version}<span class="muted"> v{i.version}</span>{/if}
             </div>
             <div class="muted small inturl">Calls back to {i.callbackUrl}</div>
-            <div class="formrow">
+            {#if intStatus[i.id] === 'checking'}
+              <div class="muted small">Checking…</div>
+            {:else if checked(i.id)}
+              {@const st = checked(i.id) as IntegrationStatus}
+              <div class="small">
+                {#if st.reachable}<span class="tag ok">Reachable</span>{:else}<span class="tag bad">Unreachable</span>{/if}
+              </div>
+              {#if st.error}<div class="small reqerr inturl">{st.error}</div>{/if}
+              {#each st.health.filter((h) => h.type !== 'ok') as h (h.source + h.message)}
+                <div class="small inturl"><span class="tag" class:bad={h.type === 'error'}>{h.type}</span> <span class="muted">{h.message}</span></div>
+              {/each}
+            {/if}
+            <div class="muted small">
+              {#if i.lastEventAt}
+                Last event: {i.lastEvent}{#if i.lastEventTitle}{' · '}{i.lastEventTitle}{/if}{' · '}{since(utc(i.lastEventAt))}
+              {:else}
+                No events received yet
+              {/if}
+            </div>
+            <div class="muted small inturl">
+              Requests: {checked(i.id)?.qualityProfiles.find((q) => q.id === i.qualityProfileId)?.name ?? (i.qualityProfileId ? `profile ${i.qualityProfileId}` : 'first quality profile')}
+              · {i.rootFolder || 'first root folder'}{#if i.pathMaps.length > 0}{' · '}paths mapped: {i.pathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}{/if}
+            </div>
+            {#if optsFor?.id === i.id}
+              {@const st = checked(i.id)}
+              <form class="form reqform" onsubmit={saveOptions}>
+                <label>Quality profile for requests
+                  <select bind:value={optsFor.qualityProfileId}>
+                    <option value={0}>The first one ({st?.qualityProfiles[0]?.name ?? `as ${kindLabel(i.kind)} lists them`})</option>
+                    {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
+                  </select>
+                </label>
+                <label>Folder for requests
+                  <select bind:value={optsFor.rootFolder}>
+                    <option value="">The first one ({st?.rootFolders[0]?.path ?? 'as listed'})</option>
+                    {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path} · {freeSpace(f.freeSpace)}</option>{/each}
+                  </select>
+                </label>
+                <div class="facefield">
+                  <span class="facelabel">Path mapping <span class="muted small">— when {kindLabel(i.kind)} sees the media at other paths than Cineva, as it does in a container</span></span>
+                  {#each optsFor.pathMaps as m, mi (mi)}
+                    <div class="maprow">
+                      <input bind:value={m.from} placeholder="{kindLabel(i.kind)}'s path, e.g. /tv" aria-label="{kindLabel(i.kind)}'s path" />
+                      <span class="muted">→</span>
+                      <input bind:value={m.to} placeholder="Cineva's path, e.g. /mnt/media/TV" aria-label="Cineva's path" />
+                      <button type="button" class="danger" aria-label="Remove this mapping" onclick={() => optsFor && (optsFor.pathMaps = optsFor.pathMaps.filter((_, x) => x !== mi))}>Remove</button>
+                    </div>
+                  {/each}
+                  <div class="formrow wrap">
+                    <button type="button" onclick={() => optsFor && (optsFor.pathMaps = [...optsFor.pathMaps, { from: '', to: '' }])}>+ Add mapping</button>
+                    {#if st && st.suggestedPathMaps.some((sm) => !optsFor?.pathMaps.some((m) => m.from === sm.from))}
+                      <button type="button" onclick={() => st && addSuggested(st.suggestedPathMaps)}>
+                        Use suggested: {st.suggestedPathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+                {#if optsErr}<div class="error slim">{optsErr}</div>{/if}
+                <div class="formrow">
+                  <button class="primary" type="submit" disabled={optsSaving}>{optsSaving ? 'Saving…' : 'Save'}</button>
+                  <button type="button" onclick={() => (optsFor = null)}>Cancel</button>
+                </div>
+              </form>
+            {/if}
+            <div class="formrow wrap">
+              <button onclick={() => testIntegration(i)} disabled={intStatus[i.id] === 'checking'}>Test</button>
+              <button onclick={() => editOptions(i)}>Requests &amp; paths</button>
               <button onclick={() => editIntegration(i)}>Edit</button>
               <button class="danger" onclick={() => removeIntegration(i)}>Disconnect</button>
             </div>
@@ -2403,6 +2764,27 @@
         </div>
         <div class="setting">
           <span>
+            Requests for new accounts
+            <span class="muted small">
+              — what happens when someone asks for a film or series that is
+              not in the library. Set each person's own on the Users page;
+              admins' requests always go straight through.
+              {#if settings && !settings.tmdbConfigured}Requests are off until a TMDB key is configured.{/if}
+            </span>
+          </span>
+          <select
+            class="setting-select"
+            value={settings?.requestDefaultLevel ?? 'approval'}
+            onchange={(e) => setRequestDefault((e.currentTarget as HTMLSelectElement).value as RequestLevel)}
+            aria-label="Request level for new accounts"
+          >
+            {#each settings?.requestLevels ?? ['none', 'approval', 'auto'] as l (l)}
+              <option value={l}>{levelLabel[l as RequestLevel]}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="setting">
+          <span>
             Background work schedule
             <span class="muted small">
               — when intro &amp; credits detection and seek-bar previews may
@@ -2630,6 +3012,23 @@
   .devtext .small { overflow-wrap: anywhere; }
   .addrow { flex-wrap: wrap; justify-content: flex-end; }
   .intro { margin-bottom: 1rem; }
+  .navcount {
+    margin-left: 0.4rem; padding: 0 0.4rem; border-radius: 999px; font-size: 0.72rem; font-weight: 600;
+    background: var(--accent); color: var(--bg);
+  }
+  .linkbtn { color: var(--accent-2); text-decoration: underline; }
+  .reqlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr)); gap: 1rem; }
+  .reqcard { display: flex; gap: 0.9rem; margin-bottom: 0; align-items: flex-start; }
+  .reqposter { width: 4.5rem; aspect-ratio: 2 / 3; flex: none; border-radius: 8px; object-fit: cover; background: var(--bg); }
+  .reqbody { display: flex; flex-direction: column; gap: 0.45rem; min-width: 0; flex: 1; }
+  .reqtitle { overflow-wrap: anywhere; }
+  .reqerr { color: var(--err); }
+  .reqform { max-width: none; margin-top: 0.25rem; }
+  .maprow { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+  .maprow input {
+    flex: 1 1 9rem; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); padding: 0.4rem 0.6rem; font: inherit;
+  }
   .intgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); gap: 1rem; }
   .intcard { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0; }
   .inthead { display: flex; align-items: center; gap: 0.5rem; }

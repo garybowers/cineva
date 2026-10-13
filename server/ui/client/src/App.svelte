@@ -10,6 +10,8 @@
     uploadAvatar, removeAvatar, setAvatarColour, AVATAR_COLOURS, type AvatarColour,
     listDevices, nameDevice, revokeDevice, revokeOtherDevices, saveDeviceQueue, deviceQueue, playOnDevice, type Device,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
+    requestStatus, discoverSearch, discoverTitle, listRequests, createRequest, withdrawRequest, itemMissing, searchMissing,
+    type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
   } from './lib/api'
   import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
@@ -23,9 +25,12 @@
     RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
     Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone, Upload,
+    Inbox, Plus, Clock, CalendarClock,
   } from '@lucide/svelte'
 
-  type Tab = 'home' | 'libraries' | 'queue' | 'settings'
+  // 'requests' and 'discover' (a title outside the library) are reached from
+  // the sidebar and from search; neither is one of the always-there tabs.
+  type Tab = 'home' | 'libraries' | 'queue' | 'settings' | 'requests' | 'discover'
   const tabs = [
     { id: 'home' as Tab, label: 'Home', icon: House },
     { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
@@ -398,6 +403,8 @@
     if (tab === 'home') return '/'
     if (tab === 'queue') return '/queue'
     if (tab === 'settings') return '/settings'
+    if (tab === 'requests') return '/requests'
+    if (tab === 'discover' && discoverKey) return `/discover/${discoverKey.type}/${discoverKey.id}`
     let p = '/libraries'
     if (currentLib) {
       p += '/' + encodeURIComponent(currentLib.name)
@@ -438,6 +445,15 @@
       }
       if (parts[0] === 'queue') {
         tab = 'queue'
+        return
+      }
+      if (parts[0] === 'requests') {
+        tab = 'requests'
+        loadMyRequests()
+        return
+      }
+      if (parts[0] === 'discover' && (parts[1] === 'movie' || parts[1] === 'tv') && Number(parts[2]) > 0) {
+        await openDiscover(parts[1], Number(parts[2]))
         return
       }
       if (parts[0] === 'listening') {
@@ -1288,9 +1304,19 @@
     const q = searchQ.trim()
     if (q.length < 2) {
       searchResults = []
+      discoverResults = []
       return
     }
     searchTimer = setTimeout(async () => {
+      // TMDB is slower than the library, so the library's own results are
+      // not held back for it: the row below them fills in when it answers.
+      if (reqStatus?.enabled) {
+        discoverSearch(q)
+          .then((r) => { if (searchQ.trim() === q) discoverResults = r })
+          .catch(() => (discoverResults = []))
+      } else {
+        discoverResults = []
+      }
       try {
         searchResults = await searchItems(q)
       } catch {
@@ -1302,15 +1328,208 @@
   function clearSearch() {
     searchQ = ''
     searchResults = []
+    discoverResults = []
   }
 
   // Results hang over the page like any other popup, so they dismiss like
   // one. Only the list is cleared, not the query: clicking away should not
   // also wipe what was typed.
   $effect(() => {
-    if (searchResults.length === 0) return
-    return onDismiss('.search', () => (searchResults = []))
+    if (searchResults.length === 0 && discoverResults.length === 0) return
+    return onDismiss('.search', () => {
+      searchResults = []
+      discoverResults = []
+    })
   })
+
+  // ---- Requests: asking for what the library does not have ----
+  // Shown only to accounts that may request, and only for the kinds a
+  // connected Sonarr (series) or Radarr (films) can fetch; the server
+  // decides both.
+  let reqStatus: RequestStatus | null = $state(null)
+  const loadRequestStatus = () =>
+    requestStatus().then((s) => (reqStatus = s)).catch(() => (reqStatus = null))
+  // The phone's tab bar gains Requests for accounts that may request.
+  const navTabs = $derived.by(() =>
+    reqStatus && reqStatus.level !== 'none'
+      ? [...tabs.slice(0, 3), { id: 'requests' as Tab, label: 'Requests', icon: Inbox }, tabs[3]]
+      : tabs,
+  )
+  // "Not in your library": search results from TMDB.
+  let discoverResults: DiscoverResult[] = $state([])
+  const requestLabel: Record<RequestState, string> = {
+    requested: 'Requested', approved: 'Approved', downloading: 'Downloading', available: 'Available', declined: 'Declined',
+  }
+
+  // A title page from TMDB, for something the library does not have.
+  let discover: DiscoverTitle | null = $state(null)
+  let discoverKey: { type: 'movie' | 'tv'; id: number } | null = $state(null)
+  let discoverErr = $state('')
+  let choosingSeasons = $state(false)
+  let pickedSeasons: number[] = $state([])
+  let requestBusy = $state(false)
+  let requestMsg = $state('')
+  async function openDiscover(type: 'movie' | 'tv', id: number) {
+    tab = 'discover'
+    listening = false
+    discoverKey = { type, id }
+    discover = null
+    discoverErr = ''
+    choosingSeasons = false
+    pickedSeasons = []
+    requestMsg = ''
+    syncURL()
+    await loadDiscover()
+  }
+  async function loadDiscover() {
+    const k = discoverKey
+    if (!k) return
+    try {
+      const d = await discoverTitle(k.type, k.id)
+      if (discoverKey === k) discover = d
+    } catch (err) {
+      if (discoverKey === k) discoverErr = errText(err)
+    }
+  }
+  // The open request a season (or the whole series) is covered by.
+  const seasonRequest = (n: number) => discover?.seasons?.find((s) => s.seasonNumber === n)?.request
+  async function requestTitle(seasons?: number[]) {
+    if (!discover) return
+    requestBusy = true
+    requestMsg = ''
+    try {
+      const r = await createRequest({ mediaType: discover.mediaType, tmdbId: discover.tmdbId, seasons })
+      requestMsg = r.error
+        ? `Saved, but it could not be sent yet (${r.error}). An admin will see it.`
+        : r.status === 'requested'
+          ? 'Requested. It will be sent once an admin approves it.'
+          : 'Requested. It is on its way.'
+      choosingSeasons = false
+      pickedSeasons = []
+      await loadDiscover()
+    } catch (err) {
+      requestMsg = errText(err)
+    } finally {
+      requestBusy = false
+    }
+  }
+  function toggleSeasonPick(n: number) {
+    pickedSeasons = pickedSeasons.includes(n) ? pickedSeasons.filter((x) => x !== n) : [...pickedSeasons, n].sort((a, b) => a - b)
+  }
+  async function openLibraryItem(id: string) {
+    try {
+      const d = await itemDetail(id)
+      await showItem(d.item)
+    } catch (err) {
+      notify('error', errText(err))
+    }
+  }
+  function openFound(r: DiscoverResult) {
+    clearSearch()
+    void openDiscover(r.mediaType, r.tmdbId)
+  }
+
+  // The Requests page: your own, newest first (an admin sees everyone's).
+  let myRequests: MediaRequest[] = $state([])
+  let requestsErr = $state('')
+  function loadMyRequests() {
+    listRequests(me?.role === 'admin')
+      .then((r) => {
+        myRequests = r
+        requestsErr = ''
+      })
+      .catch((err) => (requestsErr = errText(err)))
+  }
+  async function withdraw(r: MediaRequest) {
+    const before = myRequests
+    myRequests = myRequests.filter((x) => x.id !== r.id)
+    try {
+      await withdrawRequest(r.id)
+    } catch (err) {
+      myRequests = before
+      requestsErr = errText(err)
+    }
+  }
+  function requestScope(r: MediaRequest): string {
+    if (r.mediaType === 'movie') return 'Film'
+    const parts: string[] = []
+    if (r.seasons.length) parts.push(`${r.seasons.length === 1 ? 'Season' : 'Seasons'} ${r.seasons.join(', ')}`)
+    if (r.episodes.length) parts.push(r.episodes.map((e) => epCode(e.season, e.episode)).join(', '))
+    return parts.length ? parts.join(' · ') : 'Whole series'
+  }
+  const epCode = (s: number, e: number) => `S${String(s).padStart(2, '0')}E${String(e).padStart(2, '0')}`
+  // SQLite's datetime('now') is UTC without a zone; say so before parsing.
+  const utcDate = (s: string) => airLabel(s.includes('T') ? s : s.replace(' ', 'T') + 'Z')
+
+  // What a series held is missing, by Sonarr's account: seasons not on
+  // disk on the series page, episodes on the season page, both greyed and
+  // after what can be played.
+  let missing: MissingInfo | null = $state(null)
+  let missingFor = ''
+  let missingBusy = $state('')
+  // Closures rather than plain expressions: TypeScript would otherwise
+  // narrow `detail` to its initial null here.
+  const missingSeriesId = $derived.by(() => {
+    const it = detail?.item
+    return it?.kind === 'series' ? it.id : it?.kind === 'season' ? (it.parentId ?? '') : ''
+  })
+  function loadMissing(seriesId: string) {
+    missingFor = seriesId
+    itemMissing(seriesId)
+      .then((m) => { if (missingFor === seriesId) missing = m })
+      .catch(() => { if (missingFor === seriesId) missing = null })
+  }
+  $effect(() => {
+    const id = missingSeriesId
+    const on = !!reqStatus?.enabled && !!reqStatus.tv
+    if (!id || !on) {
+      missing = null
+      missingFor = ''
+      return
+    }
+    if (id === missingFor) return
+    missing = null
+    loadMissing(id)
+  })
+  const missingSeason = $derived.by(() => {
+    const d = detail
+    return d?.item.kind === 'season' ? missing?.seasons.find((s) => s.seasonNumber === d.item.seasonNum) : undefined
+  })
+  // Seasons Sonarr lists with nothing on disk, for the series page.
+  const absentSeasons = $derived.by(() => {
+    const d = detail
+    if (d?.item.kind !== 'series' || !missing) return []
+    return missing.seasons.filter((s) => !d.children.some((c) => c.kind === 'season' && c.seasonNum === s.seasonNumber))
+  })
+  // The open request covering a season or an episode of the series shown.
+  function coveringRequest(season: number, episode?: number): MediaRequest | undefined {
+    return missing?.requests.find((r) =>
+      (r.seasons.length === 0 && r.episodes.length === 0) || r.seasons.includes(season) ||
+      (episode !== undefined && r.episodes.some((e) => e.season === season && e.episode === episode)))
+  }
+  // Request it (users needing approval) or have Sonarr search now (admins
+  // and users whose requests go straight through).
+  async function askForMissing(season: number, episode?: number) {
+    if (!missing || !reqStatus || !missingFor) return
+    const key = episode === undefined ? `s${season}` : `s${season}e${episode}`
+    const seasons = episode === undefined ? [season] : []
+    const episodes = episode === undefined ? [] : [{ season, episode }]
+    missingBusy = key
+    try {
+      if (reqStatus.level === 'auto') {
+        await searchMissing(missingFor, seasons, episodes)
+        notify('info', `Sonarr is searching for ${episode === undefined ? `season ${season}` : epCode(season, episode)}.`)
+      } else {
+        const r = await createRequest({ mediaType: 'tv', tmdbId: missing.tmdbId, seasons, episodes })
+        notify('info', r.error ? `Requested; it could not be sent yet (${r.error}).` : 'Requested. An admin will take a look.')
+      }
+      loadMissing(missingFor)
+    } catch (err) {
+      notify('error', errText(err))
+    } finally {
+      missingBusy = ''
+    }
+  }
 
   // The full player shows on the playing item's own page; anywhere else it
   // collapses to the bottom now-playing bar (Plex-style).
@@ -1596,11 +1815,15 @@
 
   function closePlayer() {
     playing = null
+    // Fullscreen belongs to the page while playing; nothing to show in it now.
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
     poll() // refresh continue-watching
   }
 
+  // The next episode replaces this one when it is ready, rather than
+  // clearing the player first: a gap would drop out of fullscreen and
+  // flash the page between episodes.
   function playNext(next: Item) {
-    playing = null
     startPlay(next, readQuality(), false, undefined, true)
   }
 
@@ -2001,6 +2224,7 @@
       if (p['music-quality']) musicQuality = p['music-quality'] as MusicQuality
     }).catch(() => {})
     poll()
+    loadRequestStatus()
     applyRoute(location.pathname)
     if (tab === 'settings') loadKeys()
     const onPop = () => applyRoute(location.pathname)
@@ -2030,6 +2254,16 @@
         handoff: receiveHandoff,
         // This device was signed out from another: back to the sign-in screen.
         revoked: () => window.dispatchEvent(new Event(UNAUTHORISED)),
+        // A request moved (made, approved, grabbed, found on disk): refresh
+        // whatever shows one.
+        requests: () => {
+          loadRequestStatus()
+          if (tab === 'requests') loadMyRequests()
+          if (tab === 'discover') loadDiscover()
+          if (missingFor) loadMissing(missingFor)
+        },
+        // The server's settings can change what may be requested.
+        settings: loadRequestStatus,
         // Fired throughout a scan as items land, so the grid fills in live.
         items: (data) => {
           const e = data as { libraryId?: string; scanning?: boolean } | null
@@ -2234,6 +2468,25 @@
   {/if}
 {/snippet}
 
+<!-- Asking for something a series is missing: a request for users whose
+     requests need approval, a search in Sonarr for admins and users whose
+     requests go straight through, or the state of a request already made. -->
+{#snippet askButton(season: number, episode: number | undefined, what: string = '')}
+  {@const covered = coveringRequest(season, episode)}
+  {@const key = episode === undefined ? `s${season}` : `s${season}e${episode}`}
+  {#if covered}
+    <span class="reqstate tiny" data-state={covered.status}>{requestLabel[covered.status]}</span>
+  {:else if reqStatus && reqStatus.level !== 'none'}
+    <button class="askbtn" disabled={missingBusy === key} onclick={() => askForMissing(season, episode)}>
+      {#if reqStatus.level === 'auto'}
+        <Search size={13} /> {missingBusy === key ? 'Searching…' : what ? `Search ${what}` : 'Search now'}
+      {:else}
+        <Plus size={13} /> {missingBusy === key ? 'Requesting…' : what ? `Request ${what}` : 'Request'}
+      {/if}
+    </button>
+  {/if}
+{/snippet}
+
 <!-- open defaults to opening the item in place, inside its library; the
      home screen passes showItem instead, which switches to the library
      first. -->
@@ -2334,7 +2587,7 @@
         oninput={onSearchInput}
         onkeydown={(e) => e.key === 'Escape' && clearSearch()}
       />
-      {#if searchResults.length > 0}
+      {#if searchResults.length > 0 || discoverResults.length > 0}
         <div class="search-results">
           {#each searchResults as r (r.id)}
             {@const open = () => { if (r.kind === 'track') playTrackResult(r); else showItem(r); clearSearch() }}
@@ -2359,6 +2612,25 @@
               {/if}
             </div>
           {/each}
+          {#if discoverResults.length > 0}
+            <!-- After the library's own results, never before: what can be
+                 played comes first. -->
+            <div class="sr-head">Not in your library</div>
+            <div class="sr-found">
+              {#each discoverResults as f (f.mediaType + f.tmdbId)}
+                <button class="found" onclick={() => openFound(f)} title="{f.title}{f.year ? ` (${f.year})` : ''}">
+                  {#if f.poster}
+                    <img src={f.poster} alt="" loading="lazy" />
+                  {:else}
+                    <span class="found-ph">{#if f.mediaType === 'tv'}<Tv size={18} />{:else}<Clapperboard size={18} />{/if}</span>
+                  {/if}
+                  <span class="found-title">{f.title}</span>
+                  <span class="found-sub">{f.mediaType === 'tv' ? 'Series' : 'Film'}{f.year ? ` · ${f.year}` : ''}</span>
+                  {#if f.request}<span class="reqstate tiny" data-state={f.request}>{requestLabel[f.request]}</span>{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -2441,6 +2713,11 @@
            button appeared to do nothing at all. -->
       {#if queue.length > 0}<span class="side-count">{queue.length}</span>{/if}
     </button>
+    {#if reqStatus && reqStatus.level !== 'none'}
+      <button class="side-item" class:active={tab === 'requests'} title="Requests" onclick={() => { setTab('requests'); loadMyRequests() }}>
+        <Inbox size={16} /> <span class="side-label">Requests</span>
+      </button>
+    {/if}
     <div class="tree">
       {#each libraryTree as group (group.type)}
         {@const TypeIcon = group.icon}
@@ -2628,6 +2905,179 @@
           </div>
         {/if}
       </section>
+    {:else if tab === 'requests'}
+      <h1>Requests</h1>
+      {#if me?.role === 'admin'}
+        <p class="muted small reqnote">Everyone's requests. Approve or decline those waiting on the <a href="/admin/requests">Requests page of the admin</a>.</p>
+      {/if}
+      {#if requestsErr}<div class="empty">{requestsErr}</div>{/if}
+      {#if myRequests.length === 0 && !requestsErr}
+        <div class="empty">
+          Nothing requested yet. Search for a film or series: anything the
+          library does not have shows under <strong>Not in your library</strong>,
+          ready to request.
+        </div>
+      {:else}
+        <ul class="reqlist">
+          {#each myRequests as r (r.id)}
+            <li class="reqrow">
+              <button class="reqart" onclick={() => openDiscover(r.mediaType, r.tmdbId)} aria-label="Open {r.title}">
+                {#if r.poster}<img src={r.poster} alt="" loading="lazy" />{:else}<span class="ph">{#if r.mediaType === 'tv'}<Tv size={18} />{:else}<Clapperboard size={18} />{/if}</span>{/if}
+              </button>
+              <div class="reqmain">
+                <button class="reqtitle" onclick={() => openDiscover(r.mediaType, r.tmdbId)}>
+                  {r.title}{#if r.year}{' '}<span class="muted">({r.year})</span>{/if}
+                </button>
+                <span class="muted small">
+                  {requestScope(r)} · {utcDate(r.createdAt)}{#if me?.role === 'admin' && r.userId !== me.id}{' · '}{r.userName}{/if}
+                </span>
+                {#if r.note}<span class="small">“{r.note}”</span>{/if}
+                {#if r.error && r.status === 'requested'}<span class="small muted">Not sent yet: {r.error}</span>{/if}
+              </div>
+              <div class="reqside">
+                <span class="reqstate" data-state={r.status}>{requestLabel[r.status]}</span>
+                {#if r.status === 'requested' && (r.userId === me?.id || me?.role === 'admin')}
+                  <button class="linkish small" onclick={() => withdraw(r)}>Withdraw</button>
+                {/if}
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {:else if tab === 'discover'}
+      {#if discoverErr}
+        <div class="empty">{discoverErr}</div>
+      {:else if !discover}
+        <p class="muted">Loading…</p>
+      {:else}
+        {@const d = discover}
+        {@const open = d.requests.find((r) => r.status !== 'declined' && r.status !== 'available')}
+        {@const whole = !!open && open.seasons.length === 0 && open.episodes.length === 0}
+        {@const declined = !open ? d.requests.find((r) => r.status === 'declined') : undefined}
+        {#if d.backdrop || d.poster}
+          <div class="pagebg" class:from-poster={!d.backdrop} style="background-image: url({d.backdrop || d.poster})" aria-hidden="true"></div>
+        {/if}
+        <div class="detail">
+          {#if d.poster}
+            <img class="poster" src={d.poster} alt={d.title} />
+          {:else}
+            <div class="poster placeholder"><span>{#if d.mediaType === 'tv'}<Tv size={26} />{:else}<Clapperboard size={26} />{/if}</span></div>
+          {/if}
+          <div class="detail-body">
+            <h1>
+              {d.title}
+              {#if d.year}<span class="muted">({d.year})</span>{/if}
+            </h1>
+            <p class="meta">
+              {d.mediaType === 'tv' ? 'Series' : 'Film'}{#if d.runtimeMins}{' · '}{d.runtimeMins} min{d.mediaType === 'tv' ? ' an episode' : ''}{/if}{#if !d.itemId}{' · '}<span class="notheld">Not in your library</span>{/if}
+            </p>
+            {#if d.overview}<p class="overview">{d.overview}</p>{/if}
+            <div class="actions wrap">
+              {#if d.itemId}
+                <button class="play" onclick={() => d.itemId && openLibraryItem(d.itemId)}><Play size={15} /> Open in library</button>
+              {/if}
+              {#if open}
+                <span class="reqstate big" data-state={open.status}>
+                  {#if open.status === 'requested'}<Clock size={14} /> Requested · waiting for approval
+                  {:else if open.status === 'approved'}<Check size={14} /> Approved · on its way
+                  {:else if open.status === 'downloading'}<Download size={14} /> Downloading
+                  {:else}{requestLabel[open.status]}{/if}
+                </span>
+              {/if}
+              {#if d.canRequest && d.mediaType === 'movie' && !open}
+                <button class="play" disabled={requestBusy} onclick={() => requestTitle()}>
+                  <Plus size={15} /> {requestBusy ? 'Requesting…' : 'Request'}
+                </button>
+              {:else if d.canRequest && d.mediaType === 'tv' && !whole}
+                <button class="play" disabled={requestBusy} onclick={() => requestTitle()}>
+                  <Plus size={15} /> {requestBusy ? 'Requesting…' : d.itemId ? 'Request everything missing' : 'Request the series'}
+                </button>
+                {#if (d.seasons?.length ?? 0) > 0}
+                  <button class="dl" aria-expanded={choosingSeasons} onclick={() => (choosingSeasons = !choosingSeasons)}>Choose seasons</button>
+                {/if}
+              {/if}
+            </div>
+            {#if requestMsg}<p class="reqmsg muted">{requestMsg}</p>{/if}
+            {#if open?.note}<p class="reqmsg muted">“{open.note}”</p>{/if}
+            {#if declined}<p class="reqmsg">Declined{#if declined.note}: “{declined.note}”{/if}</p>{/if}
+            {#if d.originalTitle}<p class="origtitle muted">{d.originalTitle}</p>{/if}
+            {#if d.tagline}<p class="tagline">{d.tagline}</p>{/if}
+            {#if d.rating || d.certification || d.genres.length}
+              <p class="facts">
+                {#if d.rating}<span class="score" title="{d.voteCount} votes on TMDB">★ {d.rating.toFixed(1)}</span>{/if}
+                {#if d.certification}<span class="cert" title="Content rating">{d.certification}</span>{/if}
+                {#if d.genres.length}<span class="muted">{d.genres.join(' · ')}</span>{/if}
+                {#if d.network}<span class="muted">· {d.network}</span>{/if}
+                {#if d.status && d.mediaType === 'tv'}
+                  <span class="status" class:ongoing={d.status === 'Returning Series'}>{d.status === 'Returning Series' ? 'Returning' : d.status}</span>
+                {/if}
+              </p>
+            {/if}
+            {#if d.crew.some((c) => c.role && CREW_ROLES.includes(c.role))}
+              <dl class="crew">
+                <!-- The same roles, in the same order, as a library title's page. -->
+                {#each CREW_ROLES.filter((role) => d.crew.some((c) => c.role === role)) as role (role)}
+                  <div>
+                    <dt>{role}</dt>
+                    <dd>{[...new Set(d.crew.filter((c) => c.role === role).map((c) => c.name))].join(', ')}</dd>
+                  </div>
+                {/each}
+              </dl>
+            {/if}
+          </div>
+        </div>
+        {#if d.mediaType === 'tv' && d.seasons?.length}
+          <section class="dseasons" aria-label="Seasons">
+            <h2>Seasons</h2>
+            <ul>
+              {#each d.seasons as ss (ss.seasonNumber)}
+                {@const full = ss.episodeCount > 0 && ss.held >= ss.episodeCount}
+                {@const taken = full || !!ss.request}
+                <li class:held={ss.held > 0}>
+                  {#if choosingSeasons}
+                    <input type="checkbox" checked={pickedSeasons.includes(ss.seasonNumber)} disabled={taken}
+                      onchange={() => toggleSeasonPick(ss.seasonNumber)} aria-label="Request {ss.name}" />
+                  {/if}
+                  <span class="dsname">{ss.name}</span>
+                  <span class="muted small">{ss.episodeCount} episodes{#if ss.airDate}{' · '}{ss.airDate.slice(0, 4)}{/if}</span>
+                  <span class="dsstate">
+                    {#if ss.request}<span class="reqstate tiny" data-state={ss.request}>{requestLabel[ss.request]}</span>
+                    {:else if full}<span class="muted small">In library</span>
+                    {:else if ss.held > 0}<span class="muted small">{ss.held} of {ss.episodeCount} in library</span>{/if}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+            {#if choosingSeasons}
+              <div class="actions">
+                <button class="play" disabled={requestBusy || pickedSeasons.length === 0} onclick={() => requestTitle(pickedSeasons)}>
+                  <Plus size={15} /> {requestBusy ? 'Requesting…' : pickedSeasons.length === 0 ? 'Tick the seasons you want' : pickedSeasons.length === 1 ? 'Request 1 season' : `Request ${pickedSeasons.length} seasons`}
+                </button>
+                <button class="dl" onclick={() => { choosingSeasons = false; pickedSeasons = [] }}>Cancel</button>
+              </div>
+            {/if}
+          </section>
+        {/if}
+        {#if d.cast.length}
+          <section class="castsec">
+            <h2>Cast</h2>
+            <div class="castrow">
+              {#each d.cast as c (c.tmdbId)}
+                <div class="castcard">
+                  {#if c.profile}
+                    <img class="headshot" src={c.profile} alt="" loading="lazy" />
+                  {:else}
+                    <span class="headshot ph"><User size={20} /></span>
+                  {/if}
+                  <span class="castname">{c.name}</span>
+                  {#if c.role}<span class="castrole muted">{c.role}</span>{/if}
+                </div>
+              {/each}
+            </div>
+          </section>
+        {/if}
+        <p class="muted small attrib">This product uses the TMDB API but is not endorsed or certified by TMDB.</p>
+      {/if}
     {:else if tab === 'queue'}
       <h1>Queue</h1>
       <section>
@@ -3005,9 +3455,11 @@
             <!-- Seasons as a poster grid -->
             <div class="grid seasons">
               {#each detail.children as child (child.id)}
+                {@const gaps = missing?.seasons.find((m) => m.seasonNumber === child.seasonNum)?.episodes.filter((e) => e.status === 'missing').length ?? 0}
                 <button class="cell" onclick={() => openItem(child.id, true, child)}>
                   {@render poster(child)}
                   <span class="cell-title">{child.title}</span>
+                  {#if gaps > 0}<span class="cell-sub">{gaps} not in library</span>{/if}
                 </button>
               {/each}
             </div>
@@ -3095,6 +3547,54 @@
               {/each}
             </ul>
           {/if}
+        {/if}
+        {#if detail.item.kind === 'series' && absentSeasons.length > 0}
+          <!-- Seasons Sonarr knows of with nothing on disk: greyed, after
+               what can be played. -->
+          <section class="missingsec" aria-label="Seasons not in your library">
+            <header class="missinghead"><h2>Not in your library</h2></header>
+            <div class="grid seasons">
+              {#each absentSeasons as ms (ms.seasonNumber)}
+                {@const unaired = ms.episodes.length > 0 && ms.episodes.every((e) => e.status === 'upcoming')}
+                {@const firstAir = ms.episodes.find((e) => e.airDate)?.airDate}
+                <div class="cell ghostcell">
+                  <div class="poster placeholder"><span>{#if unaired}<CalendarClock size={26} />{:else}<Tv size={26} />{/if}</span></div>
+                  <span class="cell-title">Season {ms.seasonNumber}</span>
+                  <span class="cell-sub">{unaired ? (firstAir ? `Airs ${airLabel(firstAir)}` : 'Not aired yet') : `${ms.total} episodes`}</span>
+                  {#if !unaired}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
+                </div>
+              {/each}
+            </div>
+          </section>
+        {:else if detail.item.kind === 'season' && missingSeason && missingSeason.episodes.length > 0}
+          {@const ms = missingSeason}
+          {@const aired = ms.episodes.filter((e) => e.status === 'missing').length}
+          {@const coming = ms.episodes.length - aired}
+          <section class="missingsec" aria-label="Episodes not in your library">
+            <header class="missinghead">
+              <h2>Not in your library</h2>
+              <span class="muted small">
+                {[aired ? `${aired} missing` : '', coming ? `${coming} still to air` : ''].filter(Boolean).join(' · ')}
+              </span>
+              {#if aired > 1}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
+            </header>
+            <ul class="eplist">
+              {#each ms.episodes as ep (ep.episode)}
+                <li class="eprow ghost">
+                  <span class="epthumb"><span class="ph">{#if ep.status === 'upcoming'}<CalendarClock size={18} />{:else}<Tv size={18} />{/if}</span></span>
+                  <div class="epmain">
+                    <div class="eptop">
+                      <span class="eptitle"><span class="epnum">{ep.episode}.</span> {ep.title || `Episode ${ep.episode}`}</span>
+                      <span class="epmeta muted">
+                        {#if ep.status === 'upcoming'}{ep.airDate ? `Airs ${airLabel(ep.airDate)}` : 'Not aired yet'}{:else}{ep.airDate ? `Aired ${airLabel(ep.airDate)}` : 'Aired'}{/if}
+                      </span>
+                    </div>
+                  </div>
+                  {#if ep.status === 'missing'}{@render askButton(ep.season, ep.episode)}{/if}
+                </li>
+              {/each}
+            </ul>
+          </section>
         {/if}
       {:else if currentLib && currentLib.mediaType === 'music'}
         <h1>{currentLib.name}</h1>
@@ -3673,9 +4173,9 @@
   {@render personPanel()}
 
   <nav class="tabbar">
-    {#each tabs as t (t.id)}
+    {#each navTabs as t (t.id)}
       {@const TabIcon = t.icon}
-      <button class:active={tab === t.id} onclick={() => setTab(t.id)}>
+      <button class:active={tab === t.id} onclick={() => { setTab(t.id); if (t.id === 'requests') loadMyRequests() }}>
         <TabIcon size={19} />
         <span>{t.label}</span>
       </button>
@@ -3861,6 +4361,88 @@
   .thumb.square { width: var(--thumb-h, 3rem); }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .sr-text { display: flex; flex-direction: column; min-width: 0; }
+  /* "Not in your library": a row of posters under the library's results. */
+  .sr-head {
+    padding: 0.6rem 0.8rem 0.3rem; border-top: 1px solid var(--border);
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+  }
+  .sr-found { display: flex; gap: 0.6rem; overflow-x: auto; padding: 0.2rem 0.8rem 0.8rem; scrollbar-width: thin; }
+  .found { flex: none; width: 5.5rem; display: flex; flex-direction: column; gap: 0.2rem; text-align: left; }
+  .found img, .found-ph {
+    width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  .found-ph { display: grid; place-items: center; color: var(--muted); }
+  .found:hover img, .found:focus-visible img { border-color: var(--accent); }
+  .found-title { font-size: 0.78rem; line-height: 1.2; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
+  .found-sub { font-size: 0.7rem; color: var(--muted); }
+
+  /* A request's state, the same pill everywhere it appears. */
+  .reqstate {
+    display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap;
+    border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem;
+    font-size: 0.8rem; color: var(--muted);
+  }
+  .reqstate.big { padding: 0.5rem 0.9rem; font-size: 0.88rem; border-radius: 8px; }
+  .reqstate.tiny { padding: 0.05rem 0.45rem; font-size: 0.68rem; align-self: flex-start; }
+  .reqstate[data-state='approved'] { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 45%, transparent); }
+  .reqstate[data-state='downloading'] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .reqstate[data-state='available'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .reqstate[data-state='declined'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+  .notheld { color: var(--accent-2); }
+  .reqmsg { font-size: 0.88rem; margin-top: 0.6rem; }
+  .actions.wrap { flex-wrap: wrap; }
+  .play:disabled { opacity: 0.55; cursor: progress; }
+
+  /* Seasons of a title outside the library. */
+  .dseasons { margin-top: 1.5rem; }
+  .dseasons h2, .missinghead h2 { font-size: 1rem; margin: 0; }
+  .dseasons ul { list-style: none; margin: 0.6rem 0 0.9rem; }
+  .dseasons li {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 0.3rem 0.75rem;
+    padding: 0.55rem 0.3rem; border-bottom: 1px solid var(--border);
+  }
+  .dseasons li:last-child { border-bottom: none; }
+  .dsname { font-weight: 500; }
+  .dsstate { margin-left: auto; }
+
+  /* What a series held is missing: quieter than what can be played. */
+  .missingsec { margin-top: 1.75rem; }
+  .missinghead { display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem 0.8rem; }
+  .missinghead .askbtn { margin-left: auto; }
+  .eprow.ghost { opacity: 0.6; align-items: center; }
+  .eprow.ghost:hover, .eprow.ghost:focus-within { opacity: 1; }
+  .ghostcell { opacity: 0.6; }
+  .ghostcell:hover, .ghostcell:focus-within { opacity: 1; }
+  .ghostcell .poster { filter: grayscale(1); }
+  .askbtn {
+    display: inline-flex; align-items: center; gap: 0.3rem; flex: none; white-space: nowrap; align-self: flex-start;
+    border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem;
+    font-size: 0.78rem; color: var(--accent-2);
+  }
+  .eprow.ghost .askbtn { align-self: center; }
+  .askbtn:hover { border-color: var(--accent); }
+  .askbtn:disabled { opacity: 0.6; cursor: progress; }
+
+  /* The Requests page. */
+  .reqnote { margin-bottom: 1rem; }
+  .reqnote a { color: var(--accent-2); }
+  .reqlist { list-style: none; }
+  .reqrow {
+    display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap;
+    padding: 0.7rem 0.3rem; border-bottom: 1px solid var(--border);
+  }
+  .reqrow:last-child { border-bottom: none; }
+  .reqart {
+    width: 3.2rem; aspect-ratio: 2 / 3; flex: none; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .reqart img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .reqart .ph { display: grid; place-items: center; height: 100%; color: var(--muted); }
+  .reqmain { flex: 1 1 12rem; min-width: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+  .reqtitle { text-align: left; font-weight: 500; overflow-wrap: anywhere; }
+  .reqtitle:hover { color: var(--accent-2); }
+  .reqside { display: flex; flex-direction: column; align-items: flex-end; gap: 0.3rem; margin-left: auto; }
   .sr-title { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sr-sub { font-size: 0.76rem; color: var(--muted); }
   .dlwrap { position: relative; margin-left: auto; }
@@ -4901,6 +5483,12 @@
   .crew div { display: flex; gap: 0.6rem; }
   .crew dt { color: var(--muted); min-width: 10rem; flex: none; }
   .crew dd { margin: 0; }
+  /* At phone width the role sits above the names rather than beside them,
+     where a 10rem label left the names a sliver of the screen. */
+  @media (max-width: 30rem) {
+    .crew div { flex-direction: column; gap: 0; margin-bottom: 0.35rem; }
+    .crew dt { min-width: 0; }
+  }
 
   /* Person overlay */
   .pback { position: fixed; inset: 0; background: rgb(0 0 0 / 0.6); z-index: 40; }

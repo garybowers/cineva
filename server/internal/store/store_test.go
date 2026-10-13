@@ -757,6 +757,7 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		"WatchedAt":    true,
 		"VersionOf":    true, // set by version grouping, not the caller
 		"FileMtime":    true, // write-only; read back through FileStamps, below
+		"SidecarStamp": true, // likewise
 	}
 	wv, gv := reflect.ValueOf(want), reflect.ValueOf(got)
 	typ := wv.Type()
@@ -786,6 +787,9 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 	}
 	if want.FileMtime == 0 || stamps[saved.Path].FileMtime != want.FileMtime {
 		t.Errorf("FileMtime = %d, want %d", stamps[saved.Path].FileMtime, want.FileMtime)
+	}
+	if want.SidecarStamp == 0 || stamps[saved.Path].SidecarStamp != want.SidecarStamp {
+		t.Errorf("SidecarStamp = %d, want %d", stamps[saved.Path].SidecarStamp, want.SidecarStamp)
 	}
 
 	// Locked fields round-trip through their own CSV column.

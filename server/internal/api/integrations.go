@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/arr"
 	"github.com/garybowers/cineva/server/internal/auth"
+	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
 )
@@ -201,6 +203,18 @@ func (s *server) integrationWebhook(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
+	// Every delivery is noted, Test included, for the connection's status
+	// line: proof the webhook reaches us, and what came last.
+	if err := s.store.RecordArrEvent(ctx, conn.ID, ev.Type, ev.Describe()); err != nil {
+		integrationsLog.Warn("recording webhook event failed", "connection", conn.Name, "err", err)
+	} else {
+		s.events.Publish(events.Event{Type: "integrations"})
+	}
+	if ev.Grab() && s.requests != nil {
+		if err := s.requests.Grabbed(ctx, conn, ev); err != nil {
+			integrationsLog.Warn("updating requests for a grab failed", "connection", conn.Name, "err", err)
+		}
+	}
 	if !ev.ChangesFiles() {
 		// Test, Grab, Health and the rest: acknowledged, nothing to do.
 		return c.JSON(http.StatusOK, map[string]any{"event": ev.Type, "rescanning": []string{}})
@@ -210,7 +224,7 @@ func (s *server) integrationWebhook(c echo.Context) error {
 		return err
 	}
 	rescanning := []string{}
-	for _, lib := range arr.Libraries(libs, conn.Kind, ev.Paths) {
+	for _, lib := range arr.Libraries(libs, conn.Kind, arr.MapPaths(conn.PathMaps, ev.Paths)) {
 		if err := s.manager.RequestScan(ctx, lib); err != nil {
 			integrationsLog.Error("rescan request failed", "connection", conn.Name, "event", ev.Type, "library", lib.Name, "err", err)
 			continue
@@ -263,4 +277,116 @@ func (s *server) webhookFor(conn store.ArrConnection, secret string) arr.Webhook
 		Username: webhookUser,
 		Password: secret,
 	}
+}
+
+// integrationStatus is a connection checked live: whether it answers, its
+// health warnings, and the profiles and folders requests can be made with.
+type integrationStatus struct {
+	Reachable       bool                 `json:"reachable"`
+	Error           string               `json:"error,omitempty"`
+	Version         string               `json:"version,omitempty"`
+	Health          []arr.HealthCheck    `json:"health"`
+	QualityProfiles []arr.QualityProfile `json:"qualityProfiles"`
+	RootFolders     []arr.RootFolder     `json:"rootFolders"`
+	// SuggestedPathMaps map the instance's root folders onto Cineva's
+	// library folders, where the two see the media at different paths.
+	SuggestedPathMaps []store.PathMap `json:"suggestedPathMaps"`
+}
+
+// GET /integrations/:id/status (admin) — the Test button.
+func (s *server) integrationStatus(c echo.Context) error {
+	ctx, cancel := context.WithTimeout(c.Request().Context(), 15*time.Second)
+	defer cancel()
+	conn, err := s.store.ArrConnection(ctx, c.Param("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "integration not found")
+	} else if err != nil {
+		return err
+	}
+	out := integrationStatus{
+		Health: []arr.HealthCheck{}, QualityProfiles: []arr.QualityProfile{},
+		RootFolders: []arr.RootFolder{}, SuggestedPathMaps: []store.PathMap{},
+	}
+	client := arr.New(conn.Kind, conn.URL, conn.APIKey)
+	st, err := client.Status(ctx)
+	if err != nil {
+		out.Error = err.Error()
+		return c.JSON(http.StatusOK, out)
+	}
+	out.Reachable, out.Version = true, st.Version
+	// The rest is best effort: an old instance missing one endpoint should
+	// still show what it has.
+	var problems []string
+	if out.Health, err = client.Health(ctx); err != nil {
+		problems = append(problems, "health: "+err.Error())
+	}
+	if out.QualityProfiles, err = client.QualityProfiles(ctx); err != nil {
+		problems = append(problems, "quality profiles: "+err.Error())
+	}
+	if out.RootFolders, err = client.RootFolders(ctx); err != nil {
+		problems = append(problems, "root folders: "+err.Error())
+	}
+	out.Error = strings.Join(problems, "; ")
+	libs, err := s.store.Libraries(ctx)
+	if err != nil {
+		return err
+	}
+	roots := make([]string, 0, len(out.RootFolders))
+	for _, r := range out.RootFolders {
+		roots = append(roots, r.Path)
+	}
+	out.SuggestedPathMaps = arr.SuggestPathMaps(conn.Kind, roots, libs)
+	// Keep the stored version current, since this is the newest word on it.
+	if conn.Version != st.Version {
+		conn.Version = st.Version
+		if _, err := s.store.UpdateArrConnection(ctx, conn); err != nil {
+			integrationsLog.Warn("saving the instance's version failed", "connection", conn.Name, "err", err)
+		}
+	}
+	return c.JSON(http.StatusOK, out)
+}
+
+// PUT /integrations/:id/options (admin) — what requests are made with,
+// and how the instance's paths map onto Cineva's. Nothing is sent to the
+// instance, so the webhook is left alone.
+func (s *server) setIntegrationOptions(c echo.Context) error {
+	ctx := c.Request().Context()
+	conn, err := s.store.ArrConnection(ctx, c.Param("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "integration not found")
+	} else if err != nil {
+		return err
+	}
+	var req struct {
+		QualityProfileID int             `json:"qualityProfileId"`
+		RootFolder       string          `json:"rootFolder"`
+		PathMaps         []store.PathMap `json:"pathMaps"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid body")
+	}
+	if req.QualityProfileID < 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "qualityProfileId must not be negative")
+	}
+	maps := []store.PathMap{}
+	for _, m := range req.PathMaps {
+		m.From, m.To = strings.TrimSpace(m.From), strings.TrimSpace(m.To)
+		if m.From == "" && m.To == "" {
+			continue // an empty row left in the form
+		}
+		if m.From == "" || m.To == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "a path mapping needs both the instance's path and Cineva's")
+		}
+		maps = append(maps, m)
+	}
+	if err := s.store.SetArrOptions(ctx, conn.ID, req.QualityProfileID, strings.TrimSpace(req.RootFolder), maps); err != nil {
+		return err
+	}
+	saved, err := s.store.ArrConnection(ctx, conn.ID)
+	if err != nil {
+		return err
+	}
+	s.audit(c, "integration.options", "integration", conn.ID, conn.Name, "")
+	s.events.Publish(events.Event{Type: "integrations"})
+	return c.JSON(http.StatusOK, saved)
 }
