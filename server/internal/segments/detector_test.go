@@ -379,3 +379,83 @@ func TestDetectorStopsOnStalledRead(t *testing.T) {
 		}
 	}
 }
+
+// A season with a single episode is compared with the seasons either side
+// of it; a series with nothing else to compare with is left to try again.
+func TestDetectorLoneEpisodeComparesAcrossSeasons(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := st.CreateLibrary(ctx, "TV", store.MediaTV, []string{"/tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(it store.Item) store.Item {
+		t.Helper()
+		it.LibraryID = lib.ID
+		saved, err := st.UpsertItem(ctx, it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	series := save(store.Item{Kind: store.KindSeries, Title: "Show", Path: "/tv/Show"})
+	s1 := save(store.Item{Kind: store.KindSeason, ParentID: series.ID, SeasonNum: 1, Path: "/tv/Show/S1"})
+	s2 := save(store.Item{Kind: store.KindSeason, ParentID: series.ID, SeasonNum: 2, Path: "/tv/Show/S2"})
+	solo := save(store.Item{Kind: store.KindSeries, Title: "Solo", Path: "/tv/Solo"})
+	soloS1 := save(store.Item{Kind: store.KindSeason, ParentID: solo.ID, SeasonNum: 1, Path: "/tv/Solo/S1"})
+
+	th := theme(1, 45)
+	starts := map[string]float64{"/s1e1.mkv": 20, "/s1e2.mkv": 75, "/s2e1.mkv": 40, "/solo.mkv": 30}
+	ids := map[string]string{}
+	add := func(season store.Item, num int, path string) {
+		ids[path] = save(store.Item{Kind: store.KindEpisode, ParentID: season.ID, EpisodeNum: num,
+			Path: path, FileMtime: 1, RuntimeSecs: 2400}).ID
+	}
+	add(s1, 1, "/s1e1.mkv")
+	add(s1, 2, "/s1e2.mkv")
+	add(s2, 1, "/s2e1.mkv")
+	add(soloS1, 1, "/solo.mkv")
+
+	d := NewDetector(st)
+	d.Fingerprint = func(_ context.Context, path string, start, dur float64) (media.Fingerprint, error) {
+		seed := int64(len(path)) + int64(starts[path])
+		if start > 0 { // no shared credits anywhere
+			fp := media.FingerprintSamples(theme(seed+100, dur))
+			fp.Start = start
+			return fp, nil
+		}
+		return media.FingerprintSamples(episode(seed, 240, starts[path], th)), nil
+	}
+	if err := d.analyseLibrary(ctx, lib.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	segs, err := st.Segments(ctx, ids["/s2e1.mkv"])
+	if err != nil || len(segs) != 1 || segs[0].Kind != store.SegmentIntro {
+		t.Fatalf("lone episode's segments = %+v, %v; want an intro found across seasons", segs, err)
+	}
+	if got := segs[0].StartSecs; math.Abs(got-40) > 1 {
+		t.Errorf("lone episode's intro starts at %.1f, want 40", got)
+	}
+	state, err := st.SeasonSegmentState(ctx, s2.ID, store.SegmentIntro)
+	if err != nil || len(state) != 1 || !state[0].Analysed {
+		t.Fatalf("lone episode state = %+v, %v; want analysed", state, err)
+	}
+	// The borrowed partners are their own season's to analyse, and were.
+	if segs, _ := st.Segments(ctx, ids["/s1e1.mkv"]); len(segs) != 1 {
+		t.Errorf("s1e1 segments = %+v, want its intro", segs)
+	}
+	// Nothing to compare the only episode of a one-season series with: it
+	// stays unrecorded, to be looked at once it has company.
+	soloState, err := st.SeasonSegmentState(ctx, soloS1.ID, store.SegmentIntro)
+	if err != nil || len(soloState) != 1 || soloState[0].Analysed {
+		t.Fatalf("solo state = %+v, %v; want unanalysed", soloState, err)
+	}
+}

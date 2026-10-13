@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -129,6 +130,7 @@ func (s *server) deleteLibrary(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
 	s.events.Publish(events.Event{Type: "libraries"})
+	s.prunePreviews(context.WithoutCancel(c.Request().Context()))
 	s.audit(c, "library.delete", "library", c.Param("id"), lib.Name, "")
 	return c.NoContent(http.StatusNoContent)
 }
@@ -303,14 +305,24 @@ func (s *server) withPlayState(c echo.Context, libraryID string, items []store.I
 		return items
 	}
 	states, err := s.store.PlayStatesByLibrary(c.Request().Context(), uid, libraryID)
-	if err != nil || len(states) == 0 {
+	if err != nil {
 		return items
+	}
+	// Play counts too: a track list's plays column, and the "most played"
+	// a client may sort by.
+	counts, err := s.store.PlayCountsByLibrary(c.Request().Context(), uid, libraryID)
+	if err != nil {
+		counts = nil
 	}
 	for i := range items {
 		if ps, ok := states[items[i].ID]; ok {
 			items[i].Watched = ps.Watched
 			items[i].PositionSecs = ps.PositionSecs
 			items[i].WatchedAt = ps.UpdatedAt
+		}
+		if pc, ok := counts[items[i].ID]; ok {
+			items[i].PlayCount = pc.Plays
+			items[i].LastPlayedAt = pc.LastPlayedAt
 		}
 	}
 	return items
@@ -456,7 +468,8 @@ func (s *server) getItem(c echo.Context) error {
 	}
 	// A season's episodes carry the viewer's progress so each row can show
 	// how far in they are without opening it.
-	if item.Kind == store.KindSeason {
+	// An album's tracks carry the viewer's play counts likewise.
+	if item.Kind == store.KindSeason || item.Kind == store.KindAlbum {
 		children = s.withPlayState(c, item.LibraryID, children)
 	}
 	resp := map[string]any{"item": item, "children": children}

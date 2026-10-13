@@ -197,11 +197,22 @@ func (x *sidecarIndex) claims(videoStem, name string) bool {
 func (x *sidecarIndex) stamp(videoPath string) int64 {
 	base := filepath.Base(videoPath)
 	videoStem := strings.TrimSuffix(base, filepath.Ext(base))
-	var parts []string
+	var claimed []fs.DirEntry
 	for _, d := range x.byDir[filepath.Dir(videoPath)] {
-		if !x.claims(videoStem, d.Name()) {
-			continue
+		if x.claims(videoStem, d.Name()) {
+			claimed = append(claimed, d)
 		}
+	}
+	return fingerprint(claimed)
+}
+
+// fingerprint hashes files' names, sizes and modification times, in name
+// order: the same files unchanged give the same value, and an edit, an
+// addition or a removal a different one. Never 0, which the store reads as
+// "not recorded" — an empty set has a fingerprint too.
+func fingerprint(entries []fs.DirEntry) int64 {
+	var parts []string
+	for _, d := range entries {
 		fi, err := d.Info()
 		if err != nil {
 			continue // gone since the walk listed it

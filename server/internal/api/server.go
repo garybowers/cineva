@@ -321,6 +321,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	go s.requests.Run(samplerCtx)
 	manager.OnScanDone = func(lib store.Library) {
 		s.enqueueBackground(lib)
+		s.prunePreviews(samplerCtx)
 		if lib.MediaType == store.MediaMovies || lib.MediaType == store.MediaTV {
 			if err := s.requests.CheckAvailable(context.Background()); err != nil {
 				serverLog.Warn("checking requests after a scan failed", "library", lib.Name, "err", err)
@@ -338,6 +339,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		go s.segments.Run(samplerCtx)
 	}
 	go s.previews.Run(samplerCtx)
+	// Previews of titles deleted while the server was down.
+	s.prunePreviews(samplerCtx)
 	// Started once the workers its OnChange catches up exist.
 	go s.storage.Run(samplerCtx)
 
@@ -560,6 +563,16 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
 	v1.GET("/continue-watching", s.continueWatching)
 	v1.GET("/home", s.home)
+	// Music: artist pages, listening rows and the viewer's own playlists.
+	v1.GET("/items/:id/artist", s.getArtist)
+	v1.GET("/libraries/:id/listening", s.libraryListening)
+	v1.GET("/playlists", s.listPlaylists)
+	v1.POST("/playlists", s.createPlaylist)
+	v1.GET("/playlists/:id", s.getPlaylist)
+	v1.PATCH("/playlists/:id", s.updatePlaylist)
+	v1.DELETE("/playlists/:id", s.deletePlaylist)
+	v1.POST("/playlists/:id/items", s.appendPlaylistItems)
+	v1.PUT("/playlists/:id/items", s.setPlaylistItems)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
 	v1.GET("/play/:sid/:file", s.hlsFile)
 
@@ -576,6 +589,10 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.POST("/segments/pause", s.pauseSegments)
 	adm.POST("/segments/resume", s.resumeSegments)
 	adm.POST("/segments/run", s.runSegments)
+	adm.GET("/items/:id/segments", s.itemSegments)
+	adm.PUT("/items/:id/segments/:kind", s.putItemSegment)
+	adm.DELETE("/items/:id/segments/:kind", s.clearItemSegment)
+	adm.POST("/items/:id/segments/redetect", s.redetectSegments)
 	adm.GET("/previews/status", s.previewStatus)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)

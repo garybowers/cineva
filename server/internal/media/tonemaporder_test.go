@@ -12,6 +12,9 @@ import (
 // Tone mapping runs on every pixel, so doing it before the downscale costs
 // four times the work on a 4K source. This measures what scaling first buys.
 func TestZToneMapOrderThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing test")
+	}
 	if _, err := os.Stat(hdrSample); err != nil {
 		t.Skip("no sample")
 	}

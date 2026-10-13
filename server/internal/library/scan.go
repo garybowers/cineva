@@ -39,6 +39,9 @@ type Manager struct {
 	// CoverArt reads a file's embedded cover art; nil uses
 	// media.ExtractCoverArt.
 	CoverArt func(path string) []byte
+	// ProbeAudio reads a music file's tags and duration; nil uses
+	// media.ProbeAudio.
+	ProbeAudio func(path string) (media.AudioInfo, error)
 	// CertRegion is the ISO 3166-1 country whose content rating is stored
 	// ("GB", "US", "DE"). Certification is regional — a BBFC 15 and an FSK
 	// 16 are different boards' judgements, not two spellings — so which one
@@ -65,6 +68,9 @@ type Manager struct {
 	// playing — or returns "" when it is (see QueueFullScan). Unset, any
 	// time is quiet.
 	Quiet func() string
+
+	// artists holds the ids of artists being looked up (see LookUpArtist).
+	artists sync.Map
 
 	mu      sync.Mutex
 	queued  map[string]bool               // libraryID -> full rescan waiting for a quiet time

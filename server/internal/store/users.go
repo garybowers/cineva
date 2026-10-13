@@ -312,7 +312,7 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 // AdoptLocalState hands everything recorded under the pre-auth placeholder
 // user to a real account — run once, for the first admin.
 func (s *Store) AdoptLocalState(ctx context.Context, userID string) error {
-	for _, table := range []string{"play_state", "play_events", "audit_log"} {
+	for _, table := range []string{"play_state", "play_events", "play_counts", "audit_log"} {
 		if _, err := s.db.ExecContext(ctx, `UPDATE `+table+` SET user_id = ? WHERE user_id = ?`, userID, LocalUser); err != nil {
 			return fmt.Errorf("adopt %s: %w", table, err)
 		}

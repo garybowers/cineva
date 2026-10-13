@@ -10,11 +10,11 @@ import (
 // parsedGraph is a filter graph built from a spec string, with its own
 // buffer source and sink.
 //
-// Used for the hardware-decode path, where the frames reaching the filter
-// are device surfaces, or downloaded copies of them, rather than what the
-// codec context describes: the vendored av helper derives its source
-// parameters from the context, which cannot name a frames context and, for
-// a download, reports the wrong format.
+// Used for every re-encode (see videoGraph) in place of the vendored av
+// helper, which derives its source parameters from the codec context. That
+// cannot name a frames context, reports the wrong format for a downloaded
+// device surface, and declares no colour space or range, which on a
+// software decode made swscale darken the picture by 1.7-2.5 levels.
 type parsedGraph struct {
 	graph *ffmpeg.AVFilterGraph
 	src   *ffmpeg.AVFilterContext

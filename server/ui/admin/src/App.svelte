@@ -23,6 +23,7 @@
     type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type PlayTotals, type DiskVolume, type AuditEntry, type User, type UserRequest,
   } from './lib/api'
   import LineChart from './LineChart.svelte'
+  import AvatarCrop from './AvatarCrop.svelte'
   import BarChart from './BarChart.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
@@ -236,19 +237,27 @@
   function replaceUser(u: User) {
     users = users.map((x) => (x.id === u.id ? u : x))
   }
-  async function pickUserAvatar(e: Event, u: User) {
+  // The photo being framed before it goes up (AvatarCrop), and whose.
+  let crop: { file: File; user: User } | null = $state(null)
+  function pickUserAvatar(e: Event, u: User) {
     const input = e.currentTarget as HTMLInputElement
     const file = input.files?.[0]
     input.value = ''
     if (!file) return
+    userErr = ''
+    crop = { file, user: u }
+  }
+  async function sendUserAvatar(picture: Blob) {
+    if (!crop) return
     avatarBusy = true
     userErr = ''
     try {
-      replaceUser(await uploadUserAvatar(u.id, file))
+      replaceUser(await uploadUserAvatar(crop.user.id, picture))
     } catch (err) {
       userErr = String(err instanceof Error ? err.message : err)
     } finally {
       avatarBusy = false
+      crop = null
     }
   }
   async function dropUserAvatar(u: User) {
@@ -2854,6 +2863,12 @@
     {/if}
   </main>
 </div>
+
+<!-- Outside the layout, so no transformed dialogue it is opened from can
+     trap it. -->
+{#if crop}
+  <AvatarCrop file={crop.file} busy={avatarBusy} oncrop={sendUserAvatar} oncancel={() => (crop = null)} />
+{/if}
 
 <style>
   .shell { display: flex; min-height: 100vh; flex-direction: column; }

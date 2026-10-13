@@ -5,13 +5,14 @@
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
     PLAYBACK_STOPPED, itemStorage, streamProblem,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
-    type SubtitleTrack,
+    type SubtitleTrack, type Device,
   } from './lib/api'
   import { onDismiss } from './lib/dismiss'
   import { pref } from './lib/prefs'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize, Expand, Shrink,
-    Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge,
+    Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge, Cast,
+    MonitorSmartphone,
   } from '@lucide/svelte'
 
   let {
@@ -27,6 +28,9 @@
     onburnsubtitle,
     onexpand,
     ontime,
+    devices = [],
+    ondevices,
+    onplayon,
   }: {
     item: Item
     info: PlayInfo
@@ -44,6 +48,15 @@
     onburnsubtitle: (streamIndex: number) => void
     onexpand: () => void
     ontime?: (secs: number) => void
+    /** The user's other devices that have the app open: where "Play on…"
+        can send what is playing. */
+    devices?: Device[]
+    /** The "Play on…" menu opened: the host refreshes devices. */
+    ondevices?: () => void
+    /** Send what is playing — the host's queue, or this title — to another
+        device, which carries on from the place saved here. The host closes
+        this player once it is sent, and throws if it could not be. */
+    onplayon?: (d: Device) => Promise<void>
   } = $props()
 
   // Where the up-next card appears: at the episode's detected credits, or,
@@ -643,9 +656,40 @@
   // ---- Control-bar menus ----
   // One menu open at a time, closing on a pick, on Escape, or on a click
   // anywhere else — the usual expectations for a popup over a video.
-  type Menu = 'cc' | 'audio' | 'quality' | 'chapters' | 'speed'
+  type Menu = 'cc' | 'audio' | 'quality' | 'chapters' | 'speed' | 'cast'
   let openMenu: Menu | null = $state(null)
-  const toggleMenu = (m: Menu) => (openMenu = openMenu === m ? null : m)
+  const toggleMenu = (m: Menu) => {
+    openMenu = openMenu === m ? null : m
+    if (openMenu === 'cast') ondevices?.()
+  }
+
+  // ---- Play on another device ----
+  // The place is saved before the queue goes, so the other device resumes
+  // where this one is rather than at the last heartbeat; this one pauses
+  // while it is sent and stops once it has gone. Fullscreen is the page's,
+  // so it is left too: there is nothing here to watch any more.
+  let sending = $state('')
+  const deviceTitle = (d: Device) => d.name || d.client || 'Unknown browser'
+  async function playOn(d: Device) {
+    if (!onplayon || sending) return
+    openMenu = null
+    sending = d.id
+    const wasPaused = video?.paused ?? true
+    video?.pause()
+    try {
+      if (video && !stoppedByAdmin && !failure) {
+        lastPosted = Math.floor(video.currentTime)
+        await postProgress(item.id, lastPosted, true).catch(() => {})
+      }
+      await onplayon(d)
+      if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {})
+    } catch {
+      // The host has said why; carry on here as if nothing happened.
+      if (!wasPaused && !destroyed) video?.play().catch(() => {})
+    } finally {
+      sending = ''
+    }
+  }
 
   $effect(() => {
     if (openMenu === null) return
@@ -1085,6 +1129,29 @@
             </div>
           {/if}
         </div>
+        {#if onplayon}
+          <div class="menuwrap">
+            <button
+              class="ctl" class:on={openMenu === 'cast' || !!sending}
+              onclick={() => toggleMenu('cast')}
+              disabled={!!sending}
+              title="Play on another device" aria-label="Play on another device"
+              aria-haspopup="menu" aria-expanded={openMenu === 'cast'}><Cast size={16} /></button>
+            {#if openMenu === 'cast'}
+              <div class="menu cast" role="menu">
+                <div class="menu-head">Play on</div>
+                {#each devices as d (d.id)}
+                  <button class="menu-item dev-row" role="menuitem" onclick={() => playOn(d)}>
+                    <MonitorSmartphone size={15} />
+                    <span class="dev-name">{deviceTitle(d)}</span>
+                  </button>
+                {:else}
+                  <p class="menu-note">No other device has Cineva open. Open it on the TV or phone you want to watch on, signed in as you.</p>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
         <button
           class="ctl"
           class:on={showInfo}
@@ -1152,6 +1219,20 @@
   /* Chapter rows carry a name and a time, so the menu is given room for
      both rather than the narrow width the single-column menus need. */
   .menu.chapters { min-width: 15rem; }
+  /* Device rows carry an icon and a name, which ellipsises. The note for
+     when there are none wraps, so the menu keeps a sensible width. */
+  .menu.cast { width: max-content; min-width: 13rem; max-width: min(18rem, calc(100vw - 2rem)); }
+  .dev-row { display: flex; align-items: center; gap: 0.5rem; }
+  .dev-row::before { display: none; }
+  .dev-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .menu-note {
+    margin: 0;
+    padding: 0.2rem 0.55rem 0.4rem;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: rgb(255 255 255 / 0.7);
+    white-space: normal;
+  }
   /* A chapter row is a name and its timestamp, the name taking the slack. */
   .ch-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ch-at { opacity: 0.6; font-variant-numeric: tabular-nums; margin-left: 0.75rem; }
@@ -1501,6 +1582,19 @@
   }
 
   .buttons { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.2rem; }
+  /* At phone width the row would run off the edge, taking the last buttons
+     — fullscreen, "Play on…" — with it. The volume slider goes (a phone has
+     buttons for that, and mute stays), and the rest wrap onto a second
+     row rather than being cut off. */
+  @media (max-width: 40rem) {
+    .buttons { flex-wrap: wrap; gap: 0.1rem; }
+    .vol { display: none; }
+    .ctl { padding: 0.3rem 0.4rem; }
+    /* A menu hung from a button near the left edge would open off the
+       screen; at this width every menu spans the control box instead. */
+    .menuwrap { position: static; }
+    .menu, .menu.cast, .menu.chapters { left: 0; right: 0; width: auto; min-width: 0; max-width: none; }
+  }
   .ctl {
     color: var(--muted);
     font-size: 0.95rem;

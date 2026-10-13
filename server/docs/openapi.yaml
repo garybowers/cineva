@@ -31,6 +31,8 @@ tags:
     description: "Films, series, seasons, episodes and music"
   - name: Playback
     description: "Playing, streaming, downloading, subtitles and watch state"
+  - name: Music
+    description: "Artist pages, listening history and playlists"
   - name: Users
     description: "Accounts and groups (admin)"
   - name: Integrations
@@ -914,6 +916,31 @@ paths:
                   size: { type: integer, description: The page size applied after clamping }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /items/{id}/artist:
+    get:
+      summary: An artist's page
+      description: >
+        The artist with their own albums oldest first, other artists' albums
+        they appear on (compilations, soundtracks, duets), their top tracks
+        ranked by the viewer's plays and then the household's (tracks nobody
+        has played are left out), and counts. The artist's poster and
+        overview are a picture and biography found through MusicBrainz,
+        Wikidata and Wikipedia; opening the page starts that lookup when it
+        is due (never done, or something missing after 30 days), and
+        lookingUp says so — an "items" event follows when it finishes.
+      operationId: getArtist
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The artist page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArtistPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /items/{id}:
     get:
       summary: Get an item with its direct children
@@ -1371,6 +1398,88 @@ paths:
       responses:
         "204": { description: Cleared }
         "404": { $ref: "#/components/responses/NotFound" }
+  /items/{id}/segments:
+    get:
+      summary: An episode's intro and credits, for correcting them (admin)
+      description: >
+        Each kind of segment, found or not, with whether detection has
+        looked at the current file and whether an administrator set it by
+        hand (locked: re-detection leaves it alone until cleared).
+      operationId: itemSegments
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The episode's segments, content: { application/json: { schema: { $ref: "#/components/schemas/ItemSegments" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /items/{id}/segments/{kind}:
+    put:
+      summary: Set an episode's intro or credits by hand (admin)
+      description: >
+        Sets the segment's start and end in seconds from the start of the
+        file, or with none true says the episode has no segment of this
+        kind. Either way the value is locked: detection, a season's
+        re-detection and a replaced file all leave it alone until it is
+        cleared.
+      operationId: putItemSegment
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [intro, credits] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                none: { type: boolean, description: The episode has no segment of this kind }
+                startSecs: { type: number, minimum: 0 }
+                endSecs: { type: number, description: At least a second after startSecs, and no later than the episode's end }
+      responses:
+        "200": { description: The episode's segments, content: { application/json: { schema: { $ref: "#/components/schemas/ItemSegments" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Hand an episode's intro or credits back to detection (admin)
+      description: >
+        Removes a value set by hand, segment and lock, so detection looks at
+        the episode again on its next pass. A detected value is left as it is.
+      operationId: clearItemSegment
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [intro, credits] } }
+      responses:
+        "200": { description: The episode's segments, content: { application/json: { schema: { $ref: "#/components/schemas/ItemSegments" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /items/{id}/segments/redetect:
+    post:
+      summary: Detect a season's intros and credits again (admin)
+      description: >
+        Takes a season, or any episode of it. Every episode's analysis is
+        reopened except values set by hand, and detection starts straight
+        away whatever its schedule says — still giving way to playback,
+        scans and a manual pause. What was found before is served until the
+        new analysis replaces it. 409 when intro detection is turned off.
+      operationId: redetectSegments
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reopened: { type: integer, description: Analyses sent back to detection }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Intro detection is turned off }
   /items/{id}/trickplay.vtt:
     get:
       summary: Seek-bar preview cues for a video
@@ -1601,6 +1710,166 @@ paths:
                     items:
                       type: array
                       items: { $ref: "#/components/schemas/Item" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/listening:
+    get:
+      summary: The viewer's listening rows for a music library
+      description: >
+        Albums the viewer played a track from, most recent first; their most
+        played tracks; and the albums whose tracks they played most. Built
+        from play counts, which outlive the pruned play history.
+      operationId: libraryListening
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The rows; each may be empty
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recentlyPlayed, mostPlayed, mostPlayedAlbums]
+                properties:
+                  recentlyPlayed: { type: array, items: { $ref: "#/components/schemas/Item" } }
+                  mostPlayed: { type: array, items: { $ref: "#/components/schemas/Item" } }
+                  mostPlayedAlbums: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /playlists:
+    get:
+      summary: Your playlists
+      description: >
+        The requesting user's playlists by name, each summarised over the
+        tracks they can play now. Playlists are personal: nobody else sees
+        them, admins included.
+      operationId: listPlaylists
+      tags: [Music]
+      responses:
+        "200":
+          description: Playlists
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Playlist" }
+    post:
+      summary: Create a playlist
+      description: >
+        A manual playlist, or a smart one when rules are given. Smart rules
+        are checked here; an unknown field, an operator the field lacks or a
+        value of the wrong kind is refused with the rule named.
+      operationId: createPlaylist
+      tags: [Music]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaylistRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Playlist" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /playlists/{id}:
+    get:
+      summary: A playlist and its tracks
+      description: >
+        Tracks in playlist order; a smart playlist is evaluated now, so it
+        follows the library and the listener's history. Tracks in libraries
+        the user can no longer see are left out. Each carries the user's
+        play count.
+      operationId: getPlaylist
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The playlist
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Rename a playlist, or change a smart playlist's rules
+      description: Absent fields are left alone. A manual playlist cannot be given rules.
+      operationId: updatePlaylist
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaylistRequest" }
+      responses:
+        "200":
+          description: The playlist as it now is
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a playlist
+      operationId: deletePlaylist
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /playlists/{id}/items:
+    post:
+      summary: Add to the end of a manual playlist
+      description: >
+        Tracks, albums or artists: an album adds its tracks in order, an
+        artist their albums oldest first. Anything the user cannot see is
+        skipped. A smart playlist refuses with 400.
+      operationId: appendPlaylistItems
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaylistItems" }
+      responses:
+        "200":
+          description: The playlist as it now is
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Replace a manual playlist's tracks
+      description: >
+        The tracks, in the order given — how a client reorders and removes.
+        A track may appear more than once.
+      operationId: setPlaylistItems
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaylistItems" }
+      responses:
+        "200":
+          description: The playlist as it now is
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaylistDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /libraries/{id}/collections:
@@ -2467,7 +2736,7 @@ paths:
                       properties:
                         libraryId: { type: string }
                         libraryName: { type: string }
-                        kind: { type: string, description: '"recent", or a recommendation row kind (because, toprated, genre, unwatched)' }
+                        kind: { type: string, description: '"recent"; for a music library "played" (recently played albums) or "mostPlayed" (most played albums); or a recommendation row kind (because, toprated, genre, unwatched)' }
                         title: { type: string }
                         genre: { type: string }
                         items:
@@ -3098,7 +3367,89 @@ components:
         positionSecs:
           type: integer
           description: The requesting user's resume position, as for watched.
+        playCount:
+          type: integer
+          description: >
+            How many times the requesting user has played the item — for an
+            album in a listening row, its tracks' plays summed. A play counts
+            once it ends far enough in: a track half way or four minutes in,
+            a film or episode once watched. Stamped on by the library
+            listing, an album's tracks in item detail, the listening rows,
+            artist pages and playlists.
+        lastPlayedAt: { type: string, description: When the requesting user's last counted play was, as for playCount }
 
+    ArtistPage:
+      type: object
+      required: [artist, albums, appearsOn, topTracks, stats]
+      properties:
+        artist: { $ref: "#/components/schemas/Item" }
+        albums: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        appearsOn: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        topTracks: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        stats:
+          type: object
+          properties:
+            tracks: { type: integer, description: Tracks on the artist's own albums }
+            secs: { type: integer, description: Their total running time }
+            plays: { type: integer, description: The viewer's plays of them }
+        bioUrl: { type: string, description: The Wikipedia article the biography (the artist's overview) is from, to credit it }
+        lookingUp: { type: boolean, description: A picture and biography are being looked up now }
+    SmartRules:
+      type: object
+      description: >
+        Tracks matching all (or any) of the rules, sorted and cut to a
+        limit. Fields and their operators — artist (is, isNot, contains;
+        the track's or the album's artist), album (is, contains), title
+        (contains), genre (is, isNot; from the files' tags), year (is, gt,
+        lt), format (is; container or codec, e.g. flac), added (inLast,
+        notInLast; days), plays (is, gt, lt; the user's own), lastPlayed
+        (inLast, notInLast; days, and never played counts as not in the
+        last N days).
+      properties:
+        match: { type: string, enum: [all, any], default: all }
+        rules:
+          type: array
+          items:
+            type: object
+            required: [field, op, value]
+            properties:
+              field: { type: string, enum: [artist, album, title, genre, year, format, added, plays, lastPlayed] }
+              op: { type: string, enum: [is, isNot, contains, gt, lt, inLast, notInLast] }
+              value: { type: string, description: Text, or a whole number as text for year, added, plays and lastPlayed }
+        sort:
+          type: string
+          enum: [random, title, artist, album, year, added, plays, lastPlayed, leastRecent]
+          default: random
+          description: random reshuffles on every read; leastRecent puts the longest unplayed first
+        limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+    Playlist:
+      type: object
+      required: [id, name, trackCount, durationSecs, covers]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        smart: { $ref: "#/components/schemas/SmartRules" }
+        trackCount: { type: integer, description: Tracks the user can play now }
+        durationSecs: { type: integer }
+        covers: { type: array, items: { type: string }, description: Up to four distinct album covers, for a mosaic }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    PlaylistDetail:
+      type: object
+      required: [playlist, tracks]
+      properties:
+        playlist: { $ref: "#/components/schemas/Playlist" }
+        tracks: { type: array, items: { $ref: "#/components/schemas/Item" } }
+    PlaylistRequest:
+      type: object
+      properties:
+        name: { type: string, description: Required to create }
+        smart: { $ref: "#/components/schemas/SmartRules" }
+    PlaylistItems:
+      type: object
+      required: [itemIds]
+      properties:
+        itemIds: { type: array, items: { type: string, format: uuid }, description: Track, album or artist ids }
     PlayInfo:
       type: object
       properties:
@@ -3151,6 +3502,28 @@ components:
         kind: { type: string, enum: [intro, credits] }
         startSecs: { type: number }
         endSecs: { type: number }
+
+    SegmentState:
+      type: object
+      description: Where one kind of segment stands for an episode.
+      required: [kind, found, analysed, locked]
+      properties:
+        kind: { type: string, enum: [intro, credits] }
+        found: { type: boolean, description: The episode has this segment; startSecs and endSecs are its bounds }
+        startSecs: { type: number }
+        endSecs: { type: number }
+        analysed: { type: boolean, description: Detection has looked at the current file, or the value was set by hand }
+        locked: { type: boolean, description: Set by hand — a segment, or that there is none — and left alone by detection }
+
+    ItemSegments:
+      type: object
+      required: [detection, runtimeSecs, segments]
+      properties:
+        detection: { type: boolean, description: Intro detection is on, so a season can be re-detected }
+        runtimeSecs: { type: integer }
+        segments:
+          type: array
+          items: { $ref: "#/components/schemas/SegmentState" }
 
     AudioTrack:
       type: object

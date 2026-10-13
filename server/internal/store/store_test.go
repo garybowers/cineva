@@ -755,6 +755,8 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		"Watched":      true, // per-user play state, not an item column
 		"PositionSecs": true,
 		"WatchedAt":    true,
+		"PlayCount":    true, // per-user play counts, see play_counts
+		"LastPlayedAt": true,
 		"VersionOf":    true, // set by version grouping, not the caller
 		"FileMtime":    true, // write-only; read back through FileStamps, below
 		"SidecarStamp": true, // likewise

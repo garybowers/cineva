@@ -5,10 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"unsafe"
-
-	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
-	"github.com/linuxmatters/ffmpeg-statigo/av"
 )
 
 // Real transcode of an HDR source through the tone-mapping chain. Skipped
@@ -75,70 +71,16 @@ func lumaPlanes(t *testing.T, src, hdr string) [][]byte {
 
 // lumaPlanesSpec renders the same frames through an arbitrary filter chain,
 // so two chains can be compared pixel for pixel.
+//
+// Through videoGraph on a software decode, which is what RunHLS uses.
 func lumaPlanesSpec(t *testing.T, src, spec string) [][]byte {
 	t.Helper()
-	in, err := av.Open(src)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer in.Close()
-	vs, err := in.BestStream(ffmpeg.AVMediaTypeVideo)
-	if err != nil {
-		t.Fatalf("stream: %v", err)
-	}
+	g := &videoGraph{spec: spec + ",format=yuv420p"}
+	defer g.Close()
 	// Films open on black, and black maps to black whatever the transfer
 	// curve, so sample well past the fade-in or the comparison is vacuous.
 	const sampleAtSecs = 65 * 60
-	if _, err := ffmpeg.AVSeekFrame(in.Raw(), -1, int64(sampleAtSecs)*int64(ffmpeg.AVTimeBase), ffmpeg.AVSeekFlagBackward); err != nil {
-		t.Fatalf("seek: %v", err)
-	}
-	dec, err := newThreadedDecoder(vs)
-	if err != nil {
-		t.Fatalf("decoder: %v", err)
-	}
-	defer dec.Close()
-	g, err := av.NewVideoFilterGraphFromContext(dec.Raw(), spec, ffmpeg.AVPixFmtYuv420P)
-	if err != nil {
-		t.Fatalf("graph (%s): %v", spec, err)
-	}
-	defer g.Close()
-
-	var planes [][]byte
-	const want = 8
-	framesSeen := 0
-	pkt := ffmpeg.AVPacketAlloc()
-	defer ffmpeg.AVPacketFree(&pkt)
-	for framesSeen < want {
-		rerr := in.ReadPacket(pkt)
-		if rerr != nil {
-			break
-		}
-		if pkt.StreamIndex() != vs.Index() {
-			continue
-		}
-		derr := dec.Decode(pkt, func(f *ffmpeg.AVFrame) error {
-			f.SetPts(f.BestEffortTimestamp())
-			if err := g.Push(f); err != nil {
-				return err
-			}
-			return g.Pull(func(out *ffmpeg.AVFrame) error {
-				w, h := out.Width(), out.Height()
-				stride := out.Linesize().Get(0)
-				base := out.Data().Get(0)
-				plane := make([]byte, 0, w*h)
-				for y := 0; y < h; y++ {
-					row := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(base)+uintptr(y*stride))), w)
-					plane = append(plane, row...)
-				}
-				planes = append(planes, plane)
-				framesSeen++
-				return nil
-			})
-		})
-		if derr != nil {
-			t.Fatalf("decode (%s): %v", spec, derr)
-		}
-	}
+	planes, _ := lumaThrough(t, src, sampleAtSecs, nil, g)
 	if len(planes) == 0 {
 		t.Fatalf("no frames decoded for spec=%q", spec)
 	}

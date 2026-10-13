@@ -14,7 +14,7 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 - **Downloads**: any item can be downloaded from the web client — the original file, or a portable transcode prepared server-side — so laptops can carry media offline while travelling.
 - **Built-in web client**: mobile-first responsive layout, installable as a PWA — until the native apps exist, a phone browser is the mobile interface, so every screen must work at phone width.
 - **Admin UI**: manage libraries (with a server-paged Manage list for very large ones), trigger/monitor scans, manage users and their devices, view active streams/transcodes, integrations, server settings.
-- **Integrations**: Sonarr and Radarr are connected from the admin UI (`internal/arr`). Cineva registers its own webhook in each, authenticated by a per-connection secret, so an import rescans the affected library within seconds; the scheduled rescan (`libraries.scan_interval`, 15 minutes by default) is the fallback.
+- **Integrations**: Sonarr and Radarr are connected from the admin UI (`internal/arr`). Cineva registers its own webhook in each, authenticated by a per-connection secret, so an import rescans the affected library within seconds; the scheduled rescan (`libraries.scan_interval`, 15 minutes by default) is the fallback. Users can also request missing films and series from search (`internal/requests`): an admin sets each user's permission (none, needs approval, automatic) and each connection's default quality profile and root folder, and the request follows the title from grab to import. The focus stays on playing what is already there.
 
 ### Video — movies & TV (stage 1, v1)
 - Metadata from TMDB: artwork, synopsis, cast, episode data.
@@ -103,13 +103,17 @@ server/                 Go module (all backend code)
   internal/playback/    registry of active playbacks (who is watching what, on which client)
   internal/metadata/    provider interfaces + TMDB/MusicBrainz/Open Library clients
   internal/segments/    intro & credits detection: audio fingerprints compared across a season's episodes
+  internal/trickplay/   seek-bar preview sprite sheets, built in the background
+  internal/background/  the gate background work runs through: schedule, pause, read-speed cap, yielding to playback
   internal/arr/         Sonarr/Radarr connections: webhook registration and the events that trigger rescans
+  internal/requests/    requests for missing films and series: permissions, approval, sending to Sonarr/Radarr, progress
   internal/avatar/      uploaded pictures turned into avatars (upright, square, small JPEG)
   internal/events/      in-process event bus behind the /events stream; events can be addressed to one user or device
   internal/stats/       host and transcode statistics for the admin dashboard
   internal/store/       repository interfaces + SQLite implementation, migrations
   internal/auth/        sessions, password hashing, API keys
   internal/version/     the version string, stamped in at build time
+  internal/logging/     slog setup: pretty console or JSON, component loggers, the startup card
   internal/books/       (planned) EPUB/PDF/CBZ/CBR parsing, OPDS feed
   internal/podcast/     (planned) RSS polling, episode download/retention
   internal/federation/  (planned) nebula membership, invites, mTLS links, rendezvous/relay, sync, heartbeat, delegated sign-in
@@ -178,5 +182,4 @@ backlog entries; it cannot be called done with undocumented gaps.
 
 ## Open questions (resolve before building the relevant milestone)
 
-- Music: full-text search / smart playlists scope for milestone 7
 - Live TV / DVR — explicitly out of scope for now, revisit after v1

@@ -40,6 +40,15 @@ type hlsRun struct {
 	segments int
 	dir      string
 	accel    string
+	bytes    int64 // segment bytes written
+}
+
+// mbps is the video and audio bitrate of what was written.
+func (r hlsRun) mbps(segSecs int) float64 {
+	if r.segments == 0 {
+		return 0
+	}
+	return float64(r.bytes*8) / float64(r.segments*segSecs) / 1e6
 }
 
 // realtime is seconds of video produced per second of wall clock.
@@ -47,20 +56,26 @@ func (r hlsRun) realtime(segSecs int) float64 {
 	return float64(r.segments*segSecs) / r.wall.Seconds()
 }
 
-// runHLSSlice transcodes about want segments from 20 minutes in and reports
-// what it cost.
+// runHLSSlice transcodes about want segments of the 4K sample from 20
+// minutes in and reports what it cost.
 func runHLSSlice(t *testing.T, label string, hw *HWContext, hdr string, segSecs, want int) hlsRun {
+	t.Helper()
+	return runHLSFrom(t, label, hdrSample, 200, hw, hdr, 1080, segSecs, want)
+}
+
+// runHLSFrom transcodes about want segments of src, starting at segment
+// start, to the given height, and reports what it cost.
+func runHLSFrom(t *testing.T, label, src string, start int, hw *HWContext, hdr string, height, segSecs, want int) hlsRun {
 	t.Helper()
 	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	const start = 200
 	r := hlsRun{label: label, dir: dir}
 	before := processCPU()
 	began := time.Now()
 	job := HLSJob{
-		InputPath: hdrSample, OutDir: dir, SegmentSecs: segSecs,
-		StartSegment: start, VideoHeight: 1080, VideoBitrateKbps: 6000,
+		InputPath: src, OutDir: dir, SegmentSecs: segSecs,
+		StartSegment: start, VideoHeight: height, VideoBitrateKbps: 6000,
 		AudioTrack: -1, HW: hw, HDR: hdr,
 		OnAccel: func(name string) { r.accel = name },
 		Throttle: func(_ context.Context, pos int64) error {
@@ -77,9 +92,14 @@ func runHLSSlice(t *testing.T, label string, hw *HWContext, hdr string, segSecs,
 	r.cpu = processCPU() - before
 	files, _ := filepath.Glob(filepath.Join(dir, "seg*.m4s"))
 	r.segments = len(files)
-	t.Logf("%-28s encoder %-6s cpu %-9v wall %-8v %d segments = %.2fx realtime",
+	for _, f := range files {
+		if st, err := os.Stat(f); err == nil {
+			r.bytes += st.Size()
+		}
+	}
+	t.Logf("%-28s encoder %-6s cpu %-9v wall %-8v %d segments = %.2fx realtime, %.2f Mbit/s",
 		label, r.accel, r.cpu.Round(time.Millisecond), r.wall.Round(time.Millisecond),
-		r.segments, r.realtime(segSecs))
+		r.segments, r.realtime(segSecs), r.mbps(segSecs))
 	return r
 }
 
@@ -195,12 +215,9 @@ func TestHardwareDecodeWithSoftwareEncode(t *testing.T) {
 // The reference is the hardware decode as it shipped before device scaling:
 // the same surfaces, downloaded at full size and scaled by swscale. That
 // isolates the one thing that changed. A software decode is compared as well
-// and logged; with tone mapping it agrees as closely, but untone-mapped a
-// 10-bit PQ source sits 1.7-1.9 levels darker through the software graph
-// than through either hardware path or reference ffmpeg. The likely cause is
-// that newParsedGraph declares the source colour space and range on its
-// buffer source and the av helper's does not; not confirmed, it predates
-// this, and it is not what is being tested here.
+// and logged. It used to sit 1.7-1.9 levels darker untone-mapped, because
+// the software graph declared no colour space or range on its source; it
+// now goes through the same graph and agrees (TestCPUGraphMatchesReference).
 func TestDeviceScaleMatchesCPU(t *testing.T) {
 	if _, err := os.Stat(hdrSample); err != nil {
 		t.Skip("4K sample not present")
@@ -281,12 +298,27 @@ func TestDeviceScaleMatchesCPU(t *testing.T) {
 }
 
 // lumaPlanesGPU is lumaPlanesSpec through the hardware path: decoded on the
-// device and run through gpuFrames, as RunHLS does.
+// device and run through videoGraph, as RunHLS does.
 func lumaPlanesGPU(t *testing.T, src string, hw *HWContext, hdr string, w, h int) ([][]byte, bool) {
 	return lumaPlanesGPUAt(t, src, 65*60, hw, hdr, w, h) // as lumaPlanesSpec: well past the fade-in
 }
 
 func lumaPlanesGPUAt(t *testing.T, src string, at int, hw *HWContext, hdr string, w, h int) ([][]byte, bool) {
+	t.Helper()
+	g := &videoGraph{
+		spec: videoFilterSpec(hdr, w, h) + ",format=yuv420p",
+		outW: w, outH: h, scale: hw.scalesOnDevice(), kind: hw.Kind,
+	}
+	defer g.Close()
+	planes, _ := lumaThrough(t, src, at, hw, g)
+	return planes, g.onDevice
+}
+
+// lumaThrough decodes 8 frames from at seconds in (from the keyframe before
+// it), on hw when it is not nil, runs them through g as RunHLS does, and
+// returns each output frame's luma plane and the first frame's time in
+// seconds. Frames the graph leaves on the device are downloaded to be read.
+func lumaThrough(t *testing.T, src string, at int, hw *HWContext, g *videoGraph) ([][]byte, float64) {
 	t.Helper()
 	in, err := av.Open(src)
 	if err != nil {
@@ -307,16 +339,19 @@ func lumaPlanesGPUAt(t *testing.T, src string, at int, hw *HWContext, hdr string
 		t.Fatalf("decoder: %v", err)
 	}
 	defer dec.Close()
-	if dec.HardwarePixFmt() == ffmpeg.AVPixFmtNone {
+	if hw != nil && dec.HardwarePixFmt() == ffmpeg.AVPixFmtNone {
 		t.Fatal("decoder did not open on the device")
 	}
-	g := &gpuFrames{
-		spec: videoFilterSpec(hdr, w, h) + ",format=yuv420p",
-		outW: w, outH: h, timeBase: vs.TimeBase(), scale: hw.scalesOnDevice(), kind: hw.Kind,
-	}
-	defer g.Close()
+	g.timeBase = vs.TimeBase()
 
+	var dl *ffmpeg.AVFrame
+	defer func() {
+		if dl != nil {
+			ffmpeg.AVFrameFree(&dl)
+		}
+	}()
 	var planes [][]byte
+	first := -1.0
 	const want = 8
 	pkt := ffmpeg.AVPacketAlloc()
 	defer ffmpeg.AVPacketFree(&pkt)
@@ -334,6 +369,16 @@ func lumaPlanesGPUAt(t *testing.T, src string, at int, hw *HWContext, hdr string
 				if len(planes) >= want {
 					return nil
 				}
+				if first < 0 {
+					tb := vs.TimeBase()
+					first = float64(out.Pts()) * float64(tb.Num()) / float64(tb.Den())
+				}
+				if out.HwFramesCtx() != nil {
+					var err error
+					if out, err = downloadFrame(&dl, out); err != nil {
+						return err
+					}
+				}
 				stride := out.Linesize().Get(0)
 				base := out.Data().Get(0)
 				plane := make([]byte, 0, out.Width()*out.Height())
@@ -350,7 +395,7 @@ func lumaPlanesGPUAt(t *testing.T, src string, at int, hw *HWContext, hdr string
 		}
 	}
 	if len(planes) == 0 {
-		t.Fatal("no frames through the device path")
+		t.Fatal("no frames through the graph")
 	}
-	return planes, g.onDevice
+	return planes, first
 }

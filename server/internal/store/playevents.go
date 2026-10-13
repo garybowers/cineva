@@ -15,7 +15,7 @@ type PlayDay struct {
 
 type PlayEventRepo interface {
 	RecordPlay(ctx context.Context, userID, itemID string, kind ItemKind) (int64, error)
-	FinishPlay(ctx context.Context, id int64, secs int, completed bool) error
+	FinishPlay(ctx context.Context, id int64, secs int, completed, counts bool) error
 	PlaysByDay(ctx context.Context, days int) ([]PlayDay, error)
 	PlayTotals(ctx context.Context, days int) (PlayTotals, error)
 }
@@ -47,20 +47,45 @@ func (s *Store) RecordPlay(ctx context.Context, userID, itemID string, kind Item
 }
 
 // FinishPlay closes a history row with how long it ran and whether it
-// finished.
+// finished. counts adds the play to the user's play count for the item
+// (see migration 0035 for what counts as a play).
 //
 // Only ever written once: a playback that is stopped and resumed opens a new
 // row, so a late duplicate — a reap racing an explicit stop — must not
-// overwrite a longer measured session with a shorter one.
-func (s *Store) FinishPlay(ctx context.Context, id int64, secs int, completed bool) error {
+// overwrite a longer measured session with a shorter one, nor count the
+// play twice.
+func (s *Store) FinishPlay(ctx context.Context, id int64, secs int, completed, counts bool) error {
 	if secs < 0 {
 		secs = 0
 	}
-	if _, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("finish play %d: %w", id, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
 		`UPDATE play_events
 		 SET ended_at = datetime('now'), secs = ?, completed = ?
 		 WHERE id = ? AND ended_at IS NULL`,
-		secs, completed, id); err != nil {
+		secs, completed, id)
+	if err != nil {
+		return fmt.Errorf("finish play %d: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("finish play %d: %w", id, err)
+	} else if n == 1 && counts {
+		// Joined to items so a play of something deleted since is simply
+		// not counted, rather than failing the foreign key.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO play_counts (user_id, item_id, plays, last_played_at)
+			 SELECT p.user_id, p.item_id, 1, datetime('now')
+			 FROM play_events p JOIN items i ON i.id = p.item_id WHERE p.id = ?
+			 ON CONFLICT (user_id, item_id) DO UPDATE SET
+			 	plays = plays + 1, last_played_at = excluded.last_played_at`, id); err != nil {
+			return fmt.Errorf("count play %d: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finish play %d: %w", id, err)
 	}
 	return nil

@@ -87,6 +87,10 @@ type HWContext struct {
 	// noDeviceScale keeps scaling on the CPU after a hardware decode, so
 	// tests can measure the device scaler against the path it replaced.
 	noDeviceScale bool
+	// noDeviceEncode copies scaled frames back to system memory even when
+	// they could go straight to the encoder, so tests can measure keeping
+	// them on the device against the path it replaced.
+	noDeviceEncode bool
 }
 
 // chipDecodes reports whether the device's own hardware decodes a codec, as

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"os"
 
@@ -77,4 +78,16 @@ func (s *server) enqueueBackground(lib store.Library) {
 	case store.MediaMovies:
 		s.previews.EnqueueLibrary(lib.ID)
 	}
+}
+
+// prunePreviews removes, in the background, the previews of titles that no
+// longer exist: a scan has pruned the items of deleted files, or a library
+// has gone with its items. Previews live outside the database, so nothing
+// else would.
+func (s *server) prunePreviews(ctx context.Context) {
+	go func() {
+		if _, err := s.previews.Prune(ctx); err != nil && ctx.Err() == nil {
+			serverLog.Warn("removing previews of deleted titles failed", "err", err)
+		}
+	}()
 }

@@ -76,6 +76,9 @@ export interface Item {
   positionSecs?: number
   /** When this viewer last touched it, for a "recently watched" ordering. */
   watchedAt?: string
+  /** The viewer's counted plays (an album's: its tracks' summed) and the last one. */
+  playCount?: number
+  lastPlayedAt?: string
 }
 
 export interface ItemDetail {
@@ -300,9 +303,10 @@ export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
 export const createAPIKey = (name: string) => post<APIKey & { key: string }>('/auth/keys', { name })
 export const deleteAPIKey = (id: string) => req<void>(`/auth/keys/${id}`, { method: 'DELETE' })
 
-export const uploadAvatar = (file: File) => {
+/** A photo as chosen, or as framed in the crop dialogue (a JPEG Blob). */
+export const uploadAvatar = (file: Blob) => {
   const form = new FormData()
-  form.append('image', file)
+  form.append('image', file, file instanceof File ? file.name : 'avatar.jpg')
   return req<User>('/auth/avatar', { method: 'POST', body: form })
 }
 export const removeAvatar = () => req<User>('/auth/avatar', { method: 'DELETE' })
@@ -328,6 +332,35 @@ const post = <T>(path: string, body?: unknown) =>
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
+
+// ---- Intro and credits, corrected by an administrator ----
+export type SegmentKind = 'intro' | 'credits'
+export interface SegmentState {
+  kind: SegmentKind
+  /** The episode has this segment; startSecs and endSecs are its bounds. */
+  found: boolean
+  startSecs?: number
+  endSecs?: number
+  /** Detection has looked at the current file, or it was set by hand. */
+  analysed: boolean
+  /** Set by hand (a segment, or that there is none): detection leaves it alone. */
+  locked: boolean
+}
+export interface ItemSegments {
+  /** Intro detection is on, so the season can be re-detected. */
+  detection: boolean
+  runtimeSecs: number
+  segments: SegmentState[]
+}
+export const itemSegments = (id: string) => get<ItemSegments>(`/items/${id}/segments`)
+/** Set by hand, or "none": locked against re-detection until cleared. */
+export const setItemSegment = (id: string, kind: SegmentKind, body: { startSecs: number; endSecs: number } | { none: true }) =>
+  req<ItemSegments>(`/items/${id}/segments/${kind}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+/** Hand a hand-set segment back to detection. */
+export const clearItemSegment = (id: string, kind: SegmentKind) =>
+  req<ItemSegments>(`/items/${id}/segments/${kind}`, { method: 'DELETE' })
+/** Detect a season's intros and credits again; id is the season or one of its episodes. */
+export const redetectSeason = (id: string) => post<{ reopened: number }>(`/items/${id}/segments/redetect`)
 
 export const getHealth = () => get<Health>('/health')
 export const listLibraries = () => get<Library[]>('/libraries')
@@ -686,3 +719,63 @@ export const withdrawRequest = (id: string) => req<void>(`/requests/${id}`, { me
 export const itemMissing = (id: string) => get<MissingInfo>(`/items/${id}/missing`)
 export const searchMissing = (id: string, seasons: number[], episodes: EpisodeRef[]) =>
   post<void>(`/items/${id}/missing/search`, { seasons, episodes })
+
+// ---- Music: artist pages, listening rows, playlists ----
+
+export interface ArtistPage {
+  artist: Item
+  /** Their own albums, oldest first. */
+  albums: Item[]
+  /** Other artists' albums with a track of theirs: compilations, soundtracks. */
+  appearsOn: Item[]
+  /** Ranked by the viewer's plays, then the household's; unplayed left out. */
+  topTracks: Item[]
+  stats: { tracks: number; secs: number; plays: number }
+  /** The Wikipedia article the biography (artist.overview) is from. */
+  bioUrl?: string
+  /** A picture and biography are being looked up; ask again shortly. */
+  lookingUp?: boolean
+}
+export const artistPage = (id: string) => get<ArtistPage>(`/items/${id}/artist`)
+
+export interface Listening {
+  recentlyPlayed: Item[]
+  mostPlayed: Item[]
+  mostPlayedAlbums: Item[]
+}
+export const libraryListening = (id: string) => get<Listening>(`/libraries/${id}/listening`)
+
+export type SmartField = 'artist' | 'album' | 'title' | 'genre' | 'year' | 'format' | 'added' | 'plays' | 'lastPlayed'
+export type SmartOp = 'is' | 'isNot' | 'contains' | 'gt' | 'lt' | 'inLast' | 'notInLast'
+export type SmartSort = 'random' | 'title' | 'artist' | 'album' | 'year' | 'added' | 'plays' | 'lastPlayed' | 'leastRecent'
+export interface SmartRule { field: SmartField; op: SmartOp; value: string }
+export interface SmartRules { match: 'all' | 'any'; rules: SmartRule[]; sort: SmartSort; limit: number }
+
+export interface Playlist {
+  id: string
+  name: string
+  /** Present on a smart playlist: its rules, evaluated each time it is read. */
+  smart?: SmartRules
+  trackCount: number
+  durationSecs: number
+  /** Up to four distinct album covers, for a mosaic. */
+  covers: string[]
+  createdAt?: string
+  updatedAt?: string
+}
+export interface PlaylistDetail { playlist: Playlist; tracks: Item[] }
+
+const send = <T>(method: string, path: string, body: unknown) =>
+  req<T>(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+
+export const listPlaylists = () => get<Playlist[]>('/playlists')
+export const createPlaylist = (name: string, smart?: SmartRules) => post<Playlist>('/playlists', { name, smart })
+export const playlistDetail = (id: string) => get<PlaylistDetail>(`/playlists/${id}`)
+export const updatePlaylist = (id: string, change: { name?: string; smart?: SmartRules }) =>
+  send<PlaylistDetail>('PATCH', `/playlists/${id}`, change)
+export const deletePlaylist = (id: string) => req<void>(`/playlists/${id}`, { method: 'DELETE' })
+/** Tracks, albums or artists, added to the end in listening order. */
+export const addToPlaylist = (id: string, itemIds: string[]) => post<PlaylistDetail>(`/playlists/${id}/items`, { itemIds })
+/** The playlist's tracks, replaced with these in this order. */
+export const setPlaylistTracks = (id: string, itemIds: string[]) =>
+  send<PlaylistDetail>('PUT', `/playlists/${id}/items`, { itemIds })

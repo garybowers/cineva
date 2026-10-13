@@ -88,9 +88,10 @@ export const createUser = (u: UserRequest) =>
 export const updateUser = (id: string, u: UserRequest) =>
   req<User>(`/users/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
 export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
-export const uploadUserAvatar = (id: string, file: File) => {
+/** A photo as chosen, or as framed in the crop dialogue (a JPEG Blob). */
+export const uploadUserAvatar = (id: string, file: Blob) => {
   const form = new FormData()
-  form.append('image', file)
+  form.append('image', file, file instanceof File ? file.name : 'avatar.jpg')
   return req<User>(`/users/${id}/avatar`, { method: 'POST', body: form })
 }
 export const deleteUserAvatar = (id: string) => req<User>(`/users/${id}/avatar`, { method: 'DELETE' })

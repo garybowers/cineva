@@ -250,3 +250,52 @@ func TestBuilderScheduleAndRunNow(t *testing.T) {
 	waitFor(t, "built on demand", func() bool { return len(f.builtIDs()) == 1 })
 	waitFor(t, "back on the schedule", func() bool { return f.b.Gate.ScheduleWait() == "on-demand" })
 }
+
+// Prune removes the previews of items that are gone and nothing else: not a
+// kept title's, not a file named otherwise, not anything in a folder below.
+func TestPrune(t *testing.T) {
+	f := newFixture(t, 2)
+	ctx := context.Background()
+	dir := f.b.Dir
+	gone := "0b6c0a4e-5a1d-4f3e-9b0e-2f6f0e0c1d2a"
+	write := func(name string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	kept := f.items[0].ID
+	files := map[string]bool{ // path -> should survive
+		write(kept + ".jpg"):                     true,
+		write(kept + ".vtt"):                     true,
+		write(gone + ".jpg"):                     false,
+		write(gone + ".vtt"):                     false,
+		write("poster.jpg"):                      true,
+		write(gone + ".mkv"):                     true,
+		write(filepath.Join("sub", gone+".jpg")): true,
+	}
+	n, err := f.b.Prune(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("pruned %d titles, want 1", n)
+	}
+	for p, survive := range files {
+		_, err := os.Stat(p)
+		if exists := err == nil; exists != survive {
+			t.Errorf("%s exists = %v, want %v", filepath.Base(p), exists, survive)
+		}
+	}
+
+	// A directory not made yet is nothing to prune.
+	f.b.Dir = filepath.Join(dir, "missing")
+	if n, err := f.b.Prune(ctx); err != nil || n != 0 {
+		t.Errorf("prune of a missing dir = %d, %v; want 0, nil", n, err)
+	}
+}

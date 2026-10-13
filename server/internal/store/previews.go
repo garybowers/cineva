@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // PreviewItem is a playable video as seek-bar preview generation sees it.
@@ -22,6 +23,7 @@ type PreviewItem struct {
 type PreviewRepo interface {
 	PreviewItems(ctx context.Context, libraryID string) ([]PreviewItem, error)
 	PreviewItem(ctx context.Context, itemID string) (PreviewItem, error)
+	ExistingItemIDs(ctx context.Context, ids []string) (map[string]bool, error)
 }
 
 var _ PreviewRepo = (*Store)(nil)
@@ -74,4 +76,39 @@ func (s *Store) PreviewItem(ctx context.Context, itemID string) (PreviewItem, er
 		return PreviewItem{}, fmt.Errorf("preview item %s: %w", itemID, err)
 	}
 	return p, nil
+}
+
+// ExistingItemIDs reports which of ids are still items, so files kept beside
+// the database under an item's id — seek-bar previews — can be removed once
+// the item has gone.
+func (s *Store) ExistingItemIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	// Chunked to stay well inside SQLite's bound-parameter limit.
+	for len(ids) > 0 {
+		chunk := ids[:min(len(ids), 500)]
+		ids = ids[len(chunk):]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT id FROM items WHERE id IN (?`+strings.Repeat(",?", len(chunk)-1)+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("existing items: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("existing items: %w", err)
+			}
+			out[id] = true
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("existing items: %w", err)
+		}
+	}
+	return out, nil
 }

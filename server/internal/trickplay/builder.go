@@ -15,11 +15,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/logging"
@@ -101,6 +106,9 @@ type Builder struct {
 	status  Status
 	started time.Time
 	wake    chan struct{}
+	// pruneMu keeps prunes from overlapping: one after a scan can meet the
+	// one at startup.
+	pruneMu sync.Mutex
 }
 
 // New returns a builder writing into dir, reading through gate.
@@ -474,4 +482,65 @@ func (b *Builder) generate(ctx context.Context, job store.PreviewItem) error {
 			}
 		}
 	}
+}
+
+// Prune removes the previews of items that no longer exist — a film whose
+// file was deleted and pruned by a scan, or a library removed — and returns
+// how many titles' previews went. Only files named as TrickplayPaths names
+// them, an item id with .jpg or .vtt, are considered, and nothing below the
+// directory, so a previews_dir pointed somewhere shared by mistake loses
+// nothing but previews. Media storage is never touched.
+func (b *Builder) Prune(ctx context.Context) (int, error) {
+	b.pruneMu.Lock()
+	defer b.pruneMu.Unlock()
+	entries, err := os.ReadDir(b.Dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil // nothing built yet
+	}
+	if err != nil {
+		return 0, fmt.Errorf("listing previews: %w", err)
+	}
+	files := map[string][]string{} // item id -> its preview files
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		name := e.Name()
+		ext := filepath.Ext(name)
+		if ext != ".jpg" && ext != ".vtt" {
+			continue
+		}
+		id := strings.TrimSuffix(name, ext)
+		if _, err := uuid.Parse(id); err != nil || len(id) != 36 {
+			continue
+		}
+		files[id] = append(files[id], name)
+	}
+	if len(files) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, 0, len(files))
+	for id := range files {
+		ids = append(ids, id)
+	}
+	exists, err := b.Store.ExistingItemIDs(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for id, names := range files {
+		if exists[id] {
+			continue
+		}
+		for _, name := range names {
+			if err := os.Remove(filepath.Join(b.Dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return removed, fmt.Errorf("removing previews: %w", err)
+			}
+		}
+		removed++
+	}
+	if removed > 0 {
+		logger.Info("previews of deleted titles removed", "count", removed)
+	}
+	return removed, nil
 }

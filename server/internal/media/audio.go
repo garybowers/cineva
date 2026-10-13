@@ -25,6 +25,9 @@ type AudioInfo struct {
 	DiscNum     int
 	Year        int
 	Compilation bool
+	// Genre is the genre tag as written, which may hold several separated
+	// by ";" or "/" — splitting is the scanner's business.
+	Genre string
 }
 
 // parseNum handles "3" and "3/12" style track/disc tags.
@@ -51,6 +54,7 @@ func ProbeAudio(path string) (AudioInfo, error) {
 		Album:       dictValue(meta, "album"),
 		TrackNum:    parseNum(dictValue(meta, "track")),
 		DiscNum:     parseNum(dictValue(meta, "disc")),
+		Genre:       dictValue(meta, "genre"),
 	}
 	switch strings.ToLower(dictValue(meta, "compilation")) {
 	case "1", "true", "yes":

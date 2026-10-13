@@ -96,6 +96,13 @@ func (s *server) home(c echo.Context) error {
 				Title: "Recently added", Items: s.withPlayState(c, lib.ID, recent),
 			})
 		}
+		if lib.MediaType == store.MediaMusic {
+			shelves, err := s.musicShelves(c, lib)
+			if err != nil {
+				return err
+			}
+			resp.Shelves = append(resp.Shelves, shelves...)
+		}
 	}
 	// Recommendations after every library's recently added row, so the
 	// newest things are near the top whichever library they are in.
@@ -118,4 +125,30 @@ func (s *server) home(c echo.Context) error {
 		}
 	}
 	return c.JSON(http.StatusOK, resp)
+}
+
+// musicShelves are a music library's listening rows for the home screen:
+// the albums the viewer played last and played most. Albums rather than
+// tracks, since a home row is cards to open; the music library's own page
+// has the most played tracks.
+func (s *server) musicShelves(c echo.Context, lib store.Library) ([]homeShelf, error) {
+	ctx, uid := c.Request().Context(), userID(c)
+	var out []homeShelf
+	recent, err := s.store.RecentlyPlayedAlbums(ctx, uid, lib.ID, homeRowSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(recent) > 0 {
+		out = append(out, homeShelf{LibraryID: lib.ID, LibraryName: lib.Name, Kind: "played", Title: "Recently played", Items: recent})
+	}
+	top, err := s.store.MostPlayedAlbums(ctx, uid, lib.ID, homeRowSize)
+	if err != nil {
+		return nil, err
+	}
+	// A handful of plays is not yet a "most played" worth a row: it would
+	// repeat the recently played one.
+	if len(top) >= 4 {
+		out = append(out, homeShelf{LibraryID: lib.ID, LibraryName: lib.Name, Kind: "mostPlayed", Title: "Most played", Items: top})
+	}
+	return out, nil
 }

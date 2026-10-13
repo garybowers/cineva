@@ -943,10 +943,27 @@ func (s *server) onPlaybackEnd(p playback.Playback) {
 		attrs = append(attrs, "reached", fmt.Sprintf("%d%%", min(100, p.PositionSecs*100/p.DurationSecs)))
 	}
 	playbackLog.Info("playback ended", attrs...)
-	if err := s.store.FinishPlay(ctx, p.EventID, secs, completed); err != nil {
+	counts := countsAsPlay(p.Kind, p.PositionSecs, p.DurationSecs, completed)
+	if err := s.store.FinishPlay(ctx, p.EventID, secs, completed, counts); err != nil {
 		playbackLog.Error("closing play history row failed", "event", p.EventID, "err", err)
 	}
 	s.events.Publish(events.Event{Type: "plays"})
+}
+
+// countsAsPlay decides whether a playback adds to the viewer's play count.
+// A film or episode counts once it is watched. A track counts by the rule
+// scrobblers use: played half way, or four minutes into a long one, and
+// never for a track under 30 seconds unless it finished — a listener who
+// skips a song after its intro has not played it, and one who skips the
+// last minute of an epic has.
+func countsAsPlay(kind string, position, duration int, completed bool) bool {
+	if completed {
+		return true
+	}
+	if kind != string(store.KindTrack) || duration < 30 {
+		return false
+	}
+	return position*2 >= duration || position >= 240
 }
 
 // playCompleteFraction is the share of the runtime that counts as having

@@ -417,9 +417,23 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 	if err != nil {
 		return err
 	}
-	// A lone episode has nothing to be compared with. It is left
-	// unrecorded rather than marked analysed, so that it is looked at again
-	// once the season has company.
+	// A lone episode has nothing in its own season to be compared with, so
+	// it is compared with episodes of the seasons either side: a series'
+	// titles rarely change between seasons. They are partners only — each
+	// is analysed with its own season — so they count as analysed here.
+	// With no other season either, the episode is left unrecorded rather
+	// than marked analysed, so that it is looked at again once it has
+	// company.
+	if len(eps) == 1 && !eps[0].Analysed {
+		others, err := d.Store.AdjacentSeasonEpisodes(ctx, seasonID, partners)
+		if err != nil {
+			return err
+		}
+		for _, ep := range others {
+			ep.Analysed = true
+			eps = append(eps, ep)
+		}
+	}
 	if len(eps) < 2 {
 		return nil
 	}

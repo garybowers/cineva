@@ -19,18 +19,26 @@
   import { loadQueue, saveQueue } from './lib/queue'
   import Player from './Player.svelte'
   import MusicPlayer from './MusicPlayer.svelte'
+  import ArtistView from './music/ArtistView.svelte'
+  import ListeningRows from './music/ListeningRows.svelte'
+  import PlaylistsView from './music/PlaylistsView.svelte'
+  import AddToPlaylist from './music/AddToPlaylist.svelte'
+  import TrackMenu from './music/TrackMenu.svelte'
+  import { setMusicActions, addToPlaylist, plays as playsLabel, type ItemRef } from './music/actions.svelte'
+  import AvatarCrop from './AvatarCrop.svelte'
+  import SegmentEditor from './SegmentEditor.svelte'
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
     RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
     Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone, Upload,
-    Inbox, Plus, Clock, CalendarClock,
+    Inbox, Plus, Clock, CalendarClock, ListMusic,
   } from '@lucide/svelte'
 
   // 'requests' and 'discover' (a title outside the library) are reached from
   // the sidebar and from search; neither is one of the always-there tabs.
-  type Tab = 'home' | 'libraries' | 'queue' | 'settings' | 'requests' | 'discover'
+  type Tab = 'home' | 'libraries' | 'queue' | 'settings' | 'requests' | 'discover' | 'playlists'
   const tabs = [
     { id: 'home' as Tab, label: 'Home', icon: House },
     { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
@@ -280,17 +288,25 @@
   // An uploaded photo, or the initial on a colour of the user's choosing.
   let avatarMsg = $state('')
   let avatarBusy = $state(false)
-  async function pickAvatar(e: Event) {
+  // The photo being framed before it goes up (AvatarCrop).
+  let cropFile: File | null = $state(null)
+  function pickAvatar(e: Event) {
     const input = e.currentTarget as HTMLInputElement
     const file = input.files?.[0]
-    input.value = '' // choosing the same file again should still upload it
+    input.value = '' // choosing the same file again should still offer it
     if (!file) return
+    avatarMsg = ''
+    cropFile = file
+  }
+  async function sendAvatar(picture: Blob) {
     avatarBusy = true
     avatarMsg = ''
     try {
-      me = await uploadAvatar(file)
+      me = await uploadAvatar(picture)
+      cropFile = null
     } catch (err) {
       avatarMsg = errText(err)
+      cropFile = null
     } finally {
       avatarBusy = false
     }
@@ -404,6 +420,7 @@
     if (tab === 'queue') return '/queue'
     if (tab === 'settings') return '/settings'
     if (tab === 'requests') return '/requests'
+    if (tab === 'playlists') return '/playlists' + (playlistId ? '/' + playlistId : '')
     if (tab === 'discover' && discoverKey) return `/discover/${discoverKey.type}/${discoverKey.id}`
     let p = '/libraries'
     if (currentLib) {
@@ -445,6 +462,11 @@
       }
       if (parts[0] === 'queue') {
         tab = 'queue'
+        return
+      }
+      if (parts[0] === 'playlists') {
+        tab = 'playlists'
+        playlistId = parts[1] ?? null
         return
       }
       if (parts[0] === 'requests') {
@@ -733,15 +755,18 @@
 
   async function leaveSessionToArtist(lib: Library, album: Item) {
     listening = false
-    tab = 'libraries'
-    if (currentLib?.id !== lib.id || musicAll.length === 0) await openLibrary(lib)
-    if (album.parentId) selectArtist(album.parentId)
-    syncURL()
+    if (album.parentId) await openArtist({ id: album.parentId, libraryId: lib.id })
   }
 
   // Open the album containing a track (from the music bar or search).
+  // A track carries only its album's id, so the album is looked for in what
+  // the client already holds — the playing queue's albums (fetched as each
+  // track starts), the open music library, the grid, the search results —
+  // and the page paints from it at once, as every other navigation does;
+  // the tracks fill in when the fetch returns.
   async function openAlbumOf(track: Item) {
-    if (!track.parentId) return
+    const albumId = track.parentId
+    if (!albumId) return
     tab = 'libraries'
     const lib = libraries.find((l) => l.id === track.libraryId)
     if (lib && lib.id !== currentLib?.id) {
@@ -750,10 +775,12 @@
         gridItems = items.filter(gridFilter(lib))
       })
     }
-    await openItem(track.parentId)
+    const find = (i: Item) => i.id === albumId
+    const album = sessionAlbums.get(albumId) ?? albumById.get(albumId) ?? gridItems.find(find) ?? searchResults.find(find)
+    await openItem(albumId, false, album)
   }
 
-  // Jump to a track's artist in the music view. Tracks hang off albums, so
+  // Jump to a track's or album's artist page. Tracks hang off albums, so
   // the artist id comes from the album's parent.
   async function goToArtistOf(item: Item) {
     let artistId = item.kind === 'album' ? (item.parentId ?? '') : ''
@@ -764,15 +791,58 @@
         /* album gone — fall through */
       }
     }
-    const lib = libraries.find((l) => l.id === item.libraryId)
-    if (!lib || !artistId) return
-    tab = 'libraries'
+    if (artistId) await openArtist({ id: artistId, libraryId: item.libraryId })
+  }
+
+  // An artist's page: the artist item's own detail route
+  // (/libraries/<Music>/<Artist>), which renders as ArtistView.
+  async function openArtist(a: Item | ItemRef) {
     listening = false
-    detail = null
-    if (currentLib?.id !== lib.id || musicAll.length === 0) await openLibrary(lib)
-    selectArtist(artistId)
+    if ('kind' in a && a.title) return showItem(a)
+    tab = 'libraries'
+    const lib = libraries.find((l) => l.id === a.libraryId)
+    if (lib && lib.id !== currentLib?.id) {
+      currentLib = lib
+      libraryItems(lib.id).then((items) => {
+        if (lib.mediaType === 'music') musicAll = items
+        else gridItems = items.filter(gridFilter(lib))
+      })
+    }
+    await openItem(a.id)
+  }
+
+  // ---- Playlists (their own route, /playlists[/<id>]) ----
+  let playlistId: string | null = $state(null)
+  function openPlaylist(id: string | null) {
+    listening = false
+    tab = 'playlists'
+    playlistId = id
     syncURL()
   }
+
+  // Add to the end of the music queue; start it when nothing is playing.
+  function queueMusic(tracks: Item[]) {
+    if (tracks.length === 0) return
+    if (music) music = { ...music, queue: [...music.queue, ...tracks] }
+    else startMusic(tracks, 0)
+  }
+
+  setMusicActions({
+    play: (tracks, index = 0, shuffle = false) => startSession(tracks, index, shuffle),
+    queue: queueMusic,
+    openAlbum: (al) => {
+      listening = false
+      if ('kind' in al && al.title) return void showItem(al)
+      const lib = libraries.find((l) => l.id === al.libraryId)
+      tab = 'libraries'
+      if (lib && lib.id !== currentLib?.id) currentLib = lib
+      void openItem(al.id)
+    },
+    openArtist: (a) => void openArtist(a),
+    openPlaylist: (id) => openPlaylist(id),
+    notify: (kind, text) => notify(kind, text),
+    download: (id, format) => dlNavigate(id, format),
+  })
 
   // A search hit on a song plays it in album context: queue the whole album
   // starting at that track.
@@ -1644,12 +1714,30 @@
   async function sendQueueTo(d: Device) {
     devMenu = null
     try {
-      await playOnDevice(d.id, queue.map((q) => q.id), queueIndex)
-      if (playing) closePlayer()
-      notify('info', `Playing on ${deviceTitle(d)}.`)
+      await sendTo(d)
+    } catch {
+      /* already said */
+    }
+  }
+  // What "Play on…" sends: the queue from where it is. When the title
+  // playing is not the queue's current entry — the next episode rolled on
+  // by itself, or a title played on its own — it is that title and what is
+  // queued after it.
+  function handoffList(): { ids: string[]; index: number } {
+    const now = playing?.item
+    if (!now || queue[queueIndex]?.id === now.id) return { ids: queue.map((q) => q.id), index: queueIndex }
+    return { ids: [now.id, ...upNext.map((q) => q.id)], index: 0 }
+  }
+  async function sendTo(d: Device) {
+    const { ids, index } = handoffList()
+    try {
+      await playOnDevice(d.id, ids, index)
     } catch (err) {
       notify('error', errText(err))
+      throw err
     }
+    if (playing) closePlayer()
+    notify('info', `Playing on ${deviceTitle(d)}.`)
   }
   async function takeQueueFrom(d: Device) {
     devMenu = null
@@ -1946,6 +2034,8 @@
   let upNextHere: NextUpInfo | null = $state(null)
   // The row whose ⋯ menu is open, and the row showing its whole overview.
   let epMenu: string | null = $state(null)
+  // The episode whose intro and credits an administrator is correcting.
+  let segmentsFor: Item | null = $state(null)
   let epOpen: string | null = $state(null)
 
   $effect(() => {
@@ -2732,6 +2822,11 @@
             onclick={() => { tab = 'libraries'; openLibrary(lib) }}
           ><TypeIcon size={16} /> <span class="side-label">{lib.name}</span>{#if lib.storage && !lib.storage.available}<span class="side-warn" title="Storage not reachable: {lib.storage.path}: {lib.storage.error}"><TriangleAlert size={14} /></span>{/if}</button>
         {/each}
+        {#if group.type === 'music'}
+          <button class="side-item" class:active={tab === 'playlists'} title="Playlists" onclick={() => openPlaylist(null)}>
+            <ListMusic size={16} /> <span class="side-label">Playlists</span>
+          </button>
+        {/if}
       {/each}
       {#if libraries.length === 0}
         <div class="type-label"><span class="side-label">No libraries yet</span></div>
@@ -2818,6 +2913,9 @@
           onburnsubtitle={burnSubtitle}
           onexpand={() => playing && showItem(playing.item)}
           ontime={(t) => (playingPos = t)}
+          devices={otherDevices.filter((d) => d.online)}
+          ondevices={loadDevices}
+          onplayon={sendTo}
         />
       {/key}
       {#if upNext.length > 0 && !playerCompact}
@@ -2905,6 +3003,8 @@
           </div>
         {/if}
       </section>
+    {:else if tab === 'playlists'}
+      <PlaylistsView {playlistId} onopen={openPlaylist} />
     {:else if tab === 'requests'}
       <h1>Requests</h1>
       {#if me?.role === 'admin'}
@@ -3252,7 +3352,9 @@
         {/if}
       </section>
     {:else if tab === 'libraries'}
-      {#if detail}
+      {#if detail && detail.item.kind === 'artist'}
+        <ArtistView artist={detail.item} />
+      {:else if detail}
         {#if detail.item.backdrop || detail.item.poster}
           <!-- The film's own artwork behind the page. The backdrop is the
                wide still meant for this; the poster is a fallback and is
@@ -3298,11 +3400,15 @@
               </div>
             {/if}
             {#if detail.item.kind === 'album'}
-              <p class="meta">{detail.item.artist} · {detail.children.length} tracks</p>
-              <div class="actions">
+              <p class="meta">
+                {#if detail.item.parentId}<button class="artistlink" onclick={() => detail && goToArtistOf(detail.item)}>{detail.item.artist}</button>{:else}{detail.item.artist}{/if}
+                · {detail.children.length} tracks
+              </p>
+              <div class="actions wrap">
                 <button class="play" onclick={() => detail && startSession(detail.children, 0)}><Play size={15} /> Listen</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0)}>Queue</button>
                 <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
+                <button class="dl" onclick={() => detail && addToPlaylist([detail.item.id], detail.item.title)} title="Add to playlist"><ListMusic size={14} /> Playlist</button>
                 <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { detail && dlNavigate(detail.item.id, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
                   <option value="">Download…</option>
                   <option value="original">Original (ZIP)</option>
@@ -3515,6 +3621,11 @@
                         <a class="um-item" role="menuitem" href={downloadURL(child.id)} download onclick={() => (epMenu = null)}>
                           <Download size={14} /> Download
                         </a>
+                        {#if me?.role === 'admin'}
+                          <button class="um-item" role="menuitem" onclick={() => { epMenu = null; segmentsFor = child }}>
+                            <Clock size={14} /> Intro &amp; credits…
+                          </button>
+                        {/if}
                       </div>
                     {/if}
                   </div>
@@ -3524,7 +3635,7 @@
           {:else}
             <ul class="children">
               {#each detail.children as child, ci (child.id)}
-                <li class:hl={child.id === hlTrackId}>
+                <li class:hl={child.id === hlTrackId} class:trackrow={child.kind === 'track'}>
                   {#if child.kind === 'track'}
                     <button onclick={() => detail && startMusic(detail.children, ci)}>
                       <span>
@@ -3532,8 +3643,12 @@
                         {child.title}
                         {#if child.artist && child.artist !== detail.item.artist}<span class="muted"> — {child.artist}</span>{/if}
                       </span>
-                      <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
+                      <span class="trackend">
+                        {#if child.playCount}<span class="muted trackplays">{playsLabel(child.playCount)}</span>{/if}
+                        <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
+                      </span>
                     </button>
+                    <TrackMenu track={child} album={false} />
                   {:else}
                     <button onclick={() => openItem(child.id, true, child)}>
                       <span>
@@ -3623,7 +3738,7 @@
                 <div class="rail-div"></div>
               </div>
               {#each railArtists as a (a.id)}
-                <button class="rail-item" class:sel={selArtist === a.id} onclick={() => selectArtist(a.id)}>{a.title}</button>
+                <button class="rail-item" class:sel={selArtist === a.id} onclick={() => openArtist(a)}>{a.title}</button>
               {/each}
               {#if railArtists.length === 0}
                 <div class="rail-empty muted">No artists match</div>
@@ -3663,6 +3778,9 @@
                 </div>
               </header>
 
+              {#if selArtist === 'ALL' && !filterQ && currentLib}
+                <ListeningRows libraryId={currentLib.id} onplaylists={() => openPlaylist(null)} />
+              {/if}
               {#if filterQ && matchedSongs.length > 0}
                 <div class="msongs">
                   <div class="msongs-h">Songs</div>
@@ -3680,7 +3798,7 @@
 
               {#each filteredShelfGroups as group (group.id)}
                 {#if selArtist === 'ALL'}
-                  <button class="shelf-h" onclick={() => selectArtist(group.id)}>{group.title} <span class="muted">· {group.albums.length} albums</span></button>
+                  <button class="shelf-h" onclick={() => { const a = mArtists.find((x) => x.id === group.id); if (a) openArtist(a) }}>{group.title} <span class="muted">· {group.albums.length} albums</span></button>
                 {/if}
                 <div class="shelf">
                   {#each group.albums as album (album.id)}
@@ -4058,6 +4176,7 @@
             </div>
           {/if}
           {#if avatarMsg}<span class="muted small">{avatarMsg}</span>{/if}
+
         </div>
         <div class="row col">
           <span>Password</span>
@@ -4169,6 +4288,7 @@
       </section>
     {/if}
   </main>
+  <AddToPlaylist />
 
   {@render personPanel()}
 
@@ -4185,6 +4305,13 @@
   </div>
 </div>
 
+<!-- Outside the layout, so no stacking context of the page's can sit over it. -->
+{#if cropFile}
+  <AvatarCrop file={cropFile} busy={avatarBusy} oncrop={sendAvatar} oncancel={() => (cropFile = null)} />
+{/if}
+{#if segmentsFor}
+  <SegmentEditor episode={segmentsFor} onclose={() => (segmentsFor = null)} />
+{/if}
 
 <style>
   .shell { min-height: 100vh; display: flex; flex-direction: column; }
@@ -5923,6 +6050,14 @@
   }
   .children button:hover { color: var(--accent-2); }
   .epnum { color: var(--muted); }
+  /* An album's track: the row plays it, the menu beside it does the rest. */
+  .children li.trackrow { display: flex; align-items: center; gap: 0.25rem; }
+  .children li.trackrow > button { flex: 1; min-width: 0; }
+  .trackend { display: inline-flex; gap: 0.9rem; flex: none; }
+  .trackplays { font-size: 0.82rem; }
+  @media (max-width: 30rem) { .trackplays { display: none; } }
+  .artistlink { padding: 0; color: var(--text); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 3px; }
+  .artistlink:hover { color: var(--accent-2); text-decoration-color: currentColor; }
 
   .card {
     background: var(--panel);

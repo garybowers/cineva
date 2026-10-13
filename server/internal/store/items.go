@@ -117,6 +117,12 @@ type Item struct {
 	// WatchedAt is when this viewer last touched the item, for a
 	// "recently watched" ordering. Empty when they never have.
 	WatchedAt string `json:"watchedAt,omitempty"`
+	// PlayCount and LastPlayedAt are the viewer's play count for the item
+	// and when the last counted play was (see migration 0035) — for an
+	// album or artist, the sum over its tracks and the latest of them.
+	// Viewer state like Watched, filled in by the handlers that use it.
+	PlayCount    int    `json:"playCount,omitempty"`
+	LastPlayedAt string `json:"lastPlayedAt,omitempty"`
 }
 
 type ItemRepo interface {
