@@ -1,6 +1,7 @@
 package media
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/draw"
@@ -50,7 +51,12 @@ func TrickplayPaths(dir, itemID string) (sheet, vtt string) {
 // interval. Callers run it in the background and serve the result when it
 // lands; until then a player simply shows no preview, which is how it
 // behaves for any file without one.
-func GenerateTrickplay(path, outDir, itemID string, runtimeSecs int) error {
+//
+// progress, when set, is called after each thumbnail with the bytes read
+// from the file so far — for pacing reads and noticing a stall — and an
+// error from it abandons the file, as does cancelling ctx; an abandoned
+// file writes nothing.
+func GenerateTrickplay(ctx context.Context, path, outDir, itemID string, runtimeSecs int, progress func(bytesRead int64) error) error {
 	if runtimeSecs <= 0 {
 		return fmt.Errorf("trickplay: unknown duration")
 	}
@@ -115,6 +121,9 @@ func GenerateTrickplay(path, outDir, itemID string, runtimeSecs int) error {
 	cues.WriteString("WEBVTT\n\n")
 	made := 0
 	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		at := int64(i * interval)
 		// Seek to just before the mark and take the first frame decoded —
 		// landing on the nearest keyframe is close enough for a preview and
@@ -157,6 +166,15 @@ func GenerateTrickplay(path, outDir, itemID string, runtimeSecs int) error {
 		}
 		writeCue(&cues, itemID, at, int64(interval), i, thumbH)
 		made++
+		if progress != nil {
+			var read int64
+			if pb := in.Raw().Pb(); pb != nil {
+				read = pb.BytesRead()
+			}
+			if err := progress(read); err != nil {
+				return fmt.Errorf("trickplay: %w", err)
+			}
+		}
 	}
 	if made == 0 {
 		return fmt.Errorf("trickplay: no frames decoded")

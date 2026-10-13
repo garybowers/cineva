@@ -276,7 +276,7 @@ func (s *server) playItem(c echo.Context) error {
 	// Vision profile, HDR transfer), so the file is probed once here. It is
 	// a header read, and only on starting playback. A failure is not fatal:
 	// the zero Info reads as "no Dolby Vision", which is the common case.
-	vinfo, err := library.Within(mediaTimeout, func() (media.Info, error) { return media.Probe(item.Path) })
+	vinfo, err := library.WithinFile(item.Path, mediaTimeout, func() (media.Info, error) { return media.Probe(item.Path) })
 	if errors.Is(err, library.ErrNotResponding) {
 		return s.storageFailed(c.Request().Context(), item, err)
 	}
@@ -436,17 +436,12 @@ func (s *server) streamItem(c echo.Context) error {
 		if err != nil {
 			return err
 		}
-		return c.File(path)
+		return c.File(path) // the cache, on local disk
 	}
-	// The file is opened by c.File; checking it answers first keeps a hung
-	// share from holding the request (and a browser connection) open.
-	if err := s.storageReady(c.Request().Context(), item); err != nil {
-		return err
-	}
-	if _, err := library.Within(mediaTimeout, func() (os.FileInfo, error) { return os.Stat(item.Path) }); errors.Is(err, library.ErrNotResponding) {
-		return s.storageFailed(c.Request().Context(), item, err)
-	}
-	return c.File(item.Path)
+	// Refused at once when the library is known to be down; otherwise every
+	// touch of the file has a deadline, so a hung share cannot hold the
+	// request (and a browser connection) open.
+	return s.serveMedia(c, item, item.Path, "")
 }
 
 // GET /items/:id/download — a playable item's original file as an
@@ -470,9 +465,9 @@ func (s *server) downloadItem(c echo.Context) error {
 		if format != "" && format != "original" {
 			return s.downloadTranscoded(c, item, format, quality)
 		}
-		return c.Attachment(item.Path, filepath.Base(item.Path))
+		return s.serveMedia(c, item, item.Path, filepath.Base(item.Path))
 	case store.KindMovie, store.KindEpisode:
-		return c.Attachment(item.Path, filepath.Base(item.Path))
+		return s.serveMedia(c, item, item.Path, filepath.Base(item.Path))
 	case store.KindSeason, store.KindSeries, store.KindAlbum, store.KindArtist:
 		return s.downloadArchive(c, item, format, quality)
 	}
@@ -499,9 +494,28 @@ func (s *server) transcodedTrack(ctx context.Context, item store.Item, format st
 	// A crashed transcode can leave an empty/partial file: only trust
 	// non-empty caches, and build new ones atomically via rename.
 	if st, err := os.Stat(cached); err != nil || st.Size() == 0 {
+		// The source is read from media storage; the cache is local.
+		if err := s.storageReady(ctx, item); err != nil {
+			return "", "", err
+		}
 		part := cached + ".part." + f.Ext // keep the extension so the muxer resolves
-		if err := media.TranscodeAudio(ctx, item.Path, part, f.Encoder, quality); err != nil {
-			os.Remove(part)
+		// Bounded by progress rather than by total time: a long track on a
+		// slow share may take a while, but one that stops reading is given
+		// up on. The cancel stops an abandoned transcode as soon as its
+		// blocked read returns.
+		tctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		_, err := library.WithinIdleFile(item.Path, mediaTimeout, func(progress func()) (struct{}, error) {
+			return struct{}{}, media.TranscodeAudio(tctx, item.Path, part, f.Encoder, quality, progress)
+		})
+		if err != nil {
+			cancel()
+			if rerr := os.Remove(part); rerr != nil && !os.IsNotExist(rerr) {
+				downloadLog.Warn("removing a partial transcode failed", "path", part, "err", rerr)
+			}
+			if errors.Is(err, library.ErrNotResponding) {
+				return "", "", s.storageFailed(ctx, item, err)
+			}
 			return "", "", echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
 		if err := os.Rename(part, cached); err != nil {
@@ -563,6 +577,12 @@ func (s *server) downloadArchive(c echo.Context, root store.Item, format string,
 	if len(files) == 0 {
 		return echo.NewHTTPError(http.StatusNotFound, "nothing to download")
 	}
+	// Every file is in the root's library. Refused before the 200 when that
+	// library is known to be down; a share that goes during the archive
+	// ends it (see below).
+	if err := s.storageReady(ctx, root); err != nil {
+		return err
+	}
 
 	res := c.Response()
 	res.Header().Set(echo.HeaderContentType, "application/zip")
@@ -572,25 +592,44 @@ func (s *server) downloadArchive(c echo.Context, root store.Item, format string,
 
 	zw := zip.NewWriter(res.Writer)
 	defer zw.Close()
+	// The headers are sent, so a storage failure from here on can only end
+	// the archive early. It does end it, rather than skipping to the next
+	// entry: on a share that has stopped answering the next entry would
+	// only block too, and each attempt strands another read.
+	stalled := func(path string, err error) error {
+		downloadLog.Warn("storage stopped answering, archive cut short", "archive", root.Title, "path", path, "err", err)
+		s.recheckStorage(context.WithoutCancel(ctx), root)
+		return nil
+	}
 	for _, f := range files {
 		// Music archives can transcode per entry (format=mp3/ogg).
 		if format != "" && format != "original" && f.track != nil {
-			if path, name, err := s.transcodedTrack(ctx, *f.track, format, quality); err == nil {
+			path, name, err := s.transcodedTrack(ctx, *f.track, format, quality)
+			if err == nil {
 				f.path = path
 				f.name = f.name[:len(f.name)-len(filepath.Ext(f.name))] + filepath.Ext(name)
+			} else if he := (*echo.HTTPError)(nil); errors.As(err, &he) && he.Code == http.StatusServiceUnavailable {
+				return stalled(f.track.Path, err)
 			}
 		}
-		w, err := zw.CreateHeader(&zip.FileHeader{Name: f.name, Method: zip.Store})
-		if err != nil {
-			return nil // client went away mid-stream
+		src, _, err := library.OpenMedia(f.path, mediaTimeout)
+		if errors.Is(err, library.ErrNotResponding) {
+			return stalled(f.path, err)
 		}
-		src, err := os.Open(f.path)
 		if err != nil {
 			downloadLog.Warn("archive entry unreadable, skipped", "path", f.path, "err", err)
 			continue
 		}
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: f.name, Method: zip.Store})
+		if err != nil {
+			src.Close()
+			return nil // client went away mid-stream
+		}
 		_, err = io.Copy(w, src)
 		src.Close()
+		if rerr := src.Err(); rerr != nil {
+			return stalled(f.path, rerr)
+		}
 		if err != nil {
 			return nil // client went away mid-stream
 		}
@@ -605,6 +644,11 @@ func (s *server) hlsPlaylist(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "session not found")
 	}
 	c.Response().Header().Set("Cache-Control", "no-store")
+	// A session ended by the stall watchdog says why here too: it is what a
+	// client fetches to find out what happened to its stream.
+	if err := session.Err(); err != nil {
+		return s.sessionFailed(c.Request().Context(), session, err)
+	}
 	return c.Blob(http.StatusOK, "application/vnd.apple.mpegurl", []byte(session.Playlist()))
 }
 
@@ -618,13 +662,13 @@ func (s *server) hlsFile(c echo.Context) error {
 	if c.Param("file") == "init.mp4" {
 		data, err := session.Init(c.Request().Context())
 		if err != nil {
-			return echo.NewHTTPError(http.StatusGatewayTimeout, err.Error())
+			return s.sessionFailed(c.Request().Context(), session, err)
 		}
 		return c.Blob(http.StatusOK, "video/mp4", data)
 	}
 	path, err := session.EnsureFile(c.Request().Context(), c.Param("file"))
 	if err != nil {
-		return echo.NewHTTPError(http.StatusGatewayTimeout, err.Error())
+		return s.sessionFailed(c.Request().Context(), session, err)
 	}
 	return c.File(path)
 }
@@ -853,7 +897,7 @@ func (s *server) continueWatching(c echo.Context) error {
 // them, for items scanned before they were catalogued. Best effort: a
 // failure just means the picker stays empty, which is where it already was.
 func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.AudioTrack {
-	streams, err := library.Within(mediaTimeout, func() ([]media.AudioStream, error) { return media.ProbeAudioTracks(item.Path) })
+	streams, err := library.WithinFile(item.Path, mediaTimeout, func() ([]media.AudioStream, error) { return media.ProbeAudioTracks(item.Path) })
 	if err != nil || len(streams) == 0 {
 		return nil
 	}

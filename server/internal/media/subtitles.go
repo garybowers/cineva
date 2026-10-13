@@ -104,12 +104,21 @@ func assDialogueText(payload string) string {
 // ExtractVTT demuxes one embedded text-subtitle stream and converts it to
 // WebVTT. Text subtitle packets carry the cue text directly (subrip: plain
 // text; ass: dialogue line; mov_text: 2-byte length prefix + UTF-8).
-func ExtractVTT(path string, streamIndex int, codec string) (string, error) {
+//
+// The whole file is read to find the track's packets, which on a film over
+// a network share takes a while; onRead, when set, is called each time a
+// read returns, so a caller can tell slow from stopped (see
+// library.WithinIdle).
+func ExtractVTT(path string, streamIndex int, codec string, onRead func()) (string, error) {
+	if onRead == nil {
+		onRead = func() {}
+	}
 	in, err := av.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("extract subtitles %s: %w", path, err)
 	}
 	defer in.Close()
+	onRead()
 
 	var tb *ffmpeg.AVRational
 	streams := in.Streams()
@@ -130,6 +139,7 @@ func ExtractVTT(path string, streamIndex int, codec string) (string, error) {
 	var cues []cue
 	for {
 		err := in.ReadPacket(pkt)
+		onRead()
 		if errors.Is(err, ffmpeg.AVErrorEOF) {
 			break
 		}

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
+	"unsafe"
 
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
 	"github.com/linuxmatters/ffmpeg-statigo/av"
@@ -30,7 +32,27 @@ type threadedDecoder struct {
 	// hwFramesCtx is the decoder's own frame pool, needed by the filter
 	// graph so it can be told what kind of frames it will receive.
 	hwFramesCtx *ffmpeg.AVBufferRef
+
+	// stream is kept so a hardware decoder that fails can be reopened on
+	// the CPU without the caller noticing.
+	stream *ffmpeg.AVStream
+	// probation is true from the moment a hardware decoder opens until it
+	// produces its first frame. Opening proves little: the device is only
+	// asked whether it can take this stream's profile when the first
+	// sequence header arrives, and a decoder with no software path of its
+	// own (the native av1 decoder) fails outright when it cannot. While on
+	// probation every packet sent is kept, so a failure can be replayed
+	// into a software decoder from the same keyframe.
+	probation bool
+	pending   []*ffmpeg.AVPacket
 }
+
+// maxProbationPackets bounds how many packets are kept while a hardware
+// decoder has yet to produce a frame. Frame threading delays the first frame
+// by about one packet per thread, so a working decoder clears probation well
+// inside this; one that has not after this many is not going to be rescued
+// by a replay, and keeping packets indefinitely would only cost memory.
+const maxProbationPackets = 128
 
 // HardwareFrames reports the decoder's device frame pool, or nil for a
 // software decoder.
@@ -72,11 +94,6 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 		return nil, errors.New("nil stream")
 	}
 	codecID := stream.Codecpar().CodecId()
-	codec := ffmpeg.AVCodecFindDecoder(codecID)
-	if codec == nil {
-		return nil, fmt.Errorf("find decoder (codec %v): %w",
-			codecID, ffmpeg.WrapErr(ffmpeg.AVErrorDecoderNotFoundConst))
-	}
 
 	// There are two ways to decode on a GPU, and which is available depends
 	// on how ffmpeg was built.
@@ -92,18 +109,36 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 	// The standalone decoder is tried first because it is the one that
 	// actually exists in this build; the hwaccel path follows for builds
 	// that have them.
+	//
+	// The hwaccel route also decides *which* software decoder to use. The
+	// default for a codec is not always the one that carries the hwaccel:
+	// AV1 defaults to libdav1d, which has no hardware configurations at
+	// all, while the native av1 decoder carries VAAPI's. So the decoder is
+	// chosen by what the device can do, and the default is used only for
+	// software decoding.
+	var codec *ffmpeg.AVCodec
 	var standalone bool
+	surface := ffmpeg.AVPixFmtNone
 	if hw != nil {
 		if c, name := standaloneHWDecoder(codecID, hw); c != nil {
 			codec, standalone = c, true
 			logger.Debug("using hardware decoder", "decoder", name)
+		} else if c, s, ok := hwaccelDecoder(codecID, hw); ok {
+			codec, surface = c, s
 		}
+	}
+	if codec == nil {
+		codec = ffmpeg.AVCodecFindDecoder(codecID)
+	}
+	if codec == nil {
+		return nil, fmt.Errorf("find decoder (codec %v): %w",
+			codecID, ffmpeg.WrapErr(ffmpeg.AVErrorDecoderNotFoundConst))
 	}
 	ctx := ffmpeg.AVCodecAllocContext3(codec)
 	if ctx == nil {
 		return nil, errors.New("alloc decoder context failed")
 	}
-	d := &threadedDecoder{ctx: ctx, hwPixFmt: ffmpeg.AVPixFmtNone}
+	d := &threadedDecoder{ctx: ctx, hwPixFmt: ffmpeg.AVPixFmtNone, stream: stream}
 	if _, err := ffmpeg.AVCodecParametersToContext(ctx, stream.Codecpar()); err != nil {
 		_ = d.Close()
 		return nil, fmt.Errorf("copy codec parameters to context: %w", err)
@@ -135,30 +170,30 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 		ctx.SetHwDeviceCtx(ffmpeg.AVBufferRef_(hw.ref))
 		d.hwPixFmt = hw.PixFmt
 	}
-	if hw != nil && !standalone {
-		if surface, ok := hwDecodePixFmt(codec, hw); ok {
-			d.hwPixFmt = surface
-			ctx.SetHwDeviceCtx(ffmpeg.AVBufferRef_(hw.ref))
-			// libavcodec offers the formats it can decode into and takes
-			// the one we return. Choosing the device surface is what makes
-			// the decode happen on the GPU; anything else is a CPU decode.
-			ctx.SetGetFormat(func(_ *ffmpeg.AVCodecContext, formats []ffmpeg.AVPixelFormat) ffmpeg.AVPixelFormat {
-				for _, f := range formats {
-					if f == surface {
-						return f
-					}
+	if surface != ffmpeg.AVPixFmtNone {
+		d.hwPixFmt = surface
+		ctx.SetHwDeviceCtx(ffmpeg.AVBufferRef_(hw.ref))
+		// libavcodec offers the formats it can decode into and takes the
+		// one we return. Choosing the device surface is what makes the
+		// decode happen on the GPU; anything else is a CPU decode.
+		ctx.SetGetFormat(func(_ *ffmpeg.AVCodecContext, formats []ffmpeg.AVPixelFormat) ffmpeg.AVPixelFormat {
+			for _, f := range formats {
+				if f == surface {
+					return f
 				}
-				// The device cannot take this stream — an unsupported
-				// profile or bit depth. Fall back to whatever libavcodec
-				// offered first, which is the software format.
-				logger.Debug("device cannot decode this stream, decoding on the CPU")
-				d.hwPixFmt = ffmpeg.AVPixFmtNone
-				if len(formats) > 0 {
-					return formats[0]
-				}
-				return ffmpeg.AVPixFmtNone
-			})
-		}
+			}
+			// The device cannot take this stream — an unsupported profile
+			// or bit depth. libavcodec lists hardware formats first and
+			// the software format last, so the last one offered is the
+			// CPU decode. A decoder with no software path of its own fails
+			// here instead, and probation replays it into one that has.
+			logger.Debug("device cannot decode this stream, decoding on the CPU")
+			d.hwPixFmt = ffmpeg.AVPixFmtNone
+			if len(formats) > 0 {
+				return formats[len(formats)-1]
+			}
+			return ffmpeg.AVPixFmtNone
+		})
 	}
 
 	if _, err := ffmpeg.AVCodecOpen2(ctx, codec, nil); err != nil {
@@ -176,6 +211,8 @@ func newDecoder(stream *ffmpeg.AVStream, hw *HWContext) (*threadedDecoder, error
 		// The pool libavcodec allocated for its output. The filter graph
 		// needs it to know what it is being fed.
 		d.hwFramesCtx = ctx.HwFramesCtx()
+		d.probation = true
+		logger.Debug("decoding on the GPU", "decoder", codec.Name().String(), "kind", hw.Kind)
 	}
 	d.frame = ffmpeg.AVFrameAlloc()
 	if d.frame == nil {
@@ -199,14 +236,40 @@ func decodeThreads() int {
 	return n
 }
 
+// Decode sends one packet and hands every frame it yields to fn.
+//
+// A hardware decoder that fails before producing its first frame is
+// replaced by a software one, and the packets it was given are replayed, so
+// the caller sees frames either way. Frames from the replacement are in
+// system memory rather than device surfaces; HardwarePixFmt reports which.
 func (d *threadedDecoder) Decode(pkt *ffmpeg.AVPacket, fn func(*ffmpeg.AVFrame) error) error {
+	d.remember(pkt)
+	err := d.decode(pkt, fn)
+	if err != nil && d.probation {
+		return d.fallBack(err, fn)
+	}
+	return err
+}
+
+func (d *threadedDecoder) Flush(fn func(*ffmpeg.AVFrame) error) error {
+	err := d.flush(fn)
+	if err != nil && d.probation {
+		if ferr := d.fallBack(err, fn); ferr != nil {
+			return ferr
+		}
+		return d.flush(fn)
+	}
+	return err
+}
+
+func (d *threadedDecoder) decode(pkt *ffmpeg.AVPacket, fn func(*ffmpeg.AVFrame) error) error {
 	if _, err := ffmpeg.AVCodecSendPacket(d.ctx, pkt); err != nil {
 		return fmt.Errorf("send packet: %w", err)
 	}
 	return d.drain(fn)
 }
 
-func (d *threadedDecoder) Flush(fn func(*ffmpeg.AVFrame) error) error {
+func (d *threadedDecoder) flush(fn func(*ffmpeg.AVFrame) error) error {
 	if _, err := ffmpeg.AVCodecSendPacket(d.ctx, nil); err != nil {
 		return fmt.Errorf("flush decoder: %w", err)
 	}
@@ -221,6 +284,10 @@ func (d *threadedDecoder) drain(fn func(*ffmpeg.AVFrame) error) error {
 			}
 			return fmt.Errorf("receive frame: %w", err)
 		}
+		// A frame has come out, so the device has accepted the stream.
+		// Ended before fn runs: an error from the caller's own pipeline is
+		// not a decode failure and must not trigger a fallback.
+		d.endProbation()
 		err := fn(d.frame)
 		ffmpeg.AVFrameUnref(d.frame)
 		if err != nil {
@@ -229,11 +296,78 @@ func (d *threadedDecoder) drain(fn func(*ffmpeg.AVFrame) error) error {
 	}
 }
 
+// remember keeps a reference to a packet sent while on probation, so it can
+// be replayed into a software decoder.
+func (d *threadedDecoder) remember(pkt *ffmpeg.AVPacket) {
+	if !d.probation || pkt == nil {
+		return
+	}
+	if len(d.pending) >= maxProbationPackets {
+		// No frame after this many packets is a decoder that has stalled
+		// rather than failed; a replay would not rescue it. Stop paying
+		// for the packets and let the next error surface as it is.
+		logger.Warn("hardware decoder has produced no frames, abandoning the software fallback", "packets", len(d.pending))
+		d.endProbation()
+		return
+	}
+	if c := ffmpeg.AVPacketClone(pkt); c != nil {
+		d.pending = append(d.pending, c)
+	}
+}
+
+func (d *threadedDecoder) endProbation() {
+	d.probation = false
+	d.freePending()
+}
+
+func (d *threadedDecoder) freePending() {
+	for i := range d.pending {
+		ffmpeg.AVPacketFree(&d.pending[i])
+	}
+	d.pending = nil
+}
+
+// fallBack replaces a hardware decoder that failed before its first frame
+// with a software one, and replays what it had been given.
+func (d *threadedDecoder) fallBack(cause error, fn func(*ffmpeg.AVFrame) error) error {
+	name := d.ctx.CodecId()
+	logger.Warn("hardware decode failed before the first frame, decoding on the CPU",
+		"codec", ffmpeg.AVCodecGetName(name).String(), "err", cause)
+	sw, err := newDecoder(d.stream, nil)
+	if err != nil {
+		d.endProbation()
+		return fmt.Errorf("%w (software fallback: %w)", cause, err)
+	}
+	pending := d.pending
+	d.pending = nil
+	d.release()
+	d.ctx, d.frame = sw.ctx, sw.frame
+	d.hwPixFmt, d.hwFramesCtx, d.probation = ffmpeg.AVPixFmtNone, nil, false
+	for i, p := range pending {
+		err := d.decode(p, fn)
+		ffmpeg.AVPacketFree(&pending[i])
+		if err != nil {
+			for j := i + 1; j < len(pending); j++ {
+				ffmpeg.AVPacketFree(&pending[j])
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // Raw returns the underlying decode context. Do not free it; Close owns it.
 func (d *threadedDecoder) Raw() *ffmpeg.AVCodecContext { return d.ctx }
 
-// Close frees the scratch frame and decode context. A second call is a no-op.
+// Close frees the scratch frame, decode context and any packets kept for a
+// fallback. A second call is a no-op.
 func (d *threadedDecoder) Close() error {
+	d.freePending()
+	d.release()
+	return nil
+}
+
+func (d *threadedDecoder) release() {
 	if d.frame != nil {
 		ffmpeg.AVFrameFree(&d.frame)
 		d.frame = nil
@@ -243,7 +377,6 @@ func (d *threadedDecoder) Close() error {
 		ffmpeg.AVCodecFreeContext(&d.ctx)
 		d.ctx = nil
 	}
-	return nil
 }
 
 // Reset discards the decoder's buffered state after a seek, so the next
@@ -255,6 +388,8 @@ func (d *threadedDecoder) Close() error {
 // before and carry on.
 func (d *threadedDecoder) Reset() {
 	ffmpeg.AVCodecFlushBuffers(d.ctx)
+	// Packets from before the seek would replay the wrong picture.
+	d.freePending()
 }
 
 // hwDecodePixFmt asks a codec whether it can decode on this device, and in
@@ -281,6 +416,43 @@ func hwDecodePixFmt(codec *ffmpeg.AVCodec, hw *HWContext) (ffmpeg.AVPixelFormat,
 			return cfg.PixFmt(), true
 		}
 	}
+}
+
+// hwaccelDecoder finds a decoder for a codec that can decode on this device
+// through an hwaccel, and the surface format it would decode into.
+//
+// The codec's default decoder is preferred when it qualifies, so h264 and
+// hevc keep the decoder they have always used. When it does not, every other
+// decoder for the codec is asked: AV1's default is libdav1d, which advertises
+// no hardware configurations, while the native av1 decoder carries VAAPI's.
+// Standalone hardware decoders are skipped — they are their own route,
+// looked up by name in standaloneHWDecoder.
+func hwaccelDecoder(id ffmpeg.AVCodecID, hw *HWContext) (*ffmpeg.AVCodec, ffmpeg.AVPixelFormat, bool) {
+	if hw == nil || !hw.chipDecodes(id) {
+		return nil, ffmpeg.AVPixFmtNone, false
+	}
+	def := ffmpeg.AVCodecFindDecoder(id)
+	if def != nil {
+		if surface, ok := hwDecodePixFmt(def, hw); ok {
+			return def, surface, true
+		}
+	}
+	var it unsafe.Pointer
+	for c := ffmpeg.AVCodecIterate(&it); c != nil; c = ffmpeg.AVCodecIterate(&it) {
+		if c.Id() != id || c.Capabilities()&ffmpeg.AVCodecCapHardware != 0 {
+			continue
+		}
+		if n, _ := ffmpeg.AVCodecIsDecoder(c); n == 0 {
+			continue
+		}
+		if def != nil && c.Name().String() == def.Name().String() {
+			continue // already asked
+		}
+		if surface, ok := hwDecodePixFmt(c, hw); ok {
+			return c, surface, true
+		}
+	}
+	return nil, ffmpeg.AVPixFmtNone, false
 }
 
 // hwDecoderSuffix is the naming convention each backend's standalone
@@ -338,12 +510,33 @@ func hwDecodeAvailable(path string, hw *HWContext) bool {
 	if c, _ := standaloneHWDecoder(id, hw); c != nil {
 		return true
 	}
-	if codec := ffmpeg.AVCodecFindDecoder(id); codec != nil {
-		if _, ok := hwDecodePixFmt(codec, hw); ok {
-			return true
+	_, _, ok := hwaccelDecoder(id, hw)
+	return ok
+}
+
+// commonVideoCodecs are the codecs worth naming in a startup summary, in
+// the order they are named.
+var commonVideoCodecs = []struct {
+	name string
+	id   ffmpeg.AVCodecID
+}{
+	{"h264", ffmpeg.AVCodecIdH264},
+	{"hevc", ffmpeg.AVCodecIdHevc},
+	{"av1", ffmpeg.AVCodecIdAV1},
+	{"vp9", ffmpeg.AVCodecIdVp9},
+	{"mpeg2", ffmpeg.AVCodecIdMpeg2Video},
+}
+
+// cpuDecodedCodecs is the complement of a hwDecodableCodecs result: the
+// common codecs that will decode on the CPU.
+func cpuDecodedCodecs(gpu []string) []string {
+	var out []string
+	for _, c := range commonVideoCodecs {
+		if !slices.Contains(gpu, c.name) {
+			out = append(out, c.name)
 		}
 	}
-	return false
+	return out
 }
 
 // hwDecodableCodecs lists the common video codecs this device can decode,
@@ -358,26 +551,14 @@ func hwDecodableCodecs(hw *HWContext) []string {
 	if hw == nil {
 		return nil
 	}
-	common := []struct {
-		name string
-		id   ffmpeg.AVCodecID
-	}{
-		{"h264", ffmpeg.AVCodecIdH264},
-		{"hevc", ffmpeg.AVCodecIdHevc},
-		{"av1", ffmpeg.AVCodecIdAV1},
-		{"vp9", ffmpeg.AVCodecIdVp9},
-		{"mpeg2", ffmpeg.AVCodecIdMpeg2Video},
-	}
 	var out []string
-	for _, c := range common {
+	for _, c := range commonVideoCodecs {
 		if _, name := standaloneHWDecoder(c.id, hw); name != "" {
 			out = append(out, c.name)
 			continue
 		}
-		if dec := ffmpeg.AVCodecFindDecoder(c.id); dec != nil {
-			if _, ok := hwDecodePixFmt(dec, hw); ok {
-				out = append(out, c.name)
-			}
+		if _, _, ok := hwaccelDecoder(c.id, hw); ok {
+			out = append(out, c.name)
 		}
 	}
 	return out

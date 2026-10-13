@@ -52,12 +52,20 @@ func audioFilterSpecFmt(sampleFmt string, rate, frameSize int) string {
 
 // TranscodeAudio converts a music file to dst (extension selects the muxer)
 // using the named encoder at the given bitrate, downmixing to stereo.
-func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKbps int) error {
+//
+// onRead, when set, is called each time a read from src returns, so a
+// caller can give up on a source that has stopped answering (see
+// library.WithinIdle).
+func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKbps int, onRead func()) error {
+	if onRead == nil {
+		onRead = func() {}
+	}
 	in, err := av.Open(src)
 	if err != nil {
 		return fmt.Errorf("audio transcode open: %w", err)
 	}
 	defer in.Close()
+	onRead()
 
 	aStream, err := in.BestStream(ffmpeg.AVMediaTypeAudio)
 	if err != nil {
@@ -138,6 +146,7 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 			return err
 		}
 		err := in.ReadPacket(pkt)
+		onRead()
 		if errors.Is(err, ffmpeg.AVErrorEOF) {
 			break
 		}

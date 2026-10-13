@@ -1022,34 +1022,74 @@ paths:
 
   /segments/pause:
     post:
-      summary: Pause intro and credits detection until resumed (admin); kept across restarts
+      summary: Pause background work until resumed (admin); kept across restarts
+      description: >
+        Holds intro and credits detection and seek-bar preview building
+        before their next file. The pause is shared; both report it.
       operationId: pauseSegments
       tags: [Administration]
       responses:
-        "200": { description: The detection status, now paused }
-        "409": { description: Detection is turned off (libraries.intro_detection) }
+        "200": { description: "The detection status, now paused (enabled: false when detection is off)" }
 
   /segments/resume:
     post:
-      summary: Resume intro and credits detection (admin)
+      summary: Resume background work (admin)
       operationId: resumeSegments
       tags: [Administration]
       responses:
-        "200": { description: The detection status }
-        "409": { description: Detection is turned off (libraries.intro_detection) }
+        "200": { description: "The detection status (enabled: false when detection is off)" }
   /segments/run:
     post:
       summary: Analyse now (admin)
       description: >
-        Starts detection on every TV library straight away, whatever the
-        schedule (detectionMode) says, until everything waiting has been
-        analysed; the schedule applies again after that. A manual pause still
-        holds it.
+        Starts background work straight away — intro and credits detection
+        on every TV library, and seek-bar previews for every film and
+        episode without them — whatever the schedule (detectionMode) says,
+        until everything waiting is done; the schedule applies again after
+        that. A manual pause still holds it.
       operationId: runSegments
       tags: [Administration]
       responses:
-        "202": { description: Started; the detection status }
-        "409": { description: Detection is turned off (libraries.intro_detection) }
+        "202": { description: "Started; the detection status (enabled: false when detection is off)" }
+
+  /previews/status:
+    get:
+      summary: Progress of background seek-bar preview building (admin)
+      description: >
+        Previews are built for every film and episode, newest additions
+        first, after each completed scan and once at startup; a player
+        asking for a title's previews moves it to the front of the queue.
+        Building follows the detection schedule, pause and read-speed cap,
+        gives way to playback, scans and detection, and reads one file at a
+        time. The same status is pushed over /events as "previews".
+      operationId: previewStatus
+      tags: [Administration]
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  running: { type: boolean, description: Titles are queued; it may still be waiting (paused) }
+                  current: { type: string, description: The title being worked on }
+                  done: { type: integer, description: Titles given previews in this run }
+                  failed: { type: integer, description: Titles whose files could not be read; tried again once the file changes or the server restarts }
+                  waiting: { type: integer, description: Titles still queued }
+                  paused: { type: boolean }
+                  pauseReason:
+                    type: string
+                    enum: [manual, playing, scanning, detecting, schedule, on-demand]
+                    description: As for /segments/status, plus detecting — giving way to intro and credits detection, so one of them reads at a time
+                  last:
+                    type: object
+                    description: Summary of the most recent finished run
+                    properties:
+                      finishedAt: { type: string, format: date-time }
+                      seconds: { type: integer }
+                      done: { type: integer }
+                      failed: { type: integer }
 
   /search:
     get:
@@ -1110,16 +1150,20 @@ paths:
     get:
       summary: Seek-bar preview cues for a video
       description: >
-        WebVTT cues pointing into the sprite sheet at trickplay.jpg. Previews
-        are made in the background on first request: until they exist this
-        answers 202 with no body, and the player simply shows none.
+        WebVTT cues pointing into the sprite sheet at trickplay.jpg.
+        Previews are made in the background (see /previews/status), usually
+        before a title is first played. Until they exist — or while they are
+        older than the file — this answers 202 with no body and moves the
+        title to the front of the queue; they are never built while anything
+        is playing, so the player shows none this time. 404 for an audio
+        track.
       operationId: trickplayVTT
       tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         "200": { description: The cues, content: { text/vtt: {} } }
-        "202": { description: Being generated; ask again on the next play }
+        "202": { description: Queued; ask again on the next play }
         "404": { $ref: "#/components/responses/NotFound" }
   /items/{id}/trickplay.jpg:
     get:
@@ -1618,6 +1662,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { description: Permission denied }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: "The folder did not answer within 15 s (a network share that has stopped responding)" }
 
   /stats/system:
     get:
@@ -1867,7 +1912,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/PlayInfo" }
         "400": { $ref: "#/components/responses/BadRequest" }
-        "503": { description: "The library's storage is not reachable, or the file did not answer within 15 s. The message names the library and folder and says what to check." }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /items/{id}/stream:
@@ -1879,11 +1924,16 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: format, in: query, required: false, schema: { type: string, enum: [original, opus, aac, mp3, ogg] }, description: Music only — stream a cached transcode instead of the file (Opus for bandwidth, AAC as the universal browser fallback) }
         - { name: quality, in: query, required: false, schema: { type: integer, enum: [64, 96, 128, 192, 256, 320] }, description: Bitrate in kbps for transcoded formats (default 192) }
+      description: >
+        Every read of the file has a deadline: if the storage stops answering
+        part-way through a response, the response is cut short rather than
+        left hanging, and the next request is refused with 503 once the
+        library has been found unreachable.
       responses:
         "200": { description: The media file }
         "206": { description: Partial content (range request) }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503": { description: "The library's storage is not reachable, or the file did not answer within 15 s. The message names the library and folder and says what to check." }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
 
   /items/{id}/download:
     get:
@@ -1900,8 +1950,9 @@ paths:
         - { name: format, in: query, required: false, schema: { type: string, enum: [original, mp3, ogg] }, description: Music only — transcode tracks (or every track in an album/artist ZIP) }
         - { name: quality, in: query, required: false, schema: { type: integer, enum: [128, 192, 256, 320] }, description: Bitrate in kbps for transcoded formats (default 192) }
       responses:
-        "200": { description: The media file or ZIP archive, Content-Disposition attachment }
+        "200": { description: "The media file or ZIP archive, Content-Disposition attachment. A file is served with range support; if the storage stops answering part-way, the response is cut short (a ZIP ends early) rather than left hanging." }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
 
   /items/{id}/watched:
     put:
@@ -2058,6 +2109,39 @@ paths:
             text/vtt: {}
         "404": { $ref: "#/components/responses/NotFound" }
         "422": { description: Image-based track — needs burn-in, not yet available }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
+
+  /items/{id}/storage:
+    get:
+      summary: Check the storage behind an item now
+      description: >
+        For a client whose playback has stopped receiving data and wants to
+        say why. The item's library folders are checked at the time of the
+        request (not read from the last 30-second check), bounded by the
+        check's own 5-second deadline, so this answers promptly even when the
+        share does not. Also unavailable while an earlier read of the item's
+        file is still blocked. The result updates the library's storage
+        status, and a change is announced on /events as usual.
+      operationId: itemStorage
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The storage's state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available, library]
+                properties:
+                  available: { type: boolean }
+                  since: { type: string, format: date-time, description: When the library's state last changed }
+                  path: { type: string, description: The folder or file that failed }
+                  error: { type: string, description: 'How it failed, e.g. "not responding", "host is down"' }
+                  library: { type: string, description: The library's name }
+                  message: { type: string, description: The sentence to show when unavailable — which library, which folder, what to check }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /continue-watching:
     get:
@@ -2148,10 +2232,19 @@ paths:
           content:
             application/vnd.apple.mpegurl: {}
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
 
   /play/{sid}/{file}:
     get:
       summary: HLS session asset (init.mp4 or segNNNNN.m4s); blocks until produced, seeking restarts the transcoder
+      description: >
+        A request waits up to 30 s for the file. While it waits, a watchdog
+        checks that the transcoder is still reading its source: if nothing
+        has been read for 20 s, the storage is taken to have stopped
+        answering, the session ends, and this and every later request for
+        the session (and its playlist) answers 503 with the storage message.
+        A transcoder ahead of the viewer, or a viewer who has paused, is
+        never judged stalled.
       operationId: hlsFile
       tags: [Playback]
       parameters:
@@ -2160,6 +2253,8 @@ paths:
       responses:
         "200": { description: The segment }
         "404": { $ref: "#/components/responses/NotFound" }
+        "500": { description: The transcoder stopped with an error before producing the file; the message says how }
+        "503": { $ref: "#/components/responses/StorageUnavailable" }
         "504": { description: Segment not produced in time }
 
   /play/{sid}:
@@ -2331,17 +2426,19 @@ components:
           type: integer
           enum: [0, 50, 25, 10]
           description: >
-            Cap on how fast intro and credits detection reads media, in MB/s;
-            0 is no cap. Default 10. With a cap, files are read one at a
-            time. Detection also always pauses while anything plays or a scan
-            runs, and stops as soon as a library's storage stops answering.
+            Cap on how fast background work — intro and credits detection,
+            and seek-bar previews — reads media, in MB/s; 0 is no cap.
+            Default 10. With a cap, files are read one at a time. Background
+            work also always pauses while anything plays or a scan runs, and
+            stops as soon as a library's storage stops answering.
         detectionMode:
           type: string
           enum: [window, idle, manual]
           description: >
-            When detection may read media. window (the default): only between
-            detectionWindowStart and detectionWindowEnd. idle: whenever
-            nothing is playing or scanning. manual: only after POST
+            When background work — intro and credits detection, and
+            seek-bar previews — may read media. window (the default): only
+            between detectionWindowStart and detectionWindowEnd. idle:
+            whenever nothing is playing or scanning. manual: only after POST
             /segments/run.
         detectionWindowStart:
           type: string
@@ -2444,8 +2541,10 @@ components:
           type: object
           description: >
             Whether the library's folders can be reached, from a check every
-            30 s. While unavailable, play and stream for its items fail at
-            once with 503, scans fail, and intro detection skips it.
+            30 s, and at once when a read of one of its files times out.
+            While unavailable, play, stream, download and subtitle requests
+            for its items fail at once with 503, scans fail, and intro
+            detection skips it.
           properties:
             available: { type: boolean }
             since: { type: string, format: date-time, description: When it last changed }
@@ -2664,6 +2763,18 @@ components:
         finishedAt: { type: string }
 
   responses:
+    StorageUnavailable:
+      description: >
+        The library's storage is not reachable, did not answer within 15 s,
+        or an earlier read of the same file is still blocked on it. The
+        message is meant to be shown as it is: it names the library and the
+        folder or file, and says what to check.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
     UpstreamFailed:
       description: Sonarr or Radarr could not be reached, refused the API key, or refused the webhook (its own message is passed on)
       content:

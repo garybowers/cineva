@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -8,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/labstack/echo/v4"
+
+	"github.com/garybowers/cineva/server/internal/library"
 )
 
 // Folder picker support for the admin UI's add-library form: a browser
@@ -37,17 +41,33 @@ func (s *server) listDirs(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "path must be absolute")
 	}
 	p = filepath.Clean(p)
-	entries, err := os.ReadDir(p)
+	showHidden := c.QueryParam("hidden") == "1"
+	// The folders worth browsing are mostly on network shares, and listing
+	// one that has stopped answering blocks; the picker says so instead.
+	out, err := library.WithinFile(p, mediaTimeout, func() (dirListing, error) {
+		return readDirs(p, showHidden)
+	})
 	if err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case errors.Is(err, library.ErrNotResponding):
+			return echo.NewHTTPError(http.StatusServiceUnavailable,
+				fmt.Sprintf("%s isn't responding. Check that the share is connected, then try again.", p))
+		case os.IsNotExist(err):
 			return echo.NewHTTPError(http.StatusNotFound, "directory not found")
-		}
-		if os.IsPermission(err) {
+		case os.IsPermission(err):
 			return echo.NewHTTPError(http.StatusForbidden, "permission denied")
 		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	showHidden := c.QueryParam("hidden") == "1"
+	return c.JSON(http.StatusOK, out)
+}
+
+// readDirs lists the subdirectories of p, sorted by name.
+func readDirs(p string, showHidden bool) (dirListing, error) {
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		return dirListing{}, err
+	}
 	out := dirListing{Path: p, Dirs: []dirEntry{}}
 	if parent := filepath.Dir(p); parent != p {
 		out.Parent = parent
@@ -70,5 +90,5 @@ func (s *server) listDirs(c echo.Context) error {
 	sort.Slice(out.Dirs, func(i, j int) bool {
 		return strings.ToLower(out.Dirs[i].Name) < strings.ToLower(out.Dirs[j].Name)
 	})
-	return c.JSON(http.StatusOK, out)
+	return out, nil
 }

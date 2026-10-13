@@ -21,6 +21,7 @@ import (
 
 	"github.com/garybowers/cineva/server/docs"
 	"github.com/garybowers/cineva/server/internal/auth"
+	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
@@ -29,6 +30,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/segments"
 	"github.com/garybowers/cineva/server/internal/stats"
 	"github.com/garybowers/cineva/server/internal/store"
+	"github.com/garybowers/cineva/server/internal/trickplay"
 	"github.com/garybowers/cineva/server/internal/version"
 	"github.com/garybowers/cineva/server/ui"
 )
@@ -56,6 +58,11 @@ type Config struct {
 	RetainDays int
 	// IntroDetect runs intro detection over TV libraries in the background.
 	IntroDetect bool
+	// PreviewsDir is where seek-bar previews are kept. Not under the
+	// transcode scratch: that is often tmpfs, and previews for a whole
+	// library are worth keeping across a reboot. Empty puts them beside the
+	// transcode scratch, as before.
+	PreviewsDir string
 	// Ready, when set, is called once the server is listening — where the
 	// command prints its startup card.
 	Ready func(Startup)
@@ -90,7 +97,8 @@ type server struct {
 	subtitleDir       string
 	dlCacheDir        string
 	trickplayDir      string
-	trickplay         *trickplayJobs
+	previews          *trickplay.Builder
+	background        *background.Policy // schedule, pause and read cap for background reading
 	segments          *segments.Detector // nil when intro detection is off
 	storage           *library.StorageMonitor
 	presence          *presence // which sessions have an event stream open
@@ -117,9 +125,12 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		defaultCertRegion: cfg.CertRegion,
 		subtitleDir:       filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:        filepath.Join(cfg.TranscodeDir, "dlcache"),
-		trickplayDir:      filepath.Join(cfg.TranscodeDir, "trickplay"),
-		trickplay:         newTrickplayJobs(),
+		trickplayDir:      cfg.PreviewsDir,
+		background:        background.NewPolicy(),
 		refreshes:         map[string]*refreshJob{},
+	}
+	if s.trickplayDir == "" {
+		s.trickplayDir = filepath.Join(cfg.TranscodeDir, "trickplay")
 	}
 	// Transcode sessions survive a restart: the segments are on disk and
 	// expensive to remake, so the stored descriptions are re-registered and
@@ -159,6 +170,9 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// while the process runs. A nil result means software, which is a
 	// supported outcome — DetectHW logs which path was taken and why.
 	s.sessions.MaxBytes = cfg.TranscodeMax
+	// A transcode whose source stops answering is ended with a reason, and
+	// the library's storage is checked at once (see onTranscodeStall).
+	s.sessions.OnStall = s.onTranscodeStall
 
 	hw := media.DetectHW(cfg.HWAccel)
 	defer hw.Close()
@@ -194,9 +208,15 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// Periodic rescans and history pruning. Both are off by default: a
 	// server nobody has configured should not start rewriting rows on a
 	// timer. Shares the sampler's context, so shutdown stops it too.
+	//
+	// A due rescan waits for playback to stop (up to a ceiling), and so does
+	// one a Sonarr or Radarr webhook asks for; one started by hand does not.
+	playing := func() bool { return len(s.playbacks.List()) > 0 }
+	manager.Playing = playing
 	go (&library.Scheduler{
 		Manager: manager, Store: st,
 		Interval: cfg.ScanInterval, Retain: cfg.RetainDays,
+		Playing: playing,
 	}).Run(samplerCtx)
 
 	// Storage is watched so requests can fail at once, with a reason, when a
@@ -205,13 +225,32 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s.storage = library.NewStorageMonitor(st)
 	s.storage.OnChange = func(lib store.Library, st library.StorageStatus) {
 		s.events.Publish(events.Event{Type: "libraries"})
-		// Detection skipped this library while it was down; catch up.
-		if st.Available && lib.MediaType == store.MediaTV && s.segments != nil {
-			s.segments.Enqueue(lib.ID)
+		// Detection and previews skipped this library while it was down;
+		// catch up.
+		if st.Available {
+			s.enqueueBackground(lib)
 		}
 	}
 	manager.Storage = s.storage
-	go s.storage.Run(samplerCtx)
+
+	// Background reading — intro detection and seek-bar previews — follows
+	// one admin policy: a schedule, a pause and a read-speed cap.
+	if v, err := st.Setting(context.Background(), settingDetectionPaused, "false"); err == nil {
+		s.background.SetPaused(v == "true")
+	}
+	s.background.SetRateLimit(int64(s.detectionRateMB(context.Background())) * 1_000_000)
+	s.background.SetSchedule(s.detectionSchedule(context.Background()))
+	// Both read a lot from the same share playback streams from, so they
+	// give way to anyone watching and to scans.
+	busy := func() string {
+		if playing() {
+			return "playing"
+		}
+		if manager.AnyScanning() {
+			return "scanning"
+		}
+		return ""
+	}
 
 	// Intro detection follows every completed TV scan, and runs once at
 	// startup so a library scanned before it existed (or while the server
@@ -219,40 +258,50 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// yet analysed are decoded.
 	if cfg.IntroDetect {
 		s.segments = segments.NewDetector(st)
+		s.segments.Gate = background.NewGate(s.background)
+		s.segments.Gate.Busy = busy
 		s.segments.Available = func(libraryID string) bool { return s.storage.Status(libraryID).Available }
-		// Detection reads a lot from the same share playback streams from,
-		// so it gives way to anyone watching and to scans.
-		s.segments.Busy = func() string {
-			if len(s.playbacks.List()) > 0 {
-				return "playing"
-			}
-			if manager.AnyScanning() {
-				return "scanning"
-			}
-			return ""
-		}
-		if v, err := st.Setting(context.Background(), settingDetectionPaused, "false"); err == nil {
-			s.segments.SetPaused(v == "true")
-		}
-		s.segments.SetRateLimit(int64(s.detectionRateMB(context.Background())) * 1_000_000)
-		s.segments.SetSchedule(s.detectionSchedule(context.Background()))
+		s.segments.SetPaused(s.background.Paused()) // so the status says so from the start
 		s.segments.OnProgress = func(status segments.Status) {
 			s.events.Publish(events.Event{Type: "segments", Data: status})
 		}
-		manager.OnScanDone = func(lib store.Library) {
-			if lib.MediaType == store.MediaTV {
-				s.segments.Enqueue(lib.ID)
+	}
+
+	// Seek-bar previews are built the same way, after every completed scan
+	// of a film or TV library, newest additions first; a player asking for
+	// a title's previews moves it up the queue. They give way to detection
+	// too, so only one of them reads at a time.
+	s.previews = trickplay.New(st, s.trickplayDir, background.NewGate(s.background))
+	s.previews.Available = func(libraryID string) bool { return s.storage.Status(libraryID).Available }
+	s.previews.Gate.Busy = func() string {
+		if r := busy(); r != "" {
+			return r
+		}
+		if s.segments != nil {
+			if d := s.segments.Status(); d.Running && !d.Paused {
+				return "detecting"
 			}
 		}
-		if libs, err := st.Libraries(context.Background()); err == nil {
-			for _, lib := range libs {
-				if lib.MediaType == store.MediaTV {
-					s.segments.Enqueue(lib.ID)
-				}
-			}
+		return ""
+	}
+	s.previews.OnProgress = func(status trickplay.Status) {
+		s.events.Publish(events.Event{Type: "previews", Data: status})
+	}
+
+	manager.OnScanDone = s.enqueueBackground
+	if libs, err := st.Libraries(context.Background()); err == nil {
+		for _, lib := range libs {
+			s.enqueueBackground(lib)
 		}
+	} else {
+		serverLog.Warn("listing libraries for background work failed", "err", err)
+	}
+	if s.segments != nil {
 		go s.segments.Run(samplerCtx)
 	}
+	go s.previews.Run(samplerCtx)
+	// Started once the workers its OnChange catches up exist.
+	go s.storage.Run(samplerCtx)
 
 	// Active playbacks: any change (start, heartbeat, stop, idle reap) tells
 	// the UIs to refetch the sessions list.
@@ -457,6 +506,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/items/:id/next-up", s.nextUpFor)
 	v1.GET("/items/:id/prev", s.prevEpisode)
 	v1.GET("/items/:id/subtitles", s.itemSubtitles)
+	v1.GET("/items/:id/storage", s.itemStorage)
 	v1.GET("/items/:id/trickplay.vtt", s.trickplayVTT)
 	v1.GET("/items/:id/trickplay.jpg", s.trickplaySheet)
 	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
@@ -476,6 +526,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.POST("/segments/pause", s.pauseSegments)
 	adm.POST("/segments/resume", s.resumeSegments)
 	adm.POST("/segments/run", s.runSegments)
+	adm.GET("/previews/status", s.previewStatus)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)
 	adm.GET("/integrations", s.listIntegrations)

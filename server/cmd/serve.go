@@ -59,6 +59,7 @@ var serveCmd = &cobra.Command{
 			ScanInterval: viper.GetDuration("libraries.scan_interval"),
 			RetainDays:   viper.GetInt("libraries.history_retention_days"),
 			IntroDetect:  viper.GetBool("libraries.intro_detection"),
+			PreviewsDir:  viper.GetString("libraries.previews_dir"),
 			TranscodeMax: viper.GetInt64("transcode.max_bytes"),
 			SampleSecs:   viper.GetInt("stats.sample_secs"),
 			StatsHours:   viper.GetInt("stats.retention_hours"),

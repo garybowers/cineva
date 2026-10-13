@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
 )
@@ -75,15 +77,30 @@ func (s *server) subtitleVTT(c echo.Context) error {
 		return c.Blob(http.StatusOK, "text/vtt; charset=utf-8", data)
 	}
 
+	// Both kinds are read from media storage: refused at once when it is
+	// known to be down, and given up on when it stops answering.
+	ctx := c.Request().Context()
+	item, err := s.store.Item(ctx, track.ItemID)
+	if err != nil || !canSeeLibrary(currentUser(c), item.LibraryID) {
+		return echo.NewHTTPError(http.StatusNotFound, "subtitle not found")
+	}
+	if err := s.storageReady(ctx, item); err != nil {
+		return err
+	}
 	var vtt string
 	if track.Source == "sidecar" {
-		vtt, err = media.ConvertSidecarVTT(track.Path)
+		vtt, err = library.WithinFile(track.Path, mediaTimeout, func() (string, error) {
+			return media.ConvertSidecarVTT(track.Path)
+		})
 	} else {
-		item, itemErr := s.store.Item(c.Request().Context(), track.ItemID)
-		if itemErr != nil {
-			return itemErr
-		}
-		vtt, err = media.ExtractVTT(item.Path, track.StreamIndex, track.Codec)
+		// The whole film is read to find the track, which can take a while
+		// over a share; bounded by progress, not by total time.
+		vtt, err = library.WithinIdleFile(item.Path, mediaTimeout, func(progress func()) (string, error) {
+			return media.ExtractVTT(item.Path, track.StreamIndex, track.Codec, progress)
+		})
+	}
+	if errors.Is(err, library.ErrNotResponding) {
+		return s.storageFailed(ctx, item, err)
 	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

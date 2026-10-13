@@ -11,8 +11,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/events"
-	"github.com/garybowers/cineva/server/internal/segments"
 )
 
 // Runtime settings (admin UI). Each has a config-file default and a
@@ -35,13 +35,15 @@ const (
 	// changing region wants a metadata refresh to take full effect.
 	settingCertRegion = "metadata.cert_region"
 
-	// settingDetectionPaused holds intro detection until resumed;
-	// settingDetectionRate caps its reads in MB/s, "0" for none. Detection
-	// reads a quarter of every episode, which at full speed can fill the
-	// link to a NAS and starve anything else using it.
+	// settingDetectionPaused holds background work — intro detection and
+	// seek-bar previews — until resumed; settingDetectionRate caps its reads
+	// in MB/s, "0" for none. Detection reads a quarter of every episode and
+	// previews seek through the whole file, which at full speed can fill the
+	// link to a NAS and starve anything else using it. The names predate
+	// previews sharing them.
 	settingDetectionPaused = "segments.paused"
 	settingDetectionRate   = "segments.rate_mb"
-	// settingDetectionMode says when detection may read: "window" (only
+	// settingDetectionMode says when background work may read: "window" (only
 	// between the times in settingDetectionWindow, "HH:MM-HH:MM"), "idle"
 	// (whenever nothing is playing or scanning) or "manual" (only when an
 	// admin starts it). The overnight window is the default: playback comes
@@ -57,7 +59,7 @@ const defaultDetectionRateMB = 10
 
 const defaultDetectionWindow = "02:00-06:00"
 
-var detectionModes = []string{segments.ModeWindow, segments.ModeIdle, segments.ModeManual}
+var detectionModes = []string{background.ModeWindow, background.ModeIdle, background.ModeManual}
 
 // parseWindow reads "HH:MM-HH:MM" into minutes after midnight.
 func parseWindow(v string) (start, end int, err error) {
@@ -84,12 +86,13 @@ func parseClock(v string) (int, error) {
 
 func formatClock(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
 
-// detectionSchedule reads when detection may run, falling back to the
-// overnight window for anything missing or malformed.
-func (s *server) detectionSchedule(ctx context.Context) segments.Schedule {
-	mode, err := s.store.Setting(ctx, settingDetectionMode, segments.ModeWindow)
+// detectionSchedule reads when background work — intro detection and
+// seek-bar previews — may run, falling back to the overnight window for
+// anything missing or malformed.
+func (s *server) detectionSchedule(ctx context.Context) background.Schedule {
+	mode, err := s.store.Setting(ctx, settingDetectionMode, background.ModeWindow)
 	if err != nil || !slices.Contains(detectionModes, mode) {
-		mode = segments.ModeWindow
+		mode = background.ModeWindow
 	}
 	window, err := s.store.Setting(ctx, settingDetectionWindow, defaultDetectionWindow)
 	if err != nil {
@@ -99,7 +102,7 @@ func (s *server) detectionSchedule(ctx context.Context) segments.Schedule {
 	if err != nil {
 		start, end, _ = parseWindow(defaultDetectionWindow)
 	}
-	return segments.Schedule{Mode: mode, Start: start, End: end}
+	return background.Schedule{Mode: mode, Start: start, End: end}
 }
 
 // certRegions are the regions offered in the admin UI. TMDB carries ratings
@@ -124,11 +127,12 @@ type settingsResponse struct {
 	// CertRegions is the list the UI offers.
 	CertRegion  string   `json:"certRegion"`
 	CertRegions []string `json:"certRegions"`
-	// DetectionRateMB caps intro detection's reads, in MB/s; 0 is no cap.
+	// DetectionRateMB caps background reads — intro detection and seek-bar
+	// previews — in MB/s; 0 is no cap.
 	DetectionRateMB      int   `json:"detectionRateMB"`
 	DetectionRateOptions []int `json:"detectionRateOptions"`
-	// DetectionMode is when detection may read — "window", "idle" or
-	// "manual" — and the window, local time, applies to "window".
+	// DetectionMode is when background work may read — "window", "idle"
+	// or "manual" — and the window, local time, applies to "window".
 	DetectionMode        string `json:"detectionMode"`
 	DetectionWindowStart string `json:"detectionWindowStart"`
 	DetectionWindowEnd   string `json:"detectionWindowEnd"`
@@ -258,9 +262,7 @@ func (s *server) putSettings(c echo.Context) error {
 		if err := s.store.SetSetting(c.Request().Context(), settingDetectionRate, strconv.Itoa(mb)); err != nil {
 			return err
 		}
-		if s.segments != nil {
-			s.segments.SetRateLimit(int64(mb) * 1_000_000)
-		}
+		s.background.SetRateLimit(int64(mb) * 1_000_000)
 		label := "unlimited"
 		if mb > 0 {
 			label = strconv.Itoa(mb) + " MB/s"
@@ -296,9 +298,7 @@ func (s *server) putSettings(c echo.Context) error {
 		if err := s.store.SetSetting(ctx, settingDetectionWindow, window); err != nil {
 			return err
 		}
-		if s.segments != nil {
-			s.segments.SetSchedule(sched)
-		}
+		s.background.SetSchedule(sched)
 		s.audit(c, "settings.update", "settings", settingDetectionMode, "Detection schedule", sched.Mode+" "+window)
 	}
 	s.events.Publish(events.Event{Type: "settings"})

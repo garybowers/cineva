@@ -11,10 +11,10 @@ import (
 // buffer source and sink.
 //
 // Used for the hardware-decode path, where the frames reaching the filter
-// are downloaded device surfaces rather than the decoder's own output: the
-// vendored av helper derives its source parameters from the codec context,
-// which for a hardware decoder reports the device surface format, not the
-// format the downloaded frames actually arrive in.
+// are device surfaces, or downloaded copies of them, rather than what the
+// codec context describes: the vendored av helper derives its source
+// parameters from the context, which cannot name a frames context and, for
+// a download, reports the wrong format.
 type parsedGraph struct {
 	graph *ffmpeg.AVFilterGraph
 	src   *ffmpeg.AVFilterContext
@@ -36,10 +36,22 @@ func newParsedGraph(spec string, sample *ffmpeg.AVFrame, timeBase *ffmpeg.AVRati
 		return nil, errors.New("allocate filter graph")
 	}
 	g := &parsedGraph{graph: graph}
+	// A device surface cannot be named on the source's argument string: the
+	// buffer filter refuses a hardware format at init unless it already
+	// holds the frames context, and that can only be handed over with
+	// av_buffersrc_parameters_set. So the source is parsed as the frames'
+	// software format and switched to the device surface, frames context
+	// and all, before the graph is configured — which is when the format is
+	// actually negotiated.
+	pixFmt := sample.Format()
+	hwFrames := sample.HwFramesCtx()
+	if hwFrames != nil {
+		pixFmt = int(ffmpeg.ToAVHWFramesContext(hwFrames.Data()).SwFormat())
+	}
 	full := fmt.Sprintf(
 		"buffer=video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1"+
 			":colorspace=%d:range=%d,%s,buffersink",
-		sample.Width(), sample.Height(), sample.Format(),
+		sample.Width(), sample.Height(), pixFmt,
 		timeBase.Num(), timeBase.Den(),
 		int(sample.Colorspace()), int(sample.ColorRange()), spec)
 
@@ -55,6 +67,12 @@ func newParsedGraph(spec string, sample *ffmpeg.AVFrame, timeBase *ffmpeg.AVRati
 		g.Close()
 		return nil, errors.New("graph is missing its source or sink")
 	}
+	if hwFrames != nil {
+		if err := setSourceFrames(g.src, sample); err != nil {
+			g.Close()
+			return nil, err
+		}
+	}
 	if _, err := ffmpeg.AVFilterGraphConfig(graph, nil); err != nil {
 		g.Close()
 		return nil, fmt.Errorf("configure %q: %w", full, err)
@@ -65,6 +83,23 @@ func newParsedGraph(spec string, sample *ffmpeg.AVFrame, timeBase *ffmpeg.AVRati
 		return nil, errors.New("allocate filter output frame")
 	}
 	return g, nil
+}
+
+// setSourceFrames tells a buffer source it will be fed device surfaces from
+// the sample's frames context.
+func setSourceFrames(src *ffmpeg.AVFilterContext, sample *ffmpeg.AVFrame) error {
+	par := ffmpeg.AVBuffersrcParametersAlloc()
+	if par == nil {
+		return errors.New("allocate buffer source parameters")
+	}
+	defer ffmpeg.AVFree(par.RawPtr())
+	par.SetFormat(sample.Format())
+	// libavfilter takes its own reference; this one stays the frame's.
+	par.SetHwFramesCtx(sample.HwFramesCtx())
+	if _, err := ffmpeg.AVBuffersrcParametersSet(src, par); err != nil {
+		return fmt.Errorf("hand device frames to the filter graph: %w", err)
+	}
+	return nil
 }
 
 // find returns the first filter of a type, by type rather than instance

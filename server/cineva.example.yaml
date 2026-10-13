@@ -30,11 +30,19 @@ libraries:
   # Where cached posters, backdrops and headshots are written.
   #                                              CINEVA_LIBRARIES_ARTWORK_DIR
   artwork_dir: artwork
+  # Where seek-bar previews (a sprite sheet and cue file per title) are kept.
+  # They are built in the background on the same schedule and read-speed cap
+  # as intro detection (Settings in the admin UI), and are worth keeping
+  # across a reboot, so this is not under transcode.dir, which is often
+  # tmpfs. Under a megabyte per title.       CINEVA_LIBRARIES_PREVIEWS_DIR
+  previews_dir: previews
   # Automatic rescan interval (Go duration, e.g. "6h"). A rescan walks the
   # folders and skips unchanged files, so a short interval is cheap; new
   # downloads appear within it. "0" disables it and scans run only when
-  # triggered — by hand, or by a Sonarr/Radarr connection's webhook.
-  #                                           CINEVA_LIBRARIES_SCAN_INTERVAL
+  # triggered — by hand, or by a Sonarr/Radarr connection's webhook. A
+  # rescan due while something is playing waits for it to stop, for up to
+  # two hours (a webhook's, up to ten minutes); one started by hand runs at
+  # once.                                     CINEVA_LIBRARIES_SCAN_INTERVAL
   scan_interval: "15m"
   # How long play history is kept, in days.
   #                                   CINEVA_LIBRARIES_HISTORY_RETENTION_DAYS

@@ -3,6 +3,7 @@ package media
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -63,6 +64,21 @@ type Session struct {
 	lastReq      int // highest segment index a client asked for
 	lastAccess   time.Time
 	initBytes    []byte // cached init.mp4; restarts rewrite the file mid-flight
+
+	// The stall watchdog; see checkStall.
+	//
+	// progressAt is when the transcoder last read from its source, or last
+	// chose not to (throttled ahead of the viewer), in Unix nanoseconds.
+	progressAt atomic.Int64
+	// failed ends the session for good: every request answers with it.
+	failed error
+	// runErr is how the current transcode ended, when it ended in failure.
+	// A seek starts a new one and clears it.
+	runErr error
+	// mgr is the manager the session belongs to, for its watchdog settings
+	// and hooks — read when needed, so hooks set after a session was
+	// restored still reach it. Nil in tests that build a bare Session.
+	mgr *SessionManager
 }
 
 type SessionManager struct {
@@ -88,6 +104,15 @@ type SessionManager struct {
 	Persist func(SessionState)
 	Forget  func(id string)
 
+	// OnStall, when set, is called when the watchdog ends a session whose
+	// source stopped answering. stuck is closed when the blocked read
+	// finally returns, which may be never.
+	OnStall func(s *Session, stuck <-chan struct{})
+	// StallAfter overrides inputStallTimeout; zero uses it.
+	StallAfter time.Duration
+	// run is the transcoder sessions use; RunHLS unless a test stands one in.
+	run func(context.Context, HLSJob) error
+
 	mu       sync.Mutex
 	sessions map[string]*Session
 	baseCtx  context.Context
@@ -103,6 +128,7 @@ func NewSessionManager(root string, segmentSecs int) *SessionManager {
 		baseCtx:     ctx,
 		stop:        cancel,
 		MaxBytes:    DefaultTranscodeMaxBytes,
+		run:         RunHLS,
 	}
 	sm.hwEnabled.Store(true) // the admin switch defaults to on
 	go sm.janitor()
@@ -214,6 +240,7 @@ func (sm *SessionManager) Restore(states []SessionState) []string {
 			// called — the first segment request starts one at the right
 			// offset.
 			restored: true,
+			mgr:      sm,
 		}
 		sm.mu.Lock()
 		sm.sessions[s.ID] = s
@@ -269,6 +296,7 @@ func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
 		Accel:       hw.Name(),
 		hw:          hw,
 		lastAccess:  time.Now(),
+		mgr:         sm,
 	}
 	s.restartLocked(sm.baseCtx, startSecs/sm.SegmentSecs)
 
@@ -435,6 +463,10 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 	s.done = done
 	s.startSegment = startSegment
 	s.lastReq = startSegment
+	s.runErr = nil
+	// Opening and seeking the source count as progress until the first
+	// packet: the clock starts now, not at the last run's final read.
+	s.noteProgress()
 	job := HLSJob{
 		InputPath: s.InputPath, OutDir: s.Dir,
 		SegmentSecs: s.SegmentSecs, StartSegment: startSegment,
@@ -450,8 +482,11 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 			s.Accel = name
 			s.mu.Unlock()
 		},
+		OnInput: s.noteProgress,
 		Throttle: func(ctx context.Context, posSecs int64) error {
 			for {
+				// Waiting here is the transcoder's own choice, not a stall.
+				s.noteProgress()
 				if posSecs <= s.aheadSecs() {
 					return nil
 				}
@@ -463,10 +498,22 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 			}
 		},
 	}
+	run := RunHLS
+	if s.mgr != nil && s.mgr.run != nil {
+		run = s.mgr.run
+	}
 	go func() {
 		defer close(done)
-		if err := RunHLS(ctx, job); err != nil && ctx.Err() == nil {
+		if err := run(ctx, job); err != nil && ctx.Err() == nil {
 			logger.Error("transcode failed", "session", s.ID, "err", err)
+			// Kept so a viewer waiting on a segment hears about it now
+			// rather than when the wait runs out. Only for the run that is
+			// still current: a superseded one has nothing to say.
+			s.mu.Lock()
+			if s.done == done {
+				s.runErr = err
+			}
+			s.mu.Unlock()
 		}
 	}()
 }
@@ -489,9 +536,16 @@ func (s *Session) stopTranscode() {
 		s.cancel()
 	}
 	done := s.done
+	stalled := errors.Is(s.failed, ErrInputStalled)
 	s.mu.Unlock()
 	if done == nil {
 		return // restored session: nothing was ever started
+	}
+	if stalled {
+		// Its transcoder is blocked in a read of storage that stopped
+		// answering, and will return when the storage does — waiting for
+		// that would hold up the caller for nothing.
+		return
 	}
 	// Wait for the transcoder to actually exit rather than sleeping and
 	// hoping. This used to be a flat 200ms, which is longer than ffmpeg
@@ -592,40 +646,38 @@ func (s *Session) Init(ctx context.Context) ([]byte, error) {
 
 	// The init is guaranteed complete once the first segment of the current
 	// run exists (the muxer writes init fully before any segment completes).
-	deadline := time.Now().Add(30 * time.Second)
-	initPath := filepath.Join(s.Dir, "init.mp4")
-	for time.Now().Before(deadline) {
+	err := s.waitFor(ctx, func() bool {
 		s.mu.Lock()
 		first := s.segmentFile(s.startSegment)
 		s.mu.Unlock()
-		if _, err := os.Stat(first); err == nil {
-			data, err := os.ReadFile(initPath)
-			if err != nil {
-				return nil, fmt.Errorf("read init: %w", err)
-			}
-			// Sessions preserve source timestamps (segment N carries pts
-			// ~N*segmentSecs, matching the playlist), so the muxer's edit
-			// list — an "empty edit" spanning the whole start offset — is
-			// wrong for us. Firefox honours edit lists in MSE and shifts the
-			// buffered range far past the playhead (silent stall); Chrome
-			// ignores them. Strip edts so both agree with the playlist.
-			data = stripEdts(data)
-			data = forceHVC1(data)
-			s.mu.Lock()
-			if s.initBytes == nil {
-				s.initBytes = data
-			}
-			data = s.initBytes
-			s.mu.Unlock()
-			return data, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(150 * time.Millisecond):
-		}
+		_, err := os.Stat(first)
+		return err == nil
+	})
+	if errors.Is(err, errNotProduced) {
+		return nil, fmt.Errorf("init segment not produced in time")
 	}
-	return nil, fmt.Errorf("init segment not produced in time")
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.Dir, "init.mp4"))
+	if err != nil {
+		return nil, fmt.Errorf("read init: %w", err)
+	}
+	// Sessions preserve source timestamps (segment N carries pts
+	// ~N*segmentSecs, matching the playlist), so the muxer's edit
+	// list — an "empty edit" spanning the whole start offset — is
+	// wrong for us. Firefox honours edit lists in MSE and shifts the
+	// buffered range far past the playhead (silent stall); Chrome
+	// ignores them. Strip edts so both agree with the playlist.
+	data = stripEdts(data)
+	data = forceHVC1(data)
+	s.mu.Lock()
+	if s.initBytes == nil {
+		s.initBytes = data
+	}
+	data = s.initBytes
+	s.mu.Unlock()
+	return data, nil
 }
 
 // EnsureFile blocks until the requested playlist file exists, restarting the
@@ -633,6 +685,9 @@ func (s *Session) Init(ctx context.Context) ([]byte, error) {
 // range. Returns the absolute path to serve.
 func (s *Session) EnsureFile(ctx context.Context, name string) (string, error) {
 	s.touch()
+	if err := s.Err(); err != nil {
+		return "", err
+	}
 	path := filepath.Join(s.Dir, filepath.Base(name)) // Base() forbids traversal
 
 	var segIdx = -1
@@ -649,18 +704,150 @@ func (s *Session) EnsureFile(ctx context.Context, name string) (string, error) {
 		s.maybeRestart(segIdx)
 	}
 
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+	err := s.waitFor(ctx, func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	})
+	if errors.Is(err, errNotProduced) {
+		return "", fmt.Errorf("segment %s not produced in time", name)
+	}
+	if err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// How long a request waits for a file the transcoder has not written yet,
+// and how often it looks.
+const (
+	produceTimeout = 30 * time.Second
+	producePoll    = 150 * time.Millisecond
+)
+
+// inputStallTimeout is how long a session may go without reading anything
+// from its source, while a viewer is waiting on it, before the source is
+// taken to have stopped answering and the session is ended.
+//
+// Long enough for a NAS disk spinning up from standby, which takes five to
+// fifteen seconds and must not be mistaken for a failure; short enough that
+// the viewer is told within one segment request (produceTimeout), rather
+// than hls.js retrying into a stream that will never come.
+const inputStallTimeout = 20 * time.Second
+
+// ErrInputStalled ends a session whose source stopped answering: the media
+// is on storage that has gone away, and the read is blocked in the kernel.
+var ErrInputStalled = errors.New("media file not responding")
+
+// ErrTranscodeFailed is how a session reports a transcoder that stopped
+// with an error before writing what was asked for.
+var ErrTranscodeFailed = errors.New("transcode failed")
+
+// errNotProduced is waitFor running out of time with the transcoder still
+// making progress — slow, not stalled.
+var errNotProduced = errors.New("not produced in time")
+
+// Err is why the session has ended for good, or nil while it is usable.
+func (s *Session) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+// noteProgress restarts the stall clock.
+func (s *Session) noteProgress() { s.progressAt.Store(time.Now().UnixNano()) }
+
+// waitFor polls until ready reports true, giving up when the request ends,
+// when produceTimeout passes, or when the session fails. It is where the
+// stall watchdog runs: only a request that is waiting can see a stall that
+// matters, so the check needs no goroutine of its own, and a session no one
+// is waiting on — a paused viewer, a transcoder throttled far ahead — is
+// never judged at all.
+func (s *Session) waitFor(ctx context.Context, ready func() bool) error {
+	deadline := time.Now().Add(produceTimeout)
+	for {
+		if ready() {
+			return nil
+		}
+		if err := s.checkStall(time.Now()); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errNotProduced
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(150 * time.Millisecond):
+			return ctx.Err()
+		case <-time.After(producePoll):
 		}
 	}
-	return "", fmt.Errorf("segment %s not produced in time", name)
+}
+
+// checkStall is the watchdog, run on behalf of a request that is waiting
+// for a file. It ends the session when the transcoder is running but has
+// read nothing from its source for inputStallTimeout (or the manager's
+// StallAfter), and reports a transcoder that has already stopped with an
+// error.
+//
+// What it must not catch: a transcoder ahead of the viewer and throttled
+// marks progress every time it decides to wait, and a viewer who has paused
+// is not waiting on anything. Only "a viewer is waiting and the input is not
+// advancing" ends a session.
+func (s *Session) checkStall(now time.Time) error {
+	s.mu.Lock()
+	if s.failed != nil {
+		err := s.failed
+		s.mu.Unlock()
+		return err
+	}
+	if s.runErr != nil {
+		err := fmt.Errorf("%w: %w", ErrTranscodeFailed, s.runErr)
+		s.mu.Unlock()
+		return err
+	}
+	done := s.done
+	if done == nil || isClosed(done) {
+		// Nothing running: a restored session not yet resumed, or a
+		// transcoder that reached the end of the file.
+		s.mu.Unlock()
+		return nil
+	}
+	limit := inputStallTimeout
+	var onStall func(*Session, <-chan struct{})
+	if s.mgr != nil {
+		if s.mgr.StallAfter > 0 {
+			limit = s.mgr.StallAfter
+		}
+		onStall = s.mgr.OnStall
+	}
+	idle := now.Sub(time.Unix(0, s.progressAt.Load()))
+	if idle <= limit {
+		s.mu.Unlock()
+		return nil
+	}
+	s.failed = fmt.Errorf("%w: nothing read for %s", ErrInputStalled, idle.Round(time.Second))
+	err, cancel := s.failed, s.cancel
+	s.mu.Unlock()
+
+	// The cancel cannot interrupt a read blocked in the kernel; it makes
+	// the transcoder stop as soon as that read returns.
+	if cancel != nil {
+		cancel()
+	}
+	logger.Warn("transcode source stopped answering, session ended",
+		"session", s.ID, "title", s.Title, "path", s.InputPath, "idle", idle.Round(time.Second))
+	if onStall != nil {
+		onStall(s, done)
+	}
+	return err
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // maybeRestart decides whether the requested segment needs a pipeline restart:

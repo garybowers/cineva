@@ -5,9 +5,9 @@ import (
 	"errors"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
@@ -53,47 +53,8 @@ var specs = []spec{
 // audio takes a few seconds from local disk and under ten from a NAS.
 const decodeTimeout = 3 * time.Minute
 
-// Schedule modes: when detection may read.
-const (
-	// ModeWindow reads only between Schedule.Start and Schedule.End.
-	ModeWindow = "window"
-	// ModeIdle reads whenever nothing else needs the storage.
-	ModeIdle = "idle"
-	// ModeManual reads only after an admin asks (RunNow).
-	ModeManual = "manual"
-)
-
-// Schedule says when detection may read. Start and End are minutes after
-// midnight, local time; a window may run past midnight (22:00 to 06:00).
-type Schedule struct {
-	Mode       string
-	Start, End int
-}
-
-// allows reports whether the schedule lets detection read at now.
-func (sc Schedule) allows(now time.Time) bool {
-	switch sc.Mode {
-	case ModeManual:
-		return false
-	case ModeWindow:
-		m := now.Hour()*60 + now.Minute()
-		switch {
-		case sc.Start == sc.End:
-			return true // a window of the whole day
-		case sc.Start < sc.End:
-			return m >= sc.Start && m < sc.End
-		default:
-			return m >= sc.Start || m < sc.End
-		}
-	}
-	return true
-}
-
-// errStorageGone ends a run whose share has stopped answering. Carrying on
-// would only add reads to the ones already stuck on it — and on a network
-// share they all queue on one connection, so every other use of that share,
-// playback included, stalls behind them.
-var errStorageGone = errors.New("storage stopped responding")
+// errStorageGone ends a run whose share has stopped answering.
+var errStorageGone = background.ErrStorageGone
 
 // How many other episodes each one is compared with. More than one, so a
 // stretch only two episodes happen to share is outvoted (see pick); a few,
@@ -209,25 +170,16 @@ type Detector struct {
 	// Available, when set, says whether a library's storage can be reached;
 	// a library that cannot is skipped rather than left to hang the run.
 	Available func(libraryID string) bool
-	// Busy, when set, names what detection should give way to — "playing",
-	// "scanning" — or returns "". Reading a quarter of every episode is
-	// enough traffic to starve playback from the same share, so detection
-	// waits while anything else needs it.
-	Busy func() string
-	// Cooldown is how long after the last busy moment detection resumes, so
-	// it does not dart in between one episode ending and the next starting.
-	Cooldown time.Duration
+	// Gate decides when detection may read: the admin's schedule, pause and
+	// read-speed cap (its Policy, shared with other background work), and
+	// what detection gives way to (its Busy). Reading a quarter of every
+	// episode is enough traffic to starve playback from the same share, so
+	// detection waits while anything else needs it.
+	Gate *background.Gate
 
 	// DecodeTimeout bounds one file's fingerprinting; decodeTimeout
 	// outside tests.
 	DecodeTimeout time.Duration
-	// Now is the clock the schedule is read against; time.Now outside tests.
-	Now func() time.Time
-
-	paused    atomic.Bool  // by an admin
-	rateLimit atomic.Int64 // bytes per second; 0 = as fast as it can
-	schedule  atomic.Pointer[Schedule]
-	runNow    atomic.Bool // "Analyse now": overrides the schedule until the queue is done
 
 	mu       sync.Mutex
 	queue    []string
@@ -237,50 +189,24 @@ type Detector struct {
 }
 
 func NewDetector(st *store.Store) *Detector {
-	return &Detector{Store: st, Fingerprint: media.FingerprintFile, Cooldown: time.Minute,
-		DecodeTimeout: decodeTimeout, Now: time.Now, wake: make(chan struct{}, 1)}
+	return &Detector{Store: st, Fingerprint: media.FingerprintFile,
+		Gate:          background.NewGate(background.NewPolicy()),
+		DecodeTimeout: decodeTimeout, wake: make(chan struct{}, 1)}
 }
 
-// SetSchedule changes when detection may read. A run in progress obeys it
-// from the next file.
-func (d *Detector) SetSchedule(sc Schedule) {
-	d.schedule.Store(&sc)
-	select {
-	case d.wake <- struct{}{}:
-	default:
-	}
-}
+// SetSchedule changes when detection — and anything else sharing its
+// Policy — may read. A run in progress obeys it from the next file.
+func (d *Detector) SetSchedule(sc background.Schedule) { d.Gate.Policy.SetSchedule(sc) }
 
 // RunNow lets detection read straight away, whatever the schedule says,
 // until everything queued is done. A manual pause still holds it.
-func (d *Detector) RunNow() {
-	d.runNow.Store(true)
-}
+func (d *Detector) RunNow() { d.Gate.RunNow() }
 
-// scheduleWait names why the schedule holds detection — "schedule" outside
-// the window, "on-demand" until an admin starts it — or returns "".
-func (d *Detector) scheduleWait() string {
-	sc := d.schedule.Load()
-	if sc == nil || d.runNow.Load() {
-		return ""
-	}
-	now := time.Now
-	if d.Now != nil {
-		now = d.Now
-	}
-	if sc.allows(now()) {
-		return ""
-	}
-	if sc.Mode == ModeManual {
-		return "on-demand"
-	}
-	return "schedule"
-}
-
-// SetPaused pauses or resumes detection. A pause holds before the next file;
-// the one being read finishes first.
+// SetPaused pauses or resumes detection, and anything else sharing its
+// Policy. A pause holds before the next file; the one being read finishes
+// first.
 func (d *Detector) SetPaused(p bool) {
-	d.paused.Store(p)
+	d.Gate.Policy.SetPaused(p)
 	d.setStatus(true, func(s *Status) {
 		if p {
 			s.Paused, s.PauseReason = true, "manual"
@@ -290,51 +216,29 @@ func (d *Detector) SetPaused(p bool) {
 	})
 }
 
-// SetRateLimit caps how fast detection reads media, in bytes per second;
-// 0 removes the cap. Takes effect from the next file.
-func (d *Detector) SetRateLimit(bytesPerSec int64) { d.rateLimit.Store(max(0, bytesPerSec)) }
+// SetRateLimit caps how fast detection — and anything else sharing its
+// Policy — reads media, in bytes per second; 0 removes the cap. Takes effect
+// from the next file.
+func (d *Detector) SetRateLimit(bytesPerSec int64) { d.Gate.Policy.SetRateLimit(bytesPerSec) }
 
 // gate holds before each file while detection is paused, outside its
 // schedule, or while something else needs the storage, and returns when it
 // may read — or errStorageGone once the library's share stops answering.
+// Why it waits goes into the status.
 func (d *Detector) gate(ctx context.Context) error {
-	var lastBusy time.Time
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if lib := d.Status().LibraryID; lib != "" && d.Available != nil && !d.Available(lib) {
-			return errStorageGone
-		}
-		reason := ""
-		if d.paused.Load() {
-			reason = "manual"
-		} else if r := d.scheduleWait(); r != "" {
-			reason = r
-		} else if d.Busy != nil {
-			if r := d.Busy(); r != "" {
-				reason, lastBusy = r, time.Now()
-			}
-		}
-		// Busy a moment ago counts as busy until the cooldown has passed.
-		if reason == "" && !lastBusy.IsZero() && time.Since(lastBusy) < d.Cooldown {
-			reason = d.Status().PauseReason
-		}
-		if reason == "" {
-			if d.Status().Paused {
-				d.setStatus(true, func(s *Status) { s.Paused, s.PauseReason = false, "" })
-			}
-			return nil
-		}
-		if st := d.Status(); !st.Paused || st.PauseReason != reason {
-			d.setStatus(true, func(s *Status) { s.Paused, s.PauseReason = true, reason })
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
+	var available func() bool
+	if d.Available != nil {
+		available = func() bool {
+			lib := d.Status().LibraryID
+			return lib == "" || d.Available(lib)
 		}
 	}
+	return d.Gate.Wait(ctx, available, func(reason string) {
+		if st := d.Status(); st.Paused == (reason != "") && st.PauseReason == reason {
+			return
+		}
+		d.setStatus(true, func(s *Status) { s.Paused, s.PauseReason = reason != "", reason })
+	})
 }
 
 // pace sleeps after reading a file for long enough that detection averages
@@ -342,19 +246,11 @@ func (d *Detector) gate(ctx context.Context) error {
 // size and the share of its running time the window covered: the demuxer
 // reads the video around the audio, so that is close to the truth.
 func (d *Detector) pace(ctx context.Context, ep store.SegmentEpisode, dur float64, took time.Duration) {
-	limit := d.rateLimit.Load()
-	if limit <= 0 || ep.SizeBytes <= 0 || ep.RuntimeSecs <= 0 {
+	if ep.SizeBytes <= 0 || ep.RuntimeSecs <= 0 {
 		return
 	}
 	read := float64(ep.SizeBytes) * min(1, dur/float64(ep.RuntimeSecs))
-	wait := time.Duration(read/float64(limit)*float64(time.Second)) - took
-	if wait <= 0 {
-		return
-	}
-	select {
-	case <-ctx.Done():
-	case <-time.After(wait):
-	}
+	d.Gate.Policy.Pace(ctx, int64(read), took)
 }
 
 // Enqueue asks for a library to be analysed. A library already queued is not
@@ -418,7 +314,7 @@ func (d *Detector) Run(ctx context.Context) {
 		}
 		d.mu.Lock()
 		if len(d.queue) == 0 {
-			d.runNow.Store(false) // "Analyse now" lasts until the work it asked for is done
+			d.Gate.EndRunNow() // "Analyse now" lasts until the work it asked for is done
 		}
 		d.mu.Unlock()
 	}
@@ -496,7 +392,7 @@ seasons:
 			Cancelled: runErr != nil,
 		}
 		// A manual pause outlives the run, so the page still says so.
-		manual := d.paused.Load()
+		manual := d.Gate.Policy.Paused()
 		*s = Status{Last: s.Last, Recent: s.Recent, Paused: manual}
 		if manual {
 			s.PauseReason = "manual"
@@ -559,7 +455,7 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 	// With a rate limit files are read one at a time, so the limit is the
 	// whole of detection's traffic rather than per reader.
 	readers := workers()
-	if d.rateLimit.Load() > 0 {
+	if d.Gate.Policy.RateLimit() > 0 {
 		readers = 1
 	}
 	// The first file to find the share gone, or to stall on it, stops the

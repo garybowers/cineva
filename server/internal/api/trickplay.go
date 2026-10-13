@@ -3,68 +3,45 @@ package api
 import (
 	"net/http"
 	"os"
-	"sync"
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/store"
 )
 
-var trickplayLog = logging.For("trickplay")
-
-// Seek-preview thumbnails are generated on demand, once per item, and cached
-// on disk beside the transcode scratch.
-//
-// Lazily rather than during the scan: generating them for a whole library up
-// front is hours of decoding for films nobody may watch, and the first
-// viewer only loses the preview for the half-minute it takes.
-type trickplayJobs struct {
-	mu      sync.Mutex
-	running map[string]bool
-}
-
-func newTrickplayJobs() *trickplayJobs {
-	return &trickplayJobs{running: map[string]bool{}}
-}
-
-// claim reports whether the caller should generate this item, marking it in
-// flight. Several players asking at once must not start several jobs on the
-// same file.
-func (t *trickplayJobs) claim(itemID string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.running[itemID] {
-		return false
-	}
-	t.running[itemID] = true
-	return true
-}
-
-func (t *trickplayJobs) release(itemID string) {
-	t.mu.Lock()
-	delete(t.running, itemID)
-	t.mu.Unlock()
-}
+// Seek-preview thumbnails are built in the background by s.previews
+// (internal/trickplay), under the same rules as intro detection: never while
+// anything plays or scans, only when the admin's schedule allows, and no
+// faster than the read-speed cap. Every film and episode is queued after
+// each scan, so previews are usually there before the first play.
 
 // GET /items/:id/trickplay.vtt — the cue index for the sprite sheet.
 //
-// 202 while nothing has been generated yet, with generation kicked off in
-// the background on the first miss. 202 rather than 404 because the request
-// was understood and the work is now under way — nothing is missing or
-// wrong, and a 404 here put a failed request in every viewer's console and
-// in the server log for what is ordinary first-play behaviour. The player
-// shows no previews either way and picks them up on the next load.
+// 202 while the previews do not exist yet (or are older than the file),
+// with the title moved to the front of the queue. 202 rather than 404
+// because the request was understood and the work is queued — nothing is
+// missing or wrong, and a 404 here put a failed request in every viewer's
+// console for ordinary behaviour. The previews are never built while the
+// title is playing, so the player shows none this time and picks them up on
+// a later play.
 func (s *server) trickplayVTT(c echo.Context) error {
 	item, err := s.playableItem(c)
 	if err != nil {
 		return err
 	}
-	_, vtt := media.TrickplayPaths(s.trickplayDir, item.ID)
-	if _, err := os.Stat(vtt); err != nil {
-		s.startTrickplay(item.ID, item.Path, item.RuntimeSecs)
+	if item.Kind == store.KindTrack {
+		return echo.NewHTTPError(http.StatusNotFound, "no previews for audio")
+	}
+	p, err := s.store.PreviewItem(c.Request().Context(), item.ID)
+	if err != nil {
+		return err
+	}
+	if !s.previews.Has(item.ID, p.FileMtime) {
+		s.previews.Request(p)
 		return c.NoContent(http.StatusAccepted)
 	}
+	_, vtt := media.TrickplayPaths(s.trickplayDir, item.ID)
 	return c.File(vtt)
 }
 
@@ -81,18 +58,23 @@ func (s *server) trickplaySheet(c echo.Context) error {
 	return c.File(sheet)
 }
 
-// startTrickplay generates previews in the background, at most one job per
-// item. Failures are logged and not retried in a loop: the next request
-// starts a fresh attempt, which is enough for a transient problem and does
-// not hammer a file that cannot be decoded.
-func (s *server) startTrickplay(itemID, path string, runtimeSecs int) {
-	if runtimeSecs <= 0 || !s.trickplay.claim(itemID) {
-		return
-	}
-	go func() {
-		defer s.trickplay.release(itemID)
-		if err := media.GenerateTrickplay(path, s.trickplayDir, itemID, runtimeSecs); err != nil {
-			trickplayLog.Warn("preview generation failed", "item", itemID, "err", err)
+// GET /previews/status — what seek-bar preview building is doing, for the
+// admin's activity page. Also pushed over /events as "previews".
+func (s *server) previewStatus(c echo.Context) error {
+	return c.JSON(http.StatusOK, s.previews.Status())
+}
+
+// enqueueBackground queues a film or TV library for the background work that
+// follows a scan: seek-bar previews for both, intro and credits detection
+// for TV.
+func (s *server) enqueueBackground(lib store.Library) {
+	switch lib.MediaType {
+	case store.MediaTV:
+		if s.segments != nil {
+			s.segments.Enqueue(lib.ID)
 		}
-	}()
+		s.previews.EnqueueLibrary(lib.ID)
+	case store.MediaMovies:
+		s.previews.EnqueueLibrary(lib.ID)
+	}
 }

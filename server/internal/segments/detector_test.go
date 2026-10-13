@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
 )
@@ -200,10 +201,10 @@ func TestDetectorRetriesUnreadableFiles(t *testing.T) {
 // paused it, and says why; it carries on once the cooldown has passed.
 func TestDetectorGate(t *testing.T) {
 	d := NewDetector(nil)
-	d.Cooldown = 1500 * time.Millisecond
+	d.Gate.Cooldown = 1500 * time.Millisecond
 	var busy atomic.Value
 	busy.Store("playing")
-	d.Busy = func() string { return busy.Load().(string) }
+	d.Gate.Busy = func() string { return busy.Load().(string) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -278,49 +279,20 @@ func TestDetectorPace(t *testing.T) {
 	}
 }
 
-func TestScheduleAllows(t *testing.T) {
-	at := func(h, m int) time.Time { return time.Date(2026, 10, 13, h, m, 0, 0, time.Local) }
-	overnight := Schedule{Mode: ModeWindow, Start: 2 * 60, End: 6 * 60}
-	lateNight := Schedule{Mode: ModeWindow, Start: 22 * 60, End: 6 * 60}
-	for _, tc := range []struct {
-		name string
-		sc   Schedule
-		now  time.Time
-		want bool
-	}{
-		{"inside the window", overnight, at(3, 0), true},
-		{"window opens", overnight, at(2, 0), true},
-		{"window has closed", overnight, at(6, 0), false},
-		{"daytime", overnight, at(14, 30), false},
-		{"past midnight, before it", lateNight, at(23, 15), true},
-		{"past midnight, after it", lateNight, at(4, 0), true},
-		{"past midnight, daytime", lateNight, at(12, 0), false},
-		{"start equals end: all day", Schedule{Mode: ModeWindow, Start: 60, End: 60}, at(12, 0), true},
-		{"idle: any time", Schedule{Mode: ModeIdle}, at(12, 0), true},
-		{"manual: never by itself", Schedule{Mode: ModeManual}, at(3, 0), false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.sc.allows(tc.now); got != tc.want {
-				t.Fatalf("allows = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // Outside its window, or in manual mode, detection holds before reading and
 // says why; "Analyse now" lets it through; storage gone ends it outright.
 func TestDetectorScheduleAndStorage(t *testing.T) {
 	d := NewDetector(nil)
-	d.Now = func() time.Time { return time.Date(2026, 10, 13, 14, 0, 0, 0, time.Local) }
+	d.Gate.Now = func() time.Time { return time.Date(2026, 10, 13, 14, 0, 0, 0, time.Local) }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	for _, tc := range []struct {
-		sc     Schedule
+		sc     background.Schedule
 		reason string
 	}{
-		{Schedule{Mode: ModeWindow, Start: 2 * 60, End: 6 * 60}, "schedule"},
-		{Schedule{Mode: ModeManual}, "on-demand"},
+		{background.Schedule{Mode: background.ModeWindow, Start: 2 * 60, End: 6 * 60}, "schedule"},
+		{background.Schedule{Mode: background.ModeManual}, "on-demand"},
 	} {
 		d.SetSchedule(tc.sc)
 		done := make(chan error, 1)
@@ -342,11 +314,11 @@ func TestDetectorScheduleAndStorage(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("%s: Analyse now did not open the gate", tc.sc.Mode)
 		}
-		d.runNow.Store(false)
+		d.Gate.EndRunNow()
 	}
 
 	// The library's share going away ends the run rather than waiting.
-	d.SetSchedule(Schedule{Mode: ModeIdle})
+	d.SetSchedule(background.Schedule{Mode: background.ModeIdle})
 	d.setStatus(true, func(s *Status) { s.LibraryID = "lib" })
 	d.Available = func(string) bool { return false }
 	if err := d.gate(ctx); !errors.Is(err, errStorageGone) {

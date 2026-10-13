@@ -6,7 +6,7 @@
     type UserGroup, type LibraryAccess,
     listIntegrations, createIntegration, updateIntegration, deleteIntegration,
     type Integration, type IntegrationKind, type IntegrationRequest,
-    pauseSegments, resumeSegments, runSegments,
+    pauseSegments, resumeSegments, runSegments, previewStatus, type PreviewStatus,
     cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
     libraryManage, type ManageFilter, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
     updateLibrary,
@@ -175,7 +175,7 @@
 
   async function toggleDetectionPause() {
     try {
-      intro = intro?.paused && intro.pauseReason === 'manual' ? await resumeSegments() : await pauseSegments()
+      intro = bgPaused ? await resumeSegments() : await pauseSegments()
     } catch (err) {
       error = err instanceof Error ? err.message : String(err)
     }
@@ -184,6 +184,7 @@
     manual: 'Paused — resume when you are ready.',
     playing: 'Paused while something is playing; carries on a minute after it stops.',
     scanning: 'Paused while a library scans; carries on a minute after it finishes.',
+    detecting: 'Waiting for intro detection to finish; one reads at a time.',
     schedule: 'Waiting for its window — it only reads between the times set in Settings. "Analyse now" starts it anyway.',
     'on-demand': 'Set to run only when started — press "Analyse now" to begin.',
   }
@@ -547,6 +548,32 @@
   // status arrives over the event stream; the clock only ticks so elapsed
   // and remaining time move between events.
   let intro = $state<IntroStatus | null>(null)
+  // Seek-bar previews are built the same way, under the same schedule and
+  // pause; one line says how they are getting on.
+  let previews = $state<PreviewStatus | null>(null)
+  const bgPaused = $derived(
+    (intro?.paused && intro.pauseReason === 'manual') || (previews?.paused && previews.pauseReason === 'manual'),
+  )
+  const scheduleHeld = (r?: string) => r === 'schedule' || r === 'on-demand'
+  const previewWait: Record<string, string> = {
+    manual: 'Paused',
+    playing: 'Waiting while something plays',
+    scanning: 'Waiting while a library scans',
+    detecting: 'Waiting for intro detection',
+    schedule: 'Waiting for the window',
+    'on-demand': 'Waiting to be started',
+  }
+  const previewLine = $derived.by(() => {
+    const p = previews
+    if (!p) return ''
+    const failed = p.failed ? ` · ${p.failed} unreadable` : ''
+    if (p.running && p.paused && p.pauseReason) return `${previewWait[p.pauseReason] ?? 'Paused'} · ${p.waiting} waiting`
+    if (p.running && p.current) return `Building ${p.current} · ${p.done} done, ${p.waiting} waiting${failed}`
+    if (p.running) return `${p.done} done, ${p.waiting} waiting${failed}`
+    if (p.paused) return 'Paused'
+    if (p.last) return `Finished ${since(p.last.finishedAt)} · ${p.last.done} made${p.last.failed ? ` · ${p.last.failed} unreadable` : ''}`
+    return 'Up to date — built after each scan, newest titles first.'
+  })
   let now = $state(Date.now())
   $effect(() => {
     if (!intro?.running) return
@@ -1217,11 +1244,13 @@
     loadIntegrations()
     loadSettings()
     segmentStatus().then((s) => (intro = s)).catch(() => {})
+    previewStatus().then((p) => (previews = p)).catch(() => {})
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
         scan: onScanEvent,
         segments: (data) => (intro = data as IntroStatus | null),
+        previews: (data) => (previews = data as PreviewStatus | null),
         refresh: (data) => {
           const p = data as RefreshProgress | null
           if (!p || !manage || p.libraryId !== manage.id) return
@@ -2188,12 +2217,14 @@
       {/if}
       <div class="titlerow grouphead">
         <h2>Intro &amp; credits detection</h2>
-        {#if intro && intro.enabled !== false}
+        <!-- Both buttons act on detection and seek-bar previews together:
+             they share one schedule and one pause. -->
+        {#if intro || previews}
           <div class="formrow">
-            {#if intro.paused && (intro.pauseReason === 'schedule' || intro.pauseReason === 'on-demand')}
+            {#if (intro?.paused && scheduleHeld(intro.pauseReason)) || (previews?.paused && scheduleHeld(previews.pauseReason))}
               <button onclick={analyseNow}>Analyse now</button>
             {/if}
-            <button onclick={toggleDetectionPause}>{intro.paused && intro.pauseReason === 'manual' ? 'Resume' : 'Pause'}</button>
+            <button onclick={toggleDetectionPause}>{bgPaused ? 'Resume' : 'Pause'}</button>
           </div>
         {/if}
       </div>
@@ -2225,6 +2256,9 @@
           </div>
         {:else}
           <div class="muted">Idle. Runs after each TV library scan, on episodes not yet analysed for intros and credits.</div>
+        {/if}
+        {#if previewLine}
+          <div class="previewline small">Seek-bar previews <span class="muted">· {previewLine}</span></div>
         {/if}
         {#if intro?.recent?.length}
           <table class="introrecent">
@@ -2369,11 +2403,12 @@
         </div>
         <div class="setting">
           <span>
-            Intro &amp; credits detection schedule
+            Background work schedule
             <span class="muted small">
-              — when detection may read your media. Playback always comes
-              first: detection gives way to anything playing or scanning, and
-              stops as soon as a share stops answering.
+              — when intro &amp; credits detection and seek-bar previews may
+              read your media. Playback always comes first: both give way to
+              anything playing or scanning, and stop as soon as a share stops
+              answering.
             </span>
           </span>
           <div class="schedule">
@@ -2381,7 +2416,7 @@
               class="setting-select"
               value={settings?.detectionMode ?? 'window'}
               onchange={(e) => setDetectionSchedule({ detectionMode: (e.currentTarget as HTMLSelectElement).value as ServerSettings['detectionMode'] })}
-              aria-label="When detection runs"
+              aria-label="When background work runs"
             >
               <option value="window">Only between set times</option>
               <option value="idle">Whenever nothing is playing</option>
@@ -2401,19 +2436,20 @@
         </div>
         <div class="setting">
           <span>
-            Intro &amp; credits detection speed
+            Background work speed
             <span class="muted small">
-              — how fast detection may read from your media storage. It reads
-              part of every episode, which at full speed can fill the link to
-              a NAS. It always pauses while anything plays or scans; a cap
-              also keeps it gentle the rest of the time.
+              — how fast intro &amp; credits detection and seek-bar previews
+              may read from your media storage. Between them they read much
+              of every file, which at full speed can fill the link to a NAS.
+              They always pause while anything plays or scans; a cap also
+              keeps them gentle the rest of the time.
             </span>
           </span>
           <select
             class="setting-select"
             value={String(settings?.detectionRateMB ?? 10)}
             onchange={(e) => setDetectionRate(Number((e.currentTarget as HTMLSelectElement).value))}
-            aria-label="Detection read speed"
+            aria-label="Background read speed"
           >
             {#each settings?.detectionRateOptions ?? [0] as mb (mb)}
               <option value={String(mb)}>{mb === 0 ? 'Unlimited' : `Up to ${mb} MB/s`}</option>
@@ -2951,6 +2987,7 @@
     margin-bottom: 1rem; padding: 0.75rem 1rem;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   }
+  .previewline { border-top: 1px solid var(--border); padding-top: 0.4rem; }
   .introrecent { margin-top: 0.5rem; }
   .introrecent td, .introrecent th { padding-left: 0; }
 </style>

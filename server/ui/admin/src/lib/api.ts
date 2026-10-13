@@ -247,8 +247,21 @@ export interface IntroResult {
 export const segmentStatus = () => req<IntroStatus>('/segments/status')
 export const pauseSegments = () => req<IntroStatus>('/segments/pause', { method: 'POST' })
 export const resumeSegments = () => req<IntroStatus>('/segments/resume', { method: 'POST' })
-/** "Analyse now": run straight away, whatever the schedule, until the backlog is done. */
+/** "Analyse now": run straight away, whatever the schedule, until the backlog is done. Starts seek-bar previews too. */
 export const runSegments = () => req<IntroStatus>('/segments/run', { method: 'POST' })
+
+/** Background seek-bar preview building; also pushed over /events as "previews". */
+export interface PreviewStatus {
+  running: boolean
+  current?: string
+  done: number
+  failed: number
+  waiting: number
+  paused?: boolean
+  pauseReason?: 'manual' | 'playing' | 'scanning' | 'detecting' | 'schedule' | 'on-demand'
+  last?: { finishedAt: string; seconds: number; done: number; failed: number }
+}
+export const previewStatus = () => req<PreviewStatus>('/previews/status')
 export const cancelScan = (id: string) => req<void>(`/scans/${id}/cancel`, { method: 'POST' })
 
 export interface PlaySession {

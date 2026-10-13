@@ -3,7 +3,7 @@
   import Hls from 'hls.js'
   import {
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
-    PLAYBACK_STOPPED,
+    PLAYBACK_STOPPED, itemStorage, streamProblem,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
     type SubtitleTrack,
   } from './lib/api'
@@ -115,6 +115,13 @@
       hls.on(Hls.Events.FRAG_LOADED, (_e, data) => {
         noteSegment(data.frag.stats?.total ?? 0, data.frag.duration)
       })
+      // hls.js retries a 503 for the best part of a minute before giving
+      // up, and keeps only the status. The server answers 503 when the
+      // session's storage has stopped answering, so the first one is
+      // reason enough to ask why rather than sit through the retries.
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.fatal || data.response?.code === 503) explainFailure(data.fatal)
+      })
       hls.loadSource(info.url)
       hls.attachMedia(video)
     } else {
@@ -141,6 +148,77 @@
   // picture simply freezing with no explanation.
   let stoppedByAdmin = $state(false)
 
+  // ---- Storage failures ----
+  // Media usually lives on a network share, and a share that stops
+  // answering does not fail — reads just stop arriving. The server ends a
+  // transcode whose source has stalled and says why; a direct play just
+  // stops receiving data. Either way the viewer is told which library's
+  // storage is not responding and what to do, instead of watching a frozen
+  // picture.
+
+  // A playing video whose time has not moved, with too little buffered to
+  // move, for this long is asked about. Long enough for a NAS disk to spin
+  // up, short enough that nobody is left wondering for a minute.
+  const STALL_CHECK_SECS = 15
+
+  let failure: { title: string; body: string } | null = $state(null)
+  let explaining = false
+  // Set as the player is torn down, when releasing the stream can itself
+  // raise an error that is not worth explaining.
+  let destroyed = false
+
+  function fail(title: string, body: string) {
+    if (failure || stoppedByAdmin) return
+    reportProgress(true) // keep the place before the stream is released
+    failure = { title, body }
+    if (video) {
+      video.pause()
+      video.removeAttribute('src')
+      video.load() // aborts any request still waiting on the server
+    }
+    hls?.destroy()
+    hls = null
+  }
+
+  /** Find out why the stream stopped and, if the server knows, say so.
+      fatal: playback cannot carry on by itself, so something is shown
+      whether or not the server has a reason. */
+  async function explainFailure(fatal: boolean) {
+    if (explaining || failure || stoppedByAdmin || destroyed) return
+    explaining = true
+    try {
+      let reason: string | null = null
+      if (info.mode === 'hls') reason = await streamProblem(info.url).catch(() => null)
+      if (!reason) {
+        const st = await itemStorage(item.id).catch(() => null)
+        if (st && !st.available) reason = st.message ?? null
+      }
+      if (destroyed) return
+      if (reason) fail('Storage not responding', reason)
+      else if (fatal) fail('Playback stopped', 'The stream stopped and could not be recovered. Try again in a moment.')
+    } finally {
+      explaining = false
+    }
+  }
+
+  let stalledSecs = 0
+  let stallLastTime = -1
+  const stallWatch = setInterval(() => {
+    if (!video || failure || stoppedByAdmin) return
+    const stuck = !video.paused && !video.ended && !seeking &&
+      video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA && video.currentTime === stallLastTime
+    stallLastTime = video.currentTime
+    stalledSecs = stuck ? stalledSecs + 1 : 0
+    // Asked again every so often while it stays stuck: the share may only
+    // be found down on a later check.
+    if (stalledSecs > 0 && stalledSecs % STALL_CHECK_SECS === 0) explainFailure(false)
+  }, 1000)
+
+  function retry() {
+    failure = null
+    onquality(quality) // the host starts a fresh playback at the saved place
+  }
+
   function onProgressError(err: unknown) {
     if (!(err instanceof Error) || err.message !== PLAYBACK_STOPPED || stoppedByAdmin) return
     stoppedByAdmin = true
@@ -158,14 +236,16 @@
   // Heartbeat keeps the admin Activity entry alive while paused (no
   // timeupdate events fire then); the server drops silent clients.
   const heartbeat = setInterval(() => {
-    if (video && !stoppedByAdmin) postProgress(item.id, Math.floor(video.currentTime), video.paused).catch(onProgressError)
+    if (video && !stoppedByAdmin && !failure) postProgress(item.id, Math.floor(video.currentTime), video.paused).catch(onProgressError)
   }, 15000)
 
   const onHide = () => beaconStop(item.id)
   window.addEventListener('pagehide', onHide)
 
   onDestroy(() => {
+    destroyed = true
     clearInterval(heartbeat)
+    clearInterval(stallWatch)
     window.removeEventListener('pagehide', onHide)
     reportProgress(true) // reads currentTime, so it runs before the teardown
     hls?.destroy()
@@ -185,7 +265,9 @@
   })
 
   function reportProgress(force = false) {
-    if (!video || stoppedByAdmin) return
+    // Once the stream has been released, currentTime reads 0: the place
+    // was saved as it was released.
+    if (!video || stoppedByAdmin || failure) return
     const t = Math.floor(video.currentTime)
     if (force || Math.abs(t - lastPosted) >= 10) {
       lastPosted = t
@@ -194,6 +276,7 @@
   }
 
   function onTimeUpdate() {
+    if (failure) return // the released stream reads 0, which is not the place
     if (!seeking) current = video.currentTime
     ontime?.(video.currentTime)
     if (video.duration && isFinite(video.duration)) duration = video.duration
@@ -710,6 +793,7 @@
       onended={onEnded}
       onplay={() => { paused = false; wake() }}
       onpause={() => { paused = true; idle = false }}
+      onerror={() => explainFailure(true)}
       onclick={onVideoClick}
       ondblclick={() => !compact && toggleFullscreen()}
     >
@@ -771,6 +855,15 @@
         <p class="stopped-body">An administrator ended this stream. Your place has been saved.</p>
         <button class="primary" onclick={onclose}>Close</button>
       </div>
+    {:else if failure && !compact}
+      <div class="stopped" role="alert">
+        <div class="stopped-title">{failure.title}</div>
+        <p class="stopped-body">{failure.body} Your place has been saved.</p>
+        <div class="stopped-actions">
+          <button class="primary" onclick={retry}><RotateCw size={15} /> Try again</button>
+          <button class="ghost" onclick={onclose}>Close</button>
+        </div>
+      </div>
     {/if}
     {#if inIntro && !compact}
       <button class="skipintro" onclick={skipIntro}>Skip intro</button>
@@ -796,7 +889,12 @@
         {item.title}
         {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
       </button>
-      <span class="time">{fmt(current)} / {fmt(duration)}</span>
+      {#if failure}
+        <!-- Too small for the explanation; expanding shows it in full. -->
+        <button class="time failed" onclick={onexpand} title={failure.body}>{failure.title}</button>
+      {:else}
+        <span class="time">{fmt(current)} / {fmt(duration)}</span>
+      {/if}
     </div>
     <div class="mini-transport">
       {#if item.kind === 'episode'}
@@ -1451,14 +1549,19 @@
   .upnext-title { font-weight: 600; margin: 0.35rem 0 0.7rem; }
   .sub2 { color: rgba(255, 255, 255, 0.65); font-weight: 400; margin-left: 0.4rem; }
   .upnext-actions { display: flex; gap: 0.5rem; }
-  .upnext .primary {
+  .stopped-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.5rem; }
+  .stopped .primary { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .mini-info .failed { color: var(--err); text-align: left; padding: 0; }
+  .upnext .primary,
+  .stopped-actions .primary {
     background: var(--accent, #7c5cff);
     color: #fff;
     padding: 0.4rem 0.9rem;
     border-radius: 8px;
     font-weight: 600;
   }
-  .upnext .ghost {
+  .upnext .ghost,
+  .stopped-actions .ghost {
     color: rgba(255, 255, 255, 0.75);
     padding: 0.4rem 0.9rem;
     border: 1px solid rgba(255, 255, 255, 0.25);

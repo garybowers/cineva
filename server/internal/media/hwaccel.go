@@ -80,6 +80,24 @@ type HWContext struct {
 	// ask a codec whether it can decode on this device.
 	DevType ffmpeg.AVHWDeviceType
 	ref     *ffmpeg.AVBufferRef
+	// decodes records which codecs the chip itself can decode, where the
+	// driver can be asked (VAAPI). nil means unknown, and the build's
+	// hwaccels are taken at their word.
+	decodes map[ffmpeg.AVCodecID]bool
+	// noDeviceScale keeps scaling on the CPU after a hardware decode, so
+	// tests can measure the device scaler against the path it replaced.
+	noDeviceScale bool
+}
+
+// chipDecodes reports whether the device's own hardware decodes a codec, as
+// far as is known. Unknown counts as yes: the decoder's probation catches a
+// device that turns out not to.
+func (h *HWContext) chipDecodes(id ffmpeg.AVCodecID) bool {
+	if h == nil || h.decodes == nil {
+		return true
+	}
+	ok, known := h.decodes[id]
+	return !known || ok
 }
 
 // EncoderFor returns the encoder to use for a codec on this device, and
@@ -106,6 +124,9 @@ func (h *HWContext) EncoderFor(codec string) (string, bool) {
 func (h *HWContext) NewFrames(width, height int) (*ffmpeg.AVBufferRef, error) {
 	if h == nil {
 		return nil, errors.New("no hardware context")
+	}
+	if h.Encoder == "" {
+		return nil, errors.New("device does not encode")
 	}
 	ref := ffmpeg.AVHWFrameCtxAlloc(h.ref)
 	if ref == nil {
@@ -248,7 +269,13 @@ func DetectHW(pref string) *HWContext {
 		// GPU is worth saying plainly rather than leaving someone to wonder
 		// why a "hardware" transcode still pegs the CPU.
 		if codecs := hwDecodableCodecs(found); len(codecs) > 0 {
-			logger.Info("decoding on the GPU", "codecs", strings.Join(codecs, ", "))
+			attrs := []any{"codecs", strings.Join(codecs, ", ")}
+			// Naming what stays on the CPU answers the next question
+			// before it is asked — usually AV1 on an older GPU.
+			if cpu := cpuDecodedCodecs(codecs); len(cpu) > 0 {
+				attrs = append(attrs, "on_cpu", strings.Join(cpu, ", "))
+			}
+			logger.Info("decoding on the GPU", attrs...)
 		} else {
 			logger.Warn("decoding on the CPU: this ffmpeg has no decoder or hwaccel built in for the device", "kind", found.Kind)
 		}
@@ -263,10 +290,14 @@ func DetectHW(pref string) *HWContext {
 func (c hwCandidate) open() *HWContext {
 	for _, path := range c.devices {
 		if ref := openHWDevice(c.devType, path); ref != nil {
-			return &HWContext{
+			hw := &HWContext{
 				Kind: c.kind, Device: path, Encoder: c.encoder, PixFmt: c.pixFmt,
 				Alt: availableEncoders(c.alt), DevType: c.devType, ref: ref,
 			}
+			if c.kind == HWVAAPI {
+				hw.decodes = vaapiDecodeCodecs(ref)
+			}
+			return hw
 		}
 	}
 	return nil

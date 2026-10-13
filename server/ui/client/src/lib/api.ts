@@ -463,6 +463,30 @@ export const continueWatching = () => get<ResumeItem[]>('/continue-watching')
 export const stopSession = (sid: string) => fetch(`/api/v1/play/${sid}`, { method: 'DELETE' })
 export const downloadURL = (id: string) => `/api/v1/items/${id}/download`
 
+/** A fresh check of the storage behind an item, with the sentence to show
+    when it is unavailable. For a player whose stream has stopped arriving. */
+export interface ItemStorage extends StorageStatus {
+  library: string
+  message?: string
+}
+export const itemStorage = (id: string) => get<ItemStorage>(`/items/${id}/storage`)
+
+/** The server's reason a stream URL is failing, or null when it answers.
+    A transcode session ended by the server (its storage stopped answering)
+    says why on its playlist, and hls.js keeps only the status code. */
+export async function streamProblem(url: string): Promise<string | null> {
+  const res = await fetch(url, { cache: 'no-store' })
+  if (res.ok) {
+    await res.body?.cancel()
+    return null
+  }
+  try {
+    const body = await res.json()
+    if (body?.message) return String(body.message)
+  } catch { /* not JSON */ }
+  return `${res.status} ${res.statusText}`
+}
+
 export async function prevEpisode(id: string): Promise<Item | null> {
   const res = await fetch(`/api/v1/items/${id}/prev`)
   if (res.status === 204 || !res.ok) return null

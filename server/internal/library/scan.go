@@ -55,9 +55,19 @@ type Manager struct {
 	// how the server starts work that depends on what a scan found.
 	OnScanDone func(lib store.Library)
 
+	// Playing, when set, reports whether anything is being played. A
+	// rescan requested by a webhook waits for it to stop, up to
+	// webhookRescanCeiling; a scan an admin starts by hand does not.
+	Playing func() bool
+
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // libraryID -> cancel for the active scan
 	again   map[string]bool               // libraryID -> rescan once the active scan ends
+	waiting map[string]bool               // libraryID -> a requested rescan is waiting for playback
+
+	// poll and ceiling override playbackPoll and webhookRescanCeiling in
+	// tests.
+	poll, ceiling time.Duration
 }
 
 func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string) *Manager {
@@ -68,6 +78,7 @@ func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string
 		Probe:      media.Probe,
 		running:    map[string]context.CancelFunc{},
 		again:      map[string]bool{},
+		waiting:    map[string]bool{},
 	}
 }
 
@@ -140,6 +151,10 @@ func (m *Manager) StartScan(ctx context.Context, lib store.Library, full bool) (
 // already running here, queues another to follow it: the scan in flight may
 // have walked past the folder a new file has just landed in. Requests made
 // during one scan collapse into a single follow-up.
+//
+// While anything is playing the scan waits for it to stop, for up to
+// webhookRescanCeiling, and requests made while it waits collapse into it.
+// RequestScan itself returns at once either way.
 func (m *Manager) RequestScan(ctx context.Context, lib store.Library) error {
 	m.mu.Lock()
 	if _, ok := m.running[lib.ID]; ok {
@@ -147,14 +162,69 @@ func (m *Manager) RequestScan(ctx context.Context, lib store.Library) error {
 		m.mu.Unlock()
 		return nil
 	}
+	if m.waiting[lib.ID] {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.Playing != nil && m.Playing() {
+		m.waiting[lib.ID] = true
+		m.mu.Unlock()
+		go m.scanAfterPlayback(lib)
+		return nil
+	}
 	m.mu.Unlock()
 	_, err := m.StartScan(ctx, lib, false)
 	return err
 }
 
-// rescanIfRequested starts the follow-up RequestScan queued during a scan.
-// The library is read again, since it may have been edited or deleted
-// while the scan ran.
+// scanAfterPlayback waits for playback to stop, or the ceiling, then starts
+// the requested scan. The library is read again, since it may have been
+// edited or deleted while it waited.
+func (m *Manager) scanAfterPlayback(lib store.Library) {
+	poll, ceiling := m.poll, m.ceiling
+	if poll <= 0 {
+		poll = playbackPoll
+	}
+	if ceiling <= 0 {
+		ceiling = webhookRescanCeiling
+	}
+	logger.Debug("rescan waiting for playback to finish", "library", lib.Name, "max_wait", ceiling)
+	ctx := context.Background()
+	waited, timedOut, err := waitForPlayback(ctx, m.Playing, poll, ceiling)
+	m.mu.Lock()
+	delete(m.waiting, lib.ID)
+	m.mu.Unlock()
+	if err != nil {
+		logger.Warn("requested rescan abandoned", "library", lib.Name, "err", err)
+		return
+	}
+	if timedOut {
+		logger.Info("requested rescan starting while playback continues", "library", lib.Name, "waited", waited.Round(time.Second))
+	} else {
+		logger.Debug("playback finished, requested rescan starting", "library", lib.Name, "waited", waited.Round(time.Second))
+	}
+	fresh, err := m.Store.Library(ctx, lib.ID)
+	if err != nil {
+		logger.Warn("requested rescan: library lookup failed", "library_id", lib.ID, "err", err)
+		return
+	}
+	m.mu.Lock()
+	if _, ok := m.running[lib.ID]; ok {
+		// Someone started one by hand meanwhile; follow it, as a request
+		// made during a scan would.
+		m.again[lib.ID] = true
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	if _, err := m.StartScan(ctx, fresh, false); err != nil {
+		logger.Error("requested rescan failed", "library", fresh.Name, "err", err)
+	}
+}
+
+// rescanIfRequested starts the follow-up RequestScan queued during a scan,
+// waiting for playback like any requested scan. The library is read again,
+// since it may have been edited or deleted while the scan ran.
 func (m *Manager) rescanIfRequested(libID string) {
 	m.mu.Lock()
 	queued := m.again[libID]
@@ -169,7 +239,7 @@ func (m *Manager) rescanIfRequested(libID string) {
 		logger.Warn("queued rescan: library lookup failed", "library_id", libID, "err", err)
 		return
 	}
-	if _, err := m.StartScan(ctx, lib, false); err != nil {
+	if err := m.RequestScan(ctx, lib); err != nil {
 		logger.Error("queued rescan failed", "library", lib.Name, "err", err)
 	}
 }
