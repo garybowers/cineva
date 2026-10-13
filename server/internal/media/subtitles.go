@@ -178,11 +178,8 @@ var (
 )
 
 func srtMs(h, m, s, ms string) int64 {
-	toI := func(v string) int64 {
-		var n int64
-		fmt.Sscanf(v, "%d", &n)
-		return n
-	}
+	// srtTimeRe has already matched each part as digits.
+	toI := func(v string) int64 { return int64(parseNum(v)) }
 	return toI(h)*3600000 + toI(m)*60000 + toI(s)*1000 + toI(ms)
 }
 

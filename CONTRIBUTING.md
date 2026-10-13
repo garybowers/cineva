@@ -50,9 +50,9 @@ it has to pass.
 Before pushing, run:
 
 ```sh
-make lint    # gofmt and go vet
+make lint    # gofmt, go vet and golangci-lint
 make test    # the Go tests
-make ui      # if you changed either UI — the built dist folders are committed
+make ui      # if you changed a UI, to check it builds (built files are not committed)
 ```
 
 and, for UI changes, `npx svelte-check` in the UI's folder, adding no new

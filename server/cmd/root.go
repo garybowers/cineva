@@ -54,12 +54,14 @@ func init() {
 // loadDotEnv reads KEY=VALUE lines from a git-ignored ./.env file into the
 // environment (existing variables win), so secrets like the TMDB key can
 // live outside both the repo and the yaml: CINEVA_METADATA_TMDB_API_KEY=...
-func loadDotEnv() {
+// A missing file is not an error; a line that cannot be set (an empty name,
+// say) is.
+func loadDotEnv() error {
 	data, err := os.ReadFile(".env")
 	if err != nil {
-		return
+		return nil
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for n, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -71,13 +73,19 @@ func loadDotEnv() {
 		k = strings.TrimSpace(k)
 		v = strings.Trim(strings.TrimSpace(v), `"'`)
 		if os.Getenv(k) == "" {
-			os.Setenv(k, v)
+			if err := os.Setenv(k, v); err != nil {
+				return fmt.Errorf(".env line %d: %w", n+1, err)
+			}
 		}
 	}
+	return nil
 }
 
 func initConfig() {
-	loadDotEnv()
+	if err := loadDotEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(1)
+	}
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.port", 4747)
 	viper.SetDefault("database.path", "cineva.db")

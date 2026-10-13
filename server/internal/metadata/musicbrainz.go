@@ -110,11 +110,12 @@ func (m *MusicBrainz) SearchRelease(ctx context.Context, artist, album string) (
 		} `json:"media"`
 	}
 	if err := m.get(ctx, "https://musicbrainz.org/ws/2/release/"+r.ID+"?fmt=json&inc=recordings", &rel); err == nil {
-		for _, med := range rel.Media {
-			for _, t := range med.Tracks {
+		// The first medium only: positions restart on every disc, so later
+		// discs' tracks would collide with the first's.
+		if len(rel.Media) > 0 {
+			for _, t := range rel.Media[0].Tracks {
 				out.Tracks = append(out.Tracks, MBTrack{Pos: t.Position, Title: t.Title})
 			}
-			break // first medium; multi-disc positions restart per disc
 		}
 	}
 	return out, nil

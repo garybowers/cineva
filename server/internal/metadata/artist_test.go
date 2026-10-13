@@ -18,8 +18,8 @@ func TestArtistInfo(t *testing.T) {
 		if r.Header.Get("User-Agent") == "" {
 			t.Errorf("%s requested without a User-Agent", r.URL.Path)
 		}
-		switch {
-		case r.URL.Path == "/ws/2/artist/":
+		switch r.URL.Path {
+		case "/ws/2/artist/":
 			q := r.URL.Query().Get("query")
 			switch {
 			case strings.Contains(q, "Portishead"):
@@ -29,15 +29,15 @@ func TestArtistInfo(t *testing.T) {
 			default:
 				fmt.Fprint(w, `{"artists":[]}`)
 			}
-		case r.URL.Path == "/ws/2/artist/mb-ph":
+		case "/ws/2/artist/mb-ph":
 			fmt.Fprint(w, `{"relations":[{"type":"official homepage","url":{"resource":"https://portishead.co.uk"}},
 				{"type":"wikidata","url":{"resource":"https://www.wikidata.org/wiki/Q191352"}}]}`)
-		case r.URL.Path == "/wiki/Special:EntityData/Q191352.json":
+		case "/wiki/Special:EntityData/Q191352.json":
 			fmt.Fprint(w, `{"entities":{"Q191352":{"claims":{"P18":[{"mainsnak":{"datavalue":{"value":"Portishead live.jpg"}}}]},
 				"sitelinks":{"enwiki":{"title":"Portishead (band)"}}}}}`)
-		case r.URL.Path == "/wiki/Special:FilePath/Portishead live.jpg":
+		case "/wiki/Special:FilePath/Portishead live.jpg":
 			fmt.Fprint(w, "JPEG")
-		case r.URL.Path == "/api/rest_v1/page/summary/Portishead_(band)":
+		case "/api/rest_v1/page/summary/Portishead_(band)":
 			fmt.Fprint(w, `{"extract":"Portishead are an English band formed in 1991 in Bristol."}`)
 		default:
 			http.NotFound(w, r)

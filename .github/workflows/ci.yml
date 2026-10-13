@@ -127,12 +127,12 @@ jobs:
           path: ${{ env.LIB_DIR }}
           key: ${{ steps.libkey.outputs.key }}
 
-      - name: Build the web client, admin UI and API reference
+      # make build builds the UIs into the binary; they are not committed.
+      - name: Install the web client, admin UI and API reference dependencies
         run: |
           npm ci --prefix server/ui/client
           npm ci --prefix server/ui/admin
           npm ci --prefix server/ui/apidocs
-          make ui
 
       - name: Lint
         run: make lint

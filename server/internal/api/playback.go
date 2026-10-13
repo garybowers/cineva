@@ -591,7 +591,14 @@ func (s *server) downloadArchive(c echo.Context, root store.Item, format string,
 	res.WriteHeader(http.StatusOK)
 
 	zw := zip.NewWriter(res.Writer)
-	defer zw.Close()
+	// Close writes the central directory, without which the archive does
+	// not open. The headers are sent, so a failure can only be noted; it is
+	// almost always the client having gone away.
+	defer func() {
+		if err := zw.Close(); err != nil {
+			downloadLog.Debug("archive not finished", "archive", root.Title, "err", err)
+		}
+	}()
 	// The headers are sent, so a storage failure from here on can only end
 	// the archive early. It does end it, rather than skipping to the next
 	// entry: on a share that has stopped answering the next entry would

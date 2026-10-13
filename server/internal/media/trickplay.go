@@ -250,9 +250,12 @@ func writeJPEG(path string, img image.Image) error {
 	if err != nil {
 		return fmt.Errorf("trickplay sheet: %w", err)
 	}
-	defer f.Close()
 	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: trickQuality}); err != nil {
+		f.Close()
 		return fmt.Errorf("encode trickplay sheet: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write trickplay sheet: %w", err)
 	}
 	return nil
 }

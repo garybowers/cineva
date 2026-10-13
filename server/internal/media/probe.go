@@ -116,7 +116,7 @@ func Probe(path string) (Info, error) {
 		info.Tags.Overview = dictValue(meta, "description")
 	}
 	if date := dictValue(meta, "date"); len(date) >= 4 {
-		fmt.Sscanf(date[:4], "%d", &info.Tags.Year)
+		info.Tags.Year = parseNum(date[:4]) // zero when the tag is not a year
 	}
 	streams := in.Streams()
 	for i := uint(0); i < in.NbStreams(); i++ {

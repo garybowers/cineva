@@ -13,8 +13,11 @@ cineva.db-*
 # Downloaded artwork cache
 artwork/
 
-# Note: server/ui/*/dist IS committed for now so a fresh clone can
-# `go build` (go:embed needs the built assets). Revisit once CI builds them.
+# Built UIs: `make ui` writes them and `make build` embeds them. Each dist/
+# keeps a .gitkeep (put back by every build) so go:embed has a file to match
+# in a fresh clone.
+server/ui/*/dist/*
+!server/ui/*/dist/.gitkeep
 
 # Real local config (may hold secrets like the TMDB key) — the committed
 # reference is server/cineva.example.yaml. Viper searches the working

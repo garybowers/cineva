@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -13,6 +14,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/store"
 	"github.com/garybowers/cineva/server/internal/version"
+	"github.com/garybowers/cineva/server/ui"
 )
 
 var serveCmd = &cobra.Command{
@@ -96,6 +98,9 @@ func printCard(ctx context.Context, st *store.Store) {
 // announce says the server is up. A person at a terminal has had the card
 // already; a log collector gets one structured line once it is listening.
 func announce(s api.Startup) {
+	if missing := ui.Missing(); len(missing) > 0 {
+		startLog.Warn("built without part of its interface; run make ui and rebuild", "missing", strings.Join(missing, ", "))
+	}
 	if prettyLogs {
 		return
 	}

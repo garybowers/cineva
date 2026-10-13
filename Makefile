@@ -25,11 +25,12 @@ LDFLAGS := -X github.com/garybowers/cineva/server/internal/metadata.defaultAPIKe
 	-X github.com/garybowers/cineva/server/internal/version.Version=$(VERSION)
 # CI builds one binary per architecture and names them apart.
 OUT ?= bin/cineva
+GOLANGCI_LINT := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 # The recipe is silenced with @ because $(LDFLAGS) carries the TMDB key:
 # make echoes every command it runs, which puts the key in the terminal, in
 # scrollback, and in any CI log that ever builds this.
-build: $(LIB)
+build: $(LIB) ui
 	@echo "building $(OUT) $(VERSION)"
 	@cd server && go build -ldflags "$(LDFLAGS)" -o $(abspath $(OUT)) .
 
@@ -42,7 +43,10 @@ test: $(LIB)
 lint: $(LIB)
 	cd server && out=$$(gofmt -l .); [ -z "$$out" ] || { echo "$$out"; exit 1; }
 	cd server && go vet ./...
+	cd server && go run $(GOLANGCI_LINT) run ./...
 
+# The built UIs are not committed; `make build` runs this first so the binary
+# embeds them.
 ui:
 	npm --prefix server/ui/client run build
 	npm --prefix server/ui/admin run build

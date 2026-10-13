@@ -42,6 +42,9 @@ music are in daily use; audiobooks, podcasts and books are on the way.
 - For hardware transcoding: a GPU with a VA-API driver (`mesa-va-drivers` or
   `intel-media-va-driver`; the container image includes both). Without one,
   Cineva transcodes in software.
+- To watch: a browser from 2023 or later — Chrome or Edge 111, Firefox 113,
+  Safari 16.2 (iOS and iPadOS 16.2 on phones and tablets). The interface's
+  colours are mixed with CSS `color-mix()`, which older browsers lack.
 
 ## Running with Docker
 
@@ -216,7 +219,7 @@ toolchain with `cargo-c` (`cargo install cargo-c`).
 git clone --recurse-submodules git@github.com:garybowers/cineva.git
 cd cineva
 make setup   # builds the static FFmpeg library (slow, once) and installs the UI dependencies
-make ui      # builds the web client and admin UI into server/ui/*/dist
+make ui      # builds the web client, admin UI and API reference (make build does this too)
 make run     # runs the server from server/
 make build   # writes bin/cineva
 ```

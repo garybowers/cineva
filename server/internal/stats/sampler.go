@@ -152,7 +152,7 @@ func (s *Sampler) take(now time.Time) {
 	// is not worth stopping sampling for, so it is logged and dropped.
 	if coarseTick && s.Store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := s.Store.AppendStatsSample(ctx, stored(smp)); err != nil {
+		if err := s.Store.AppendStatsSample(ctx, StoredSample(smp)); err != nil {
 			logger.Warn("persisting sample failed", "err", err)
 		}
 		cancel()
@@ -249,13 +249,6 @@ func (s *Sampler) retain() time.Duration {
 	return 24 * time.Hour
 }
 
-func stored(s Sample) StoredSample {
-	return StoredSample{
-		At: s.At, CPUPct: s.CPUPct, MemUsed: s.MemUsed,
-		MemTotal: s.MemTotal, ProcRSS: s.ProcRSS, NumCPU: s.NumCPU,
-	}
-}
-
 // restore seeds the coarse ring from the database so the dashboard shows
 // the history either side of a restart rather than starting from nothing.
 //
@@ -277,10 +270,7 @@ func (s *Sampler) restore(ctx context.Context) {
 	}
 	s.mu.Lock()
 	for _, r := range rows {
-		s.coarse = append(s.coarse, Sample{
-			At: r.At, CPUPct: r.CPUPct, MemUsed: r.MemUsed,
-			MemTotal: r.MemTotal, ProcRSS: r.ProcRSS, NumCPU: r.NumCPU,
-		})
+		s.coarse = append(s.coarse, Sample(r))
 	}
 	// Treat the newest restored row as the last coarse tick, so sampling
 	// resumes on the minute boundary rather than immediately duplicating it.

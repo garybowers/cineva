@@ -65,7 +65,7 @@ func TestIntegrationWebhookAuth(t *testing.T) {
 			c := echo.New().NewContext(req, rec)
 			c.SetParamNames("id")
 			c.SetParamValues(tc.id)
-			code := http.StatusOK
+			var code int
 			if err := s.integrationWebhook(c); err != nil {
 				var he *echo.HTTPError
 				if !errors.As(err, &he) {

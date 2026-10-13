@@ -56,7 +56,7 @@ func audioFilterSpecFmt(sampleFmt string, rate, frameSize int) string {
 // onRead, when set, is called each time a read from src returns, so a
 // caller can give up on a source that has stopped answering (see
 // library.WithinIdle).
-func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKbps int, onRead func()) error {
+func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKbps int, onRead func()) (retErr error) {
 	if onRead == nil {
 		onRead = func() {}
 	}
@@ -121,7 +121,12 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 	if err != nil {
 		return fmt.Errorf("audio transcode output: %w", err)
 	}
-	defer out.Close()
+	// Closing flushes and closes dst; a failure there leaves it incomplete.
+	defer func() {
+		if err := out.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("audio transcode close: %w", err)
+		}
+	}()
 	aOut, err := out.AddStream(aenc)
 	if err != nil {
 		return fmt.Errorf("audio transcode stream: %w", err)

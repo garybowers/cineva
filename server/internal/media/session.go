@@ -523,7 +523,9 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 // replaced by a new one for the same item.
 func (s *Session) shutdown() {
 	s.stopTranscode()
-	os.RemoveAll(s.Dir)
+	if err := os.RemoveAll(s.Dir); err != nil {
+		logger.Warn("transcode segments not removed", "dir", s.Dir, "err", err)
+	}
 }
 
 // stopTranscode halts the transcoder but leaves the segments where they are.

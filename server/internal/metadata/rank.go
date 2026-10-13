@@ -79,10 +79,10 @@ func scoreCandidate(c VideoResult, wantTitle string, wantYear int) int {
 		score += 25
 	}
 	if wantYear > 0 && c.Year > 0 {
-		switch d := c.Year - wantYear; {
-		case d == 0:
+		switch c.Year - wantYear {
+		case 0:
 			score += 60
-		case d == 1 || d == -1:
+		case 1, -1:
 			// A film released in December is routinely tagged with the
 			// following year by one source and not the other.
 			score += 30

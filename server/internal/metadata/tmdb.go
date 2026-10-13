@@ -531,14 +531,6 @@ func (t *TMDB) TVByID(ctx context.Context, tmdbID int) (VideoResult, error) {
 	return r.toVideoResult(), nil
 }
 
-func (t *TMDB) search(ctx context.Context, kind string, params url.Values) (VideoResult, error) {
-	results, err := t.searchAll(ctx, kind, params)
-	if err != nil {
-		return VideoResult{}, err
-	}
-	return results[0], nil
-}
-
 // searchAll returns every result, best first, or ErrNotFound when there are
 // none — so callers wanting just the best can take the first safely.
 func (t *TMDB) searchAll(ctx context.Context, kind string, params url.Values) ([]VideoResult, error) {
@@ -702,7 +694,10 @@ func DownloadArtwork(ctx context.Context, client *http.Client, rawURL, dir, name
 		os.Remove(tmp)
 		return "", fmt.Errorf("write artwork: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("write artwork: %w", err)
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return "", fmt.Errorf("write artwork: %w", err)
 	}

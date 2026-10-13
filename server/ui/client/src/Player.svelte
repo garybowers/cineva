@@ -1180,6 +1180,7 @@
     border-radius: 10px;
     border: 1px solid rgb(255 255 255 / 0.14);
     background: rgb(10 12 16 / 0.82);
+    -webkit-backdrop-filter: blur(6px);
     backdrop-filter: blur(6px);
     color: #fff;
     font-size: 0.78rem;
@@ -1280,6 +1281,7 @@
     border-radius: 10px;
     border: 1px solid rgb(255 255 255 / 0.14);
     background: rgb(10 12 16 / 0.92);
+    -webkit-backdrop-filter: blur(6px);
     backdrop-filter: blur(6px);
     z-index: 6;
   }

@@ -105,7 +105,7 @@ func setPrivOpt(cc *ffmpeg.AVCodecContext, key, value string) {
 	}
 }
 
-func RunHLS(ctx context.Context, job HLSJob) error {
+func RunHLS(ctx context.Context, job HLSJob) (retErr error) {
 	onInput := job.OnInput
 	if onInput == nil {
 		onInput = func() {}
@@ -186,7 +186,13 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	if err != nil {
 		return fmt.Errorf("hls output: %w", err)
 	}
-	defer out.Close()
+	// Closing flushes whatever output the muxer opened itself; a failure
+	// there leaves the stream incomplete.
+	defer func() {
+		if err := out.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("hls close: %w", err)
+		}
+	}()
 
 	// Stream 0: video — copied untouched, or decoded/scaled/re-encoded when a
 	// quality level was requested.

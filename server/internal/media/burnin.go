@@ -24,8 +24,7 @@ import (
 
 // subBurner decodes one subtitle stream and paints its bitmaps onto frames.
 type subBurner struct {
-	ctx    *ffmpeg.AVCodecContext
-	stream *ffmpeg.AVStream
+	ctx *ffmpeg.AVCodecContext
 	// The subtitle currently on screen, and the window it occupies in
 	// stream time. A PGS stream sends a bitmap and then a clear; between
 	// them the same image stays up across many frames.

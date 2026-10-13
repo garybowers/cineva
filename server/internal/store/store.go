@@ -41,7 +41,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // versions in schema_migrations. Migration files are append-only. Migrations
 // run on a dedicated connection with foreign keys disabled so table rebuilds
 // (SQLite's only way to change constraints) don't cascade into child tables.
-func (s *Store) Migrate(ctx context.Context) error {
+func (s *Store) Migrate(ctx context.Context) (retErr error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("migration connection: %w", err)
@@ -50,7 +50,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
 		return fmt.Errorf("disable foreign keys: %w", err)
 	}
-	defer conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`)
+	// The connection goes back to the pool afterwards, so failing to turn
+	// foreign keys back on would leave a connection that silently ignores
+	// them: that fails the migration rather than passing unnoticed.
+	defer func() {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`); err != nil && retErr == nil {
+			retErr = fmt.Errorf("re-enable foreign keys: %w", err)
+		}
+	}()
 
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,

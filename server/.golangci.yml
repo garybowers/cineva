@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  # The standard set: errcheck, govet, ineffassign, staticcheck and unused.
+  default: standard
+  settings:
+    errcheck:
+      exclude-functions:
+        # The deferred-rollback idiom: after a successful Commit, Rollback
+        # only returns sql.ErrTxDone, and on an error path the error that
+        # caused the rollback is the one worth returning.
+        - (*database/sql.Tx).Rollback
+  exclusions:
+    presets:
+      # Unchecked Close, Flush, os.Remove and print errors. Closes of files
+      # and writers that were written to are checked regardless, since a
+      # failed close there can lose data; what this leaves ignored is
+      # read-side closes, response bodies, rows and best-effort cleanup.
+      - std-error-handling
+    rules:
+      # Tests are held to a lower bar: fake HTTP handlers writing canned
+      # JSON and similar, where a failed write fails the test anyway.
+      - path: _test\.go
+        linters:
+          - errcheck
