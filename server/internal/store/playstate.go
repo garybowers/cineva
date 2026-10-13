@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // LocalUser is the placeholder user id until auth lands in milestone 4.
@@ -25,28 +26,70 @@ type PlayState struct {
 type ResumeItem struct {
 	Item
 	PositionSecs int `json:"positionSecs"`
+	// SeriesTitle names an episode's series: "The Big Bran Hypothesis" on
+	// its own does not say which show it is. The series' artwork comes too:
+	// an episode's own image is a landscape still, which a poster card or a
+	// home-screen banner would crop badly.
+	SeriesID       string `json:"seriesId,omitempty"`
+	SeriesTitle    string `json:"seriesTitle,omitempty"`
+	SeriesPoster   string `json:"seriesPoster,omitempty"`
+	SeriesBackdrop string `json:"seriesBackdrop,omitempty"`
 }
 
 type PlayStateRepo interface {
 	SetProgress(ctx context.Context, userID, itemID string, positionSecs, runtimeSecs int) (PlayState, error)
 	SetWatched(ctx context.Context, userID, itemID string, watched bool) (PlayState, error)
 	PlayStateFor(ctx context.Context, userID, itemID string) (PlayState, error)
-	ContinueWatching(ctx context.Context, userID string, limit int) ([]ResumeItem, error)
+	ContinueWatching(ctx context.Context, userID string, libraryIDs []string, limit int) ([]ResumeItem, error)
 	NextEpisode(ctx context.Context, episodeID string) (Item, bool, error)
 	PrevEpisode(ctx context.Context, episodeID string) (Item, bool, error)
+	NextUp(ctx context.Context, userID, parentID string) (NextUp, bool, error)
+}
+
+// NextUp is the episode a series or season should play next, with enough
+// context for a client to label the button honestly.
+//
+// Reason is why this episode was chosen:
+//
+//   - "resume"  — part-watched; carry on from PositionSecs
+//   - "next"    — the first episode never started
+//   - "restart" — everything is watched, so this is the first episode again
+//
+// The distinction matters: "Resume S02E05" and "Watch again from the start"
+// are different promises, and a button that says the wrong one loses
+// someone their place.
+type NextUp struct {
+	Item         Item   `json:"item"`
+	PositionSecs int    `json:"positionSecs"`
+	Reason       string `json:"reason"`
 }
 
 var _ PlayStateRepo = (*Store)(nil)
 
 func (s *Store) SetProgress(ctx context.Context, userID, itemID string, positionSecs, runtimeSecs int) (PlayState, error) {
-	// Recorded against the primary so every version of a film shares one
-	// resume position (see primaryID).
-	itemID = s.primaryID(ctx, itemID)
 	watched := 0
 	if runtimeSecs > 0 && float64(positionSecs) >= watchedFraction*float64(runtimeSecs) {
 		watched = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO play_state (user_id, item_id, position_secs, watched)
+	// Reaching detected end credits also counts: the player rolls on to the
+	// next episode once they start, and on a short episode with long credits
+	// that can be before the 90% mark — which would leave the episode
+	// unwatched and next-up pointing back at it.
+	var creditsAt float64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT start_secs FROM media_segments WHERE item_id = ? AND kind = 'credits'`, itemID).Scan(&creditsAt)
+	switch {
+	case err == nil:
+		if creditsAt > 0 && float64(positionSecs) >= creditsAt {
+			watched = 1
+		}
+	case !errors.Is(err, sql.ErrNoRows):
+		return PlayState{}, fmt.Errorf("credits for %s: %w", itemID, err)
+	}
+	// Recorded against the primary so every version of a film shares one
+	// resume position (see primaryID).
+	itemID = s.primaryID(ctx, itemID)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO play_state (user_id, item_id, position_secs, watched)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT (user_id, item_id) DO UPDATE SET
 			position_secs = excluded.position_secs,
@@ -77,12 +120,31 @@ func (s *Store) PlayStateFor(ctx context.Context, userID, itemID string) (PlaySt
 	return ps, nil
 }
 
-func (s *Store) ContinueWatching(ctx context.Context, userID string, limit int) ([]ResumeItem, error) {
+// ContinueWatching returns the viewer's part-watched items, most recently
+// played first. libraryIDs limits them to the libraries the viewer may see
+// (nil means every library, for admins). The limit applies after that, so
+// items from a library they have lost access to cannot crowd out the rest.
+func (s *Store) ContinueWatching(ctx context.Context, userID string, libraryIDs []string, limit int) ([]ResumeItem, error) {
+	scope, args := "", []any{userID}
+	if libraryIDs != nil {
+		if len(libraryIDs) == 0 {
+			return []ResumeItem{}, nil
+		}
+		scope = ` AND i.library_id IN (?` + strings.Repeat(", ?", len(libraryIDs)-1) + `)`
+		for _, id := range libraryIDs {
+			args = append(args, id)
+		}
+	}
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+itemColumns("i")+`, p.position_secs FROM play_state p
+		`SELECT `+itemColumns("i")+`, p.position_secs,
+		        COALESCE(sr.id, ''), COALESCE(sr.title, ''), COALESCE(sr.poster, ''), COALESCE(sr.backdrop, '')
+		 FROM play_state p
 		 JOIN items i ON i.id = p.item_id
-		 WHERE p.user_id = ? AND p.watched = 0 AND p.position_secs > 10
-		 ORDER BY p.updated_at DESC LIMIT ?`, userID, limit)
+		 LEFT JOIN items se ON se.id = i.parent_id AND i.kind = 'episode'
+		 LEFT JOIN items sr ON sr.id = se.parent_id
+		 WHERE p.user_id = ? AND p.watched = 0 AND p.position_secs > 10`+scope+`
+		 ORDER BY p.updated_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("continue watching: %w", err)
 	}
@@ -92,7 +154,8 @@ func (s *Store) ContinueWatching(ctx context.Context, userID string, limit int) 
 		// The item's own columns, then the trailing position. Sharing
 		// itemScanTargets means a new item column cannot desynchronise this.
 		var r ResumeItem
-		targets := append(itemScanTargets(&r.Item), &r.PositionSecs)
+		targets := append(itemScanTargets(&r.Item), &r.PositionSecs,
+			&r.SeriesID, &r.SeriesTitle, &r.SeriesPoster, &r.SeriesBackdrop)
 		if err := rows.Scan(targets...); err != nil {
 			return nil, fmt.Errorf("scan resume item: %w", err)
 		}
@@ -215,4 +278,82 @@ func (s *Store) PlayStatesByLibrary(ctx context.Context, userID, libraryID strin
 		out[ps.ItemID] = ps
 	}
 	return out, rows.Err()
+}
+
+// NextUp picks the episode to play for a series or a season.
+//
+// The rule is the one every other media server settles on, in this order:
+// carry on with whatever is part-watched, otherwise start the first episode
+// nobody has begun, otherwise offer the first episode again. Episodes are
+// ordered by season then number, so the pointer crosses season boundaries
+// without the client knowing anything about the hierarchy — which is the
+// point of it living here (see CLAUDE.md).
+//
+// parentID may be a series or a season; a season confines the answer to its
+// own episodes.
+func (s *Store) NextUp(ctx context.Context, userID, parentID string) (NextUp, bool, error) {
+	parent, err := s.Item(ctx, parentID)
+	if err != nil {
+		return NextUp{}, false, err
+	}
+
+	// A series matches episodes through their season; a season matches its
+	// own directly. Both joins come before the WHERE, which the first
+	// version of this got wrong by appending the play_state join after it.
+	var from, cond string
+	switch parent.Kind {
+	case KindSeries:
+		from = `FROM items e JOIN items season ON e.parent_id = season.id`
+		cond = `season.parent_id = ?`
+	case KindSeason:
+		from = `FROM items e`
+		cond = `e.parent_id = ?`
+	default:
+		return NextUp{}, false, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+itemColumns("e")+`,
+		        COALESCE(p.position_secs, 0), COALESCE(p.watched, 0)
+		 `+from+`
+		 LEFT JOIN play_state p ON p.item_id = e.id AND p.user_id = ?
+		 WHERE `+cond+` AND e.kind = 'episode'
+		 ORDER BY e.season_num, e.episode_num`, userID, parentID)
+	if err != nil {
+		return NextUp{}, false, fmt.Errorf("next up: %w", err)
+	}
+	defer rows.Close()
+
+	var first *NextUp
+	var firstUnstarted *NextUp
+	for rows.Next() {
+		var it Item
+		var pos int
+		var watched bool
+		targets := append(itemScanTargets(&it), &pos, &watched)
+		if err := rows.Scan(targets...); err != nil {
+			return NextUp{}, false, fmt.Errorf("scan next up: %w", err)
+		}
+		if first == nil {
+			first = &NextUp{Item: it, Reason: "restart"}
+		}
+		// Part-watched wins outright, and the earliest one does: someone
+		// who left two episodes half-finished means the earlier one.
+		if !watched && pos > 10 {
+			return NextUp{Item: it, PositionSecs: pos, Reason: "resume"}, true, nil
+		}
+		if !watched && firstUnstarted == nil {
+			firstUnstarted = &NextUp{Item: it, Reason: "next"}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return NextUp{}, false, fmt.Errorf("next up rows: %w", err)
+	}
+	if firstUnstarted != nil {
+		return *firstUnstarted, true, nil
+	}
+	if first != nil {
+		return *first, true, nil
+	}
+	return NextUp{}, false, nil // a series with no episodes
 }

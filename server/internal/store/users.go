@@ -18,17 +18,20 @@ const (
 // User is an account. PasswordHash never leaves the store package's
 // callers unhashed and is omitted from JSON.
 type User struct {
-	ID           string   `json:"id"`
-	Username     string   `json:"username"`
-	DisplayName  string   `json:"displayName"`
-	PasswordHash string   `json:"-"`
-	PINHash      string   `json:"-"`
-	HasPassword  bool     `json:"hasPassword"`
-	HasPin       bool     `json:"hasPin"`
-	Role         string   `json:"role"`
-	Disabled     bool     `json:"disabled"`
-	CreatedAt    string   `json:"createdAt"`
-	LibraryIDs   []string `json:"libraryIds"` // grants; admins: every library (informational)
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"displayName"`
+	PasswordHash string `json:"-"`
+	PINHash      string `json:"-"`
+	HasPassword  bool   `json:"hasPassword"`
+	HasPin       bool   `json:"hasPin"`
+	Role         string `json:"role"`
+	Disabled     bool   `json:"disabled"`
+	CreatedAt    string `json:"createdAt"`
+	// LibraryIDs is every library this user can see: the open ones, plus
+	// restricted ones naming them or a group they are in (all of them for
+	// an admin). Computed on load, not stored; access is set per library.
+	LibraryIDs []string `json:"libraryIds"`
 }
 
 func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
@@ -69,7 +72,6 @@ type UserRepo interface {
 	SetPINHash(ctx context.Context, id, hash string) error
 	Profiles(ctx context.Context) ([]User, error)
 	DeleteUser(ctx context.Context, id string) error
-	SetLibraryGrants(ctx context.Context, userID string, libraryIDs []string) error
 	AdoptLocalState(ctx context.Context, userID string) error
 
 	CreateSession(ctx context.Context, tokenHash, userID, expiresAt, client, ip string) error
@@ -130,7 +132,7 @@ func (s *Store) UserByID(ctx context.Context, id string) (User, error) {
 	if err != nil {
 		return User{}, fmt.Errorf("user %s: %w", id, err)
 	}
-	u.LibraryIDs, err = s.grantsFor(ctx, id)
+	u.LibraryIDs, err = s.visibleLibraries(ctx, u)
 	return u, err
 }
 
@@ -142,7 +144,7 @@ func (s *Store) UserByUsername(ctx context.Context, username string) (User, erro
 	if err != nil {
 		return User{}, fmt.Errorf("user %q: %w", username, err)
 	}
-	u.LibraryIDs, err = s.grantsFor(ctx, u.ID)
+	u.LibraryIDs, err = s.visibleLibraries(ctx, u)
 	return u, err
 }
 
@@ -164,7 +166,7 @@ func (s *Store) Users(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	for i := range out {
-		if out[i].LibraryIDs, err = s.grantsFor(ctx, out[i].ID); err != nil {
+		if out[i].LibraryIDs, err = s.visibleLibraries(ctx, out[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -250,41 +252,6 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-func (s *Store) grantsFor(ctx context.Context, userID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT library_id FROM library_grants WHERE user_id = ?`, userID)
-	if err != nil {
-		return nil, fmt.Errorf("grants: %w", err)
-	}
-	defer rows.Close()
-	out := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
-// SetLibraryGrants replaces a user's library grants wholesale.
-func (s *Store) SetLibraryGrants(ctx context.Context, userID string, libraryIDs []string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("grants tx: %w", err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM library_grants WHERE user_id = ?`, userID); err != nil {
-		return fmt.Errorf("clear grants: %w", err)
-	}
-	for _, lib := range libraryIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO library_grants (user_id, library_id) VALUES (?, ?)`, userID, lib); err != nil {
-			return fmt.Errorf("grant %s: %w", lib, err)
-		}
-	}
-	return tx.Commit()
 }
 
 // AdoptLocalState hands everything recorded under the pre-auth placeholder

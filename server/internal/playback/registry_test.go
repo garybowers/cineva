@@ -63,3 +63,120 @@ func TestParseUserAgent(t *testing.T) {
 		}
 	}
 }
+
+// A playback's history row has to be closed however the playback ends.
+// Browsers close tabs without telling the server, so the reap path matters
+// as much as the explicit stop.
+func TestOnEndFiresForEveryExitPath(t *testing.T) {
+	cases := []struct {
+		name string
+		end  func(r *Registry)
+	}{
+		{"explicit stop", func(r *Registry) { r.Stop("u1", "i1") }},
+		{"transcode session killed", func(r *Registry) { r.StopSession("sess-1") }},
+		{"idle reap", func(r *Registry) { r.reap(time.Now().UTC().Add(time.Hour)) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ended []Playback
+			r := NewRegistry(time.Second)
+			r.OnEnd = func(p Playback) { ended = append(ended, p) }
+			r.Start(Playback{
+				UserID: "u1", ItemID: "i1", SessionID: "sess-1", EventID: 42,
+				DurationSecs: 100,
+			})
+			tc.end(r)
+			if len(ended) != 1 {
+				t.Fatalf("OnEnd fired %d times, want 1", len(ended))
+			}
+			if ended[0].EventID != 42 {
+				t.Errorf("EventID = %d, want 42 — the history row cannot be closed without it", ended[0].EventID)
+			}
+			if len(r.List()) != 0 {
+				t.Errorf("playback still listed after ending")
+			}
+		})
+	}
+}
+
+// Ending twice must not fire twice: a reap racing an explicit stop would
+// otherwise close the same history row with two different durations.
+func TestOnEndFiresOncePerPlayback(t *testing.T) {
+	var n int
+	r := NewRegistry(time.Second)
+	r.OnEnd = func(Playback) { n++ }
+	r.Start(Playback{UserID: "u1", ItemID: "i1", SessionID: "s1", EventID: 7})
+	r.Stop("u1", "i1")
+	r.Stop("u1", "i1")
+	r.StopSession("s1")
+	r.reap(time.Now().UTC().Add(time.Hour))
+	if n != 1 {
+		t.Errorf("OnEnd fired %d times, want 1", n)
+	}
+}
+
+// A registry with no OnEnd must still work — `scan` and the tests use one.
+func TestNilOnEndIsSafe(t *testing.T) {
+	r := NewRegistry(time.Second)
+	r.Start(Playback{UserID: "u", ItemID: "i"})
+	r.Stop("u", "i") // must not panic
+}
+
+// An administrator's stop has to survive the client's own heartbeat. The
+// progress endpoint re-registers a playback it cannot find — so that a reap
+// or a restart does not lose a stream that is still running — which would
+// otherwise undo the stop a few seconds later.
+func TestAdminStopSurvivesHeartbeat(t *testing.T) {
+	r := NewRegistry(time.Second)
+	r.Start(Playback{UserID: "u1", ItemID: "i1", EventID: 1})
+
+	if _, ok := r.StopByAdmin("u1", "i1"); !ok {
+		t.Fatal("StopByAdmin did not find the playback")
+	}
+	if len(r.List()) != 0 {
+		t.Fatal("playback still listed after an admin stop")
+	}
+	// The heartbeat that follows must be told, exactly once.
+	if !r.Stopped("u1", "i1") {
+		t.Fatal("Stopped() false right after an admin stop — the client would never be told")
+	}
+	if r.Stopped("u1", "i1") {
+		t.Error("Stopped() true twice — the viewer could never restart the item")
+	}
+}
+
+// A stop for a playback that is not currently listed is still remembered:
+// the client can be mid-heartbeat when the stop arrives.
+func TestAdminStopOfUnlistedPlaybackIsRemembered(t *testing.T) {
+	r := NewRegistry(time.Second)
+	if _, ok := r.StopByAdmin("u1", "i1"); ok {
+		t.Error("StopByAdmin reported finding a playback that was never started")
+	}
+	if !r.Stopped("u1", "i1") {
+		t.Error("stop was not remembered, so a racing heartbeat would resurrect the playback")
+	}
+}
+
+// Markers must not accumulate for clients that never come back.
+func TestStopMarkersArePruned(t *testing.T) {
+	r := NewRegistry(time.Second)
+	r.StopByAdmin("u1", "i1")
+	r.reap(time.Now().UTC().Add(stopGrace + time.Minute))
+	if r.Stopped("u1", "i1") {
+		t.Error("a stop marker outlived its grace window")
+	}
+}
+
+// Stopping one playback must not stop another.
+func TestAdminStopIsScopedToOnePlayback(t *testing.T) {
+	r := NewRegistry(time.Second)
+	r.Start(Playback{UserID: "u1", ItemID: "i1"})
+	r.Start(Playback{UserID: "u2", ItemID: "i1"}) // same item, different viewer
+	r.StopByAdmin("u1", "i1")
+	if r.Stopped("u2", "i1") {
+		t.Error("stopping one viewer's playback also stopped another's")
+	}
+	if len(r.List()) != 1 {
+		t.Errorf("%d playbacks left, want 1", len(r.List()))
+	}
+}

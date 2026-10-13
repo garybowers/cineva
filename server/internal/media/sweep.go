@@ -27,12 +27,16 @@ type dirUsage struct {
 // every crash, restart or redeploy leaks a directory that nothing will ever
 // clean up.
 //
-// Called before any session exists, so every directory under Root is by
-// definition an orphan. It returns the number of directories removed and the
+// Called at startup after restoring sessions, so every directory under Root
+// except those named in keep is by definition an orphan. It returns the number of directories removed and the
 // bytes reclaimed. Errors removing one directory are logged and skipped
 // rather than returned: a leftover directory must never stop the server
 // starting.
-func SweepOrphans(root string) (int, int64, error) {
+func SweepOrphans(root string, keep ...string) (int, int64, error) {
+	spare := make(map[string]bool, len(keep))
+	for _, d := range keep {
+		spare[filepath.Base(d)] = true
+	}
 	entries, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
 		return 0, 0, nil
@@ -48,7 +52,12 @@ func SweepOrphans(root string) (int, int64, error) {
 		}
 		// Sibling caches that are not session directories and must survive.
 		switch e.Name() {
-		case "subtitles", "dlcache":
+		case "subtitles", "dlcache", "trickplay":
+			continue
+		}
+		// A session restored from the previous run owns its directory; its
+		// segments are the whole reason the session was worth keeping.
+		if spare[e.Name()] {
 			continue
 		}
 		p := filepath.Join(root, e.Name())
@@ -82,7 +91,7 @@ func enforceCap(root string, maxBytes int64, keep map[string]bool) (int, int64) 
 			continue
 		}
 		switch e.Name() {
-		case "subtitles", "dlcache":
+		case "subtitles", "dlcache", "trickplay":
 			continue
 		}
 		p := filepath.Join(root, e.Name())

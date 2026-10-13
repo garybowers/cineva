@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -49,6 +50,11 @@ type Item struct {
 	Poster      string   `json:"poster,omitempty"`
 	AddedAt     string   `json:"addedAt"`
 	UpdatedAt   string   `json:"updatedAt"`
+	// FileMtime is the file's modification time (Unix seconds) when it was
+	// last scanned; with SizeBytes it decides whether a rescan can skip the
+	// file. Write-only: it is not loaded with the item, and an upsert that
+	// leaves it 0 keeps the stored value.
+	FileMtime int64 `json:"-"`
 	// VersionOf is the id of the item this one is an alternative version of
 	// — the same film at a different quality. Empty for a primary, which is
 	// what the library grid lists.
@@ -64,6 +70,30 @@ type Item struct {
 	// the scale is per-country. Distinct from Rating, which is an audience
 	// score. See migration 0015.
 	Certification string `json:"certification,omitempty"`
+	// Status is TMDB's wording for where a series stands — "Ended",
+	// "Returning Series", "Canceled". Kept verbatim: "Canceled" and "Ended"
+	// are not the same news.
+	Status string `json:"status,omitempty"`
+	// Network is the broadcaster a series began on.
+	Network string `json:"network,omitempty"`
+	// AirDate is the broadcast date of an episode, or a season's premiere,
+	// as "2008-01-20". An episode has no other date, and Year alone cannot
+	// order episodes within a year.
+	AirDate string `json:"airDate,omitempty"`
+	// SeasonCount and EpisodeCount are what the provider says the series
+	// has, not what is on disk — the gap is what makes them worth storing.
+	SeasonCount  int `json:"seasonCount,omitempty"`
+	EpisodeCount int `json:"episodeCount,omitempty"`
+	// LastAirDate is when a series last aired; NextAirDate when the next
+	// episode is due, which only a running series has and which stops being
+	// true the moment it airs.
+	LastAirDate string `json:"lastAirDate,omitempty"`
+	NextAirDate string `json:"nextAirDate,omitempty"`
+	// OriginalTitle is the name in the work's own language, kept only when
+	// it differs from Title.
+	OriginalTitle string `json:"originalTitle,omitempty"`
+	// Country is the ISO 3166-1 code it originates from.
+	Country string `json:"country,omitempty"`
 	// LockedFields are fields an operator has edited by hand. Anything
 	// automatic — a scan, a metadata refresh — leaves them alone, so a
 	// correction is not undone by the provider it was correcting. See
@@ -111,6 +141,8 @@ func itemColumns(alias string) string {
 		p("poster"), p("added_at"), p("updated_at"), p("version_of"),
 		p("rating"), p("vote_count"), p("tagline"), p("backdrop"),
 		p("collection_id"), p("collection_name"), p("certification"),
+		p("status"), p("network"), p("air_date"), p("season_count"), p("episode_count"),
+		p("last_air_date"), p("next_air_date"), p("original_title"), p("country"),
 		p("locked_fields"),
 	}
 	return strings.Join(cols, ", ")
@@ -130,6 +162,8 @@ func itemScanTargets(it *Item) []any {
 		&it.TmdbID, &it.Overview, &it.Poster, &it.AddedAt, &it.UpdatedAt, &it.VersionOf,
 		&it.Rating, &it.VoteCount, &it.Tagline, &it.Backdrop,
 		&it.CollectionID, &it.CollectionName, &it.Certification,
+		&it.Status, &it.Network, &it.AirDate, &it.SeasonCount, &it.EpisodeCount,
+		&it.LastAirDate, &it.NextAirDate, &it.OriginalTitle, &it.Country,
 		// Stored as CSV and split on the way out; see lockedFieldsScanner.
 		lockedFieldsScanner{it},
 	}
@@ -190,6 +224,19 @@ func scanItem(row interface{ Scan(...any) error }) (Item, error) {
 	return it, err
 }
 
+// addedAt is when a new item counts as added: when its file arrived, not
+// when a scan first noticed it. A scan can run long after a download (or
+// walk a whole back catalogue in one go), and ranking by scan time would
+// order a library by the scanner's walk rather than by what is actually new.
+// A modification time in the future is a wrong clock, not a promise.
+func addedAt(fileMtime int64, now time.Time) string {
+	t := now.UTC()
+	if fileMtime > 0 && fileMtime < t.Unix() {
+		t = time.Unix(fileMtime, 0).UTC()
+	}
+	return t.Format(time.DateTime)
+}
+
 // UpsertItem inserts the item or, if one exists at (library_id, path),
 // refreshes its mutable fields, keeping the original id and added_at.
 func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
@@ -211,15 +258,19 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			 size_bytes, runtime_secs, container, video_codec, audio_codec, width, height,
 			 tmdb_id, overview, poster,
 			 rating, vote_count, tagline, backdrop, collection_id, collection_name,
-			 certification)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 certification, status, network, air_date, season_count, episode_count,
+			 last_air_date, next_air_date, original_title, country, file_mtime, added_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, item.LibraryID, string(item.Kind), parent, item.Title, item.Year,
 			item.SeasonNum, item.EpisodeNum, item.DiscNum, item.TrackNum, item.Artist,
 			item.Path, item.SizeBytes, item.RuntimeSecs,
 			item.Container, item.VideoCodec, item.AudioCodec, item.Width, item.Height,
 			item.TmdbID, item.Overview, item.Poster,
 			item.Rating, item.VoteCount, item.Tagline, item.Backdrop,
-			item.CollectionID, item.CollectionName, item.Certification)
+			item.CollectionID, item.CollectionName, item.Certification,
+			item.Status, item.Network, item.AirDate, item.SeasonCount, item.EpisodeCount,
+			item.LastAirDate, item.NextAirDate, item.OriginalTitle, item.Country, item.FileMtime,
+			addedAt(item.FileMtime, time.Now()))
 		if err != nil {
 			return Item{}, fmt.Errorf("insert item %q: %w", item.Path, err)
 		}
@@ -252,6 +303,21 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			collection_id = CASE WHEN ? != 0 THEN ? ELSE collection_id END,
 			collection_name = CASE WHEN ? != '' THEN ? ELSE collection_name END,
 			certification = CASE WHEN `+locked("certification")+` OR ? = '' THEN certification ELSE ? END,
+			status = CASE WHEN ? != '' THEN ? ELSE status END,
+			network = CASE WHEN ? != '' THEN ? ELSE network END,
+			air_date = CASE WHEN ? != '' THEN ? ELSE air_date END,
+			season_count = CASE WHEN ? != 0 THEN ? ELSE season_count END,
+			episode_count = CASE WHEN ? != 0 THEN ? ELSE episode_count END,
+			last_air_date = CASE WHEN ? != '' THEN ? ELSE last_air_date END,
+			-- Cleared as well as set: once the last episode airs TMDB stops
+			-- returning one, and a stale "next episode" date is worse than
+			-- none at all.
+			next_air_date = ?,
+			original_title = CASE WHEN ? != '' THEN ? ELSE original_title END,
+			country = CASE WHEN ? != '' THEN ? ELSE country END,
+			-- Kept when not given: an item loaded and saved back (a
+			-- track picking up its album's cover) never carries it.
+			file_mtime = CASE WHEN ? != 0 THEN ? ELSE file_mtime END,
 			updated_at = datetime('now')
 			WHERE id = ?`,
 			string(item.Kind), parent, item.Title, item.Year, item.SeasonNum, item.EpisodeNum,
@@ -263,6 +329,12 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			item.Tagline, item.Tagline, item.Backdrop, item.Backdrop,
 			item.CollectionID, item.CollectionID, item.CollectionName, item.CollectionName,
 			item.Certification, item.Certification,
+			item.Status, item.Status, item.Network, item.Network,
+			item.AirDate, item.AirDate,
+			item.SeasonCount, item.SeasonCount, item.EpisodeCount, item.EpisodeCount,
+			item.LastAirDate, item.LastAirDate, item.NextAirDate,
+			item.OriginalTitle, item.OriginalTitle, item.Country, item.Country,
+			item.FileMtime, item.FileMtime,
 			id)
 		if err != nil {
 			return Item{}, fmt.Errorf("update item %q: %w", item.Path, err)
@@ -387,17 +459,86 @@ func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, e
 		limit)
 }
 
-// PruneUnseen deletes a library's items not touched since the given cutoff
-// (UTC, sqlite datetime format). Every scan upserts all current items, so
-// anything older belongs to files no longer on disk. Cascades to subtitles
-// and play state.
-func (s *Store) PruneUnseen(ctx context.Context, libraryID, cutoff string) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM items WHERE library_id = ? AND updated_at < ?`, libraryID, cutoff)
+// FileStamp is what a rescan knows about an item already in the library:
+// enough to decide whether its file has changed, and to keep the item (and
+// the items above it) without loading or rewriting any of them.
+type FileStamp struct {
+	ID          string
+	Kind        ItemKind
+	ParentID    string
+	TmdbID      int
+	SizeBytes   int64
+	FileMtime   int64
+	RuntimeSecs int
+	Status      string
+}
+
+// FileStamps returns every item in a library keyed by path. Paths are unique
+// within a library (UpsertItem matches on them), so the map loses nothing.
+func (s *Store) FileStamps(ctx context.Context, libraryID string) (map[string]FileStamp, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, kind, COALESCE(parent_id, ''), path, tmdb_id, size_bytes, file_mtime, runtime_secs, status
+		 FROM items WHERE library_id = ?`, libraryID)
+	if err != nil {
+		return nil, fmt.Errorf("file stamps %s: %w", libraryID, err)
+	}
+	defer rows.Close()
+	out := map[string]FileStamp{}
+	for rows.Next() {
+		var st FileStamp
+		var path string
+		if err := rows.Scan(&st.ID, &st.Kind, &st.ParentID, &path, &st.TmdbID, &st.SizeBytes,
+			&st.FileMtime, &st.RuntimeSecs, &st.Status); err != nil {
+			return nil, fmt.Errorf("file stamps %s: %w", libraryID, err)
+		}
+		out[path] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("file stamps %s: %w", libraryID, err)
+	}
+	return out, nil
+}
+
+// PruneExcept deletes a library's items whose ids are not in keep: the scan
+// collects every item it saved or found unchanged, so anything else belongs
+// to a file no longer on disk. Cascades to subtitles and play state.
+//
+// The set is passed in rather than inferred from updated_at, because an
+// incremental scan deliberately leaves unchanged items untouched — and
+// touching them would make every polling client refetch them as changed.
+func (s *Store) PruneExcept(ctx context.Context, libraryID string, keep map[string]bool) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM items WHERE library_id = ?`, libraryID)
 	if err != nil {
 		return 0, fmt.Errorf("prune library %s: %w", libraryID, err)
 	}
-	n, _ := res.RowsAffected()
+	var stale []any
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("prune library %s: %w", libraryID, err)
+		}
+		if !keep[id] {
+			stale = append(stale, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("prune library %s: %w", libraryID, err)
+	}
+	var n int64
+	// Chunked to stay well inside SQLite's bound-parameter limit.
+	for len(stale) > 0 {
+		chunk := stale[:min(len(stale), 500)]
+		stale = stale[len(chunk):]
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM items WHERE id IN (?`+strings.Repeat(",?", len(chunk)-1)+`)`, chunk...)
+		if err != nil {
+			return n, fmt.Errorf("prune library %s: %w", libraryID, err)
+		}
+		k, _ := res.RowsAffected()
+		n += k
+	}
 	return n, nil
 }
 

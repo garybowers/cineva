@@ -40,15 +40,24 @@ type hwCandidate struct {
 	encoder string               // must exist in this build, or the backend is not usable
 	pixFmt  ffmpeg.AVPixelFormat // the surface format frames live in on this backend
 	devices []string             // tried in order; "" lets the driver pick
+	// Encoders this backend offers beyond h264, keyed by codec name. Which
+	// of them the hardware can actually do is a property of the chip, not
+	// the build, so each is probed at detection time rather than assumed:
+	// an older card has the h265 block and not the AV1 one.
+	alt map[string]string
 }
 
 // Ordered by how much work they take off the CPU in practice: a discrete
 // NVIDIA card first, then Intel's dedicated media engine, then VAAPI, which
 // covers AMD and also Intel where Quick Sync is unavailable.
 var hwCandidates = []hwCandidate{
-	{HWNVENC, "NVIDIA NVENC", ffmpeg.AVHWDeviceTypeCuda, "h264_nvenc", ffmpeg.AVPixFmtCuda, []string{""}},
-	{HWQSV, "Intel Quick Sync", ffmpeg.AVHWDeviceTypeQsv, "h264_qsv", ffmpeg.AVPixFmtQsv, []string{""}},
-	{HWVAAPI, "AMD/Intel VAAPI", ffmpeg.AVHWDeviceTypeVaapi, "h264_vaapi", ffmpeg.AVPixFmtVaapi, []string{"", "/dev/dri/renderD128", "/dev/dri/renderD129"}},
+	{HWNVENC, "NVIDIA NVENC", ffmpeg.AVHWDeviceTypeCuda, "h264_nvenc", ffmpeg.AVPixFmtCuda, []string{""},
+		map[string]string{"hevc": "hevc_nvenc", "av1": "av1_nvenc"}},
+	{HWQSV, "Intel Quick Sync", ffmpeg.AVHWDeviceTypeQsv, "h264_qsv", ffmpeg.AVPixFmtQsv, []string{""},
+		map[string]string{"hevc": "hevc_qsv", "av1": "av1_qsv"}},
+	{HWVAAPI, "AMD/Intel VAAPI", ffmpeg.AVHWDeviceTypeVaapi, "h264_vaapi", ffmpeg.AVPixFmtVaapi,
+		[]string{"", "/dev/dri/renderD128", "/dev/dri/renderD129"},
+		map[string]string{"hevc": "hevc_vaapi", "av1": "av1_vaapi"}},
 }
 
 // HWContext is an opened hardware device, shared by every transcode session.
@@ -58,7 +67,34 @@ type HWContext struct {
 	Device  string               // the path that opened, "" when the driver chose
 	Encoder string               // the h264 encoder to use with it
 	PixFmt  ffmpeg.AVPixelFormat // surface format the encoder consumes
+	// Alt holds the other codecs this device can encode, keyed by codec
+	// name ("hevc", "av1"). Only encoders present in this build are listed;
+	// whether the chip itself supports one is not knowable without trying,
+	// so a failure to open still falls back like any other.
+	//
+	// h264 remains the default output and should stay that way: it is the
+	// one codec every browser decodes. These exist for clients that can do
+	// better — a native app, or a future quality level — rather than to be
+	// chosen automatically.
+	Alt map[string]string
+	// DevType is the libavformat device type this context wraps, used to
+	// ask a codec whether it can decode on this device.
+	DevType ffmpeg.AVHWDeviceType
 	ref     *ffmpeg.AVBufferRef
+}
+
+// EncoderFor returns the encoder to use for a codec on this device, and
+// whether one exists. An unknown codec, or a nil context, reports false so
+// the caller falls back to software.
+func (h *HWContext) EncoderFor(codec string) (string, bool) {
+	if h == nil {
+		return "", false
+	}
+	if codec == "" || codec == "h264" {
+		return h.Encoder, h.Encoder != ""
+	}
+	name, ok := h.Alt[codec]
+	return name, ok
 }
 
 // NewFrames builds a frame pool on the device, in the surface format this
@@ -106,6 +142,21 @@ func (h *HWContext) Name() string {
 		return string(h.Kind)
 	}
 	return string(h.Kind) + " (" + h.Device + ")"
+}
+
+// Codecs lists what this device can encode, h264 first, for display. Returns
+// nil for software.
+func (h *HWContext) Codecs() []string {
+	if h == nil || h.Encoder == "" {
+		return nil
+	}
+	out := []string{"h264"}
+	for _, c := range []string{"hevc", "av1"} { // stable order, not map order
+		if _, ok := h.Alt[c]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (h *HWContext) Close() {
@@ -186,7 +237,22 @@ func DetectHW(pref string) *HWContext {
 
 	summary := strings.Join(results, " · ")
 	if found != nil {
-		log.Printf("transcode: %s — using %s", summary, found.Encoder)
+		// Naming the other codecs the device can encode makes it obvious
+		// why h264 was chosen anyway: it is the compatible one, not the
+		// only one available.
+		extra := ""
+		if codecs := found.Codecs(); len(codecs) > 1 {
+			extra = " (device also encodes " + strings.Join(codecs[1:], ", ") + ")"
+		}
+		log.Printf("transcode: %s — using %s%s", summary, found.Encoder, extra)
+		// Decode is the larger half of the cost, so whether it is on the
+		// GPU is worth saying plainly rather than leaving someone to wonder
+		// why a "hardware" transcode still pegs the CPU.
+		if codecs := hwDecodableCodecs(found); len(codecs) > 0 {
+			log.Printf("transcode: decoding on the GPU for %s", strings.Join(codecs, ", "))
+		} else {
+			log.Printf("transcode: decoding on the CPU — this ffmpeg has no %s decoder or hwaccel built in", found.Kind)
+		}
 	} else {
 		log.Printf("transcode: %s — no hardware acceleration, encoding on the CPU", summary)
 	}
@@ -198,7 +264,10 @@ func DetectHW(pref string) *HWContext {
 func (c hwCandidate) open() *HWContext {
 	for _, path := range c.devices {
 		if ref := openHWDevice(c.devType, path); ref != nil {
-			return &HWContext{Kind: c.kind, Device: path, Encoder: c.encoder, PixFmt: c.pixFmt, ref: ref}
+			return &HWContext{
+				Kind: c.kind, Device: path, Encoder: c.encoder, PixFmt: c.pixFmt,
+				Alt: availableEncoders(c.alt), DevType: c.devType, ref: ref,
+			}
 		}
 	}
 	return nil
@@ -224,4 +293,28 @@ func ValidHWPref(pref string) error {
 		names = append(names, string(c.kind))
 	}
 	return fmt.Errorf("unknown transcode.hwaccel %q (want one of: %s)", pref, strings.Join(names, ", "))
+}
+
+// availableEncoders filters a backend's alternative encoders down to those
+// this ffmpeg build actually contains. Presence in the build is necessary
+// but not sufficient — whether the chip has the encode block for a codec is
+// only discoverable by opening it — so a caller that picks one still has to
+// handle failure, exactly as it does for the h264 encoder.
+func availableEncoders(candidates map[string]string) map[string]string {
+	if len(candidates) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for codec, encoder := range candidates {
+		name := ffmpeg.ToCStr(encoder)
+		found := ffmpeg.AVCodecFindEncoderByName(name) != nil
+		name.Free()
+		if found {
+			out[codec] = encoder
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

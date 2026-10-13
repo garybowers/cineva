@@ -1,28 +1,36 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import {
     getHealth, listLibraries, libraryItems, libraryItemsSince, libraryGenres, type GenreCount,
     libraryCollections, collectionDetail, type CollectionInfo,
-    libraryRecommended, type RecRow,
+    libraryRecommended, type RecRow, homeFeed, type HomeFeed,
     personDetail, type PersonProfile, type PersonCredit, type Person as PersonT, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents, setWatched,
+    seriesNextUp, type NextUpInfo,
     authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
   } from './lib/api'
   import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
   import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
   import { onDismiss } from './lib/dismiss'
+  import { loadQueue, saveQueue } from './lib/queue'
   import Player from './Player.svelte'
   import MusicPlayer from './MusicPlayer.svelte'
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
     RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
+    ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
+    Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut,
   } from '@lucide/svelte'
 
-  type Tab = 'home' | 'libraries' | 'settings'
+  type Tab = 'home' | 'libraries' | 'queue' | 'settings'
   const tabs = [
     { id: 'home' as Tab, label: 'Home', icon: House },
     { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
+    // The queue needs a home of its own. It used to appear only inside an
+    // open player, so "Add all to queue" looked like it had done nothing and
+    // there was no way to see or change the queue before starting something.
+    { id: 'queue' as Tab, label: 'Queue', icon: ListVideo },
     { id: 'settings' as Tab, label: 'Settings', icon: SettingsIcon },
   ]
 
@@ -40,6 +48,77 @@
   $effect(() => {
     if (!showUserMenu) return
     return onDismiss('.userwrap', () => (showUserMenu = false))
+  })
+
+  // The sidebar floats over the content as a rail of icons and expands on
+  // hover; pinned, it stays open and the content makes room for it. Pinning
+  // belongs to the device — a laptop and a TV's browser want different
+  // things — so it is kept in this browser rather than on the account.
+  const SIDE_PINNED = 'cineva-side-pinned'
+  let sidePinned = $state(readSidePinned())
+  // Opened by its button rather than by hover: the way in on a touch screen.
+  let sideOpen = $state(false)
+  function readSidePinned(): boolean {
+    try {
+      return localStorage.getItem(SIDE_PINNED) === '1'
+    } catch {
+      return false
+    }
+  }
+  function setSidePinned(on: boolean) {
+    sidePinned = on
+    sideOpen = false
+    try {
+      localStorage.setItem(SIDE_PINNED, on ? '1' : '0')
+    } catch {
+      /* storage blocked: pinned for this visit only */
+    }
+  }
+  $effect(() => {
+    if (!sideOpen) return
+    return onDismiss('.side', () => (sideOpen = false))
+  })
+  // Hover opens it after a beat and closes it after a slightly longer one,
+  // so the pointer can cross it on the way to a poster, or slip off its edge,
+  // without it flapping. Mouse only: a tap on a touch screen also "enters",
+  // and should simply follow the link it landed on.
+  let sideHover = $state(false)
+  let sideFocus = $state(false) // keyboard focus inside it
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined
+  function sideHoverTo(on: boolean, e: PointerEvent) {
+    if (e.pointerType !== 'mouse') return
+    clearTimeout(hoverTimer)
+    hoverTimer = setTimeout(() => (sideHover = on), on ? 80 : 200)
+  }
+  const sideExpanded = $derived(sidePinned || sideOpen || sideHover || sideFocus)
+
+  // Poster size on desktop: four steps around today's size, one setting for
+  // every film and series grid. Per device like the pin — a TV across the
+  // room wants bigger posters than a laptop on a knee.
+  const POSTER_ZOOM = 'cineva-poster-zoom'
+  const posterScales = [0.8, 1, 1.3, 1.7]
+  let posterZoom = $state(readPosterZoom())
+  function readPosterZoom(): number {
+    try {
+      const raw = localStorage.getItem(POSTER_ZOOM)
+      const n = raw === null ? NaN : Number(raw)
+      return Number.isInteger(n) && n >= 0 && n < posterScales.length ? n : 1
+    } catch {
+      return 1
+    }
+  }
+  $effect(() => {
+    try {
+      localStorage.setItem(POSTER_ZOOM, String(posterZoom))
+    } catch {
+      /* storage blocked: this visit only */
+    }
+  })
+  // Going somewhere closes a sidebar opened by its button, as a menu would.
+  $effect(() => {
+    void tab
+    void currentLib
+    sideOpen = false
   })
 
   // Household profile picker: users with a PIN get a name tile and a
@@ -226,6 +305,7 @@
   function buildPath(): string {
     if (listening && music) return '/listening'
     if (tab === 'home') return '/'
+    if (tab === 'queue') return '/queue'
     if (tab === 'settings') return '/settings'
     let p = '/libraries'
     if (currentLib) {
@@ -263,6 +343,10 @@
       }
       if (parts[0] === 'settings') {
         tab = 'settings'
+        return
+      }
+      if (parts[0] === 'queue') {
+        tab = 'queue'
         return
       }
       if (parts[0] === 'listening') {
@@ -344,12 +428,12 @@
       }
       detail = await itemDetail(target.id)
       trail = ancestors
-      epDetail = null
+      selEpId = null
       detailSubs = []
       if (detail.item.kind === 'movie') {
         itemSubtitles(target.id).then((s) => (detailSubs = s)).catch(() => {})
       }
-      if (selectEp) selectEpisode(selectEp)
+      if (selectEp) focusEpisode(selectEp.id)
     } finally {
       routing = false
     }
@@ -470,6 +554,24 @@
         .sort((a, b) => (a.seasonNum ?? 0) - (b.seasonNum ?? 0) || (a.episodeNum ?? 0) - (b.episodeNum ?? 0))
     }
     return []
+  }
+
+  /**
+   * Queue the whole series from one episode onward and start it.
+   *
+   * "Play" starts a single episode and stops; this rolls through the rest,
+   * which is what someone settling in for an evening wants. The queue page
+   * then shows exactly what is lined up.
+   */
+  async function playSeriesFrom(start: Item) {
+    if (!detail) return
+    const eps = await collectEpisodes(detail.item)
+    const at = eps.findIndex((e) => e.id === start.id)
+    if (at < 0) {
+      startPlay(start)
+      return
+    }
+    playList(eps, at)
   }
 
   async function downloadAll(root: Item) {
@@ -945,14 +1047,25 @@
     }
   }
 
+  // ---- Home ----
+  // One request for the whole screen. Refetched whenever the resume list is
+  // (progress saved, something marked watched), since both move with it.
+  let home = $state<HomeFeed | null>(null)
+  $effect(() => {
+    if (tab !== 'home') return
+    void resume
+    homeFeed().then((h) => (home = h)).catch(() => {})
+  })
+  // The banner: what was last in progress, or else the next episode due.
+  const hero = $derived(home?.continueWatching[0] ?? home?.nextUp[0] ?? null)
+
+  function scrollShelf(e: Event, dir: number) {
+    const row = (e.currentTarget as HTMLElement).closest('.shelf-head')?.nextElementSibling as HTMLElement | null
+    row?.scrollBy({ left: dir * row.clientWidth * 0.85, behavior: 'smooth' })
+  }
+
   // ---- Recommended ----
   const resumeHere = $derived(resume.filter((r) => r.libraryId === currentLib?.id))
-  const recentlyAdded = $derived(
-    gridItems
-      .filter((i) => i.addedAt)
-      .sort((a, b) => (b.addedAt ?? '').localeCompare(a.addedAt ?? ''))
-      .slice(0, 12),
-  )
 
   // ---- Music view: artist rail + album shelves ----
   let musicAll: Item[] = $state([])
@@ -1182,9 +1295,18 @@
   // Playing a single film replaces the queue with just that film, so the
   // default stays "play this and stop". Playing a collection loads the set,
   // and the player rolls through it.
-  let queue: Item[] = $state([])
-  let queueIndex = $state(0)
+  // Restored synchronously so a reload shows the queue at first paint
+  // rather than blanking it and filling it in a moment later.
+  const restoredQueue = loadQueue()
+  let queue: Item[] = $state(restoredQueue.items)
+  let queueIndex = $state(restoredQueue.index)
   const upNext = $derived(queue.slice(queueIndex + 1))
+
+  // Kept across reloads. Reading both values here is what subscribes this
+  // effect to them.
+  $effect(() => {
+    saveQueue(queue, queueIndex)
+  })
 
   /** Queue a collection (or any list) and start at the given position. */
   function playList(items: Item[], startIndex = 0) {
@@ -1195,19 +1317,59 @@
     startPlay(items[at], readQuality(), false, undefined, true)
   }
 
+  /**
+   * Add to the end of the queue without starting anything.
+   *
+   * It used to start playing when the queue was empty, on the grounds that
+   * appending to an empty queue showed nothing. That is no longer true — the
+   * queue has its own page and a count in the sidebar — and the old
+   * behaviour made "Add to queue" start a film, which is not what it says.
+   */
   function enqueue(item: Item) {
-    // Appending to an empty queue while nothing plays would silently do
-    // nothing visible, so it starts playing instead.
-    if (queue.length === 0 && !playing) {
-      playList([item])
-      return
-    }
     queue = [...queue, item]
   }
 
-  const dequeue = (index: number) => {
-    const absolute = queueIndex + 1 + index
+  /** Add several at once, in order; used by "Add all to queue". */
+  function enqueueAll(items: Item[]) {
+    if (items.length === 0) return
+    queue = [...queue, ...items]
+  }
+
+  const dequeue = (index: number) => removeFromQueue(queueIndex + 1 + index)
+
+  /**
+   * Remove one entry by its position in the whole queue.
+   *
+   * Taking out something already played shifts the pointer with it, so the
+   * current film stays current — otherwise tidying up the history would
+   * silently skip to the next title.
+   */
+  function removeFromQueue(absolute: number) {
+    if (absolute < 0 || absolute >= queue.length) return
     queue = queue.filter((_, i) => i !== absolute)
+    if (absolute < queueIndex) queueIndex -= 1
+    else if (absolute === queueIndex) queueIndex = Math.min(queueIndex, Math.max(0, queue.length - 1))
+  }
+
+  /**
+   * Move an entry one place earlier or later, by its position in the whole
+   * queue. The pointer follows the same rule as removal: whatever is playing
+   * stays playing.
+   */
+  function moveInQueue(absolute: number, delta: -1 | 1) {
+    const to = absolute + delta
+    if (absolute < 0 || absolute >= queue.length || to < 0 || to >= queue.length) return
+    const next = [...queue]
+    ;[next[absolute], next[to]] = [next[to], next[absolute]]
+    queue = next
+    if (absolute === queueIndex) queueIndex = to
+    else if (to === queueIndex) queueIndex = absolute
+  }
+
+  /** Empty the queue completely, including anything playing. */
+  const emptyQueue = () => {
+    queue = []
+    queueIndex = 0
   }
 
   const clearQueue = () => {
@@ -1227,24 +1389,65 @@
     startPlay(next, readQuality(), false, undefined, true)
   }
 
+  // The stream index of an image subtitle being painted into the picture,
+  // carried across restarts so a quality change does not drop it.
+  let burnSub = $state(0)
+
+  /** Restart playback with a bitmap subtitle burned in. */
+  function burnSubtitle(streamIndex: number) {
+    burnSub = streamIndex
+    if (playing) startPlay(playing.item, playing.quality, false, undefined, true)
+  }
+
+  // ---- Notices ----
+  // One line at the bottom of the screen for what the viewer asked for and
+  // did not get — a title that would not start, and why. Errors stay until
+  // dismissed or replaced; anything else fades on its own.
+  let notice = $state<{ kind: 'info' | 'error'; text: string } | null>(null)
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined
+  function notify(kind: 'info' | 'error', text: string, ms = kind === 'error' ? 15000 : 4000) {
+    clearTimeout(noticeTimer)
+    notice = { kind, text }
+    noticeTimer = setTimeout(() => (notice = null), ms)
+  }
+
+  // The item being started, if any. Starting can take a few seconds (a
+  // transcode spinning up, a NAS disk waking), and a second press used to
+  // start a second session behind the first, until the browser ran out of
+  // connections and nothing could start at all.
+  let starting = $state<string | null>(null)
+
   async function startPlay(item: Item, quality: PlayQuality = readQuality(), fromStart = false, audioTrack?: number, keepQueue = false) {
+    if (starting === item.id) return
     // Anything the viewer starts directly is a fresh queue of one; only the
     // queue itself plays on without resetting it.
     if (!keepQueue) {
       queue = [item]
       queueIndex = 0
+      burnSub = 0 // a new film starts without a burned-in track
     }
+    starting = item.id
+    // Said only if it is taking a moment; a quick start needs no message.
+    const slow = setTimeout(() => notify('info', `Starting ${item.title}…`, 30000), 600)
     try {
-      const info = await playItem(item.id, quality, fromStart, audioTrack)
+      const info = await playItem(item.id, quality, fromStart, audioTrack, burnSub || undefined)
+      clearTimeout(slow)
+      if (notice?.kind === 'info') notice = null
       music = null // video and music are mutually exclusive
       playingPos = info.positionSecs || 0
       playing = { item, info, quality, gen: ++playGen }
       const inContext = detail && (detail.item.id === item.id || detail.item.id === item.parentId)
       if (!inContext) showItem(item) // full player lives on the item's (or its season's) page
     } catch (e) {
+      clearTimeout(slow)
       console.error('play failed', e)
+      notify('error', `Couldn't play ${item.title}. ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      starting = null
     }
   }
+
+  const storageOf = (libraryId?: string) => libraries.find((l) => l.id === libraryId)?.storage
 
   function closePlayer() {
     playing = null
@@ -1313,7 +1516,7 @@
     // would flash a page we are about to leave.
     if (known && known.kind !== 'episode') {
       detail = { item: known, children: [] }
-      epDetail = null
+      selEpId = null
       detailSubs = []
       if (parent) trail = [...baseTrail, parent]
       syncURL()
@@ -1328,7 +1531,7 @@
       d = await itemDetail(d.item.parentId)
     }
     detail = d
-    epDetail = null
+    selEpId = null
     if (parent && !selectEp) {
       trail = [...baseTrail, parent]
     } else {
@@ -1352,22 +1555,75 @@
     if (detail.item.kind === 'movie') {
       itemSubtitles(detail.item.id).then((s) => (detailSubs = s)).catch(() => {})
     }
-    if (selectEp) selectEpisode(selectEp)
+    // Where to carry on in this series. Decided by the server so the web
+    // client and the native apps cannot disagree about where someone is up
+    // to (see CLAUDE.md).
+    upNextHere = null
+    if (detail.item.kind === 'series' || detail.item.kind === 'season') {
+      const forID = detail.item.id
+      seriesNextUp(forID)
+        .then((u) => {
+          if (detail?.item.id === forID) upNextHere = u
+        })
+        .catch(() => {})
+    }
+    if (selectEp) focusEpisode(selectEp.id)
     syncURL()
   }
 
-  // ---- Episode selection within a season page (accordion panel) ----
-  let epDetail: ItemDetail | null = $state(null)
-  let epSubs: SubtitleTrack[] = $state([])
+  // ---- Episode rows on a season page ----
+  // An episode URL lands on its season with that row highlighted.
+  let selEpId: string | null = $state(null)
+  // Where to carry on in the series or season being viewed.
+  let upNextHere: NextUpInfo | null = $state(null)
+  // The row whose ⋯ menu is open, and the row showing its whole overview.
+  let epMenu: string | null = $state(null)
+  let epOpen: string | null = $state(null)
 
-  async function selectEpisode(ep: Item) {
-    if (epDetail?.item.id === ep.id) {
-      epDetail = null // toggle off
-      return
+  $effect(() => {
+    if (!epMenu) return
+    return onDismiss('.epmenuwrap', () => (epMenu = null))
+  })
+
+  async function focusEpisode(id: string) {
+    selEpId = id
+    await tick()
+    document.getElementById(`ep-${id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
+
+  const epResumable = (ep: Item) => !ep.watched && (ep.positionSecs ?? 0) > 10
+  // The playing episode follows the player live; the rest show where the
+  // viewer left them.
+  function epProgress(ep: Item): number {
+    if (!ep.runtimeSecs) return 0
+    const pos = playing?.item.id === ep.id ? playingPos : (ep.positionSecs ?? 0)
+    return Math.min(100, (pos / ep.runtimeSecs) * 100)
+  }
+
+  // Optimistic like the grid's toggle. The season's next-up is refetched,
+  // since marking an episode seen moves where the series carries on.
+  async function toggleEpWatched(ep: Item) {
+    epMenu = null
+    if (!detail) return
+    const before = detail
+    const next = !ep.watched
+    detail = {
+      ...detail,
+      children: detail.children.map((c) => (c.id === ep.id ? { ...c, watched: next, positionSecs: 0 } : c)),
     }
-    epSubs = []
-    epDetail = await itemDetail(ep.id)
-    itemSubtitles(ep.id).then((s) => (epSubs = s)).catch(() => {})
+    try {
+      await setWatched(ep.id, next)
+      continueWatching().then((r) => (resume = r)).catch(() => {})
+      const forID = detail.item.id
+      seriesNextUp(forID)
+        .then((u) => {
+          if (detail?.item.id === forID) upNextHere = u
+        })
+        .catch(() => {})
+    } catch (err) {
+      detail = before
+      console.error('mark watched failed', err)
+    }
   }
 
   const canResume = (d: ItemDetail | null) =>
@@ -1383,7 +1639,7 @@
   function toLibraries() {
     currentLib = null
     detail = null
-    epDetail = null
+    selEpId = null
     trail = []
     gridItems = []
     tab = 'libraries'
@@ -1395,7 +1651,7 @@
   // otherwise the crumb would be a no-op from inside one.
   function toGrid() {
     detail = null
-    epDetail = null
+    selEpId = null
     trail = []
     libTab = 'recommended'
     genre = null
@@ -1407,7 +1663,7 @@
     const target = trail[index]
     detail = await itemDetail(target.id)
     trail = trail.slice(0, index)
-    epDetail = null
+    selEpId = null
     syncURL()
   }
 
@@ -1417,11 +1673,37 @@
     return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`
   }
 
+  // How many of the series' seasons are actually on disk, against what the
+  // provider says exists — the gap is the point.
+  const seasonsHeld = $derived(detail?.children.filter((c) => c.kind === 'season').length ?? 0)
+
+  /** "12 Mar 2010" — a broadcast date, in the order British readers expect. */
+  function airLabel(iso: string): string {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return ''
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+  }
+
+  // h:mm:ss for a live playhead, where runtime()'s whole minutes would sit
+  // still for a minute at a time and look stuck.
+  function fmtClock(secs: number): string {
+    const t = Math.max(0, Math.floor(secs))
+    const h = Math.floor(t / 3600)
+    const m = Math.floor((t % 3600) / 60)
+    const sec = t % 60
+    return h > 0
+      ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+      : `${m}:${String(sec).padStart(2, '0')}`
+  }
+
   // Grouped by role — "Director: Phil Lord, Christopher Miller" — rather
   // than one entry per credit, which repeats the role for every co-director
   // and reads as noise. Producer credits are dropped: a big film has a
   // dozen and nobody scans a detail page for them.
-  const CREW_ROLES = ['Director', 'Screenplay', 'Writer', 'Story', 'Novel', 'Director of Photography', 'Original Music Composer']
+  // Creator leads: for a series it is the headline credit, the way Director
+  // is for a film. TMDB keeps it outside `credits`, in `created_by`, which is
+  // why it arrives as a crew job of our own naming.
+  const CREW_ROLES = ['Creator', 'Director', 'Screenplay', 'Writer', 'Story', 'Novel', 'Director of Photography', 'Original Music Composer']
 
   function crewByRole(crew: PersonT[]): { role: string; people: PersonT[] }[] {
     const groups = new Map<string, PersonT[]>()
@@ -1588,7 +1870,12 @@
           // Scan end: pruning and version grouping have run, and neither is
           // expressible as a delta (a removed row simply stops existing), so
           // this is the one refetch that must be a full one.
-          if (currentLib) refreshLibraryItems(true).catch(() => {})
+          if (currentLib) {
+            refreshLibraryItems(true).catch(() => {})
+            // Recently added is ranked server-side, so new episodes only
+            // move their series up once the rows are fetched again.
+            loadRecommended(currentLib)
+          }
         },
         // Fired throughout a scan as items land, so the grid fills in live.
         items: (data) => {
@@ -1713,8 +2000,48 @@
   {/if}
 {/snippet}
 
-{#snippet cell(item: Item)}
-  <button class="cell" onclick={() => openItem(item.id, false, item)}>
+<!-- Shown on a library, and on any title in it, while its storage cannot be
+     reached: browsing still works from what was scanned, playing does not. -->
+{#snippet storageWarning(libraryId: string)}
+  {@const st = storageOf(libraryId)}
+  {#if st && !st.available}
+    <div class="storage-warn" role="status">
+      <TriangleAlert size={16} />
+      <span>This library's storage isn't reachable ({st.path}: {st.error}), so its titles can't be played until it's back. Check that the share is connected.</span>
+    </div>
+  {/if}
+{/snippet}
+
+<!-- A home-screen row heading, with arrows for pointer users; touch scrolls
+     the row directly, so the arrows are hidden where there is no hover. -->
+{#snippet shelfHead(title: string, library: string)}
+  <div class="shelf-head">
+    <h2>{title}{#if library}<span class="shelf-lib">{' · '}{library}</span>{/if}</h2>
+    <span class="shelf-nav">
+      <button aria-label="Scroll {title} back" onclick={(e) => scrollShelf(e, -1)}><ChevronLeft size={18} /></button>
+      <button aria-label="Scroll {title} on" onclick={(e) => scrollShelf(e, 1)}><ChevronRight size={18} /></button>
+    </span>
+  </div>
+{/snippet}
+
+<!-- An in-progress item: an episode leads with its series, since "Episode
+     1" or "The Big Bran Hypothesis" alone does not say which show it is. -->
+{#snippet resumeBody(r: ResumeItem)}
+  {@render poster(r.seriesPoster ? { ...r, poster: r.seriesPoster } : r)}
+  <div class="progress"><div class="progress-fill" style="width: {Math.min(100, (r.positionSecs / (r.runtimeSecs || 1)) * 100)}%"></div></div>
+  {#if r.kind === 'episode'}
+    <span class="cell-title">{r.seriesTitle || r.title}</span>
+    <span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')}{#if r.seriesTitle}{' · '}{r.title}{/if}</span>
+  {:else}
+    <span class="cell-title">{r.title}</span>
+  {/if}
+{/snippet}
+
+<!-- open defaults to opening the item in place, inside its library; the
+     home screen passes showItem instead, which switches to the library
+     first. -->
+{#snippet cell(item: Item, open: () => void = () => openItem(item.id, false, item))}
+  <button class="cell" onclick={open}>
     <span class="posterwrap">
       {@render poster(item)}
       {#if item.kind === 'movie' || item.kind === 'episode'}
@@ -1799,7 +2126,7 @@
   </div>
 {/if}
 
-<div class="shell">
+<div class="shell" style:--poster-scale={posterScales[posterZoom] ?? 1}>
   <div class="topbar">
     <button class="logo" onclick={() => setTab('home')}>Cineva</button>
     <div class="search">
@@ -1889,35 +2216,76 @@
     </div>
   </div>
 
-  <div class="body">
-  <aside class="side">
-    <button class="side-item" class:active={tab === 'home'} onclick={() => setTab('home')}><House size={16} /> Home</button>
+  <div class="body" class:sidepinned={sidePinned}>
+  <aside
+    class="side"
+    class:pinned={sidePinned}
+    class:open={sideOpen}
+    class:expanded={sideExpanded}
+    class:raised={(playing && playerCompact) || !!music}
+    aria-label="Navigation"
+    onpointerenter={(e) => sideHoverTo(true, e)}
+    onpointerleave={(e) => sideHoverTo(false, e)}
+    onfocusin={(e) => (sideFocus = (e.target as HTMLElement).matches(':focus-visible'))}
+    onfocusout={(e) => { if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) sideFocus = false }}
+  >
+    <div class="side-head">
+      {#if !sidePinned}
+        <button class="side-btn side-toggle" title="Open the sidebar" aria-label="Open the sidebar" aria-expanded={sideOpen} onclick={() => (sideOpen = !sideOpen)}><PanelLeftOpen size={16} /></button>
+      {/if}
+      <button
+        class="side-btn side-pin"
+        title={sidePinned ? 'Unpin the sidebar' : 'Pin the sidebar open'}
+        aria-label={sidePinned ? 'Unpin the sidebar' : 'Pin the sidebar open'}
+        aria-pressed={sidePinned}
+        onclick={() => setSidePinned(!sidePinned)}
+      >{#if sidePinned}<PinOff size={15} />{:else}<Pin size={15} />{/if}</button>
+    </div>
+    <button class="side-item" class:active={tab === 'home'} title="Home" onclick={() => setTab('home')}><House size={16} /> <span class="side-label">Home</span></button>
+    <button class="side-item" class:active={tab === 'queue'} title="Queue" onclick={() => setTab('queue')}>
+      <ListVideo size={16} /> <span class="side-label">Queue</span>
+      <!-- The count is the feedback for "Add all to queue": without it the
+           button appeared to do nothing at all. -->
+      {#if queue.length > 0}<span class="side-count">{queue.length}</span>{/if}
+    </button>
     <div class="tree">
       {#each libraryTree as group (group.type)}
         {@const TypeIcon = group.icon}
-        <div class="type-label"><TypeIcon size={15} /> {group.label}</div>
+        <!-- Collapsed to a rule in the rail, so rows keep their places and
+             nothing jumps as the panel opens. -->
+        <div class="type-label"><span class="side-label">{group.label}</span></div>
         {#each group.libs as lib (lib.id)}
           <button
-            class="side-item leaf"
+            class="side-item"
             class:active={tab === 'libraries' && currentLib?.id === lib.id}
+            title={lib.name}
             onclick={() => { tab = 'libraries'; openLibrary(lib) }}
-          >{lib.name}</button>
+          ><TypeIcon size={16} /> <span class="side-label">{lib.name}</span>{#if lib.storage && !lib.storage.available}<span class="side-warn" title="Storage not reachable: {lib.storage.path}: {lib.storage.error}"><TriangleAlert size={14} /></span>{/if}</button>
         {/each}
       {/each}
       {#if libraries.length === 0}
-        <div class="type-label">No libraries yet</div>
+        <div class="type-label"><span class="side-label">No libraries yet</span></div>
       {/if}
     </div>
-    <div class="side-status side-bottom">
-      <!-- Connection state only. The build version is a maintainer's
-           detail, not something a viewer needs on every screen; it is still
+    {#if offline}
+      <!-- Only shown when something is wrong: a permanent "connected" dot
+           says nothing a working page doesn't already. The build version is
            on the settings page and at /api/v1/health. -->
-      <span class="status" class:offline title={offline ? 'Server unreachable' : 'Connected'}></span>
-      {#if offline}<span>offline</span>{/if}
-    </div>
+      <div class="side-status side-bottom">
+        <span class="status offline" title="Server unreachable"></span>
+        <span class="side-label">offline</span>
+      </div>
+    {/if}
   </aside>
 
   <div class="content">
+  {#if notice}
+    <div class="notice" class:error={notice.kind === 'error'} role={notice.kind === 'error' ? 'alert' : 'status'}>
+      {#if notice.kind === 'error'}<TriangleAlert size={16} />{/if}
+      <span>{notice.text}</span>
+      <button class="notice-x" aria-label="Dismiss" onclick={() => (notice = null)}><X size={14} /></button>
+    </div>
+  {/if}
   <main class:withbar={(playing && playerCompact) || !!music}>
     {#if tab === 'libraries' && currentLib && !listening}
       <nav class="crumbs" aria-label="Breadcrumb">
@@ -1977,6 +2345,7 @@
           onended={queueAdvance}
           onquality={changeQuality}
           onaudiotrack={changeAudioTrack}
+          onburnsubtitle={burnSubtitle}
           onexpand={() => playing && showItem(playing.item)}
           ontime={(t) => (playingPos = t)}
         />
@@ -2065,25 +2434,124 @@
           </div>
         {/if}
       </section>
-    {:else if tab === 'home'}
-      <h1>Home</h1>
+    {:else if tab === 'queue'}
+      <h1>Queue</h1>
       <section>
-        <h2>Continue Watching</h2>
-        {#if resume.length === 0}
-          <div class="empty">Nothing in progress — start something from your libraries.</div>
-        {:else}
-          <div class="grid">
-            {#each resume as r (r.id)}
-              <button class="cell" onclick={() => startPlay(r)}>
-                {@render poster(r)}
-                <div class="progress"><div class="progress-fill" style="width: {Math.min(100, (r.positionSecs / (r.runtimeSecs || 1)) * 100)}%"></div></div>
-                <span class="cell-title">{r.title}</span>
-                {#if r.kind === 'episode'}<span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')}</span>{/if}
-              </button>
-            {/each}
+        {#if queue.length === 0}
+          <div class="empty">
+            Nothing queued. Open a collection or a film and choose
+            <strong>Add to queue</strong> to line things up — the queue plays
+            straight through, and you can come back here to reorder it.
           </div>
+        {:else}
+          <div class="qbar">
+            <span class="muted small">
+              {queue.length} {queue.length === 1 ? 'title' : 'titles'}
+              {#if playing}· now playing {queueIndex + 1} of {queue.length}{/if}
+            </span>
+            <span class="qspacer"></span>
+            <button class="ghost" onclick={() => playList(queue, queueIndex)}>
+              <Play size={15} /> {playing ? 'Restart' : 'Play'}
+            </button>
+            <button class="ghost" onclick={emptyQueue}>Clear</button>
+          </div>
+          <ol class="qlist">
+            {#each queue as q, i (q.id + ':' + i)}
+              {@const isNow = !!playing && i === queueIndex}
+              <li class:qnow={isNow}>
+                <span class="qpos muted">{i + 1}</span>
+                <!-- The row that is playing expands the player rather than
+                     starting it again: clicking "what I am watching" to be
+                     sent back to the beginning of it is a trap. -->
+                <button
+                  class="qtitle"
+                  onclick={() => (isNow ? showItem(q) : playList(queue, i))}
+                  title={isNow ? 'Back to the player' : 'Play from here'}
+                >
+                  {q.title}{#if q.year}<span class="qyear muted">{q.year}</span>{/if}
+                  {#if isNow}<span class="qnow-tag">Playing</span>
+                  {:else if i < queueIndex}<span class="qdone-tag muted">Played</span>{/if}
+                </button>
+                <span class="qmove">
+                  <button onclick={() => moveInQueue(i, -1)} disabled={i === 0} aria-label="Move {q.title} up"><ChevronUp size={15} /></button>
+                  <button onclick={() => moveInQueue(i, 1)} disabled={i === queue.length - 1} aria-label="Move {q.title} down"><ChevronDown size={15} /></button>
+                </span>
+                <button class="qdrop" onclick={() => removeFromQueue(i)} aria-label="Remove {q.title} from the queue">
+                  <X size={14} />
+                </button>
+                {#if isNow && (q.runtimeSecs ?? 0) > 0}
+                  <!-- Live position, reported by the player as it plays. -->
+                  <span class="qprogress">
+                    <span class="progress"><span class="progress-fill" style="width: {Math.min(100, (playingPos / (q.runtimeSecs || 1)) * 100)}%"></span></span>
+                    <span class="muted small">{fmtClock(playingPos)} / {fmtClock(q.runtimeSecs ?? 0)}</span>
+                  </span>
+                {/if}
+              </li>
+            {/each}
+          </ol>
         {/if}
       </section>
+    {:else if tab === 'home'}
+      <h1 class="visually-hidden">Home</h1>
+      {#if hero}
+        {@const bg = hero.seriesBackdrop || hero.backdrop || hero.seriesPoster || hero.poster}
+        {@const left = hero.positionSecs > 0 && hero.runtimeSecs ? Math.max(1, Math.round((hero.runtimeSecs - hero.positionSecs) / 60)) : 0}
+        <section class="hero">
+          {#if bg}<img class="hero-bg" src={bg} alt="" />{/if}
+          <div class="hero-body">
+            <div class="hero-kicker">{left ? 'Continue watching' : 'Next up'}</div>
+            <h2 class="hero-title">{hero.seriesTitle || hero.title}</h2>
+            {#if hero.kind === 'episode'}
+              <div class="hero-sub">S{String(hero.seasonNum).padStart(2, '0')}E{String(hero.episodeNum).padStart(2, '0')} · {hero.title}</div>
+            {:else if hero.year}
+              <div class="hero-sub">{hero.year}</div>
+            {/if}
+            {#if hero.overview}<p class="hero-overview">{hero.overview}</p>{/if}
+            <div class="actions">
+              <button class="play" disabled={starting === hero.id} onclick={() => hero && startPlay(hero)}>
+                <Play size={15} /> {starting === hero.id ? 'Starting…' : left ? 'Resume' : 'Play'}
+              </button>
+              {#if left}<span class="hero-left">{left} min left</span>{/if}
+              <button class="dl" onclick={() => hero && showItem(hero)}>More info</button>
+            </div>
+          </div>
+        </section>
+      {/if}
+
+      {#if home && home.continueWatching.length > 0}
+        {@render shelfHead('Continue Watching', '')}
+        <div class="shelf-row">
+          {#each home.continueWatching as r (r.id)}
+            <button class="cell" onclick={() => startPlay(r)}>{@render resumeBody(r)}</button>
+          {/each}
+        </div>
+      {/if}
+      {#if home && home.nextUp.length > 0}
+        {@render shelfHead('Next Up', '')}
+        <div class="shelf-row">
+          {#each home.nextUp as r (r.id)}
+            <button class="cell" onclick={() => startPlay(r)}>
+              {@render poster(r.seriesPoster ? { ...r, poster: r.seriesPoster } : r)}
+              <span class="cell-title">{r.seriesTitle || r.title}</span>
+              <span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')} · {r.title}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+      {#if home}
+        {#each home.shelves as sh (sh.libraryId + sh.kind + sh.title)}
+          {@render shelfHead(sh.title, sh.libraryName)}
+          <div class="shelf-row">
+            {#each sh.items as item (item.id)}
+              {@render cell(item, () => showItem(item))}
+            {/each}
+          </div>
+        {/each}
+      {/if}
+      {#if home && !hero && home.shelves.length === 0}
+        <div class="empty">Nothing here yet — start something from your libraries.</div>
+      {/if}
+
       <section>
         <h2>Libraries</h2>
         {#if libraries.length === 0}
@@ -2116,12 +2584,30 @@
         <div class="detail">
           {@render poster(detail.item)}
           <div class="detail-body">
+            {@render storageWarning(detail.item.libraryId)}
             <h1>
               {detail.item.title}
               {#if detail.item.year}<span class="muted">({detail.item.year})</span>{/if}
             </h1>
             {#if detail.item.kind === 'season' || detail.item.kind === 'series'}
               <div class="actions">
+                <!-- A series had no way to start watching at all: only a
+                     download button, while a film gets Play and an album
+                     gets Listen. The server decides which episode (see
+                     CLAUDE.md) so the apps cannot disagree about it. -->
+                {#if upNextHere}
+                  {@const up = upNextHere}
+                  <button class="play" onclick={() => startPlay(up.item, readQuality(), up.reason === 'restart')}>
+                    <Play size={15} />
+                    {#if up.reason === 'resume'}Resume
+                    {:else if up.reason === 'restart'}Watch again
+                    {:else}Play{/if}
+                    <span class="epcode">S{String(up.item.seasonNum).padStart(2, '0')}E{String(up.item.episodeNum).padStart(2, '0')}</span>
+                  </button>
+                  <button class="dl" onclick={() => playSeriesFrom(up.item)} title="Play this and everything after it">
+                    Play all
+                  </button>
+                {/if}
                 <button class="dl" onclick={() => detail && downloadAll(detail.item)}>
                   <Download size={14} /> Download {detail.item.kind === 'season' ? 'season' : 'show'}
                 </button>
@@ -2186,6 +2672,12 @@
                   </div>
                 </div>
               {/if}
+              <!-- Shown only when it differs from the title, which the
+                   server already decides — an English-language series would
+                   otherwise carry its own name twice. -->
+              {#if detail.item.originalTitle}
+                <p class="origtitle muted">{detail.item.originalTitle}</p>
+              {/if}
               {#if detail.item.tagline}
                 <p class="tagline">{detail.item.tagline}</p>
               {/if}
@@ -2202,6 +2694,29 @@
                   {/if}
                   {#if detail.item.collectionName}
                     <span class="muted">· {detail.item.collectionName}</span>
+                  {/if}
+                  <!-- Television only. "Ended" and "Canceled" are different
+                       news to someone deciding whether to start a series, so
+                       TMDB's own wording is shown rather than a tidied-up
+                       "finished". -->
+                  {#if detail.item.network}
+                    <span class="muted">· {detail.item.network}</span>
+                  {/if}
+                  {#if detail.item.status}
+                    <span class="status" class:ongoing={detail.item.status === 'Returning Series'}>
+                      {detail.item.status === 'Returning Series' ? 'Returning' : detail.item.status}
+                    </span>
+                  {/if}
+                  <!-- Only a running series has one, and it stops being
+                       true the moment that episode airs, so it is never
+                       shown for anything finished. -->
+                  {#if detail.item.nextAirDate}
+                    <span class="muted" title="Next episode">· next {airLabel(detail.item.nextAirDate)}</span>
+                  {/if}
+                  {#if detail.item.kind === 'series' && detail.item.seasonCount}
+                    <span class="muted" title="Seasons held of the {detail.item.seasonCount} that exist">
+                      · {seasonsHeld} of {detail.item.seasonCount} seasons
+                    </span>
                   {/if}
                 </p>
               {/if}
@@ -2263,50 +2778,60 @@
               {/each}
             </div>
           {:else if detail.item.kind === 'season'}
-            <!-- Episodes: terminal level — rows select an inline panel -->
+            <!-- Episodes: terminal level. Each row carries everything —
+                 the thumbnail plays, the overview expands in place, and
+                 the rarer actions sit in the ⋯ menu. -->
             <ul class="eplist">
               {#each detail.children as child (child.id)}
-                <li>
-                  <button class="eprow" class:sel={epDetail?.item.id === child.id} class:nowplaying={playing?.item.id === child.id} onclick={() => selectEpisode(child)}>
+                {@const live = playing?.item.id === child.id}
+                {@const resumeAt = epResumable(child)}
+                <li id="ep-{child.id}" class="eprow" class:sel={selEpId === child.id} class:nowplaying={live}>
+                  <button class="epthumb" onclick={() => startPlay(child)} title={resumeAt ? 'Resume' : 'Play'}>
                     {#if child.poster}
-                      <img class="epthumb" src={child.poster} alt="" loading="lazy" />
+                      <img src={child.poster} alt="" loading="lazy" />
                     {:else}
-                      <span class="epthumb ph"><Tv size={20} /></span>
+                      <span class="ph"><Tv size={20} /></span>
                     {/if}
-                    <span class="epmain">
-                      <span><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
-                    </span>
-                    {#if playing?.item.id === child.id}
-                      <span class="ep-live" title="Now playing"><AudioLines size={16} /></span>
-                    {/if}
-                    <span class="muted">{runtime(child.runtimeSecs)}</span>
-                    {#if playing?.item.id === child.id && child.runtimeSecs}
-                      <span class="ep-progress"><span style="width: {Math.min(100, (playingPos / child.runtimeSecs) * 100)}%"></span></span>
+                    <span class="epplay"><Play size={18} /></span>
+                    {#if child.watched && !live}<span class="epseen" title="Watched"><Check size={12} /></span>{/if}
+                    {#if live || resumeAt}
+                      <span class="ep-progress"><span style="width: {epProgress(child)}%"></span></span>
                     {/if}
                   </button>
-                  {#if epDetail && epDetail.item.id === child.id}
-                    <div class="eppanel">
-                      <p class="meta">
-                        S{String(epDetail.item.seasonNum).padStart(2, '0')}E{String(epDetail.item.episodeNum).padStart(2, '0')}
-                        · {runtime(epDetail.item.runtimeSecs)}
-                        {#if epDetail.item.width}· {epDetail.item.width}x{epDetail.item.height} {epDetail.item.videoCodec}{/if}
-                        {#if epSubs.length}· CC: {epSubs.map((s) => s.language || s.codec).join(', ')}{/if}
-                      </p>
-                      {#if epDetail.item.overview}<p class="overview">{epDetail.item.overview}</p>{/if}
-                      <div class="actions">
-                        <button class="play" onclick={() => epDetail && startPlay(epDetail.item)}>
-                          <Play size={15} /> {canResume(epDetail) ? 'Resume' : 'Play'}
-                        </button>
-                        {#if canResume(epDetail)}
-                          <span class="muted">{minsLeft(epDetail)} min left</span>
-                          <button class="dl" onclick={() => epDetail && startPlay(epDetail.item, undefined, true)}>
+                  <div class="epmain">
+                    <div class="eptop">
+                      <span class="eptitle"><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
+                      {#if live}<span class="ep-live" title="Now playing"><AudioLines size={15} /></span>{/if}
+                      <span class="epmeta muted">
+                        {runtime(child.runtimeSecs)}{#if child.airDate}<span class="epair" title="First broadcast"> · {airLabel(child.airDate)}</span>{/if}{#if resumeAt && !live && child.runtimeSecs} · {Math.max(1, Math.round((child.runtimeSecs - (child.positionSecs ?? 0)) / 60))} min left{/if}
+                      </span>
+                    </div>
+                    {#if child.overview}
+                      <button class="epover muted" class:open={epOpen === child.id} onclick={() => (epOpen = epOpen === child.id ? null : child.id)}>
+                        {child.overview}
+                      </button>
+                    {/if}
+                  </div>
+                  <div class="epmenuwrap">
+                    <button class="epmore" title="More" aria-haspopup="menu" onclick={() => (epMenu = epMenu === child.id ? null : child.id)}>
+                      <Ellipsis size={18} />
+                    </button>
+                    {#if epMenu === child.id}
+                      <div class="usermenu" role="menu">
+                        {#if resumeAt}
+                          <button class="um-item" role="menuitem" onclick={() => { epMenu = null; startPlay(child, undefined, true) }}>
                             <RotateCcw size={14} /> Start over
                           </button>
                         {/if}
-                        <a class="dl" href={downloadURL(epDetail.item.id)} download><Download size={14} /> Download</a>
+                        <button class="um-item" role="menuitem" onclick={() => toggleEpWatched(child)}>
+                          {#if child.watched}<EyeOff size={14} /> Mark unwatched{:else}<Eye size={14} /> Mark watched{/if}
+                        </button>
+                        <a class="um-item" role="menuitem" href={downloadURL(child.id)} download onclick={() => (epMenu = null)}>
+                          <Download size={14} /> Download
+                        </a>
                       </div>
-                    </div>
-                  {/if}
+                    {/if}
+                  </div>
                 </li>
               {/each}
             </ul>
@@ -2339,6 +2864,7 @@
         {/if}
       {:else if currentLib && currentLib.mediaType === 'music'}
         <h1>{currentLib.name}</h1>
+        {@render storageWarning(currentLib.id)}
         {#if musicAll.length === 0}
           {@render emptyLibrary()}
         {:else}
@@ -2485,10 +3011,12 @@
         {/if}
       {:else if currentLib}
         <h1>{currentLib.name}</h1>
+        {@render storageWarning(currentLib.id)}
         {#if gridItems.length === 0}
           {@render emptyLibrary()}
         {:else}
           <div class="libhead" class:hidden={headHidden}>
+          <div class="subtabrow">
           <nav class="subtabs" aria-label="{currentLib.name} views">
             {#each [['recommended', 'Recommended'], ['library', 'Library'], ['genres', 'Genres'], ['collections', 'Collections']] as [id, label] (id)}
               <button
@@ -2498,6 +3026,14 @@
                 onclick={() => { libTab = id as LibTab; genre = null; collection = null; syncURL() }}>{label}</button>
             {/each}
           </nav>
+          {#if currentLib.mediaType !== 'music'}
+            <label class="pzoom" title="Poster size">
+              <ZoomOut size={14} />
+              <input type="range" min="0" max={posterScales.length - 1} step="1" bind:value={posterZoom} aria-label="Poster size" />
+              <ZoomIn size={16} />
+            </label>
+          {/if}
+          </div>
           {#if libTab === 'library'}
             <div class="filters">
               <div class="fbar">
@@ -2546,23 +3082,12 @@
                 <div class="grid">
                   {#each resumeHere as r (r.id)}
                     <button class="cell" onclick={() => startPlay(r)}>
-                      {@render poster(r)}
-                      <div class="progress"><div class="progress-fill" style="width: {Math.min(100, (r.positionSecs / (r.runtimeSecs || 1)) * 100)}%"></div></div>
-                      <span class="cell-title">{r.title}</span>
-                      {#if r.kind === 'episode'}<span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')}</span>{/if}
+                      {@render resumeBody(r)}
                     </button>
                   {/each}
                 </div>
               </section>
             {/if}
-            <section>
-              <h2>Recently Added</h2>
-              <div class="grid">
-                {#each recentlyAdded as item (item.id)}
-                  {@render cell(item)}
-                {/each}
-              </div>
-            </section>
             {#each recRows as row (row.kind + row.title)}
               <section>
                 <h2>
@@ -2648,7 +3173,7 @@
                       <Play size={15} /> Play from the start
                     </button>
                   {/if}
-                  <button class="dl" onclick={() => collItems.forEach(enqueue)}>Add all to queue</button>
+                  <button class="dl" onclick={() => enqueueAll(collItems)}>Add all to queue</button>
                 </div>
               </div>
               {#if collItems.length === 0}
@@ -3048,51 +3573,157 @@
   .avatar:hover, .topbtn:hover { border-color: var(--accent); color: var(--text); }
   .topbtn.active { border-color: var(--accent); color: var(--accent-2); }
 
-  /* ---- Sidebar: desktop only; mobile keeps the bottom tab bar ---- */
+  /* ---- Sidebar: desktop only; mobile keeps the bottom tab bar ----
+     A rounded glass panel floating clear of the edges. Unpinned it is a
+     rail of icons that opens over the content on hover (or keyboard focus,
+     or its button on a touch screen); pinned it stays open and the content
+     moves over for it. Rows keep the same icon column in both states, so
+     opening only reveals labels — nothing shifts under the pointer. */
   .side { display: none; }
   @media (min-width: 768px) {
+    .body {
+      --rail-w: 3.5rem;
+      --panel-w: 15rem;
+      --side-gap: 0.75rem;
+    }
     .side {
       display: flex;
       flex-direction: column;
-      width: 15rem;
-      flex: none;
-      position: sticky;
-      top: var(--topbar-h);
-      height: calc(100vh - var(--topbar-h));
-      overflow-y: auto;
-      background: var(--panel);
-      border-right: 1px solid var(--border);
-      padding: 0.9rem 0.8rem;
       gap: 0.15rem;
+      position: fixed;
+      z-index: 30;
+      top: calc(var(--topbar-h) + var(--side-gap));
+      bottom: var(--side-gap);
+      left: var(--side-gap);
+      width: var(--rail-w);
+      padding: 0.5rem 0.4rem;
+      overflow: hidden auto;
+      scrollbar-width: none;
+      background: color-mix(in srgb, var(--panel) 68%, transparent);
+      -webkit-backdrop-filter: blur(18px) saturate(1.4);
+      backdrop-filter: blur(18px) saturate(1.4);
+      border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+      border-radius: 18px;
+      box-shadow: 0 8px 28px color-mix(in srgb, var(--bg) 55%, transparent);
+      transition: width 0.18s ease, box-shadow 0.18s ease;
     }
+    /* Clear of the mini player and music bar when either is up. */
+    .side.raised { bottom: calc(6.5rem + var(--side-gap)); }
+    .side.expanded { width: var(--panel-w); scrollbar-width: thin; }
+    /* Open over the content rather than beside it: lift it further. */
+    .side.expanded:not(.pinned) {
+      box-shadow: 0 18px 48px color-mix(in srgb, var(--bg) 75%, transparent);
+    }
+    .content {
+      margin-left: calc(var(--rail-w) + var(--side-gap));
+      transition: margin-left 0.18s ease;
+    }
+    .body.sidepinned .content { margin-left: calc(var(--panel-w) + var(--side-gap)); }
     .tabbar { display: none !important; }
   }
-  main.withbar { padding-bottom: 6.5rem; }
-  .side-item {
+  @media (prefers-reduced-motion: reduce) {
+    .side, .content, .side-label { transition: none !important; }
+  }
+  .side-head {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    text-align: left;
-    padding: 0.5rem 0.65rem;
+    min-height: 2rem;
+    margin-bottom: 0.2rem;
+  }
+  .side-btn {
+    display: grid;
+    place-items: center;
+    width: 2.1rem;
+    height: 2rem;
+    flex: none;
     border-radius: 8px;
     color: var(--muted);
-    font-size: 0.92rem;
   }
-  .side-item:hover { background: var(--bg); color: var(--text); }
-  .side-item.active { background: var(--bg); color: var(--accent-2); }
-  .tree { display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.75rem; flex: 1; }
-  .type-label {
+  .side-btn:hover { background: color-mix(in srgb, var(--bg) 70%, transparent); color: var(--text); }
+  .side-pin { margin-left: auto; }
+  .side-pin[aria-pressed='true'] { color: var(--accent-2); }
+  main.withbar { padding-bottom: 6.5rem; }
+  .side-item {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 0.45rem;
+    gap: 0.6rem;
+    text-align: left;
+    padding: 0.5rem 0.65rem;
+    border-radius: 10px;
+    color: var(--muted);
+    font-size: 0.92rem;
+    white-space: nowrap;
+  }
+  .side-item :global(svg) { flex: none; }
+  .side-item:hover { background: color-mix(in srgb, var(--bg) 70%, transparent); color: var(--text); }
+  .side-item.active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent-2); }
+  .side-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: opacity 0.12s ease;
+  }
+  .tree { display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.6rem; flex: 1; }
+  .type-label {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 1.9rem;
     color: var(--muted);
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    padding: 0.7rem 0.65rem 0.25rem;
+    padding: 0.55rem 0.65rem 0;
+    white-space: nowrap;
+  }
+  /* The rail: labels hidden, headings become a short rule, and the badges
+     sit on the icon rather than at the row's end. */
+  @media (min-width: 768px) {
+    .side:not(.expanded) .side-label { opacity: 0; }
+    .side:not(.expanded) .type-label::after {
+      content: '';
+      position: absolute;
+      left: 0.75rem; right: 0.75rem; bottom: 0.35rem;
+      border-top: 1px solid var(--border);
+    }
+    .side:not(.expanded) :is(.side-count, .side-warn) {
+      position: absolute;
+      top: 0.1rem;
+      left: 1.45rem;
+      margin: 0;
+    }
+    .side:not(.expanded) .side-pin { display: none; }
+    .side.expanded .side-toggle { display: none; }
   }
   .type-icon { margin-right: 0.35rem; font-size: 1.15rem; vertical-align: -0.2rem; }
-  .side-item.leaf { padding-left: 1.9rem; }
+  .side-warn { margin-left: auto; color: var(--err); display: inline-grid; }
+
+  .storage-warn {
+    display: flex; align-items: flex-start; gap: 0.5rem;
+    margin: 0.25rem 0 1rem; padding: 0.65rem 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--err) 55%, transparent);
+    background: color-mix(in srgb, var(--err) 12%, var(--panel));
+    border-radius: 10px; font-size: 0.9rem;
+  }
+  .storage-warn :global(svg) { color: var(--err); flex: none; margin-top: 0.1rem; }
+
+  /* Above the bottom bars (mini player, music, phone nav), centred. */
+  .notice {
+    position: fixed; z-index: 90;
+    left: 50%; bottom: 5.5rem; transform: translateX(-50%);
+    width: max-content; max-width: min(36rem, calc(100vw - 2rem));
+    display: flex; align-items: flex-start; gap: 0.6rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--bg) 70%, transparent);
+    font-size: 0.9rem;
+  }
+  .notice.error { border-color: color-mix(in srgb, var(--err) 60%, transparent); }
+  .notice.error :global(svg) { color: var(--err); flex: none; margin-top: 0.1rem; }
+  .notice-x { color: var(--muted); flex: none; display: grid; place-items: center; }
   .side-bottom { margin-top: auto; }
   .side-status {
     display: flex;
@@ -3111,6 +3742,8 @@
     background-clip: text;
     color: transparent;
   }
+  .origtitle { margin: -0.3rem 0 0.4rem; font-size: 0.95rem; }
+  .guests { margin: 0.2rem 0 0.5rem; }
   .status {
     width: 10px; height: 10px; border-radius: 50%;
     background: var(--ok);
@@ -3182,6 +3815,86 @@
   .empty p + p { margin-top: 0.5rem; }
   .empty a, a { color: var(--accent-2); }
 
+  /* ---- Home ---- */
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip-path: inset(50%); white-space: nowrap;
+  }
+  .hero {
+    position: relative;
+    isolation: isolate;
+    min-height: 19rem;
+    margin-bottom: 1.5rem;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    align-items: flex-end;
+  }
+  .hero-bg {
+    /* Under the fade below: both sit behind the text, and at equal depth
+       the image, coming later in the page, would paint over the fade. */
+    position: absolute; inset: 0; z-index: -2;
+    width: 100%; height: 100%; object-fit: cover; object-position: center 25%;
+  }
+  /* Fades the artwork into the panel from the left, where the text sits,
+     so the text reads on a bright image too, and in a light theme. */
+  .hero::before {
+    content: ''; position: absolute; inset: 0; z-index: -1;
+    background:
+      linear-gradient(to right, var(--panel) 0%, color-mix(in srgb, var(--panel) 92%, transparent) 30%,
+        color-mix(in srgb, var(--panel) 45%, transparent) 55%, transparent 75%),
+      linear-gradient(to top, color-mix(in srgb, var(--panel) 70%, transparent), transparent 45%);
+  }
+  @media (max-width: 40rem) {
+    /* No room for the image beside the text: veil it all instead. */
+    .hero::before { background: color-mix(in srgb, var(--panel) 82%, transparent); }
+  }
+  .hero-body { padding: 1.5rem 1.75rem; max-width: 40rem; display: flex; flex-direction: column; gap: 0.35rem; }
+  .hero-kicker { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent-2); font-weight: 600; }
+  .hero-title { font-size: 2rem; line-height: 1.1; margin: 0; }
+  .hero-sub { color: var(--muted); }
+  .hero-overview {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
+    overflow: hidden; margin: 0.25rem 0 0.5rem; line-height: 1.45;
+  }
+  .hero-left { color: var(--muted); font-size: 0.88rem; }
+  @media (max-width: 30rem) {
+    .hero { min-height: 15rem; }
+    .hero-body { padding: 1rem 1.1rem; }
+    .hero-title { font-size: 1.45rem; }
+    .hero-overview { -webkit-line-clamp: 2; line-clamp: 2; }
+  }
+
+  .shelf-head { display: flex; align-items: center; justify-content: space-between; margin-top: 1.25rem; }
+  .shelf-head h2 { margin: 0; }
+  .shelf-lib { color: var(--muted); font-weight: 400; }
+  .shelf-nav { display: flex; gap: 0.25rem; }
+  .shelf-nav button {
+    display: grid; place-items: center; width: 1.9rem; height: 1.9rem; border-radius: 50%;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .shelf-nav button:hover { color: var(--text); border-color: var(--accent); }
+  @media (hover: none) { .shelf-nav { display: none; } }
+  /* One row that scrolls sideways inside itself; the page never does. */
+  .shelf-row {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 9rem;
+    gap: 0.9rem;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+    padding: 0.6rem 0 0.4rem;
+    /* Hidden: arrows scroll it with a pointer, a swipe or a trackpad
+       without, and a bar under every row is clutter. */
+    scrollbar-width: none;
+  }
+  .shelf-row::-webkit-scrollbar { display: none; }
+  .shelf-row > * { scroll-snap-align: start; }
+  @media (max-width: 30rem) { .shelf-row { grid-auto-columns: 7.25rem; gap: 0.7rem; } }
+
   .librow { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 0.75rem; }
   .libcard {
     background: var(--panel);
@@ -3229,6 +3942,15 @@
     cursor: pointer;
   }
   .subtab:hover { color: var(--text); }
+  .subtabrow { display: flex; align-items: center; gap: 1rem; border-bottom: 1px solid var(--border); }
+  .subtabrow .subtabs { flex: 1; min-width: 0; border-bottom: 0; }
+  /* Desktop only: on a phone the column count is already decided by the
+     screen, and the row has no room to spare. */
+  .pzoom { display: none; }
+  @media (min-width: 768px) {
+    .pzoom { display: flex; align-items: center; gap: 0.45rem; flex: none; color: var(--muted); padding-right: 0.25rem; }
+    .pzoom input { width: 6.5rem; accent-color: var(--accent); cursor: pointer; }
+  }
   .subtab.on { color: var(--text); border-bottom-color: var(--accent); }
 
   /* ---- A–Z sections and the index rail ---- */
@@ -3923,6 +4645,105 @@
   .qdrop { color: var(--muted); display: flex; flex: none; }
   .qdrop:hover { color: var(--err); }
 
+  /* ---- Queue page ----
+     The in-player panel above is a glance at what is next; this is the
+     full queue, including what has already played, where it can be
+     reordered. Shares the .q* parts so the two read as the same thing. */
+  /* The episode a series button will start, so "Resume" says what it will
+     resume rather than leaving it to be discovered by pressing it. */
+  .origtitle { margin: -0.3rem 0 0.4rem; font-size: 0.95rem; }
+  .guests { margin: 0.2rem 0 0.5rem; }
+  .status {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.05rem 0.45rem;
+    color: var(--muted);
+  }
+  .status.ongoing { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  /* Hidden on a phone: the title and runtime matter more than the date when
+     the row is only 390px wide. */
+  @media (max-width: 30rem) { .epair { display: none; } }
+  .epcode {
+    margin-left: 0.15rem;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+  }
+  .qbar { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; flex-wrap: wrap; }
+  .qlist {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .qlist li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    /* Wraps at every width, not just on a phone: the progress bar below
+       takes a full-width basis, and without wrapping it shares the one line
+       and squeezes the title down to nothing. */
+    flex-wrap: wrap;
+  }
+  .qlist li.qnow { border-color: var(--accent); }
+  .qnow-tag {
+    margin-left: 0.5rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+  }
+  .qdone-tag { margin-left: 0.5rem; font-size: 0.72rem; }
+  /* Takes the whole row under the title so the bar is wide enough to read
+     at a glance rather than squeezed between the controls. */
+  .qprogress {
+    flex: 1 1 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.1rem;
+  }
+  .qprogress .progress { flex: 1; }
+  .qmove { display: flex; flex: none; gap: 0.1rem; }
+  .qmove button {
+    color: var(--muted);
+    display: flex;
+    padding: 0.2rem;
+    border-radius: 5px;
+  }
+  .qmove button:hover:not(:disabled) { color: var(--text); background: var(--bg); }
+  .qmove button:disabled { opacity: 0.3; cursor: default; }
+  /* At phone width the reorder controls would crowd the title off the row,
+     so they sit under it instead of beside it. */
+  @media (max-width: 30rem) {
+    .qlist .qtitle { flex: 1 1 100%; order: 1; }
+    .qlist .qpos { order: 0; }
+    .qlist .qmove { order: 2; margin-left: auto; }
+    .qlist .qdrop { order: 3; }
+    .qlist .qprogress { order: 4; }
+  }
+
+  /* Count beside the sidebar's Queue entry: the feedback that "Add all to
+     queue" actually did something. */
+  .side-count {
+    margin-left: auto;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.05rem 0.4rem;
+    color: var(--muted);
+  }
+
   .collacts { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 
   /* A row heading that is also a link into the full listing. Inherits the
@@ -4041,55 +4862,86 @@
   .tech dt { color: var(--muted); width: 5.5rem; flex: none; }
 
   .grid.seasons { margin-top: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); }
+  /* The poster-size slider (.pzoom) scales the film and series grids on
+     desktop. After the base rules, which it overrides. */
+  @media (min-width: 768px) {
+    .grid { grid-template-columns: repeat(auto-fill, minmax(calc(7.5rem * var(--poster-scale, 1)), 1fr)); }
+    .grid.seasons { grid-template-columns: repeat(auto-fill, minmax(calc(9rem * var(--poster-scale, 1)), 1fr)); }
+    .shelf-row { grid-auto-columns: calc(9rem * var(--poster-scale, 1)); }
+  }
 
   /* ---- Episode list (season page, terminal level) ---- */
   .eplist { list-style: none; margin-top: 1.25rem; }
-  .eplist li { border-bottom: 1px solid var(--border); }
-  .eplist li:last-child { border-bottom: none; }
   .eprow {
-    position: relative;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.9rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.5rem 0.4rem;
-    border-radius: 10px;
+    padding: 0.6rem 0.4rem;
+    border-bottom: 1px solid var(--border);
   }
-  .eprow:hover { background: var(--panel); }
-  .eprow.sel { background: var(--panel); }
+  .eprow:last-child { border-bottom: none; }
+  .eprow.sel { background: var(--panel); border-radius: 10px; }
   .epthumb {
-    width: 7.5rem;
+    position: relative;
+    width: 9.5rem;
     aspect-ratio: 16 / 9;
-    object-fit: cover;
     border-radius: 8px;
     border: 1px solid var(--border);
-    flex: none;
-  }
-  .epthumb.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); }
-  .epmain { flex: 1; min-width: 0; }
-  .eprow.nowplaying .epmain { color: var(--accent-2); }
-  .ep-live { color: var(--accent-2); flex: none; display: grid; place-items: center; }
-  .ep-progress {
-    position: absolute;
-    left: 0.4rem;
-    right: 0.4rem;
-    bottom: 0;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--border);
     overflow: hidden;
+    flex: none;
+    background: var(--panel);
+  }
+  .epthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .epthumb .ph { display: grid; place-items: center; height: 100%; color: var(--muted); }
+  .epplay {
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    color: var(--text);
+    background: color-mix(in srgb, var(--bg) 45%, transparent);
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .epthumb:hover .epplay, .epthumb:focus-visible .epplay { opacity: 1; }
+  .epseen {
+    position: absolute; top: 0.3rem; right: 0.3rem;
+    display: grid; place-items: center;
+    width: 1.2rem; height: 1.2rem; border-radius: 50%;
+    background: var(--accent); color: var(--text);
+  }
+  .ep-progress {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: color-mix(in srgb, var(--bg) 60%, transparent);
   }
   .ep-progress span { display: block; height: 100%; background: var(--accent); }
-  .eppanel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1rem 1.2rem;
-    margin: 0.35rem 0 0.85rem;
+  .epmain { flex: 1; min-width: 0; }
+  .eptop { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.2rem 0.5rem; }
+  .eptitle { font-weight: 500; }
+  .eprow.nowplaying .eptitle { color: var(--accent-2); }
+  .ep-live { color: var(--accent-2); align-self: center; display: grid; }
+  .epmeta { margin-left: auto; font-size: 0.82rem; white-space: nowrap; }
+  .epover {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    margin-top: 0.25rem;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    text-align: left;
+    overflow-wrap: anywhere;
   }
-  .eppanel .overview { margin: 0.5rem 0 0.9rem; }
-  .eppanel .meta { margin: 0; }
+  .epover.open { display: block; }
+  .epmenuwrap { position: relative; flex: none; }
+  .epmore { display: grid; place-items: center; padding: 0.3rem; border-radius: 6px; color: var(--muted); }
+  .epmore:hover { color: var(--text); background: var(--panel); }
+  /* At phone width the thumbnail shrinks and the date goes, so the title
+     and overview keep a usable width. */
+  @media (max-width: 30rem) {
+    .epthumb { width: 6.5rem; }
+    .epmeta { margin-left: 0; }
+  }
 
   .children { list-style: none; margin-top: 1.25rem; }
   .children li { border-bottom: 1px solid var(--border); }

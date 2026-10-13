@@ -29,6 +29,9 @@ var (
 	bareYearRe = regexp.MustCompile(`\b((?:19|20)\d{2})\b`)
 	// "Season 04" directory
 	seasonDirRe = regexp.MustCompile(`(?i)^season\s*(\d{1,3})$`)
+	// Specials are season 0 by the convention TMDB, Plex and Jellyfin all
+	// share, so the folder names a season like any other.
+	specialsDirRe = regexp.MustCompile(`(?i)^specials?$`)
 	// Trailing quality/release tags worth stripping from titles
 	qualityRe = regexp.MustCompile(`(?i)[\s.-]*\b(HDTV|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|Remux|x26[45]|h26[45]|HEVC|\d{3,4}p)\b.*$`)
 	// Any marker that gives a release name away, anywhere in the string.
@@ -110,37 +113,58 @@ type EpisodeInfo struct {
 	Season  int
 	Episode int
 	Title   string
+	// Year from a folder or filename like "Archer (2009)". Series share
+	// titles far more often than films do — "Alone" is a 2013 US series and
+	// a 2023 UK one — so it is kept to disambiguate the match rather than
+	// thrown away with the rest of the name.
+	Year int
 }
 
 // ParseEpisode extracts show/season/episode from a file path, using the
 // SxxEyy marker in the filename and the directory layout
-// (Show/Season NN/file) as fallback for the show name and season.
+// (Show/Season NN/file) for the show name and season.
+//
+// The folder wins over the filename wherever the layout identifies one. A
+// series folder is named by whoever keeps the library — "Animal Kingdom
+// (2016)" — while the filename is usually a release name, lower-cased and
+// dot-separated: "animal.kingdom.s05e01.1080p.web.h264". Reading the show
+// from the filename produced series called "alone" and "Animal.Kingdom",
+// neither of which matches anything at TMDB.
 func ParseEpisode(path string) (EpisodeInfo, bool) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	m := episodeRe.FindStringSubmatchIndex(base)
 	if m == nil {
-		return EpisodeInfo{}, false
+		// No SxxEyy marker. A season folder plus a numbered filename says
+		// the same thing, and that layout is common enough that refusing it
+		// silently dropped 176 episodes of this library — 47 of House of
+		// Cards alone.
+		return parseNumberedEpisode(path, base)
 	}
 	season, _ := strconv.Atoi(base[m[2]:m[3]])
 	episode, _ := strconv.Atoi(base[m[4]:m[5]])
 
 	info := EpisodeInfo{Season: season, Episode: episode}
 
-	// Show: text before the marker, else the grandparent directory.
-	show := strings.Trim(strings.TrimRight(base[:m[0]], " -."), " ")
+	// Show: the series folder when the layout names one, else the text
+	// before the marker in the filename.
+	fromFile := strings.Trim(strings.TrimRight(base[:m[0]], " -."), " ")
 	seasonDir := filepath.Base(filepath.Dir(path))
 	showDir := filepath.Base(filepath.Dir(filepath.Dir(path)))
-	if sm := seasonDirRe.FindStringSubmatch(seasonDir); sm != nil {
-		if s, _ := strconv.Atoi(sm[1]); s > 0 {
-			info.Season = s
+	show := fromFile
+	if n, ok := seasonFromDir(seasonDir); ok {
+		// A season folder confirms the grandparent is the series. Season 0
+		// (Specials) is a real answer, so only a *missing* folder leaves the
+		// filename's own number standing.
+		if n > 0 {
+			info.Season = n
 		}
-		if show == "" {
+		if showDir != "" {
 			show = showDir
 		}
 	} else if show == "" {
 		show = seasonDir
 	}
-	info.Show = show
+	info.Show, info.Year = showName(show)
 
 	// Episode title: text after the marker, minus quality tags.
 	title := strings.Trim(strings.TrimLeft(base[m[1]:], " -."), " ")
@@ -153,7 +177,15 @@ func ParseEpisode(path string) (EpisodeInfo, bool) {
 // the feature itself. These are the conventions Plex, Jellyfin and Kodi all
 // use, so a library laid out for any of them is understood here.
 var (
-	extrasDirRe  = regexp.MustCompile(`(?i)^(extras?|featurettes?|behind the scenes|deleted scenes|interviews|scenes|shorts|trailers?|other|specials|bonus|sample)$`)
+	// "Season 3 Extras" is as common as a bare "Extras" and was not being
+	// matched, so its contents were walked and then refused one by one by
+	// the episode parser — the right outcome reached by accident, and one
+	// that stopped being right as soon as the parser got better at guessing.
+	// "Specials" is deliberately absent: season 0 is the standard place for
+	// Christmas episodes and one-offs, and those are episodes people want,
+	// not bonus material. A file in there with no episode marker is refused
+	// by the parser anyway, so nothing bonus slips through by including it.
+	extrasDirRe  = regexp.MustCompile(`(?i)^(?:season\s*\d{1,3}\s+)?(extras?|featurettes?|behind the scenes|deleted scenes|interviews|scenes|shorts|trailers?|other|bonus|sample)$`)
 	extrasFileRe = regexp.MustCompile(`(?i)[ ._-](trailer|sample|featurette|behindthescenes|behind the scenes|deleted|interview|short|scene|other)\d*$`)
 )
 
@@ -272,4 +304,104 @@ func ParseMovie(path string) MovieInfo {
 		}
 	}
 	return withHints(MovieInfo{Title: cleanTitle(base)})
+}
+
+// showYearRe matches a trailing year, parenthesised or not: "Archer (2009)",
+// "Big.Sky.2020". Anchored at the end so a year inside a title — "1883",
+// "Babylon 5" — is left alone.
+var showYearRe = regexp.MustCompile(`[\s._-]*\(?((?:19|20)\d{2})\)?$`)
+
+// packSeasonRe matches a trailing season marker on a folder that is a season
+// pack rather than a series: "Ted Lasso S01", "The Wire Season 2". Requires a
+// separator before it so a title ending in a number — "Babylon 5", "Season 1"
+// as an actual programme name — is left alone.
+var packSeasonRe = regexp.MustCompile(`(?i)[\s._-]+(?:s|season|series)\s*\d{1,2}$`)
+
+// showName turns a folder or filename fragment into a series title and the
+// year that disambiguates it.
+//
+// The year is removed from the title because TMDB searches on the name, and
+// returned separately because series reuse titles: "Alone" is both a 2013
+// survival series and a 2023 UK one, and the only thing telling them apart
+// is the year the library owner put in the folder name.
+func showName(s string) (string, int) {
+	s = cleanTitle(s)
+	// A season pack sits at the top level under its own name —
+	// "Ted.Lasso.S01.1080p.WEBRip.x265" — so the series folder carries a
+	// season marker the series itself does not. Left on, it is searched for
+	// verbatim and matches nothing.
+	if m := packSeasonRe.FindString(s); m != "" && len(s) > len(m) {
+		s = strings.TrimSpace(s[:len(s)-len(m)])
+	}
+	year := 0
+	// A title that is nothing but a year ("1883") is a title, not a year.
+	if m := showYearRe.FindStringSubmatch(s); m != nil && len(s) > len(m[0]) {
+		year, _ = strconv.Atoi(m[1])
+		s = strings.TrimSpace(s[:len(s)-len(m[0])])
+	}
+	return cleanTitle(s), year
+}
+
+// numberedEpRe matches a filename that leads with its episode number:
+// "11 Birth", "01 Janine", "05 Chapter 5", "01 - Pilot", "E03 Hide and Seek".
+//
+// The number must be followed by a separator or end the name, so "1917" is
+// not episode 191, and the name must start with it, so "Season 1 - Outtakes"
+// and "A Very Sunny Christmas" stay skipped — they are bonus material, not
+// episodes, and inventing numbers for them would scatter them through the
+// season.
+var numberedEpRe = regexp.MustCompile(`^(?i)(?:e|ep|episode)?[\s._-]*(\d{1,3})(?:[\s._-]+(.*))?$`)
+
+// parseNumberedEpisode reads an episode from a season folder plus a numbered
+// filename: "Season 1/02 Part Two.mp4".
+//
+// It needs the season folder. Without one there is nothing to say which
+// season a bare "02" belongs to, and guessing season 1 would merge every
+// season of a flat library into one.
+func parseNumberedEpisode(path, base string) (EpisodeInfo, bool) {
+	parent := filepath.Dir(path)
+	season, ok := seasonFromDir(filepath.Base(parent))
+	if !ok {
+		// No season folder. Episodes numbered straight inside the series
+		// folder — "Show/01_Pilot.mkv" — are one season's worth by the only
+		// reading the layout offers, so they are taken as season 1 rather
+		// than refused. A library that nests seasons never reaches here,
+		// because the branch above matched.
+		season = 1
+	}
+	em := numberedEpRe.FindStringSubmatch(base)
+	if em == nil {
+		return EpisodeInfo{}, false
+	}
+	episode, _ := strconv.Atoi(em[1])
+	if episode == 0 {
+		return EpisodeInfo{}, false // "00 Something" is not an episode number
+	}
+	info := EpisodeInfo{Season: season, Episode: episode}
+	info.Title = strings.TrimSpace(qualityRe.ReplaceAllString(em[2], ""))
+	// The series folder is the one above the season, or the parent itself
+	// when the episodes sit directly in it.
+	seriesDir := parent
+	if ok {
+		seriesDir = filepath.Dir(parent)
+	}
+	info.Show, info.Year = showName(filepath.Base(seriesDir))
+	return info, true
+}
+
+// seasonFromDir reads a season number out of a directory name, reporting
+// whether the name identifies a season at all.
+//
+// "Specials" counts, as season 0: that is where the conventions every other
+// media server follows put Christmas episodes and one-offs, and treating the
+// folder as bonus material dropped 17 real episodes of this library.
+func seasonFromDir(name string) (int, bool) {
+	if m := seasonDirRe.FindStringSubmatch(name); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n, true
+	}
+	if specialsDirRe.MatchString(name) {
+		return 0, true
+	}
+	return 0, false
 }

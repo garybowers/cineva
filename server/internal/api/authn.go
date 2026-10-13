@@ -125,6 +125,19 @@ func canSeeLibrary(u store.User, libraryID string) bool {
 	return false
 }
 
+// visibleLibraryIDs scopes a store query to what the user may see: nil for
+// an admin (every library), otherwise their libraries — never nil, so a
+// user who can see nothing gets nothing rather than everything.
+func visibleLibraryIDs(u store.User) []string {
+	if u.IsAdmin() {
+		return nil
+	}
+	if u.LibraryIDs == nil {
+		return []string{}
+	}
+	return u.LibraryIDs
+}
+
 func (s *server) setSessionCookie(c echo.Context, token string, expires time.Time) {
 	c.SetCookie(&http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", Expires: expires,
@@ -535,13 +548,12 @@ func (s *server) deleteAPIKey(c echo.Context) error {
 // ---- /users (admin) ----
 
 type userRequest struct {
-	Username    string   `json:"username"`
-	DisplayName string   `json:"displayName"`
-	Password    string   `json:"password"`
-	Role        string   `json:"role"`
-	Disabled    bool     `json:"disabled"`
-	LibraryIDs  []string `json:"libraryIds"`
-	PIN         *string  `json:"pin,omitempty"` // set ("1234") or clear ("") on update; optional on create
+	Username    string  `json:"username"`
+	DisplayName string  `json:"displayName"`
+	Password    string  `json:"password"`
+	Role        string  `json:"role"`
+	Disabled    bool    `json:"disabled"`
+	PIN         *string `json:"pin,omitempty"` // set ("1234") or clear ("") on update; optional on create
 }
 
 func (s *server) listUsers(c echo.Context) error {
@@ -596,18 +608,12 @@ func (s *server) createUser(c echo.Context) error {
 		}
 		u.HasPin = true
 	}
-	if len(req.LibraryIDs) > 0 {
-		if err := s.store.SetLibraryGrants(ctx, u.ID, req.LibraryIDs); err != nil {
-			return err
-		}
-		u.LibraryIDs = req.LibraryIDs
-	}
 	s.audit(c, "user.create", "user", u.ID, u.Username, u.Role)
 	s.events.Publish(events.Event{Type: "users"})
 	return c.JSON(http.StatusCreated, u)
 }
 
-// PATCH /users/:id — display name, role, disabled, library grants, and
+// PATCH /users/:id — display name, role, disabled, and
 // optionally a new password (admin reset; signs the user out everywhere).
 func (s *server) updateUser(c echo.Context) error {
 	ctx := c.Request().Context()
@@ -615,7 +621,7 @@ func (s *server) updateUser(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "user not found")
 	}
-	req := userRequest{DisplayName: u.DisplayName, Role: u.Role, Disabled: u.Disabled, LibraryIDs: u.LibraryIDs}
+	req := userRequest{DisplayName: u.DisplayName, Role: u.Role, Disabled: u.Disabled}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
@@ -625,9 +631,6 @@ func (s *server) updateUser(c echo.Context) error {
 	}
 	if err := s.store.UpdateUser(ctx, u.ID, req.DisplayName, req.Role, req.Disabled); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-	if err := s.store.SetLibraryGrants(ctx, u.ID, req.LibraryIDs); err != nil {
-		return err
 	}
 	detail := req.Role
 	if req.Password != "" {

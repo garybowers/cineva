@@ -8,4 +8,17 @@ applyTheme(currentTheme())
 
 const app = mount(App, { target: document.getElementById('app')! })
 
+// Register the service worker after the app is up, so it never competes
+// with the first paint. Only in a built app: under `vite dev` the worker
+// would cache the dev server's modules and serve them stale after an edit.
+// A failure here costs installability, not the app, so it is logged and
+// swallowed rather than thrown.
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+      console.warn('service worker registration failed', err)
+    })
+  })
+}
+
 export default app

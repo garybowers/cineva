@@ -61,7 +61,7 @@ func (s *Scheduler) sweep(ctx context.Context) {
 		if s.Manager.Scanning(lib.ID) {
 			continue
 		}
-		if _, err := s.Manager.StartScan(ctx, lib); err != nil {
+		if _, err := s.Manager.StartScan(ctx, lib, false); err != nil {
 			log.Printf("scheduled rescan %s: %v", lib.Name, err)
 		}
 	}

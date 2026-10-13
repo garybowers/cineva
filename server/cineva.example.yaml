@@ -1,108 +1,96 @@
-# Cineva server configuration.
+# Cineva configuration — every key the server reads, with its default.
 #
-# This file is optional — every key can instead be set with a CINEVA_* env var
-# (dots become underscores, uppercased): server.port -> CINEVA_SERVER_PORT.
-# Precedence: CLI flags > env vars > this file > built-in defaults.
+# Copy to cineva.yaml and edit. The server looks for ./cineva.yaml, then
+# /etc/cineva/cineva.yaml; --config names a file explicitly.
 #
-# The server looks for cineva.yaml in the working directory, then /etc/cineva.
-# This copy is for local development; grow it as features land (one section
-# per subsystem, added in the same change as the feature that reads it).
+# Precedence: flags > CINEVA_* env vars > config file > these defaults.
+#
+# Every key maps to an env var by upper-casing it and replacing dots with
+# underscores, prefixed with CINEVA_ — so `server.port` is CINEVA_SERVER_PORT
+# and `metadata.tmdb.api_key` is CINEVA_METADATA_TMDB_API_KEY. The env name is
+# given against each key below.
+#
+# This file is committed and is the reference for what is configurable. When
+# a feature adds a key, add it here in the same change. Keep cineva.yaml
+# itself out of git — it holds your API key.
 
 server:
-  # Address to bind. 0.0.0.0 listens on all interfaces; use 127.0.0.1 to
-  # keep the server local-only. (CINEVA_SERVER_HOST)
+  # Interface to bind. 0.0.0.0 serves every interface; 127.0.0.1 restricts to
+  # this machine.                                      CINEVA_SERVER_HOST
   host: 0.0.0.0
-  # HTTP port for the API, web client, and admin UI. (CINEVA_SERVER_PORT)
+  # HTTP port.                                         CINEVA_SERVER_PORT
   port: 4747
 
 database:
-  # SQLite database file; created on first run, migrations auto-apply at
-  # startup. (CINEVA_DATABASE_PATH)
+  # SQLite file. Relative paths resolve against the working directory.
+  # Migrations apply automatically at startup.          CINEVA_DATABASE_PATH
   path: cineva.db
 
 libraries:
-  # Rescan every library on this interval, so files added outside Cineva
-  # turn up without anyone pressing a button. A duration ("6h", "30m"); "0"
-  # disables it. A timer rather than a filesystem watch deliberately: a
-  # watch needs a descriptor per directory, misses anything changed while
-  # the server was down, and sees nothing on a network mount.
-  # (CINEVA_LIBRARIES_SCAN_INTERVAL)
-  scan_interval: "0"
-  # Days of audit log and play history to keep; pruned alongside each
-  # scheduled rescan. 0 keeps everything, which grows without limit.
-  # (CINEVA_LIBRARIES_HISTORY_RETENTION_DAYS)
-  history_retention_days: 90
-  # Where downloaded poster/artwork files are cached, served at /artwork.
-  # (CINEVA_LIBRARIES_ARTWORK_DIR)
+  # Where cached posters, backdrops and headshots are written.
+  #                                              CINEVA_LIBRARIES_ARTWORK_DIR
   artwork_dir: artwork
+  # Automatic rescan interval (Go duration, e.g. "6h"). A rescan walks the
+  # folders and skips unchanged files, so a short interval is cheap; new
+  # downloads appear within it. "0" disables it and scans run only when
+  # triggered — by hand, or by a Sonarr/Radarr connection's webhook.
+  #                                           CINEVA_LIBRARIES_SCAN_INTERVAL
+  scan_interval: "15m"
+  # How long play history is kept, in days.
+  #                                   CINEVA_LIBRARIES_HISTORY_RETENTION_DAYS
+  history_retention_days: 90
+  # Find TV intros and end credits in the background: "Skip intro" in the
+  # player, and the up-next card and autoplay at the real credits. Each
+  # episode's opening and closing stretch is decoded once and compared with
+  # its neighbours'; the first pass over a large library reads a lot of
+  # disk.                                CINEVA_LIBRARIES_INTRO_DETECTION
+  intro_detection: true
 
 transcode:
-  # Working directory for HLS transcode sessions (segments are temp files,
-  # cleaned up when a session ends). Default: <system tmp>/cineva-transcode.
-  # (CINEVA_TRANSCODE_DIR)
-  # dir: /tmp/cineva-transcode
-  # Target HLS segment length in seconds. (CINEVA_TRANSCODE_SEGMENT_SECS)
+  # Scratch directory for HLS segments. Defaults to <tmp>/cineva-transcode.
+  # Often tmpfs, which is why max_bytes exists.         CINEVA_TRANSCODE_DIR
+  dir: /tmp/cineva-transcode
+  # Target segment length in seconds.         CINEVA_TRANSCODE_SEGMENT_SECS
   segment_secs: 6
-  # Hardware-accelerated transcoding. "auto" probes for a usable GPU at
-  # startup and falls back to the CPU when there is none; "none" forces
-  # software. Name a backend ("nvenc", "qsv", "vaapi") to pin one on a host
-  # with several GPUs. The server logs which path it chose on startup.
-  # (CINEVA_TRANSCODE_HWACCEL)
-  hwaccel: auto
-  # Ceiling for the segment cache, in bytes. The janitor evicts whole
-  # least-recently-used session directories to stay under it; directories
-  # belonging to a live playback are never evicted. 0 disables the cap.
-  # This matters more than it looks: the default transcode dir is under
-  # /tmp, which on a systemd host is tmpfs — i.e. RAM — so an unbounded
-  # cache evicts page cache and can exhaust memory.
-  # (CINEVA_TRANSCODE_MAX_BYTES)
+  # Cap on the segment cache, in bytes. 8 GiB is roughly two 4K films.
+  # Exceeding it evicts least-recently-used sessions.
+  #                                             CINEVA_TRANSCODE_MAX_BYTES
   max_bytes: 8589934592
-
-stats:
-  # How often the admin dashboard's CPU/RAM sampler reads /proc. Samples are
-  # kept in memory only (last hour fine, last day per-minute). (CINEVA_STATS_SAMPLE_SECS)
-  sample_secs: 5
+  # Hardware acceleration: "auto" probes NVENC, QuickSync then VAAPI and uses
+  # the first that opens; "none" forces software; "vaapi", "qsv" or "nvenc"
+  # pin one backend.                              CINEVA_TRANSCODE_HWACCEL
+  hwaccel: auto
 
 auth:
-  # Browser sessions expire this many days after sign-in. (CINEVA_AUTH_SESSION_DAYS)
+  # How long a browser session lasts, in days.       CINEVA_AUTH_SESSION_DAYS
   session_days: 30
-  # Mark the session cookie Secure so browsers only send it over HTTPS.
-  # Turn on when Cineva sits behind a TLS reverse proxy. (CINEVA_AUTH_SECURE_COOKIES)
+  # Set true when served over HTTPS so session cookies carry Secure. Leave
+  # false for plain HTTP or the browser discards them.
+  #                                               CINEVA_AUTH_SECURE_COOKIES
   secure_cookies: false
-  # Default sign-in screen: "picker" shows every user as a tile ("Who's
-  # watching?") and asks for that user's PIN or password; "form" is a plain
-  # username + password-or-PIN box and reveals no names. Changeable at
-  # runtime from the admin Settings page. (CINEVA_AUTH_LOGIN_MODE)
+  # "picker" shows the profile list, Plex-style; "password" asks for a
+  # username and password outright.                  CINEVA_AUTH_LOGIN_MODE
   login_mode: picker
 
 metadata:
-  # Country whose content rating (certification) is stored and shown. These
-  # are issued per country by different boards — a BBFC "15" and an FSK "16"
-  # are different judgements, not two spellings — so pick the one that means
-  # something where this server is. Falls back to the US rating when a title
-  # is unclassified in your region. Overridable in the admin UI; changing it
-  # affects titles scanned or refreshed afterwards.
-  # (CINEVA_METADATA_CERT_REGION)
+  # Two-letter region for age certifications — ratings differ by country, so
+  # GB gives BBFC, US gives MPAA.                CINEVA_METADATA_CERT_REGION
   cert_region: GB
-  # MusicBrainz + Cover Art Archive enrichment for music with missing tags —
-  # open data, no key needed, rate-limited to 1 request/second.
-  # (CINEVA_METADATA_MUSICBRAINZ_ENABLED)
-  musicbrainz:
-    enabled: true
   tmdb:
-    # TMDB API key for movie/TV metadata + posters.
-    #
-    # Leave this empty: release builds carry the project's own key, so
-    # metadata works out of the box. Set it only to deliberately override
-    # that — your own key, a different account, or a source build that has
-    # no key baked in. Free at https://www.themoviedb.org/settings/api.
-    #
-    # Precedence: --tmdb-key > CINEVA_METADATA_TMDB_API_KEY > this file >
-    # the built-in key.
+    # Required for video metadata and artwork. Keep it out of git: set it
+    # here in your own cineva.yaml, or pass CINEVA_METADATA_TMDB_API_KEY.
+    #                                      CINEVA_METADATA_TMDB_API_KEY
     api_key: ""
+  musicbrainz:
+    # Enrich music from MusicBrainz and Cover Art Archive after embedded
+    # tags.                            CINEVA_METADATA_MUSICBRAINZ_ENABLED
+    enabled: true
 
-# --- Sections arriving with later milestones (do not uncomment until the
-# --- feature exists; config validate will show them once real):
-#
-# auth:            milestone 4   — session lifetime
-# federation:      milestone 10  — federation port, identity key location
+stats:
+  # How often the admin dashboard samples CPU, memory and disk, in seconds.
+  #                                               CINEVA_STATS_SAMPLE_SECS
+  sample_secs: 5
+  # How long the persisted one-per-minute samples are kept, in hours. The
+  # charts restore from these after a restart; raise it for a longer view.
+  #                                           CINEVA_STATS_RETENTION_HOURS
+  retention_hours: 24

@@ -8,6 +8,7 @@
 
 STATIGO := third_party/ffmpeg-statigo
 LIB := $(STATIGO)/lib/$(shell go env GOOS)_$(shell go env GOARCH)/libffmpeg.a
+PATCH := $(abspath third_party/patches/ffmpeg-statigo-hwaccel.patch)
 
 # The project's TMDB key is injected at build time rather than committed, so
 # the repository holds no credential. Release builds set it; a plain `make
@@ -19,11 +20,15 @@ LIB := $(STATIGO)/lib/$(shell go env GOOS)_$(shell go env GOARCH)/libffmpeg.a
 TMDB_KEY ?=
 LDFLAGS := -X github.com/garybowers/cineva/server/internal/metadata.defaultAPIKey=$(TMDB_KEY)
 
+# The recipe is silenced with @ because $(LDFLAGS) carries the TMDB key:
+# make echoes every command it runs, which puts the key in the terminal, in
+# scrollback, and in any CI log that ever builds this.
 build: $(LIB)
-	cd server && go build -ldflags "$(LDFLAGS)" -o ../bin/cineva .
+	@echo "building bin/cineva"
+	@cd server && go build -ldflags "$(LDFLAGS)" -o ../bin/cineva .
 
 run: $(LIB)
-	cd server && go run -ldflags "$(LDFLAGS)" . serve
+	@cd server && go run -ldflags "$(LDFLAGS)" . serve
 
 test: $(LIB)
 	cd server && go test ./...
@@ -40,9 +45,14 @@ setup: $(LIB)
 	npm --prefix server/ui/client ci
 	npm --prefix server/ui/admin ci
 
+# Built from source rather than downloaded: upstream enables no hwaccels on
+# Linux, so its prebuilt library cannot hardware-decode on VAAPI (AMD, and
+# Intel via VAAPI). $(PATCH) adds them. Re-applying is a no-op, so this
+# survives a rebuild without needing a clean submodule.
 $(LIB):
 	git submodule update --init
-	cd $(STATIGO) && go run ./cmd/download-lib
+	git -C $(STATIGO) apply --reverse --check $(PATCH) 2>/dev/null || git -C $(STATIGO) apply $(PATCH)
+	cd $(STATIGO) && go run ./internal/builder
 
 clean:
 	rm -rf bin

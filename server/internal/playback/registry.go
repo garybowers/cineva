@@ -37,6 +37,11 @@ type Playback struct {
 	Paused       bool      `json:"paused"`
 	StartedAt    time.Time `json:"startedAt"`
 	LastSeenAt   time.Time `json:"lastSeenAt"`
+
+	// EventID is the play_events row opened for this playback, closed when
+	// it ends. Not serialised: it is a server-side bookkeeping handle, not
+	// something a client has any use for.
+	EventID int64 `json:"-"`
 }
 
 // Registry is the in-memory set of active playbacks, keyed by user+item so
@@ -44,16 +49,39 @@ type Playback struct {
 type Registry struct {
 	IdleTimeout time.Duration
 	OnChange    func() // called after any change (event bus)
+	// OnEnd is called once for each playback that finishes, however it
+	// finishes: an explicit stop, its transcode session being killed, or
+	// going idle long enough to be reaped. A playback that is never
+	// explicitly stopped — the usual case, since browsers close tabs
+	// without warning — would otherwise leave its history row open for
+	// ever.
+	OnEnd func(Playback)
 
 	mu   sync.Mutex
 	byID map[string]*Playback
+	// stopped remembers playbacks an administrator ended, because removing
+	// one is not enough on its own: the progress heartbeat re-registers a
+	// missing playback so that a reap or a server restart does not lose a
+	// stream that is still running. Without this marker an admin's stop
+	// would be undone a few seconds later by the client's own heartbeat.
+	stopped map[string]time.Time
 }
+
+// stopGrace is how long a stop is remembered. It has to outlast the idle
+// timeout so a client that is mid-heartbeat still learns it was stopped,
+// but stay short enough that the viewer can start the item again by hand
+// shortly afterwards — an admin stop is not a ban.
+const stopGrace = 90 * time.Second
 
 func NewRegistry(idle time.Duration) *Registry {
 	if idle <= 0 {
 		idle = 45 * time.Second
 	}
-	return &Registry{IdleTimeout: idle, byID: map[string]*Playback{}}
+	return &Registry{
+		IdleTimeout: idle,
+		byID:        map[string]*Playback{},
+		stopped:     map[string]time.Time{},
+	}
 }
 
 func key(userID, itemID string) string { return userID + "/" + itemID }
@@ -91,12 +119,15 @@ func (r *Registry) Touch(userID, itemID string, positionSecs int, paused bool) b
 func (r *Registry) Stop(userID, itemID string) (sessionID string, ok bool) {
 	r.mu.Lock()
 	p, ok := r.byID[key(userID, itemID)]
+	var ended Playback
 	if ok {
 		sessionID = p.SessionID
+		ended = *p
 		delete(r.byID, p.ID)
 	}
 	r.mu.Unlock()
 	if ok {
+		r.ended(ended)
 		r.changed()
 	}
 	return sessionID, ok
@@ -105,15 +136,18 @@ func (r *Registry) Stop(userID, itemID string) (sessionID string, ok bool) {
 // StopSession removes whichever playback owns the given HLS session.
 func (r *Registry) StopSession(sessionID string) {
 	r.mu.Lock()
-	var removed bool
+	var ended []Playback
 	for id, p := range r.byID {
 		if p.SessionID == sessionID {
+			ended = append(ended, *p)
 			delete(r.byID, id)
-			removed = true
 		}
 	}
 	r.mu.Unlock()
-	if removed {
+	for _, p := range ended {
+		r.ended(p)
+	}
+	if len(ended) > 0 {
 		r.changed()
 	}
 }
@@ -150,16 +184,34 @@ func (r *Registry) Run(ctx context.Context) {
 
 func (r *Registry) reap(now time.Time) {
 	r.mu.Lock()
-	var removed bool
+	var ended []Playback
 	for id, p := range r.byID {
 		if now.Sub(p.LastSeenAt) > r.IdleTimeout {
+			ended = append(ended, *p)
 			delete(r.byID, id)
-			removed = true
+		}
+	}
+	// A marker whose client never came back would otherwise leak.
+	for k, at := range r.stopped {
+		if now.Sub(at) > stopGrace {
+			delete(r.stopped, k)
 		}
 	}
 	r.mu.Unlock()
-	if removed {
+	for _, p := range ended {
+		r.ended(p)
+	}
+	if len(ended) > 0 {
 		r.changed()
+	}
+}
+
+// ended notifies OnEnd outside the lock — the callback writes to the
+// database, and holding the registry's mutex across that would stall every
+// progress report.
+func (r *Registry) ended(p Playback) {
+	if r.OnEnd != nil {
+		r.OnEnd(p)
 	}
 }
 
@@ -208,4 +260,49 @@ func ParseUserAgent(ua string) (browser, os string) {
 		os = ""
 	}
 	return browser, os
+}
+
+// StopByAdmin ends a playback on an administrator's behalf and remembers it,
+// so the client's next heartbeat is told to stop rather than silently
+// re-registering. Returns the HLS session id, if any, for the caller to tear
+// down.
+//
+// This is how a direct play is stopped at all: the server only hands out
+// bytes over range requests, so there is nothing to kill server-side the way
+// a transcode can be killed. The client has to cooperate, and the heartbeat
+// is where it is told to.
+func (r *Registry) StopByAdmin(userID, itemID string) (sessionID string, ok bool) {
+	k := key(userID, itemID)
+	r.mu.Lock()
+	p, ok := r.byID[k]
+	var ended Playback
+	if ok {
+		sessionID = p.SessionID
+		ended = *p
+		delete(r.byID, k)
+	}
+	// Recorded whether or not it was found: a client can be mid-heartbeat
+	// when the stop arrives, and the marker is what stops it coming back.
+	r.stopped[k] = time.Now().UTC()
+	r.mu.Unlock()
+	if ok {
+		r.ended(ended)
+	}
+	r.changed()
+	return sessionID, ok
+}
+
+// Stopped reports whether this playback was ended by an administrator
+// recently, and clears the marker — it is asked once, by the heartbeat that
+// is about to be refused, and must not refuse every later attempt too.
+func (r *Registry) Stopped(userID, itemID string) bool {
+	k := key(userID, itemID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at, ok := r.stopped[k]
+	if !ok {
+		return false
+	}
+	delete(r.stopped, k)
+	return time.Since(at) < stopGrace
 }

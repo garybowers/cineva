@@ -274,6 +274,97 @@ paths:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /groups:
+    get:
+      summary: List user groups (admin)
+      description: Named sets of this server's users ("Kids", "Grown-ups"), for restricting libraries without listing every account.
+      operationId: listGroups
+      responses:
+        "200":
+          description: Groups, by name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/UserGroup" } }
+    post:
+      summary: Create a group (admin)
+      operationId: createGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UserGroupRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserGroup" }
+        "400": { description: Missing or duplicate name, or an unknown member }
+
+  /groups/{id}:
+    put:
+      summary: Rename a group and replace its members (admin)
+      operationId: updateGroup
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UserGroupRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserGroup" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a group (admin); it is also removed from every library's access list
+      operationId: deleteGroup
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/access:
+    get:
+      summary: Who may see a library (admin)
+      operationId: getLibraryAccess
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The library's access
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LibraryAccess" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Set who may see a library (admin)
+      description: >
+        Libraries are open to every user by default. Restricting one limits
+        it to the users and groups listed (admins always see everything); a
+        restricted library with empty lists is admin-only. The lists are kept
+        when a library is reopened, so restricting it again restores them.
+      operationId: setLibraryAccess
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LibraryAccess" }
+      responses:
+        "200":
+          description: The access now in force
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LibraryAccess" }
+        "400": { description: An unknown user or group }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /libraries:
     get:
       summary: List libraries
@@ -338,9 +429,20 @@ paths:
   /libraries/{id}/scan:
     post:
       summary: Start a background scan of the library
+      description: >
+        Incremental by default: a file whose size and modification time match
+        what the last scan recorded is skipped, and only new or changed files
+        are read and matched. Items whose files have gone are removed either
+        way. Pass full=true to reread and rematch everything, which picks up
+        new provider data and recovers from a bad match.
       operationId: scanLibrary
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+        - name: full
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Reread and rematch every file instead of only changed ones
       responses:
         "202":
           description: Scan started; poll /scans for progress
@@ -397,6 +499,94 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Scan" }
+
+  /segments/status:
+    get:
+      summary: Progress of background intro and credits detection (admin)
+      description: >
+        Detection runs over TV libraries after each completed scan and once
+        at startup, analysing only episodes not yet analysed for each kind.
+        Counts are of checks: an episode is checked once for its intro and
+        once for its credits. The same status is pushed over /events as
+        "segments" while it runs.
+      operationId: segmentStatus
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, description: "False when libraries.intro_detection is off" }
+                  running: { type: boolean }
+                  libraryId: { type: string }
+                  startedAt: { type: string, format: date-time }
+                  seasonsDone: { type: integer }
+                  seasonsTotal: { type: integer }
+                  episodesDone: { type: integer }
+                  episodesTotal: { type: integer, description: Episodes waiting when the run began }
+                  introsFound: { type: integer, description: Episodes given an intro in this run }
+                  creditsFound: { type: integer, description: Episodes given end credits in this run }
+                  unreadable: { type: integer, description: Files whose audio could not be decoded }
+                  paused: { type: boolean }
+                  pauseReason:
+                    type: string
+                    enum: [manual, playing, scanning]
+                    description: manual = paused by an admin until resumed; playing / scanning = giving way, resuming a minute after they stop
+                  current:
+                    type: object
+                    description: The season being worked on
+                    properties:
+                      series: { type: string }
+                      season: { type: integer }
+                      kind: { type: string, enum: [intro, credits] }
+                      phase: { type: string, enum: [reading, comparing, saving] }
+                      done: { type: integer }
+                      total: { type: integer }
+                  recent:
+                    type: array
+                    description: The latest episodes' outcomes, newest first
+                    items:
+                      type: object
+                      properties:
+                        itemId: { type: string }
+                        kind: { type: string, enum: [intro, credits] }
+                        series: { type: string }
+                        season: { type: integer }
+                        episode: { type: integer }
+                        found: { type: boolean }
+                        startSecs: { type: number }
+                        endSecs: { type: number }
+                  last:
+                    type: object
+                    description: Summary of the most recent finished run
+                    properties:
+                      libraryId: { type: string }
+                      finishedAt: { type: string, format: date-time }
+                      seconds: { type: integer }
+                      seasons: { type: integer }
+                      episodes: { type: integer }
+                      introsFound: { type: integer }
+                      creditsFound: { type: integer }
+                      unreadable: { type: integer }
+                      cancelled: { type: boolean }
+
+  /segments/pause:
+    post:
+      summary: Pause intro and credits detection until resumed (admin); kept across restarts
+      operationId: pauseSegments
+      responses:
+        "200": { description: The detection status, now paused }
+        "409": { description: Detection is turned off (libraries.intro_detection) }
+
+  /segments/resume:
+    post:
+      summary: Resume intro and credits detection (admin)
+      operationId: resumeSegments
+      responses:
+        "200": { description: The detection status }
+        "409": { description: Detection is turned off (libraries.intro_detection) }
 
   /search:
     get:
@@ -551,6 +741,38 @@ paths:
                     genre: { type: string }
                     count: { type: integer }
 
+  /libraries/{id}/recommended:
+    get:
+      summary: The library's Recommended tab, as rows of items
+      description: >
+        Built server-side so every client shows the same rows. Recently added
+        leads, ranked as on the home screen — series by their newest episode
+        for TV — and is left out for media types without that listing. The
+        rest are recommendations for the viewer: because you watched, highly
+        rated and unseen, genre rows and unwatched. Every item carries the
+        viewer's own watch state.
+      operationId: libraryRecommended
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Rows in display order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [kind, title, items]
+                  properties:
+                    kind: { type: string, enum: [recent, because, toprated, genre, unwatched] }
+                    title: { type: string }
+                    genre: { type: string, description: Set on a genre row, so its heading can open the full genre listing }
+                    items:
+                      type: array
+                      items: { $ref: "#/components/schemas/Item" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /libraries/{id}/collections:
     get:
       summary: The collections this library holds more than one film from
@@ -591,6 +813,137 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /integrations:
+    get:
+      summary: List connected Sonarr and Radarr instances (admin)
+      description: >
+        Cineva registers a webhook in each, so what they import is scanned in
+        within seconds rather than at the next scheduled rescan. API keys are
+        never returned.
+      operationId: listIntegrations
+      responses:
+        "200":
+          description: Connections, by kind then name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Integration" } }
+    post:
+      summary: Connect a Sonarr or Radarr instance and register Cineva's webhook in it (admin)
+      description: >
+        Checks the URL and API key against the instance's system status (and
+        that it is the kind named), then creates a webhook connection there
+        called "Cineva", subscribed to imports, upgrades, renames and
+        deletions. The instance tests the webhook by calling Cineva back
+        before it saves it, so callbackUrl must be Cineva's address as the
+        instance reaches it; it defaults to the address this request was
+        made to. Nothing is kept when any step fails.
+      operationId: createIntegration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IntegrationRequest" }
+      responses:
+        "201":
+          description: Connected, with the webhook registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Integration" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/UpstreamFailed" }
+
+  /integrations/{id}:
+    patch:
+      summary: Change a connection and register its webhook again (admin)
+      description: >
+        Blank fields keep their current values. The webhook is registered
+        again with a new secret, which also repairs one deleted on the
+        instance's side; if the instance refuses, the previous connection and
+        webhook are left as they were. When the URL changes, the webhook is
+        removed from the old instance where it can still be reached.
+      operationId: updateIntegration
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IntegrationRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Integration" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/UpstreamFailed" }
+    delete:
+      summary: Disconnect, removing Cineva's webhook from the instance (admin)
+      operationId: deleteIntegration
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Disconnected and the webhook removed }
+        "200":
+          description: >
+            Disconnected, but the instance could not be reached to remove the
+            webhook. It is left behind and fails Cineva's check from now on.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  warning: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /integrations/{id}/webhook:
+    post:
+      summary: Receive a Sonarr or Radarr webhook event
+      description: >
+        Called by the instance, not by users: public, authenticated with HTTP
+        basic auth as user "cineva" and the connection's secret, which Cineva
+        generates when it registers the webhook. Events that add, replace,
+        rename or remove files (Download, ImportComplete, Rename,
+        SeriesDelete, EpisodeFileDelete, MovieDelete, MovieFileDelete)
+        rescan the libraries of the connection's media type that contain the
+        event's paths — or all of them, when the instance sees the files at
+        different paths (as it does in a container). A rescan requested while
+        one is running follows it. Other events, including Test, are
+        acknowledged and ignored.
+      operationId: integrationWebhook
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Sonarr or Radarr's webhook payload; only the fields below are read.
+              properties:
+                eventType: { type: string }
+                series: { type: object, properties: { path: { type: string } } }
+                episodeFile: { type: object, properties: { path: { type: string } } }
+                episodeFiles: { type: array, items: { type: object, properties: { path: { type: string } } } }
+                movie: { type: object, properties: { folderPath: { type: string } } }
+                movieFile: { type: object, properties: { path: { type: string } } }
+      responses:
+        "200":
+          description: Acknowledged; the event does not change files
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookResult" }
+        "202":
+          description: Rescans started or queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { description: Missing or wrong webhook credentials }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /fs/dirs:
@@ -677,6 +1030,54 @@ paths:
                     movies: { type: integer }
                     episodes: { type: integer }
                     tracks: { type: integer }
+
+  /stats/plays/totals:
+    get:
+      summary: Watch totals for the last `days` days
+      description: >
+        Aggregates play history: how many plays started, how many reached the
+        watched threshold (90% of runtime), and the total wall-clock seconds
+        those playbacks were open. Duration is time the playback was open
+        rather than playhead movement, so seeking does not inflate or deflate
+        it. Rows recorded before the duration columns existed count as a play
+        with zero seconds and not completed, which is what was measured for
+        them. Separate from /stats/plays because that endpoint returns a bare
+        array and response shapes do not change within a version.
+      operationId: playTotals
+      parameters:
+        - { name: days, in: query, required: false, schema: { type: integer, default: 30, maximum: 365 } }
+      responses:
+        "200":
+          description: Totals over the window
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plays: { type: integer, description: Playbacks started }
+                  completed: { type: integer, description: Playbacks that reached 90% of runtime }
+                  secs: { type: integer, description: Total wall-clock seconds of playback }
+
+  /playbacks/{userId}/{itemId}:
+    delete:
+      summary: End a playback (admin)
+      description: >
+        Ends a playback whether or not it is transcoding, which is how a
+        direct play is stopped at all: the server only answers range requests
+        for those, so there is no session to kill. The playback is dropped
+        from the activity list and marked stopped; the owning client is
+        refused on its next POST /items/{id}/progress with 409 and stops
+        playing, which takes up to the heartbeat interval (~15 s). A
+        transcode session, if present, is torn down immediately. The mark
+        expires after 90 seconds, so the viewer can start the item again by
+        hand — this ends a stream, it does not revoke access.
+      operationId: stopPlaybackAdmin
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string } }
+        - { name: itemId, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Ended }
+        "404": { description: No such playback }
 
   /items/{id}/playback:
     delete:
@@ -815,6 +1216,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/PlayInfo" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { description: "The library's storage is not reachable, or the file did not answer within 15 s. The message names the library and folder and says what to check." }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /items/{id}/stream:
@@ -829,6 +1231,7 @@ paths:
         "200": { description: The media file }
         "206": { description: Partial content (range request) }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: "The library's storage is not reachable, or the file did not answer within 15 s. The message names the library and folder and says what to check." }
 
   /items/{id}/download:
     get:
@@ -895,6 +1298,49 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/PlayState" }
+        "409":
+          description: >
+            An administrator ended this playback (see DELETE
+            /playbacks/{userId}/{itemId}). The client should stop playing and
+            release the stream; the position sent with this request is still
+            saved, so resume lands where the viewer got to. Said once — a
+            later attempt to play the item again succeeds.
+
+  /items/{id}/next-up:
+    get:
+      summary: Where to carry on in a series or season
+      description: >
+        The episode this series or season should play next, for the user
+        making the request. Carries on with whatever is part-watched (more
+        than 10 seconds in and not finished), otherwise the first episode
+        never started, otherwise the first episode again because everything
+        is watched. Episodes are ordered by season then number, so the
+        pointer crosses season boundaries without the client knowing anything
+        about the hierarchy — which is why this lives on the server: the web
+        client and the native apps must not disagree about where someone is
+        up to. 204 when the item is not a series or season, or has no
+        episodes.
+      operationId: nextUpFor
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The episode to play
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  item: { $ref: "#/components/schemas/Item" }
+                  positionSecs: { type: integer, description: Resume position; 0 unless reason is "resume" }
+                  reason:
+                    type: string
+                    enum: [resume, next, restart]
+                    description: >
+                      Which promise the client's button should make — carry
+                      on part-way through, start one never begun, or watch
+                      the series again from the beginning.
+        "204": { description: Not a series or season, or it has no episodes }
 
   /items/{id}/next:
     get:
@@ -956,6 +1402,7 @@ paths:
   /continue-watching:
     get:
       summary: In-progress items for the home screen, most recent first
+      description: Limited to the libraries the viewer may see; at most 20.
       operationId: continueWatching
       responses:
         "200":
@@ -964,12 +1411,47 @@ paths:
             application/json:
               schema:
                 type: array
-                items:
-                  allOf:
-                    - { $ref: "#/components/schemas/Item" }
-                    - type: object
+                items: { $ref: "#/components/schemas/ResumeItem" }
+
+  /home:
+    get:
+      summary: Everything the home screen shows, in one request
+      description: >
+        Limited to the libraries the viewer may see. Continue Watching holds
+        one entry per series (its most recently played episode); Next Up is
+        the next unstarted episode of each recently watched series that has
+        nothing part-watched; shelves are each library's recently added row
+        (series ordered by their newest episode for TV) followed by the first
+        two recommendation rows of each film and TV library.
+      operationId: home
+      responses:
+        "200":
+          description: The home screen's rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [continueWatching, nextUp, shelves]
+                properties:
+                  continueWatching:
+                    type: array
+                    items: { $ref: "#/components/schemas/ResumeItem" }
+                  nextUp:
+                    type: array
+                    items: { $ref: "#/components/schemas/ResumeItem" }
+                  shelves:
+                    type: array
+                    items:
+                      type: object
                       properties:
-                        positionSecs: { type: integer }
+                        libraryId: { type: string }
+                        libraryName: { type: string }
+                        kind: { type: string, description: '"recent", or a recommendation row kind (because, toprated, genre, unwatched)' }
+                        title: { type: string }
+                        genre: { type: string }
+                        items:
+                          type: array
+                          items: { $ref: "#/components/schemas/Item" }
 
   /play/sessions:
     get:
@@ -1037,7 +1519,14 @@ components:
         hasPassword: { type: boolean }
         hasPin: { type: boolean }
         createdAt: { type: string }
-        libraryIds: { type: array, items: { type: string }, description: Granted libraries (admins see all regardless) }
+        libraryIds:
+          type: array
+          items: { type: string }
+          description: >
+            Every library this user can see, computed: the open libraries,
+            plus restricted ones that name the user or a group they belong
+            to; every library for an admin. Read-only — access is set per
+            library (PUT /libraries/{id}/access).
     Credentials:
       type: object
       required: [username, password]
@@ -1045,6 +1534,54 @@ components:
         username: { type: string }
         password: { type: string, minLength: 8 }
         displayName: { type: string }
+    Integration:
+      type: object
+      required: [id, kind, name, url, callbackUrl, notificationId, version]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [sonarr, radarr] }
+        name: { type: string }
+        url: { type: string, description: The instance's base URL }
+        callbackUrl: { type: string, description: Cineva's address as the instance reaches it }
+        notificationId: { type: integer, description: The webhook's id inside the instance; 0 if not registered }
+        version: { type: string, description: The instance's version when the connection was last saved }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    IntegrationRequest:
+      type: object
+      description: On create, kind, url and apiKey are required. On update, kind is ignored and blank fields keep their values.
+      properties:
+        kind: { type: string, enum: [sonarr, radarr] }
+        name: { type: string, description: Defaults to "Sonarr" or "Radarr" }
+        url: { type: string }
+        apiKey: { type: string, writeOnly: true }
+        callbackUrl: { type: string }
+    WebhookResult:
+      type: object
+      properties:
+        event: { type: string }
+        rescanning: { type: array, items: { type: string }, description: Names of the libraries rescanning }
+    UserGroup:
+      type: object
+      required: [id, name, memberIds]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        memberIds: { type: array, items: { type: string } }
+        createdAt: { type: string }
+    UserGroupRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        memberIds: { type: array, items: { type: string } }
+    LibraryAccess:
+      type: object
+      required: [restricted, userIds, groupIds]
+      properties:
+        restricted: { type: boolean, description: "False: every user sees the library, and the lists are ignored" }
+        userIds: { type: array, items: { type: string } }
+        groupIds: { type: array, items: { type: string } }
     UserRequest:
       type: object
       properties:
@@ -1053,11 +1590,21 @@ components:
         password: { type: string, minLength: 8, description: On create, required unless a PIN is given (admins always); on update, resets it }
         role: { type: string, enum: [admin, user] }
         disabled: { type: boolean }
-        libraryIds: { type: array, items: { type: string } }
         pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
     Settings:
       type: object
       properties:
+        detectionRateMB:
+          type: integer
+          enum: [0, 50, 25, 10]
+          description: >
+            Cap on how fast intro and credits detection reads media, in MB/s;
+            0 is no cap. With a cap, files are read one at a time. Detection
+            also always pauses while anything plays or a scan runs.
+        detectionRateOptions:
+          type: array
+          items: { type: integer }
+          description: Read-only; the caps offered.
         loginMode:
           type: string
           enum: [picker, form]
@@ -1138,6 +1685,18 @@ components:
         itemCount: { type: integer, description: Playable items (movies + episodes) }
         createdAt: { type: string }
         updatedAt: { type: string }
+        restricted: { type: boolean, description: "Seen only by the users and groups in its access (GET /libraries/{id}/access); otherwise open to everyone" }
+        storage:
+          type: object
+          description: >
+            Whether the library's folders can be reached, from a check every
+            30 s. While unavailable, play and stream for its items fail at
+            once with 503, scans fail, and intro detection skips it.
+          properties:
+            available: { type: boolean }
+            since: { type: string, format: date-time, description: When it last changed }
+            path: { type: string, description: The folder that failed }
+            error: { type: string, description: 'How it failed, e.g. "not responding", "host is down"' }
 
     Item:
       type: object
@@ -1192,7 +1751,7 @@ components:
           type: boolean
           description: >
             The requesting user's own state, stamped on by the library
-            listing. Shared across a film's versions: it is recorded against
+            listing and on a season's episodes in item detail. Shared across a film's versions: it is recorded against
             the primary.
         positionSecs:
           type: integer
@@ -1219,8 +1778,37 @@ components:
           description: >
             Stream index actually being played — the file's default unless
             the request asked for another. -1 when the file has no audio.
+        segments:
+          type: array
+          description: >
+            Parts of the episode found by detection: an intro the player
+            offers to skip, and end credits, where the up-next card appears
+            and autoplay counts down. Reaching the credits also marks the
+            episode watched. Absent until something has been found.
+          items: { $ref: "#/components/schemas/Segment" }
         source:
           $ref: "#/components/schemas/PlaySource"
+
+    ResumeItem:
+      description: An item with the viewer's resume position; an episode also carries its series.
+      allOf:
+        - { $ref: "#/components/schemas/Item" }
+        - type: object
+          properties:
+            positionSecs: { type: integer }
+            seriesId: { type: string }
+            seriesTitle: { type: string, description: "An episode's series; absent for anything else" }
+            seriesPoster: { type: string }
+            seriesBackdrop: { type: string }
+
+    Segment:
+      type: object
+      description: A part of an item that is not the item itself, in seconds from the start of the file.
+      required: [kind, startSecs, endSecs]
+      properties:
+        kind: { type: string, enum: [intro, credits] }
+        startSecs: { type: number }
+        endSecs: { type: number }
 
     AudioTrack:
       type: object
@@ -1322,6 +1910,14 @@ components:
         finishedAt: { type: string }
 
   responses:
+    UpstreamFailed:
+      description: Sonarr or Radarr could not be reached, refused the API key, or refused the webhook (its own message is passed on)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
     BadRequest:
       description: Invalid request
       content:

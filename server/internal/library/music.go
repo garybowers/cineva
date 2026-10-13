@@ -35,7 +35,7 @@ var trackFileRe = regexp.MustCompile(`^(\d{1,3})\s*-\s*(.+)$`)
 
 // scanMusic builds artist -> album -> track from tags first, directory
 // layout (Artist/Year - Album/NN - Title.ext) as fallback.
-func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report reportFunc) (int, int, error) {
+func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPlan, report reportFunc) (int, int, error) {
 	var files []string
 	for _, root := range lib.Paths {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -52,6 +52,8 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 		}
 	}
 	sort.Strings(files)
+	todo := plan.changed(files)
+	skipped := len(files) - len(todo)
 
 	created := 0
 	artistIDs := map[string]string{}              // artist name -> item id
@@ -59,11 +61,11 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 	albumArt := map[string]bool{}                 // album dirs whose artwork is done
 	mbData := map[string]*metadata.MusicRelease{} // album dir -> MB release (nil = looked up, no match)
 
-	for i, path := range files {
+	for i, path := range todo {
 		if err := ctx.Err(); err != nil {
 			return len(files), created, err
 		}
-		report(i, created, len(files))
+		report(skipped+i, created, len(files))
 		info, err := media.ProbeAudio(path)
 		if err != nil {
 			log.Printf("probe audio %s: %v", path, err)
@@ -140,6 +142,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 			if err != nil {
 				return len(files), created, err
 			}
+			plan.keep[saved.ID] = true
 			artistID, artistIDs[artistName] = saved.ID, saved.ID
 			created++
 		}
@@ -175,6 +178,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 			if err != nil {
 				return len(files), created, err
 			}
+			plan.keep[saved.ID] = true
 			albumID, albumIDs[albumDir] = saved.ID, saved.ID
 			created++
 		}
@@ -205,13 +209,12 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, report repor
 			RuntimeSecs: info.RuntimeSecs, Container: info.Container,
 			AudioCodec: info.Codec,
 		}
-		if st, err := os.Stat(path); err == nil {
-			track.SizeBytes = st.Size()
-		}
+		plan.stamp(&track, path)
 		saved, err := m.Store.UpsertItem(ctx, track)
 		if err != nil {
 			return len(files), created, err
 		}
+		plan.keep[saved.ID] = true
 		// Tracks inherit their album's cover for player/list display.
 		if album, err := m.Store.Item(ctx, albumID); err == nil && album.Poster != "" && saved.Poster != album.Poster {
 			saved.Poster = album.Poster

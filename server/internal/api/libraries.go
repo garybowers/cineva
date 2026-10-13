@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -26,6 +27,9 @@ type libraryResponse struct {
 	// a client to say "scanning…" instead of telling a non-admin to start
 	// one, and not enough to leak anything the scan events withhold.
 	Scanning bool `json:"scanning"`
+	// Storage is whether the library's folders can be reached, so a client
+	// can say so instead of offering titles that cannot play.
+	Storage library.StorageStatus `json:"storage"`
 }
 
 // PATCH /libraries/:id (admin) — rename, or change which paths it covers.
@@ -93,6 +97,9 @@ func (s *server) listLibraries(c echo.Context) error {
 		// Whether a scan is running, so a client that loads mid-scan shows
 		// the right empty state without waiting for the next event.
 		resp.Scanning = s.manager.Scanning(lib.ID)
+		if s.storage != nil {
+			resp.Storage = s.storage.Status(lib.ID)
+		}
 		for _, kind := range []store.ItemKind{store.KindMovie, store.KindEpisode, store.KindTrack} {
 			n, err := s.store.CountItems(ctx, lib.ID, kind)
 			if err != nil {
@@ -129,11 +136,18 @@ func (s *server) scanLibrary(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "library not found")
 	}
-	scan, err := s.manager.StartScan(ctx, lib)
+	// Incremental unless asked otherwise: only files changed since the last
+	// scan are read and matched again.
+	full := c.QueryParam("full") == "true"
+	scan, err := s.manager.StartScan(ctx, lib, full)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
-	s.audit(c, "scan.start", "library", lib.ID, lib.Name, "")
+	detail := ""
+	if full {
+		detail = "full rescan"
+	}
+	s.audit(c, "scan.start", "library", lib.ID, lib.Name, detail)
 	return c.JSON(http.StatusAccepted, scan)
 }
 
@@ -163,7 +177,7 @@ func (s *server) libraryItems(c echo.Context) error {
 		if err != nil {
 			return err
 		}
-		return c.JSON(http.StatusOK, s.withPlayState(c, items))
+		return c.JSON(http.StatusOK, s.withPlayState(c, c.Param("id"), items))
 	}
 	// ?since=<mark> returns only what changed, for polling during a scan.
 	// The response then carries the next mark in X-Items-Mark rather than
@@ -174,7 +188,7 @@ func (s *server) libraryItems(c echo.Context) error {
 			return err
 		}
 		c.Response().Header().Set("X-Items-Mark", mark)
-		return c.JSON(http.StatusOK, s.withPlayState(c, items))
+		return c.JSON(http.StatusOK, s.withPlayState(c, c.Param("id"), items))
 	}
 	items, err := s.store.ItemsByLibrary(c.Request().Context(), c.Param("id"))
 	if err != nil {
@@ -188,7 +202,7 @@ func (s *server) libraryItems(c echo.Context) error {
 		}
 	}
 	c.Response().Header().Set("X-Items-Mark", mark)
-	return c.JSON(http.StatusOK, s.withPlayState(c, items))
+	return c.JSON(http.StatusOK, s.withPlayState(c, c.Param("id"), items))
 }
 
 // withPlayState stamps the viewer's own watched flag and resume position onto
@@ -197,12 +211,12 @@ func (s *server) libraryItems(c echo.Context) error {
 //
 // A failure here is not worth failing the listing for: the grid still works
 // without the markers, so the items are returned undecorated.
-func (s *server) withPlayState(c echo.Context, items []store.Item) []store.Item {
+func (s *server) withPlayState(c echo.Context, libraryID string, items []store.Item) []store.Item {
 	uid := userID(c)
 	if uid == "" || len(items) == 0 {
 		return items
 	}
-	states, err := s.store.PlayStatesByLibrary(c.Request().Context(), uid, c.Param("id"))
+	states, err := s.store.PlayStatesByLibrary(c.Request().Context(), uid, libraryID)
 	if err != nil || len(states) == 0 {
 		return items
 	}
@@ -219,18 +233,32 @@ func (s *server) withPlayState(c echo.Context, items []store.Item) []store.Item 
 // GET /libraries/:id/recommended — the Recommended tab's shelves.
 //
 // Built server-side for the same reason next-up is: the rules should not be
-// reimplemented, slightly differently, in every client.
+// reimplemented, slightly differently, in every client. Recently added leads,
+// ranked as on the home screen: a series by its newest episode, which a
+// client holding only series rows cannot work out for itself.
 func (s *server) libraryRecommended(c echo.Context) error {
 	if !canSeeLibrary(currentUser(c), c.Param("id")) {
 		return echo.NewHTTPError(http.StatusNotFound, "library not found")
 	}
-	rows, err := s.store.Recommendations(c.Request().Context(), userID(c), c.Param("id"))
+	ctx := c.Request().Context()
+	lib, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	recs, err := s.store.Recommendations(ctx, userID(c), lib.ID)
 	if err != nil {
 		return err
 	}
+	rows := make([]store.RecRow, 0, len(recs)+1)
+	// Not every media type has a recently added listing yet; those simply
+	// go without the row, as they do on the home screen.
+	if recent, err := s.store.RecentlyAdded(ctx, lib, homeRowSize); err == nil && len(recent) > 0 {
+		rows = append(rows, store.RecRow{Kind: "recent", Title: "Recently added", Items: recent})
+	}
+	rows = append(rows, recs...)
 	// Each row's films carry the viewer's own state, like any other listing.
 	for i := range rows {
-		rows[i].Items = s.withPlayState(c, rows[i].Items)
+		rows[i].Items = s.withPlayState(c, c.Param("id"), rows[i].Items)
 	}
 	return c.JSON(http.StatusOK, rows)
 }
@@ -286,7 +314,7 @@ func (s *server) collectionItems(c echo.Context) error {
 	// does, so native clients behave identically.
 	return c.JSON(http.StatusOK, collectionDetail{
 		Collection: col,
-		Items:      s.withPlayState(c, items),
+		Items:      s.withPlayState(c, c.Param("id"), items),
 	})
 }
 
@@ -339,6 +367,11 @@ func (s *server) getItem(c echo.Context) error {
 		if len(crew) > 0 {
 			resp0Crew = crew
 		}
+	}
+	// A season's episodes carry the viewer's progress so each row can show
+	// how far in they are without opening it.
+	if item.Kind == store.KindSeason {
+		children = s.withPlayState(c, item.LibraryID, children)
 	}
 	resp := map[string]any{"item": item, "children": children}
 	if len(resp0Cast) > 0 {
@@ -568,5 +601,5 @@ func (s *server) collectionAfterEdit(c echo.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(http.StatusOK, collectionDetail{Collection: col, Items: s.withPlayState(c, items)})
+	return c.JSON(http.StatusOK, collectionDetail{Collection: col, Items: s.withPlayState(c, c.Param("id"), items)})
 }

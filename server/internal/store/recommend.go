@@ -7,7 +7,7 @@ import "context"
 // native app show the same thing rather than each inventing its own rules.
 type RecRow struct {
 	// Kind lets a client style or reorder a row without parsing its title.
-	Kind  string `json:"kind"` // "because" | "toprated" | "genre" | "unwatched"
+	Kind  string `json:"kind"` // "recent" | "because" | "toprated" | "genre" | "unwatched"
 	Title string `json:"title"`
 	// Genre is set on a "genre" row, so tapping the heading can open the
 	// full genre listing rather than a dead end.

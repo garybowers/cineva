@@ -9,7 +9,7 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 ### Common to all domains
 - **Library management**: libraries follow the Jellyfin/Plex model. A library is created with exactly one media type (Movies, TV, Music, Audiobooks, Podcasts, Books) chosen at creation time and immutable afterwards; it points at one or more filesystem paths. You can have any number of libraries per type (e.g. "Kids Movies" and "Movies"), but a library never spans multiple media types. A scanner walks the paths, identifies files, extracts technical info via ffprobe (or format parsing for books), and matches against the domain's metadata provider for artwork and details.
 - **Per-user state**: resume positions (video playback, audio listen position, book reading position), finished flags, and continue-watching/listening/reading rows — same model everywhere.
-- **Users & auth**: local accounts with argon2id-hashed passwords, session tokens for browsers, API keys for clients. One admin role, regular user role. Per-user library grants.
+- **Users & auth**: local accounts with argon2id-hashed passwords, session tokens for browsers, API keys for clients. One admin role, regular user role. Libraries are open to every user by default; an admin can restrict one to chosen users and groups (groups are per server: "Kids", "Grown-ups"). Admins see everything.
 - **Downloads**: any item can be downloaded from the web client — the original file, or a portable transcode prepared server-side — so laptops can carry media offline while travelling.
 - **Built-in web client**: mobile-first responsive layout, installable as a PWA — until the native apps exist, a phone browser is the mobile interface, so every screen must work at phone width.
 - **Admin UI**: manage libraries, trigger/monitor scans, manage users, view active streams/transcodes, server settings.
@@ -19,7 +19,7 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 - Direct play when the client supports the file natively; on-the-fly HLS transcoding via ffmpeg when it doesn't. Seeking within transcoded streams must work (segment-based, restart-at-offset).
 - Subtitles: text-based (SRT/ASS, embedded or sidecar) extracted and served as WebVTT for the player to overlay; image-based (PGS/VobSub) burned in during transcode.
 - **Player — movies vs TV**: one player core, two presentations. Movies are standalone: play, resume, and return to the detail page when finished. TV is hierarchical (series → season → episode) and the player is next-up aware:
-  - **Next-episode autoplay**: as an episode enters its end-credits window, the player overlays an up-next card (next episode's thumbnail + countdown) and auto-plays it unless dismissed. In v1 the credits window is a heuristic (final ~40 seconds, configurable); later, credits *detection* replaces the heuristic with the real credit start. Autoplay is a per-user setting (on by default).
+  - **Next-episode autoplay**: as an episode enters its end-credits window, the player overlays an up-next card (next episode's thumbnail + countdown) and auto-plays it unless dismissed. Where credits detection has found the real credit start (`internal/segments`, by the end theme episodes share) the card appears there and autoplay counts down 15 seconds; otherwise the heuristic window (final ~40 seconds) applies and autoplay waits for the end of the file. Autoplay is a per-user setting (on by default).
   - **Next-up logic** lives server-side (`/api/v1/.../next-up`), not in the client: crossing the watched threshold (~90%) marks the episode watched and advances the series' next-up pointer, so the web client and future native apps behave identically.
 
 ### Audio — music, audiobooks, podcasts (stage 2)
@@ -33,15 +33,19 @@ All media domains share one schema, scanner framework, API shape, and per-user s
 - **OPDS catalogue feed** so external reader apps (KOReader, Calibre, Kobo-style clients) can browse and download natively.
 
 ### Federation (designed now, built post-v1)
-Two or more Cineva servers (e.g. one at home, one at a relative's house) link as peers so remote libraries appear alongside local ones — to the user it's just another library in the list.
+Several Cineva servers (e.g. ours, Mum and Dad's, Rob's) join a **nebula** and behave as **one Cineva**: whichever member's address you open, you get the same single UI across everyone's libraries, signed in as yourself. The full design is in [server/docs/federation.md](server/docs/federation.md); this is the contract.
 
-- **Identity**: every server generates an Ed25519 identity keypair on first startup. Pairing happens in the admin UI: exchange public keys + `host:port`, and both sides must approve the link (mutual trust, no one-way follows).
-- **Transport**: a dedicated federation port (separate from the main HTTP port — this is the only thing exposed to the internet) speaking mTLS, each side pinning the peer's exchanged key. All federation traffic — metadata sync, heartbeat, media — flows over this link.
-- **Metadata**: peers sync library metadata and artwork into a local cache periodically, so browsing remote libraries is instant and offline-cheap. Sync is pull-based with incremental updates.
-- **Presence-gated visibility**: a heartbeat runs over the link; when a peer is unreachable, its libraries simply disappear from every client's library list — never broken entries, never dead play buttons. The cache is kept so the library reappears instantly on reconnect.
-- **Playback**: the owning server transcodes its own media; the local server proxies the stream over the federation link to its clients. Clients never talk to the remote server directly.
-- **Access control**: per-user grants, same model as local libraries.
-- **Watch state** stays on the user's home server; it is never written to the peer.
+- **Nebula membership**: every server has an Ed25519 identity keypair (from first startup). An admin creates a nebula; other servers join with a one-time invite code from any member, and joining introduces them to every member. Any server can remove itself from its nebula at any time on its own admin's say-so, dropping what it cached from the others (and they from it); a member can also block a peer locally. Underneath, each pair of members has its own mTLS link with pinned keys.
+- **One UI from any member**: every member serves the same nebula-wide web client. Clients only ever talk to the server whose address they opened, which proxies media, metadata, sign-in and watch state from the other members.
+- **Merged and per-server views**: libraries are merged by media type by default — one Movies, one TV Shows — with copies on different members matched by a content key (`tmdb:movie:<id>`, `tmdb:tv:<id>:s<n>e<n>`, …) and played from the best available copy. A scope picker narrows any view to a single member's libraries, and a member's own address remains reachable directly.
+- **Reachability**: designed for the worst case — no member accepts inbound connections. Members connect outbound to a rendezvous (any reachable member, else a small relay on a machine the family controls), which helps them connect directly and relays when it cannot; mTLS runs end to end so a relay sees only ciphertext. Members already joined by a VPN (Tailscale, WireGuard, Slack's Nebula — no relation to the name) just use those addresses.
+- **Metadata**: members pull incremental metadata (and intro/credits segments) from each other into a local cache, as `items` rows under libraries with `source = 'federated'`, so browsing, search and recommendations are instant and work unchanged.
+- **Presence-gated visibility**: a heartbeat runs over each link; an offline member's titles leave every view, or switch to another copy — never broken entries, never dead play buttons. The cache is kept so they return instantly.
+- **Playback**: the owning server transcodes its own media; the serving server proxies the stream. Remote quality defaults to what the link can carry.
+- **Sign in anywhere**: every account belongs to one home server, the authority for who the user is and what they may see. Another member relays the credential check to the home server and holds a delegated, revocable session. A member's admin cannot grant a visiting user more than their home server allows.
+- **Access control**: same model as on a single server — every library is open to everyone in the nebula unless its owning server restricts it to chosen users and groups, which may belong to any member. The home server vouches for a user's identity and group memberships; the owning server decides.
+- **Watch state** stays on the user's home server, keyed by content key so it follows the user across copies and members; other members forward reads and writes to it and buffer writes while it is unreachable.
+- **Versions**: the federation protocol is versioned (`/federation/v1`) with capability flags; members below the nebula's minimum are hidden with the reason shown, and the admin flags version drift.
 
 ### Offline sync for native clients (designed now, built post-v1)
 Native mobile/laptop apps (planned, will live in `clients/`) need true offline media for travel without connectivity. The server side:
@@ -52,11 +56,11 @@ Native mobile/laptop apps (planned, will live in `clients/`) need true offline m
 - The v1 web-client download button is the primitive; this milestone adds the device/sync layer on top. Design the download endpoints in the OpenAPI spec from the start so native apps aren't blocked on a redesign.
 
 ### Later (don't build speculatively)
-- Intro & credits detection: fingerprint analysis across a season's episodes to find intro/credit boundaries, powering a "Skip intro" button and replacing the fixed credits-window heuristic for next-episode autoplay
+- Visual credits detection (dark frames, scrolling text) for shows whose end music changes every episode — the audio comparison in `internal/segments` cannot see their credits, and they fall back to the fixed window
 - Photo libraries
 - Hardware-accelerated transcoding (VAAPI/QSV/NVENC)
 - OIDC/SSO login
-- Remote access relay (NAT traversal for clients away from home)
+- Remote access relay for *clients* away from home (members of a federation nebula reach each other through the nebula's rendezvous; this is the phone-on-a-train case)
 - PostgreSQL backend for very large libraries
 
 ### Non-goals
@@ -72,13 +76,15 @@ Native mobile/laptop apps (planned, will live in `clients/`) need true offline m
 - **HTTP framework**: [Echo](https://echo.labstack.com/). Handlers stay thin; business logic lives in service packages.
 - **Database**: SQLite via `modernc.org/sqlite` (pure Go, keeps the binary CGO-free). All data access goes through repository interfaces in `server/internal/store` so a PostgreSQL implementation can be added later — never call SQL from handlers or services directly.
 - **Migrations**: versioned SQL files embedded with `go:embed`, applied at startup.
-- **Transcoding**: ffmpeg via [ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo) (statically linked ffmpeg; CGO). Hardware transcoding uses the host's `libva`, loaded with `dlopen` at first use (`internal/media/libva_shim.c`) rather than linked — a VA-API driver is version-locked to the libva that loads it (`__vaDriverInit_<major>_<minor>`), so the copy bundled in the static archive only matches by luck, while a hard link would stop the binary starting at all on a host without libva. The shim keeps both properties: the host's libva is used where present, and where it is absent the server falls back to software like any machine without a GPU. Media inspection uses the same bindings (`internal/media.Probe`). The package is vendored as a git submodule at `third_party/ffmpeg-statigo` with a `replace` directive in go.mod — after cloning run `make setup` once to fetch the submodule, the static libraries (not in git) and the npm dependencies before building.
+- **Transcoding**: ffmpeg via [ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo) (statically linked ffmpeg; CGO). Hardware transcoding uses the host's `libva`, loaded with `dlopen` at first use (`internal/media/libva_shim.c`) rather than linked — a VA-API driver is version-locked to the libva that loads it (`__vaDriverInit_<major>_<minor>`), so the copy bundled in the static archive only matches by luck, while a hard link would stop the binary starting at all on a host without libva. The shim keeps both properties: the host's libva is used where present, and where it is absent the server falls back to software like any machine without a GPU. Media inspection uses the same bindings (`internal/media.Probe`). The package is vendored as a git submodule at `third_party/ffmpeg-statigo` with a `replace` directive in go.mod — after cloning run `make setup` once to fetch the submodule, build the static library (not in git) and install the npm dependencies before building.
+
+  **We build our own ffmpeg rather than using upstream's prebuilt library.** Upstream populates `HWAccels` only for VideoToolbox on macOS, so its Linux builds ship `--enable-hwaccel=` for nothing. VAAPI is the one backend with no standalone decoders — it decodes *only* through an hwaccel — so a stock library gives AMD (and Intel-via-VAAPI) hosts hardware encode but software decode. `third_party/patches/ffmpeg-statigo-hwaccel.patch` adds the six Linux VAAPI hwaccels plus the `pgssub` decoder, and the `$(LIB)` target applies it to the pinned submodule and builds from source. Re-applying the patch is a no-op, so a rebuild does not need a clean submodule. Keep the patch as the unit of change: it is also what we would raise upstream. Never replace the library with `cmd/download-lib` — hardware decode silently reverts to software and only the startup log says so.
 - **Streaming**: HLS (fMP4 segments) for video transcodes; HTTP range requests for direct play and audio; Opus/AAC for audio transcodes.
 - **Book handling**: EPUB/OPF parsed natively in Go; CBZ via `archive/zip`, CBR via a pure-Go RAR reader (e.g. `nwaples/rardecode`); OPDS 1.2 for the catalogue feed.
 - **API**: REST, JSON, spec-first. The OpenAPI 3.1 spec lives at `server/docs/openapi.yaml` and is the contract — update the spec in the same change as the handlers. Third-party clients generate SDKs from it.
 - **Web client & admin UI**: Svelte + Vite. Built to static assets and embedded in the Go binary with `go:embed`. EPUB rendering via epub.js (or foliate-js); audio playback via the Media Session API for lock-screen controls.
 - **Metadata providers**: one interface per domain — TMDB (video), MusicBrainz + Cover Art Archive (music), Open Library (books/audiobooks), RSS (podcasts) — so alternatives can be added.
-- **Federation**: Ed25519 server identity, mTLS on a dedicated port with pinned peer keys, pull-based metadata sync, heartbeat-gated visibility (see Federation requirements above).
+- **Federation**: Ed25519 server identity, nebulae joined by invite code, mTLS links with pinned peer keys over direct, VPN or relayed paths (outbound-only via a rendezvous), pull-based metadata sync, heartbeat-gated visibility, content-key matching for merged libraries and portable watch state (see Federation requirements above and `server/docs/federation.md`).
 
 ## Architecture & layout
 
@@ -92,7 +98,9 @@ server/                 Go module (all backend code)
   internal/books/       EPUB/PDF/CBZ/CBR parsing, OPDS feed
   internal/podcast/     RSS polling, episode download/retention
   internal/metadata/    provider interfaces + TMDB/MusicBrainz/Open Library clients
-  internal/federation/  peer identity, pairing, mTLS listener, sync, heartbeat
+  internal/segments/    intro & credits detection: audio fingerprints compared across a season's episodes
+  internal/arr/         Sonarr/Radarr connections: webhook registration and the events that trigger rescans
+  internal/federation/  nebula membership, invites, mTLS links, rendezvous/relay, sync, heartbeat, delegated sign-in
   internal/store/       repository interfaces + SQLite implementation, migrations
   internal/auth/        sessions, password hashing, API keys
   ui/client/            built-in web client (Svelte)
@@ -106,7 +114,7 @@ Rules:
 - Server code never lives outside `server/`; the built-in UIs live in `server/ui/client` and `server/ui/admin` (not `clients/`, which is reserved for standalone client apps).
 - Cobra commands in `server/cmd/` do flag/config parsing and wiring only — construct services and call them. No business logic in commands or handlers.
 - Long-running work (scans, transcodes, feed polls) runs in managed goroutines with context cancellation; expose progress over the API, never block a request on a scan.
-- All configuration goes through Viper (config file + `CINEVA_*` env bindings + flags); nothing reads `os.Getenv` directly. `server/cineva.yaml` is the local-dev config and the living reference: when a feature adds a config key, add it there with a comment naming its `CINEVA_*` env equivalent, in the same change.
+- All configuration goes through Viper (config file + `CINEVA_*` env bindings + flags); nothing reads `os.Getenv` directly. `server/cineva.example.yaml` is committed and is the living reference for what is configurable: when a feature adds a config key, add it there with a comment naming its `CINEVA_*` env equivalent, in the same change. `server/cineva.yaml` is the local-dev copy and stays gitignored — it holds the TMDB key.
 - New media domains reuse the shared item/library/user-state schema and scanner framework — a domain is a set of implementations of existing interfaces, not a parallel subsystem.
 
 ## Conventions
@@ -137,7 +145,7 @@ backlog entries; it cannot be called done with undocumented gaps.
 7. **Audio**: music + audiobook scanners (tags, MusicBrainz), audio streaming and transcode, gapless albums, chapters/speed/resume, music + audiobook player UIs.
 8. **Podcasts**: RSS subscriptions, feed polling, episode auto-download and retention, episode player.
 9. **Books**: ebook/comic scanners, Open Library matching, EPUB web reader with position sync, CBZ/CBR page reader, PDF passthrough, OPDS feed.
-10. **Federation**: identity pairing UI, federation listener, metadata sync, heartbeat/visibility, proxied playback across all domains.
+10. **Federation**: nebulae and invites, links and heartbeat, metadata sync with per-server scope, proxied playback, merged views by content key, sign-in anywhere with watch state at home, rendezvous/relay — staged 10a–10f in `server/docs/federation.md`. Groundwork worth doing before it (content keys on items, watch state keyed by them) is listed there under "Preparing now".
 11. **Offline sync**: device registration, async download jobs, batched state sync — the server side for the native apps in `clients/`.
 
 ## Open questions (resolve before building the relevant milestone)

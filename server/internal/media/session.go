@@ -41,12 +41,21 @@ type Session struct {
 	// shows whether a stream is costing GPU or CPU.
 	Accel string `json:"accel"`
 
-	mu           sync.Mutex
-	hw           *HWContext // device this session encodes on, nil for software
-	audioTrack   int        // stream index to play, -1 for the best stream
-	hdr          string     // Info.HDRFormat, so a restart-at-offset job tone maps too
-	segSecsReal  float64    // true segment length; see realSegmentSecs
-	cancel       context.CancelFunc
+	mu          sync.Mutex
+	hw          *HWContext // device this session encodes on, nil for software
+	audioTrack  int        // stream index to play, -1 for the best stream
+	hdr         string     // Info.HDRFormat, so a restart-at-offset job tone maps too
+	burnSub     int        // image subtitle stream to paint in, 0 for none
+	segSecsReal float64    // true segment length; see realSegmentSecs
+	runtimeSecs int        // the item's duration, kept so State() can describe the session
+	// restored marks a session rebuilt from stored state, which has no
+	// transcoder running until the first segment is requested.
+	restored bool
+	cancel   context.CancelFunc
+	// done is closed when the transcode goroutine returns. shutdown waits on
+	// it before deleting the directory, so ffmpeg is never still opening a
+	// file in a directory that is being removed underneath it.
+	done         chan struct{}
 	startSegment int
 	lastReq      int // highest segment index a client asked for
 	lastAccess   time.Time
@@ -67,6 +76,14 @@ type SessionManager struct {
 	// least-recently-used session directories to stay under it. Zero
 	// disables the cap.
 	MaxBytes int64
+
+	// Persist and Forget record and remove a session's description, so a
+	// restart can pick up where it left off instead of discarding segments
+	// that are still on disk. Hooks rather than a store dependency: the
+	// media package knows how to transcode, not where anything is kept.
+	// Both may be nil, in which case sessions simply do not survive.
+	Persist func(SessionState)
+	Forget  func(id string)
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -125,6 +142,85 @@ type StartOpts struct {
 	// nominal segment length.
 	FrameRateNum int
 	FrameRateDen int
+	// BurnSubtitle is the stream index of an image-based subtitle to paint
+	// into the picture, or 0 for none. Only honoured when the video is
+	// being re-encoded — nothing can be drawn on a copied stream.
+	BurnSubtitle int
+}
+
+// SessionState is everything needed to re-register a session after a
+// restart. The transcoder's own progress is deliberately absent: a restored
+// session is idle until a segment is requested, and the restart-at-offset
+// path then starts it wherever the viewer actually is.
+type SessionState struct {
+	ID           string
+	ItemID       string
+	Title        string
+	InputPath    string
+	Dir          string
+	SegmentSecs  int
+	NumSegments  int
+	RuntimeSecs  int
+	Quality      Quality
+	AudioTrack   int
+	HDR          string
+	SegSecsReal  float64
+	BurnSubtitle int
+}
+
+// State describes the session for persistence.
+func (s *Session) State() SessionState {
+	return SessionState{
+		ID: s.ID, ItemID: s.ItemID, Title: s.Title, InputPath: s.InputPath,
+		Dir: s.Dir, SegmentSecs: s.SegmentSecs, NumSegments: s.NumSegments,
+		RuntimeSecs: s.runtimeSecs, Quality: s.Quality,
+		AudioTrack: s.audioTrack, HDR: s.hdr, SegSecsReal: s.segSecsReal,
+		BurnSubtitle: s.burnSub,
+	}
+}
+
+// Restore re-registers sessions from stored state, skipping any whose
+// segment directory has gone. Nothing is transcoded here: a restored session
+// starts work only when a segment is asked for.
+//
+// Returns the directories it took ownership of, so the orphan sweep leaves
+// them alone — they are not orphans, they are the point.
+func (sm *SessionManager) Restore(states []SessionState) []string {
+	kept := make([]string, 0, len(states))
+	for _, st := range states {
+		if fi, err := os.Stat(st.Dir); err != nil || !fi.IsDir() {
+			// The directory went (swept, or the disk was cleared), so the
+			// session has nothing to offer; forget it.
+			if sm.Forget != nil {
+				sm.Forget(st.ID)
+			}
+			continue
+		}
+		hw := sm.hardware()
+		s := &Session{
+			hdr: st.HDR, segSecsReal: st.SegSecsReal, audioTrack: st.AudioTrack,
+			burnSub: st.BurnSubtitle,
+			ID:      st.ID, ItemID: st.ItemID, Title: st.Title, InputPath: st.InputPath,
+			Dir: st.Dir, SegmentSecs: st.SegmentSecs, NumSegments: st.NumSegments,
+			runtimeSecs: st.RuntimeSecs,
+			Quality:     st.Quality,
+			Accel:       hw.Name(),
+			hw:          hw,
+			lastAccess:  time.Now(),
+			// No transcoder is running, and restartLocked has not been
+			// called — the first segment request starts one at the right
+			// offset.
+			restored: true,
+		}
+		sm.mu.Lock()
+		sm.sessions[s.ID] = s
+		sm.mu.Unlock()
+		kept = append(kept, st.Dir)
+	}
+	if len(kept) > 0 {
+		log.Printf("transcode: restored %d session(s) from the previous run", len(kept))
+	}
+	return kept
 }
 
 func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
@@ -160,20 +256,25 @@ func (sm *SessionManager) Start(o StartOpts) (*Session, error) {
 	hw := sm.hardware()
 	s := &Session{
 		hdr:         o.HDR,
+		burnSub:     o.BurnSubtitle,
 		segSecsReal: realSegmentSecs(sm.SegmentSecs, o.FrameRateNum, o.FrameRateDen),
 		audioTrack:  audioTrack,
 		ID:          id, ItemID: itemID, Title: title, InputPath: inputPath,
 		Dir: dir, SegmentSecs: sm.SegmentSecs, NumSegments: numSeg,
-		Quality:    q,
-		Accel:      hw.Name(),
-		hw:         hw,
-		lastAccess: time.Now(),
+		runtimeSecs: runtimeSecs,
+		Quality:     q,
+		Accel:       hw.Name(),
+		hw:          hw,
+		lastAccess:  time.Now(),
 	}
 	s.restartLocked(sm.baseCtx, startSecs/sm.SegmentSecs)
 
 	sm.mu.Lock()
 	sm.sessions[id] = s
 	sm.mu.Unlock()
+	if sm.Persist != nil {
+		sm.Persist(s.State())
+	}
 	return s, nil
 }
 
@@ -194,6 +295,11 @@ func (sm *SessionManager) Stop(id string) {
 	sm.mu.Unlock()
 	if ok {
 		s.shutdown()
+		// Deliberately ended, so there is nothing worth restoring; the
+		// directory has gone with it.
+		if sm.Forget != nil {
+			sm.Forget(id)
+		}
 	}
 }
 
@@ -209,6 +315,11 @@ func (sm *SessionManager) Sessions() []*Session {
 }
 
 // Close stops every session; called on server shutdown.
+//
+// Transcoders are halted but their segments are kept, so the next start can
+// restore the sessions and pick up where they stopped. Anything genuinely
+// finished has already been removed by the idle reap or an explicit stop,
+// and anything left behind by a crash is swept at startup.
 func (sm *SessionManager) Close() {
 	sm.stop()
 	sm.mu.Lock()
@@ -216,7 +327,7 @@ func (sm *SessionManager) Close() {
 	sm.sessions = map[string]*Session{}
 	sm.mu.Unlock()
 	for _, s := range sessions {
-		s.shutdown()
+		s.stopTranscode()
 	}
 }
 
@@ -238,6 +349,9 @@ func (sm *SessionManager) janitor() {
 				if idle > sessionIdleTimeout {
 					delete(sm.sessions, id)
 					go s.shutdown()
+					if sm.Forget != nil {
+						sm.Forget(id)
+					}
 					log.Printf("session %s: idle, cleaned up", id)
 				}
 			}
@@ -314,15 +428,18 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 	}
 	ctx, cancel := context.WithCancel(base)
 	s.cancel = cancel
+	done := make(chan struct{})
+	s.done = done
 	s.startSegment = startSegment
 	s.lastReq = startSegment
 	job := HLSJob{
 		InputPath: s.InputPath, OutDir: s.Dir,
 		SegmentSecs: s.SegmentSecs, StartSegment: startSegment,
 		VideoHeight: s.Quality.Height, VideoBitrateKbps: s.Quality.BitrateKbps,
-		HDR:        s.hdr,
-		HW:         s.hw,
-		AudioTrack: s.audioTrack,
+		HDR:          s.hdr,
+		BurnSubtitle: s.burnSub,
+		HW:           s.hw,
+		AudioTrack:   s.audioTrack,
 		// RunHLS reports the path it actually built, so a device that opens
 		// but cannot allocate frames is not still advertised as hardware.
 		OnAccel: func(name string) {
@@ -344,22 +461,53 @@ func (s *Session) restartLocked(base context.Context, startSegment int) {
 		},
 	}
 	go func() {
+		defer close(done)
 		if err := RunHLS(ctx, job); err != nil && ctx.Err() == nil {
 			log.Printf("session %s: transcode: %v", s.ID, err)
 		}
 	}()
 }
 
+// shutdown stops the transcoder and discards the session's segments. For a
+// session that is finished with: an idle reap, an explicit stop, or being
+// replaced by a new one for the same item.
 func (s *Session) shutdown() {
+	s.stopTranscode()
+	os.RemoveAll(s.Dir)
+}
+
+// stopTranscode halts the transcoder but leaves the segments where they are.
+// Used on server shutdown: the work is done and sitting on disk, and the
+// next start restores the session and carries on from it. Deleting here
+// would throw away the very thing that makes a session worth persisting.
+func (s *Session) stopTranscode() {
 	s.mu.Lock()
 	if s.cancel != nil {
 		s.cancel()
 	}
+	done := s.done
 	s.mu.Unlock()
-	// Give the pipeline a beat to release file handles before removal.
-	time.Sleep(200 * time.Millisecond)
-	os.RemoveAll(s.Dir)
+	if done == nil {
+		return // restored session: nothing was ever started
+	}
+	// Wait for the transcoder to actually exit rather than sleeping and
+	// hoping. This used to be a flat 200ms, which is longer than ffmpeg
+	// needs to shut down and shorter than it needs to *start* — so a session
+	// superseded moments after it began had its directory deleted while
+	// ffmpeg was still opening init.mp4, which it then reported as
+	// "Failed to open segment". Media on a network share made that the
+	// common case rather than the rare one.
+	select {
+	case <-done:
+	case <-time.After(transcodeStopTimeout):
+		log.Printf("session %s: transcoder did not stop within %s", s.ID, transcodeStopTimeout)
+	}
 }
+
+// transcodeStopTimeout bounds the wait above. A transcoder that ignores its
+// cancelled context for this long is wedged, and holding up the caller — a
+// shutdown, or the next session for the same item — helps nobody.
+const transcodeStopTimeout = 5 * time.Second
 
 func (s *Session) segmentFile(idx int) string {
 	return filepath.Join(s.Dir, fmt.Sprintf("seg%05d.m4s", idx))
@@ -520,6 +668,18 @@ func (s *Session) maybeRestart(segIdx int) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A session restored after a restart has segments on disk but nothing
+	// producing more. The look-ahead test below would see the requested
+	// segment sitting just past the last one written and decide no restart
+	// was needed — and then nothing would ever write it. The first request
+	// always starts a transcoder.
+	if s.restored {
+		s.restored = false
+		log.Printf("session %s: resuming after restart at segment %d", s.ID, segIdx)
+		s.restartLocked(context.Background(), segIdx)
+		return
+	}
 
 	head := s.startSegment
 	for ; head < s.NumSegments; head++ {

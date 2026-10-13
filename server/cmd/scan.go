@@ -42,6 +42,7 @@ var scanCmd = &cobra.Command{
 	Use:   "scan [library]",
 	Short: "Scan a library (by name or id), or all libraries when none is given",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		full, _ := cmd.Flags().GetBool("full")
 		st, err := store.Open(viper.GetString("database.path"))
 		if err != nil {
 			return err
@@ -75,7 +76,7 @@ var scanCmd = &cobra.Command{
 		manager := newManager(st, viper.GetString("libraries.artwork_dir"))
 		for _, lib := range libs {
 			fmt.Printf("scanning %s (%s)…\n", lib.Name, lib.MediaType)
-			result, err := manager.RunScanSync(ctx, lib)
+			result, err := manager.RunScanSync(ctx, lib, full)
 			if err != nil {
 				return err
 			}
@@ -92,5 +93,6 @@ var scanCmd = &cobra.Command{
 
 func init() {
 	addTMDBKeyFlag(scanCmd)
+	scanCmd.Flags().Bool("full", false, "reread and rematch every file, not just those changed since the last scan")
 	rootCmd.AddCommand(scanCmd)
 }

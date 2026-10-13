@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -29,6 +32,13 @@ const (
 	// afterwards — existing rows keep the rating they were given, so
 	// changing region wants a metadata refresh to take full effect.
 	settingCertRegion = "metadata.cert_region"
+
+	// settingDetectionPaused holds intro detection until resumed;
+	// settingDetectionRate caps its reads in MB/s, "0" for none. Detection
+	// reads a quarter of every episode, which at full speed can fill the
+	// link to a NAS and starve anything else using it.
+	settingDetectionPaused = "segments.paused"
+	settingDetectionRate   = "segments.rate_mb"
 )
 
 // certRegions are the regions offered in the admin UI. TMDB carries ratings
@@ -53,6 +63,13 @@ type settingsResponse struct {
 	// CertRegions is the list the UI offers.
 	CertRegion  string   `json:"certRegion"`
 	CertRegions []string `json:"certRegions"`
+	// DetectionRateMB caps intro detection's reads, in MB/s; 0 is no cap.
+	DetectionRateMB      int   `json:"detectionRateMB"`
+	DetectionRateOptions []int `json:"detectionRateOptions"`
+	// HWCodecs is what the detected device can encode, h264 first. Shown so
+	// an operator can see what their hardware offers; h264 remains the
+	// output, being the one codec every browser decodes.
+	HWCodecs []string `json:"hwCodecs,omitempty"`
 }
 
 // certRegion reads the configured region, defaulting to GB.
@@ -73,6 +90,21 @@ func (s *server) hwAccelEnabled(c echo.Context) bool {
 	return v != "false"
 }
 
+// detectionRates are the caps offered for intro detection's reads, in MB/s.
+var detectionRates = []int{0, 50, 25, 10}
+
+func (s *server) detectionRateMB(ctx context.Context) int {
+	v, err := s.store.Setting(ctx, settingDetectionRate, "0")
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || !slices.Contains(detectionRates, n) {
+		return 0
+	}
+	return n
+}
+
 func (s *server) loginMode(c echo.Context) string {
 	mode, err := s.store.Setting(c.Request().Context(), settingLoginMode, s.defaultLoginMode)
 	if err != nil || (mode != LoginModePicker && mode != LoginModeForm) {
@@ -87,8 +119,12 @@ func (s *server) getSettings(c echo.Context) error {
 		LoginMode:     s.loginMode(c),
 		HWAccel:       s.hwAccelEnabled(c),
 		HWAccelStatus: s.sessions.HW.Name(),
+		HWCodecs:      s.sessions.HW.Codecs(),
 		CertRegion:    s.certRegion(c),
 		CertRegions:   certRegions,
+
+		DetectionRateMB:      s.detectionRateMB(c.Request().Context()),
+		DetectionRateOptions: detectionRates,
 	})
 }
 
@@ -98,6 +134,8 @@ func (s *server) putSettings(c echo.Context) error {
 		LoginMode  *string `json:"loginMode"`
 		HWAccel    *bool   `json:"hwAccel"`
 		CertRegion *string `json:"certRegion"`
+		// MB/s, one of detectionRates; 0 removes the cap.
+		DetectionRateMB *int `json:"detectionRateMB"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -137,6 +175,23 @@ func (s *server) putSettings(c echo.Context) error {
 		// a restart.
 		s.manager.CertRegion = region
 		s.audit(c, "settings.update", "settings", settingCertRegion, "Certification region", region)
+	}
+	if req.DetectionRateMB != nil {
+		mb := *req.DetectionRateMB
+		if !slices.Contains(detectionRates, mb) {
+			return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("detectionRateMB must be one of %v", detectionRates))
+		}
+		if err := s.store.SetSetting(c.Request().Context(), settingDetectionRate, strconv.Itoa(mb)); err != nil {
+			return err
+		}
+		if s.segments != nil {
+			s.segments.SetRateLimit(int64(mb) * 1_000_000)
+		}
+		label := "unlimited"
+		if mb > 0 {
+			label = strconv.Itoa(mb) + " MB/s"
+		}
+		s.audit(c, "settings.update", "settings", settingDetectionRate, "Detection read speed", label)
 	}
 	s.events.Publish(events.Event{Type: "settings"})
 	return s.getSettings(c)

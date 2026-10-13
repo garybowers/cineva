@@ -19,9 +19,16 @@ type subtitleInfo struct {
 	Title    string `json:"title,omitempty"`
 	Codec    string `json:"codec"`
 	Forced   bool   `json:"forced,omitempty"`
-	// URL is set only for text tracks (extractable to WebVTT). Image-based
-	// tracks (PGS/VobSub) are listed without a URL until burn-in lands.
+	// URL is set only for text tracks (extractable to WebVTT).
 	URL string `json:"url,omitempty"`
+	// BurnIn marks a track that can only be shown by painting it into the
+	// picture: PGS and VobSub are bitmaps with no text to hand a player.
+	// Selecting one restarts playback as a re-encode, since nothing can be
+	// drawn on a copied stream — so the client should say so rather than
+	// have the picture quietly change.
+	BurnIn bool `json:"burnIn,omitempty"`
+	// StreamIndex identifies the track to the transcoder when burning in.
+	StreamIndex int `json:"streamIndex,omitempty"`
 }
 
 func subtitleInfos(tracks []store.SubtitleTrack) []subtitleInfo {
@@ -33,6 +40,9 @@ func subtitleInfos(tracks []store.SubtitleTrack) []subtitleInfo {
 		}
 		if t.TextCodec() {
 			info.URL = "/api/v1/subtitles/" + t.ID + ".vtt"
+		} else {
+			info.BurnIn = true
+			info.StreamIndex = t.StreamIndex
 		}
 		out = append(out, info)
 	}
@@ -57,7 +67,7 @@ func (s *server) subtitleVTT(c echo.Context) error {
 	}
 	if !track.TextCodec() {
 		return echo.NewHTTPError(http.StatusUnprocessableEntity,
-			"image-based subtitles need burn-in, which is not available yet")
+			"image-based subtitles are shown by burning them in: request playback with burnSubtitle set to this track's streamIndex")
 	}
 
 	cached := filepath.Join(s.subtitleDir, track.ID+".vtt")

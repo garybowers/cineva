@@ -5,6 +5,7 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,6 +46,35 @@ type VideoResult struct {
 
 	Cast []Person // billed order, trimmed to maxCast
 	Crew []Person // key jobs only, see keyCrewJobs
+
+	// Television only. A film has none of these: it does not run for
+	// seasons, is not carried by a broadcaster, and is never "returning".
+	//
+	// Status is TMDB's own wording — "Ended", "Returning Series",
+	// "Canceled" — kept verbatim rather than mapped to a boolean, because
+	// "Canceled" and "Ended" mean different things to someone deciding
+	// whether to start a series.
+	Status string
+	// Network is the original broadcaster. TMDB lists several when a series
+	// changed hands; the first is the one it began on.
+	Network string
+	// SeasonCount and EpisodeCount are what TMDB says exists, which is not
+	// what is on disk — the difference is the point, so a series page can
+	// say "3 of 5 seasons".
+	SeasonCount  int
+	EpisodeCount int
+	// FirstAired and LastAired are full dates where Year is only the year.
+	FirstAired string
+	LastAired  string
+	// NextAired is when the next episode is due, for a series still
+	// running. Empty for anything finished, which is most of them.
+	NextAired string
+	// OriginalTitle is the name in the series' own language — "Dark" is
+	// German, "Money Heist" is "La Casa de Papel" — worth keeping because
+	// it is often what the files on disk are named after.
+	OriginalTitle string
+	// Country is the ISO 3166-1 code the series originates from.
+	Country string
 }
 
 // Person is one credit. Character is set for cast, Job for crew.
@@ -59,23 +89,40 @@ type Person struct {
 
 // EpisodeResult is one episode's metadata within a season.
 type EpisodeResult struct {
+	TmdbID   int
 	Num      int
 	Title    string
 	Overview string
 	StillURL string
+	// AirDate is the broadcast date, "2008-01-20". The only date an episode
+	// has — without it two thirds of this library's episodes had no date at
+	// all, and no correct way to sort by one.
+	AirDate   string
+	Rating    float64
+	VoteCount int
+	// GuestStars are the people in this episode and no other — the whole
+	// point of an episode-level cast, since the regulars are already on the
+	// series.
+	GuestStars []Person
 }
 
 // SeasonResult is a TV season's metadata including its episode list.
 type SeasonResult struct {
+	TmdbID    int
 	Overview  string
 	PosterURL string
+	AirDate   string
 	Episodes  []EpisodeResult
 }
 
 // VideoProvider is the video-domain metadata interface (see CLAUDE.md).
 type VideoProvider interface {
 	SearchMovie(ctx context.Context, title string, year int) (VideoResult, error)
-	SearchTV(ctx context.Context, name string) (VideoResult, error)
+	// SearchTV takes a year because series reuse titles far more than films
+	// do — "Alone" is a 2013 US series and a 2023 UK one — and the folder
+	// name is usually the only thing that distinguishes them. Pass 0 when
+	// the library gives no year.
+	SearchTV(ctx context.Context, name string, year int) (VideoResult, error)
 	TVSeason(ctx context.Context, tvID, season int) (SeasonResult, error)
 	// SearchMovies returns the candidates rather than just the best one, so
 	// an operator correcting a wrong match can choose between them.
@@ -184,6 +231,37 @@ type tmdbResult struct {
 			} `json:"release_dates"`
 		} `json:"results"`
 	} `json:"release_dates"`
+	// content_ratings is the television equivalent of release_dates: one
+	// rating per country, with no release-type breakdown because a series
+	// is not released in cinemas and then on disc.
+	ContentRatings *struct {
+		Results []struct {
+			Country string `json:"iso_3166_1"`
+			Rating  string `json:"rating"`
+		} `json:"results"`
+	} `json:"content_ratings"`
+	// A series has a runtime per episode rather than one for the whole
+	// thing, and TMDB gives a list because it can vary.
+	EpisodeRunTime   []int  `json:"episode_run_time"`
+	Status           string `json:"status"`
+	LastAirDate      string `json:"last_air_date"`
+	NumberOfSeasons  int    `json:"number_of_seasons"`
+	NumberOfEpisodes int    `json:"number_of_episodes"`
+	Networks         []struct {
+		Name string `json:"name"`
+	} `json:"networks"`
+	OriginalName     string   `json:"original_name"`
+	OriginCountry    []string `json:"origin_country"`
+	NextEpisodeToAir *struct {
+		AirDate string `json:"air_date"`
+	} `json:"next_episode_to_air"`
+	// created_by is television's answer to a director credit, and sits
+	// outside `credits` in TMDB's response.
+	CreatedBy []struct {
+		ID          int    `json:"id"`
+		Name        string `json:"name"`
+		ProfilePath string `json:"profile_path"`
+	} `json:"created_by"`
 }
 
 // tmdbCredits is the `credits` sub-object folded in by append_to_response.
@@ -209,10 +287,21 @@ type tmdbCredits struct {
 // different boards' judgements, not two spellings of one value, and which
 // one a viewer wants depends on where they are.
 func (r *tmdbResult) certifications() map[string]string {
-	if r.ReleaseDates == nil {
-		return nil
-	}
 	out := map[string]string{}
+	// Television first: a result carries one or the other, never both.
+	if r.ContentRatings != nil {
+		for _, res := range r.ContentRatings.Results {
+			if c := strings.TrimSpace(res.Rating); c != "" {
+				out[res.Country] = c
+			}
+		}
+	}
+	if r.ReleaseDates == nil {
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
 	for _, res := range r.ReleaseDates.Results {
 		for _, rd := range res.ReleaseDates {
 			if c := strings.TrimSpace(rd.Certification); c != "" {
@@ -245,7 +334,41 @@ func (r tmdbResult) toVideoResult() VideoResult {
 		out.Genres = append(out.Genres, g.Name)
 	}
 	out.Rating, out.VoteCount = r.VoteAverage, r.VoteCount
+	out.Status, out.LastAired = r.Status, r.LastAirDate
+	out.SeasonCount, out.EpisodeCount = r.NumberOfSeasons, r.NumberOfEpisodes
+	if r.FirstAirDate != "" {
+		out.FirstAired = r.FirstAirDate
+	} else {
+		out.FirstAired = r.ReleaseDate
+	}
+	if len(r.Networks) > 0 {
+		out.Network = r.Networks[0].Name
+	}
+	if r.NextEpisodeToAir != nil {
+		out.NextAired = r.NextEpisodeToAir.AirDate
+	}
+	if len(r.OriginCountry) > 0 {
+		out.Country = r.OriginCountry[0]
+	}
+	// Only worth keeping when it differs; storing "The IT Crowd" twice
+	// helps nobody and puts it on screen for every English-language show.
+	if r.OriginalName != "" && r.OriginalName != out.Title {
+		out.OriginalTitle = r.OriginalName
+	}
+	// Creators are crew, and join the crew list so one display path covers
+	// "Director" for a film and "Creator" for a series.
+	for _, c := range r.CreatedBy {
+		p := Person{TmdbID: c.ID, Name: c.Name, Job: "Creator"}
+		if c.ProfilePath != "" {
+			p.ProfileURL = tmdbProfileBase + c.ProfilePath
+		}
+		out.Crew = append(out.Crew, p)
+	}
 	out.RuntimeMins, out.Tagline = r.Runtime, r.Tagline
+	// A series reports its runtime per episode instead.
+	if out.RuntimeMins == 0 && len(r.EpisodeRunTime) > 0 {
+		out.RuntimeMins = r.EpisodeRunTime[0]
+	}
 	out.Certifications = r.certifications()
 	if r.Collection != nil {
 		out.CollectionID, out.CollectionName = r.Collection.ID, r.Collection.Name
@@ -345,8 +468,50 @@ func (t *TMDB) MovieByID(ctx context.Context, tmdbID int) (VideoResult, error) {
 	return r.toVideoResult(), nil
 }
 
-func (t *TMDB) SearchTV(ctx context.Context, name string) (VideoResult, error) {
-	return t.search(ctx, "tv", url.Values{"query": {name}})
+func (t *TMDB) SearchTV(ctx context.Context, name string, year int) (VideoResult, error) {
+	params := url.Values{"query": {name}}
+	if year > 0 {
+		params.Set("first_air_date_year", strconv.Itoa(year))
+	}
+	results, err := t.searchAll(ctx, "tv", params)
+	// A year narrows the field, but a wrong one — a folder named for the
+	// year a box set was released rather than the year the series began —
+	// would otherwise turn a good match into no match at all.
+	if err != nil && year > 0 && errors.Is(err, ErrNotFound) {
+		results, err = t.searchAll(ctx, "tv", url.Values{"query": {name}})
+	}
+	if err != nil {
+		return VideoResult{}, err
+	}
+	// Not results[0], for the same reason films are not: TMDB orders by its
+	// own relevance, which for a common title is the most popular series of
+	// that name rather than the one on disk.
+	pick := bestMatch(results, name, year)
+	full, err := t.TVByID(ctx, pick.TmdbID)
+	if err != nil {
+		return pick, nil // the search hit is still better than nothing
+	}
+	return full, nil
+}
+
+// TVByID fetches one series in full.
+//
+// Needed because a search hit carries genre *ids* and nothing else of
+// substance: without this, series had no genres, no cast, no tagline and no
+// age rating, while films had all four — the difference being that
+// SearchMovie has always followed its search with a detail call and
+// SearchTV never did.
+func (t *TMDB) TVByID(ctx context.Context, tmdbID int) (VideoResult, error) {
+	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%d?api_key=%s&append_to_response=credits,content_ratings",
+		tmdbID, url.QueryEscape(t.APIKey))
+	var r tmdbResult
+	if err := t.getJSON(ctx, u, &r); err != nil {
+		return VideoResult{}, fmt.Errorf("tmdb tv %d: %w", tmdbID, err)
+	}
+	if r.ID == 0 {
+		return VideoResult{}, ErrNotFound
+	}
+	return r.toVideoResult(), nil
 }
 
 func (t *TMDB) search(ctx context.Context, kind string, params url.Values) (VideoResult, error) {
@@ -414,13 +579,26 @@ func (t *TMDB) getJSON(ctx context.Context, u string, into any) error {
 }
 
 type tmdbSeasonResponse struct {
+	ID         int    `json:"id"`
 	Overview   string `json:"overview"`
 	PosterPath string `json:"poster_path"`
+	AirDate    string `json:"air_date"`
 	Episodes   []struct {
-		EpisodeNumber int    `json:"episode_number"`
-		Name          string `json:"name"`
-		Overview      string `json:"overview"`
-		StillPath     string `json:"still_path"`
+		ID            int     `json:"id"`
+		EpisodeNumber int     `json:"episode_number"`
+		Name          string  `json:"name"`
+		Overview      string  `json:"overview"`
+		StillPath     string  `json:"still_path"`
+		AirDate       string  `json:"air_date"`
+		VoteAverage   float64 `json:"vote_average"`
+		VoteCount     int     `json:"vote_count"`
+		GuestStars    []struct {
+			ID          int    `json:"id"`
+			Name        string `json:"name"`
+			Character   string `json:"character"`
+			Order       int    `json:"order"`
+			ProfilePath string `json:"profile_path"`
+		} `json:"guest_stars"`
 	} `json:"episodes"`
 }
 
@@ -447,12 +625,25 @@ func (t *TMDB) TVSeason(ctx context.Context, tvID, season int) (SeasonResult, er
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return SeasonResult{}, fmt.Errorf("tmdb season: %w", err)
 	}
-	out := SeasonResult{Overview: body.Overview}
+	out := SeasonResult{TmdbID: body.ID, Overview: body.Overview, AirDate: body.AirDate}
 	if body.PosterPath != "" {
 		out.PosterURL = tmdbImageBase + body.PosterPath
 	}
 	for _, e := range body.Episodes {
-		ep := EpisodeResult{Num: e.EpisodeNumber, Title: e.Name, Overview: e.Overview}
+		ep := EpisodeResult{
+			TmdbID: e.ID, Num: e.EpisodeNumber, Title: e.Name, Overview: e.Overview,
+			AirDate: e.AirDate, Rating: e.VoteAverage, VoteCount: e.VoteCount,
+		}
+		for i, g := range e.GuestStars {
+			if i >= maxCast {
+				break
+			}
+			p := Person{TmdbID: g.ID, Name: g.Name, Character: g.Character, Order: g.Order}
+			if g.ProfilePath != "" {
+				p.ProfileURL = tmdbProfileBase + g.ProfilePath
+			}
+			ep.GuestStars = append(ep.GuestStars, p)
+		}
 		if e.StillPath != "" {
 			ep.StillURL = tmdbImageBase + e.StillPath
 		}

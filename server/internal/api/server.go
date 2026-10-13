@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/playback"
+	"github.com/garybowers/cineva/server/internal/segments"
 	"github.com/garybowers/cineva/server/internal/stats"
 	"github.com/garybowers/cineva/server/internal/store"
 	"github.com/garybowers/cineva/server/internal/version"
@@ -38,6 +40,7 @@ type Config struct {
 	HWAccel      string // "auto" | "none" | "vaapi" | "nvenc" | "qsv"
 	TranscodeMax int64  // segment-cache ceiling in bytes; 0 disables the cap
 	SampleSecs   int    // host CPU/RAM sampling interval for the admin dashboard
+	StatsHours   int    // how long persisted dashboard samples are kept
 	SessionDays  int
 	SecureCookie bool
 	LoginMode    string // "picker" | "form" default for the sign-in screen
@@ -49,6 +52,8 @@ type Config struct {
 	// RetainDays caps how much audit and play history is kept; zero keeps
 	// everything.
 	RetainDays int
+	// IntroDetect runs intro detection over TV libraries in the background.
+	IntroDetect bool
 }
 
 type server struct {
@@ -57,6 +62,7 @@ type server struct {
 	sessions          *media.SessionManager
 	events            *events.Bus
 	sampler           *stats.Sampler
+	cfgStatsHours     int
 	playbacks         *playback.Registry
 	sessionTTL        time.Duration
 	throttle          *auth.Throttle
@@ -65,6 +71,10 @@ type server struct {
 	secureCookies     bool
 	subtitleDir       string
 	dlCacheDir        string
+	trickplayDir      string
+	trickplay         *trickplayJobs
+	segments          *segments.Detector // nil when intro detection is off
+	storage           *library.StorageMonitor
 
 	// Library-wide metadata refreshes in flight, keyed by library id.
 	refreshMu sync.Mutex
@@ -78,6 +88,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		sessions:          media.NewSessionManager(cfg.TranscodeDir, cfg.SegmentSecs),
 		events:            events.NewBus(),
 		sampler:           stats.New(time.Duration(cfg.SampleSecs) * time.Second),
+		cfgStatsHours:     cfg.StatsHours,
 		playbacks:         playback.NewRegistry(45 * time.Second),
 		sessionTTL:        time.Duration(max(cfg.SessionDays, 1)) * 24 * time.Hour,
 		secureCookies:     cfg.SecureCookie,
@@ -86,13 +97,38 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		defaultCertRegion: cfg.CertRegion,
 		subtitleDir:       filepath.Join(cfg.TranscodeDir, "subtitles"),
 		dlCacheDir:        filepath.Join(cfg.TranscodeDir, "dlcache"),
+		trickplayDir:      filepath.Join(cfg.TranscodeDir, "trickplay"),
+		trickplay:         newTrickplayJobs(),
 		refreshes:         map[string]*refreshJob{},
 	}
-	// Segments outlive the process that made them, so anything already in
-	// the transcode directory is an orphan from a previous run. Swept before
-	// the first session starts, while "every directory here is stale" still
-	// holds.
-	if n, freed, err := media.SweepOrphans(cfg.TranscodeDir); err != nil {
+	// Transcode sessions survive a restart: the segments are on disk and
+	// expensive to remake, so the stored descriptions are re-registered and
+	// the directories they own are spared by the sweep below. A restored
+	// session transcodes nothing until a segment is asked for.
+	s.sessions.Persist = func(state media.SessionState) {
+		if err := st.SaveTranscodeSession(context.Background(), toStoreSession(state)); err != nil {
+			log.Printf("persist session: %v", err)
+		}
+	}
+	s.sessions.Forget = func(id string) {
+		if err := st.DeleteTranscodeSession(context.Background(), id); err != nil {
+			log.Printf("forget session: %v", err)
+		}
+	}
+	var keep []string
+	if stored, err := st.TranscodeSessions(context.Background()); err != nil {
+		log.Printf("restore sessions: %v", err)
+	} else {
+		states := make([]media.SessionState, 0, len(stored))
+		for _, t := range stored {
+			states = append(states, fromStoreSession(t))
+		}
+		keep = s.sessions.Restore(states)
+	}
+
+	// Everything else in the transcode directory is an orphan from a
+	// previous run: sessions died with the process, their segments did not.
+	if n, freed, err := media.SweepOrphans(cfg.TranscodeDir, keep...); err != nil {
 		log.Printf("transcode sweep: %v", err)
 	} else if n > 0 {
 		log.Printf("transcode: removed %d orphaned session directory(ies), freed %d MiB", n, freed>>20)
@@ -130,6 +166,9 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// over the event stream so the graphs move live.
 	samplerCtx, stopSampler := context.WithCancel(context.Background())
 	s.sampler.OnSample = func(smp stats.Sample) { s.events.Publish(events.Event{Type: "stats", Data: smp}) }
+	// Persist the coarse series so the dashboard's charts survive a restart.
+	s.sampler.Store = statsStore{s.store}
+	s.sampler.Retain = time.Duration(max(s.cfgStatsHours, 1)) * time.Hour
 	go s.sampler.Run(samplerCtx)
 
 	// Periodic rescans and history pruning. Both are off by default: a
@@ -140,14 +179,85 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		Interval: cfg.ScanInterval, Retain: cfg.RetainDays,
 	}).Run(samplerCtx)
 
+	// Storage is watched so requests can fail at once, with a reason, when a
+	// library's share is down — and so every client is told when one goes
+	// or comes back, through the library list it already refetches.
+	s.storage = library.NewStorageMonitor(st)
+	s.storage.OnChange = func(lib store.Library, st library.StorageStatus) {
+		s.events.Publish(events.Event{Type: "libraries"})
+		// Detection skipped this library while it was down; catch up.
+		if st.Available && lib.MediaType == store.MediaTV && s.segments != nil {
+			s.segments.Enqueue(lib.ID)
+		}
+	}
+	manager.Storage = s.storage
+	go s.storage.Run(samplerCtx)
+
+	// Intro detection follows every completed TV scan, and runs once at
+	// startup so a library scanned before it existed (or while the server
+	// was down) is caught up. Incremental either way: only episodes not
+	// yet analysed are decoded.
+	if cfg.IntroDetect {
+		s.segments = segments.NewDetector(st)
+		s.segments.Available = func(libraryID string) bool { return s.storage.Status(libraryID).Available }
+		// Detection reads a lot from the same share playback streams from,
+		// so it gives way to anyone watching and to scans.
+		s.segments.Busy = func() string {
+			if len(s.playbacks.List()) > 0 {
+				return "playing"
+			}
+			if manager.AnyScanning() {
+				return "scanning"
+			}
+			return ""
+		}
+		if v, err := st.Setting(context.Background(), settingDetectionPaused, "false"); err == nil {
+			s.segments.SetPaused(v == "true")
+		}
+		s.segments.SetRateLimit(int64(s.detectionRateMB(context.Background())) * 1_000_000)
+		s.segments.OnProgress = func(status segments.Status) {
+			s.events.Publish(events.Event{Type: "segments", Data: status})
+		}
+		manager.OnScanDone = func(lib store.Library) {
+			if lib.MediaType == store.MediaTV {
+				s.segments.Enqueue(lib.ID)
+			}
+		}
+		if libs, err := st.Libraries(context.Background()); err == nil {
+			for _, lib := range libs {
+				if lib.MediaType == store.MediaTV {
+					s.segments.Enqueue(lib.ID)
+				}
+			}
+		}
+		go s.segments.Run(samplerCtx)
+	}
+
 	// Active playbacks: any change (start, heartbeat, stop, idle reap) tells
 	// the UIs to refetch the sessions list.
 	s.playbacks.OnChange = func() { s.events.Publish(events.Event{Type: "sessions"}) }
+	// Closes each playback's history row, so the dashboard can tell a play
+	// that was watched from one that was abandoned after ten seconds.
+	s.playbacks.OnEnd = s.onPlaybackEnd
 	go s.playbacks.Run(samplerCtx)
 
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover(), middleware.Logger())
+
+	// Compression. JSON and the UI bundles are the bulk of what a browser
+	// fetches and they shrink by roughly three quarters; a library's item
+	// list goes from 1.1 MB to under 300 KB, which is the difference between
+	// usable and not on a phone. Media and artwork are skipped: they are
+	// already compressed, so deflating them again burns CPU the transcoder
+	// wants for nothing.
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Level: 5, // compresses JSON within a few per cent of best, far cheaper
+		// Below about a packet there is nothing to win and the gzip header
+		// can make the response larger.
+		MinLength: 1024,
+		Skipper:   incompressible,
+	}))
 
 	// Public: liveness, themes, and the sign-in / first-run endpoints.
 	pub := e.Group("/api/v1")
@@ -158,6 +268,9 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	pub.POST("/auth/setup", s.authSetup)
 	pub.GET("/auth/profiles", s.authProfiles)
 	pub.POST("/auth/pin", s.authPINLogin)
+	// Sonarr and Radarr deliver here, signing in with the connection's own
+	// webhook secret rather than as a user.
+	pub.POST("/integrations/:id/webhook", s.integrationWebhook)
 
 	// Signed in (session cookie or API key). Library-scoped handlers also
 	// check the caller's grants.
@@ -192,10 +305,14 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	v1.DELETE("/items/:id/playback", s.stopPlayback)
 	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
 	v1.GET("/items/:id/next", s.nextUp)
+	v1.GET("/items/:id/next-up", s.nextUpFor)
 	v1.GET("/items/:id/prev", s.prevEpisode)
 	v1.GET("/items/:id/subtitles", s.itemSubtitles)
+	v1.GET("/items/:id/trickplay.vtt", s.trickplayVTT)
+	v1.GET("/items/:id/trickplay.jpg", s.trickplaySheet)
 	v1.GET("/subtitles/:file", s.subtitleVTT) // "<track-id>.vtt"
 	v1.GET("/continue-watching", s.continueWatching)
+	v1.GET("/home", s.home)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
 	v1.GET("/play/:sid/:file", s.hlsFile)
 
@@ -206,8 +323,15 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	adm.DELETE("/libraries/:id", s.deleteLibrary)
 	adm.POST("/libraries/:id/scan", s.scanLibrary)
 	adm.GET("/scans", s.listScans)
+	adm.GET("/segments/status", s.segmentStatus)
+	adm.POST("/segments/pause", s.pauseSegments)
+	adm.POST("/segments/resume", s.resumeSegments)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)
+	adm.GET("/integrations", s.listIntegrations)
+	adm.POST("/integrations", s.createIntegration)
+	adm.PATCH("/integrations/:id", s.updateIntegration)
+	adm.DELETE("/integrations/:id", s.deleteIntegration)
 	// Metadata management: inspect a match, search for the right title,
 	// apply it, or re-run matching.
 	// Collection management: override the provider's grouping — rename,
@@ -226,16 +350,24 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	adm.GET("/libraries/:id/refresh", s.refreshStatus)
 	adm.GET("/stats/system", s.systemStats)
 	adm.GET("/stats/plays", s.playStats)
+	adm.GET("/stats/plays/totals", s.playTotals)
 	adm.GET("/stats/disks", s.diskStats)
 	adm.GET("/logs", s.auditLog)
 	adm.GET("/play/sessions", s.listSessions)
 	adm.DELETE("/play/:sid", s.stopSession)
+	adm.DELETE("/playbacks/:userId/:itemId", s.stopPlaybackAdmin)
 	adm.GET("/settings", s.getSettings)
 	adm.PUT("/settings", s.putSettings)
 	adm.GET("/users", s.listUsers)
 	adm.POST("/users", s.createUser)
 	adm.PATCH("/users/:id", s.updateUser)
 	adm.DELETE("/users/:id", s.deleteUser)
+	adm.GET("/groups", s.listGroups)
+	adm.POST("/groups", s.createGroup)
+	adm.PUT("/groups/:id", s.updateGroup)
+	adm.DELETE("/groups/:id", s.deleteGroup)
+	adm.GET("/libraries/:id/access", s.getLibraryAccess)
+	adm.PUT("/libraries/:id/access", s.setLibraryAccess)
 
 	e.StaticFS("/themes", ui.Themes())
 	if cfg.ArtworkDir != "" {
@@ -248,15 +380,15 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	e.StaticFS("/", ui.Client())
 
 	// SPA fallback. Both apps own their URL routing — the client at
-	// /libraries/..., the admin at /admin/libraries/... — so an unknown
-	// extension-less GET returns the owning app's index.html and lets its
-	// router read the path. Without this a deep link or a reload anywhere
-	// but the root 404s.
+	// /libraries/..., the admin at /admin/libraries/... — so an unknown GET
+	// that is not asking for a static asset returns the owning app's
+	// index.html and lets its router read the path. Without this a deep link
+	// or a reload anywhere but the root 404s.
 	e.HTTPErrorHandler = func(err error, c echo.Context) {
 		he, ok := err.(*echo.HTTPError)
 		p := c.Request().URL.Path
 		if ok && he.Code == http.StatusNotFound && c.Request().Method == http.MethodGet &&
-			!strings.ContainsRune(path.Base(p), '.') &&
+			!looksLikeAsset(p) &&
 			!hasAnyPrefix(p, "/api/", "/themes/", "/artwork/") {
 			app, name := ui.Client(), "client"
 			if hasAnyPrefix(p, "/admin") {
@@ -335,4 +467,94 @@ func health(c echo.Context) error {
 		"service": "cineva",
 		"version": version.Version,
 	})
+}
+
+// toStoreSession / fromStoreSession translate between the media package's
+// view of a session and the stored row. Two types rather than one shared
+// struct, so the media package needs no knowledge of the store.
+func toStoreSession(st media.SessionState) store.TranscodeSession {
+	return store.TranscodeSession{
+		ID: st.ID, ItemID: st.ItemID, Title: st.Title, InputPath: st.InputPath,
+		Dir: st.Dir, SegmentSecs: st.SegmentSecs, NumSegments: st.NumSegments,
+		RuntimeSecs: st.RuntimeSecs, QualityLabel: st.Quality.Label,
+		QualityHeight: st.Quality.Height, QualityKbps: st.Quality.BitrateKbps,
+		AudioTrack: st.AudioTrack, HDR: st.HDR, SegSecsReal: st.SegSecsReal,
+	}
+}
+
+func fromStoreSession(t store.TranscodeSession) media.SessionState {
+	return media.SessionState{
+		ID: t.ID, ItemID: t.ItemID, Title: t.Title, InputPath: t.InputPath,
+		Dir: t.Dir, SegmentSecs: t.SegmentSecs, NumSegments: t.NumSegments,
+		RuntimeSecs: t.RuntimeSecs,
+		Quality: media.Quality{
+			Label: t.QualityLabel, Height: t.QualityHeight, BitrateKbps: t.QualityKbps,
+		},
+		AudioTrack: t.AudioTrack, HDR: t.HDR, SegSecsReal: t.SegSecsReal,
+	}
+}
+
+// Go's mime table has no entry for .webmanifest, so the PWA manifest would
+// be served as text/plain. Chrome tolerates that but the spec does not, and
+// a manifest served as the wrong type is one of the quieter ways for an app
+// to simply not offer to install.
+func init() {
+	if err := mime.AddExtensionType(".webmanifest", "application/manifest+json"); err != nil {
+		log.Printf("register .webmanifest mime type: %v", err)
+	}
+}
+
+// assetExts are the file types the embedded UIs actually serve. A request
+// for one of these that misses is a genuine 404 — a broken asset reference,
+// not a route — so the SPA fallback leaves it alone.
+var assetExts = map[string]bool{
+	".js": true, ".mjs": true, ".css": true, ".map": true,
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".svg": true,
+	".webp": true, ".avif": true, ".ico": true,
+	".woff": true, ".woff2": true, ".ttf": true, ".otf": true, ".eot": true,
+	".json": true, ".webmanifest": true, ".txt": true, ".xml": true,
+	".wasm": true, ".m3u8": true, ".m4s": true, ".mp4": true, ".vtt": true,
+}
+
+// looksLikeAsset reports whether a path is asking for a static file rather
+// than an app route.
+//
+// It tests the extension against the list above rather than asking whether
+// the last segment contains a dot, because film titles contain dots: "Dr.
+// No", "E.T. the Extra-Terrestrial" and "Guardians of the Galaxy Vol. 2"
+// are routes, and the dot rule sent all three to a JSON 404 on reload or a
+// shared link. An unknown extension is treated as a route, which is the
+// safe way round — a wrong guess here costs a route that renders the app
+// shell, while the other way costs the viewer their page.
+func looksLikeAsset(p string) bool {
+	return assetExts[strings.ToLower(path.Ext(path.Base(p)))]
+}
+
+// incompressibleExts are already-compressed payloads. Gzipping them costs
+// CPU and returns bytes that are no smaller, sometimes larger.
+var incompressibleExts = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+	".avif": true, ".woff": true, ".woff2": true, ".mp4": true, ".m4s": true,
+	".mkv": true, ".webm": true, ".mp3": true, ".m4a": true, ".flac": true,
+	".ogg": true, ".opus": true, ".zip": true, ".cbz": true, ".cbr": true,
+	".epub": true, ".pdf": true,
+}
+
+// incompressible reports whether a response should bypass gzip.
+//
+// Range requests are excluded as well as media types: gzip and a byte range
+// do not mix — the range addresses the original bytes, and compressing the
+// body after the fact would make Content-Range a lie. Direct play, audio
+// streaming and downloads all depend on ranges.
+func incompressible(c echo.Context) bool {
+	if c.Request().Header.Get("Range") != "" {
+		return true
+	}
+	p := c.Request().URL.Path
+	if incompressibleExts[strings.ToLower(path.Ext(path.Base(p)))] {
+		return true
+	}
+	// Artwork and transcode segments are served by path rather than by a
+	// name the extension test would catch.
+	return hasAnyPrefix(p, "/artwork/")
 }

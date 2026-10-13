@@ -14,6 +14,10 @@ export interface Library {
   paths: string[]
   itemCount: number
   createdAt: string
+  /** Seen only by the users and groups in its access; otherwise by everyone. */
+  restricted: boolean
+  /** Whether its folders can be reached, from the server's 30-second check. */
+  storage?: { available: boolean; since?: string; path?: string; error?: string }
 }
 
 export interface Scan {
@@ -36,6 +40,7 @@ export interface User {
   hasPassword: boolean
   hasPin: boolean
   createdAt: string
+  /** Every library this user can see, computed from library access. */
   libraryIds: string[]
 }
 export interface UserRequest {
@@ -44,7 +49,6 @@ export interface UserRequest {
   password?: string
   role?: 'admin' | 'user'
   disabled?: boolean
-  libraryIds?: string[]
   pin?: string // set, or '' to clear
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
@@ -58,6 +62,62 @@ export const createUser = (u: UserRequest) =>
 export const updateUser = (id: string, u: UserRequest) =>
   req<User>(`/users/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(u) })
 export const deleteUser = (id: string) => req<void>(`/users/${id}`, { method: 'DELETE' })
+
+// Library access: open to everyone unless restricted to users and groups.
+export interface UserGroup {
+  id: string
+  name: string
+  memberIds: string[]
+  createdAt: string
+}
+export interface LibraryAccess {
+  restricted: boolean
+  userIds: string[]
+  groupIds: string[]
+}
+const json = (method: string, body: unknown): RequestInit => ({
+  method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+})
+export const listGroups = () => req<UserGroup[]>('/groups')
+export const createGroup = (name: string, memberIds: string[]) => req<UserGroup>('/groups', json('POST', { name, memberIds }))
+export const updateGroup = (id: string, name: string, memberIds: string[]) =>
+  req<UserGroup>(`/groups/${id}`, json('PUT', { name, memberIds }))
+export const deleteGroup = (id: string) => req<void>(`/groups/${id}`, { method: 'DELETE' })
+
+// Sonarr and Radarr. Cineva registers a webhook in each, so what they import
+// is scanned in within seconds rather than at the next scheduled rescan.
+export type IntegrationKind = 'sonarr' | 'radarr'
+export interface Integration {
+  id: string
+  kind: IntegrationKind
+  name: string
+  url: string
+  /** Cineva's address as the instance reaches it. */
+  callbackUrl: string
+  /** The webhook's id inside Sonarr/Radarr; 0 if not registered. */
+  notificationId: number
+  /** The instance's version when the connection was last saved. */
+  version: string
+  createdAt: string
+  updatedAt: string
+}
+export interface IntegrationRequest {
+  kind?: IntegrationKind
+  name?: string
+  url?: string
+  /** Blank on an update keeps the current key. */
+  apiKey?: string
+  callbackUrl?: string
+}
+export const listIntegrations = () => req<Integration[]>('/integrations')
+export const createIntegration = (r: IntegrationRequest) => req<Integration>('/integrations', json('POST', r))
+export const updateIntegration = (id: string, r: IntegrationRequest) =>
+  req<Integration>(`/integrations/${id}`, json('PATCH', r))
+/** Resolves with a warning when the webhook could not be removed from the instance. */
+export const deleteIntegration = (id: string) =>
+  req<{ warning?: string } | undefined>(`/integrations/${id}`, { method: 'DELETE' })
+export const getLibraryAccess = (id: string) => req<LibraryAccess>(`/libraries/${id}/access`)
+export const setLibraryAccess = (id: string, a: LibraryAccess) => req<LibraryAccess>(`/libraries/${id}/access`, json('PUT', a))
 export interface ServerSettings {
   loginMode: 'picker' | 'form'
   hwAccel: boolean
@@ -67,6 +127,10 @@ export interface ServerSettings {
   certRegion: string
   /** Read-only: the regions the server offers. */
   certRegions: string[]
+  /** Intro detection's read cap in MB/s; 0 is no cap. */
+  detectionRateMB: number
+  /** Read-only: the caps offered. */
+  detectionRateOptions: number[]
 }
 export const getSettings = () => req<ServerSettings>('/settings')
 export const putSettings = (s: Partial<ServerSettings>) =>
@@ -103,8 +167,54 @@ export const createLibrary = (name: string, mediaType: string, paths: string[]) 
     body: JSON.stringify({ name, mediaType, paths }),
   })
 export const deleteLibrary = (id: string) => req<void>(`/libraries/${id}`, { method: 'DELETE' })
-export const scanLibrary = (id: string) => req<Scan>(`/libraries/${id}/scan`, { method: 'POST' })
+// Incremental unless full: only files changed since the last scan are read.
+export const scanLibrary = (id: string, full = false) =>
+  req<Scan>(`/libraries/${id}/scan${full ? '?full=true' : ''}`, { method: 'POST' })
 export const listScans = () => req<Scan[]>('/scans')
+
+/** Background intro detection; also pushed over /events as "segments". */
+export interface IntroStatus {
+  enabled?: boolean
+  running: boolean
+  libraryId?: string
+  startedAt?: string
+  seasonsDone: number
+  seasonsTotal: number
+  episodesDone: number
+  episodesTotal: number
+  introsFound: number
+  creditsFound: number
+  unreadable: number
+  /** Waiting: "manual" (paused here), or giving way to "playing" / "scanning". */
+  paused?: boolean
+  pauseReason?: 'manual' | 'playing' | 'scanning'
+  current?: { series: string; season: number; kind: 'intro' | 'credits'; phase: 'reading' | 'comparing' | 'saving'; done: number; total: number }
+  recent?: IntroResult[]
+  last?: {
+    libraryId: string
+    finishedAt: string
+    seconds: number
+    seasons: number
+    episodes: number
+    introsFound: number
+    creditsFound: number
+    unreadable: number
+    cancelled?: boolean
+  }
+}
+export interface IntroResult {
+  itemId: string
+  kind: 'intro' | 'credits'
+  series: string
+  season: number
+  episode: number
+  found: boolean
+  startSecs?: number
+  endSecs?: number
+}
+export const segmentStatus = () => req<IntroStatus>('/segments/status')
+export const pauseSegments = () => req<IntroStatus>('/segments/pause', { method: 'POST' })
+export const resumeSegments = () => req<IntroStatus>('/segments/resume', { method: 'POST' })
 export const cancelScan = (id: string) => req<void>(`/scans/${id}/cancel`, { method: 'POST' })
 
 export interface PlaySession {
@@ -205,6 +315,13 @@ export const refreshStatus = (id: string) => req<RefreshProgress>(`/libraries/${
 export const listSessions = () => req<PlaySession[]>('/play/sessions')
 export const stopSession = (id: string) => req<void>(`/play/${id}`, { method: 'DELETE' })
 
+// Ends a playback whether or not it is transcoding. A direct play has no
+// session to kill — the server is only answering range requests — so it is
+// dropped from the activity list and the client is told to stop on its next
+// progress heartbeat, within about 15 seconds.
+export const stopPlayback = (userId: string, itemId: string) =>
+  req<void>(`/playbacks/${userId}/${itemId}`, { method: 'DELETE' })
+
 // Live event stream: the server pushes state changes (scan progress, library
 // changes) over SSE so the UI updates without refreshes. Events are hints —
 // handlers refetch whatever they display. EventSource reconnects on its own;
@@ -255,6 +372,11 @@ export interface PlayDay {
 }
 export const systemStats = (range: '1h' | '24h') => req<SystemSample[]>(`/stats/system?range=${range}`)
 export const playStats = (days: number) => req<PlayDay[]>(`/stats/plays?days=${days}`)
+
+// Watch totals over the same window as playStats. Separate endpoint because
+// /stats/plays returns a bare array and its shape is fixed for this version.
+export type PlayTotals = { plays: number; completed: number; secs: number }
+export const playTotals = (days: number) => req<PlayTotals>(`/stats/plays/totals?days=${days}`)
 
 // Storage and audit trail (admin dashboard / Logs page).
 export interface DiskVolume {

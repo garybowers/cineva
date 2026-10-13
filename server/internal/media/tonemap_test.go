@@ -70,6 +70,12 @@ func TestHDRToneMapTranscode(t *testing.T) {
 // this: PQ pixels shown as SDR sit far too dark, so a correctly mapped
 // picture is measurably brighter.
 func lumaPlanes(t *testing.T, src, hdr string) [][]byte {
+	return lumaPlanesSpec(t, src, videoFilterSpec(hdr, 640, 360))
+}
+
+// lumaPlanesSpec renders the same frames through an arbitrary filter chain,
+// so two chains can be compared pixel for pixel.
+func lumaPlanesSpec(t *testing.T, src, spec string) [][]byte {
 	t.Helper()
 	in, err := av.Open(src)
 	if err != nil {
@@ -91,9 +97,9 @@ func lumaPlanes(t *testing.T, src, hdr string) [][]byte {
 		t.Fatalf("decoder: %v", err)
 	}
 	defer dec.Close()
-	g, err := av.NewVideoFilterGraphFromContext(dec.Raw(), videoFilterSpec(hdr, 640, 360), ffmpeg.AVPixFmtYuv420P)
+	g, err := av.NewVideoFilterGraphFromContext(dec.Raw(), spec, ffmpeg.AVPixFmtYuv420P)
 	if err != nil {
-		t.Fatalf("graph (%s): %v", hdr, err)
+		t.Fatalf("graph (%s): %v", spec, err)
 	}
 	defer g.Close()
 
@@ -130,11 +136,11 @@ func lumaPlanes(t *testing.T, src, hdr string) [][]byte {
 			})
 		})
 		if derr != nil {
-			t.Fatalf("decode (%s): %v", hdr, derr)
+			t.Fatalf("decode (%s): %v", spec, derr)
 		}
 	}
 	if len(planes) == 0 {
-		t.Fatalf("no frames decoded for hdr=%q", hdr)
+		t.Fatalf("no frames decoded for spec=%q", spec)
 	}
 	return planes
 }

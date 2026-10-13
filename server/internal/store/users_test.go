@@ -31,20 +31,6 @@ func TestUsersSessionsGrants(t *testing.T) {
 		t.Fatalf("create user: %v", err)
 	}
 
-	// Grants replace wholesale and survive lookups.
-	lib, _ := s.CreateLibrary(ctx, "Kids", MediaMovies, []string{"/k"})
-	lib2, _ := s.CreateLibrary(ctx, "Adult", MediaMovies, []string{"/a"})
-	if err := s.SetLibraryGrants(ctx, kid.ID, []string{lib.ID, lib2.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetLibraryGrants(ctx, kid.ID, []string{lib.ID}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := s.UserByUsername(ctx, "KID")
-	if len(got.LibraryIDs) != 1 || got.LibraryIDs[0] != lib.ID {
-		t.Fatalf("grants = %v, want just %s", got.LibraryIDs, lib.ID)
-	}
-
 	// Sessions: expired ones do not resolve; delete works.
 	if err := s.CreateSession(ctx, "h1", kid.ID, "2099-01-01 00:00:00", "Firefox", "::1"); err != nil {
 		t.Fatal(err)
@@ -81,6 +67,10 @@ func TestUsersSessionsGrants(t *testing.T) {
 	}
 
 	// Placeholder state adoption.
+	lib, err := s.CreateLibrary(ctx, "Kids", MediaMovies, []string{"/k"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	item, _ := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindMovie, Title: "F", Path: "/k/f.mkv", RuntimeSecs: 100})
 	if _, err := s.SetProgress(ctx, LocalUser, item.ID, 30, 100); err != nil {
 		t.Fatal(err)
@@ -92,7 +82,7 @@ func TestUsersSessionsGrants(t *testing.T) {
 		t.Fatalf("admin did not inherit local play state: %+v", ps)
 	}
 
-	// Deleting a user cascades grants and sessions.
+	// Deleting a user cascades their sessions.
 	if err := s.DeleteUser(ctx, kid.ID); err != nil {
 		t.Fatal(err)
 	}

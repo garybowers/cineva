@@ -5,8 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0e1116" />
     <!-- SVG only: every browser that can run this app supports it, and one
-         vector file covers every size instead of a pile of PNGs. -->
-    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+         vector file covers every size instead of a pile of PNGs. The path is
+         absolute because the app owns its routing: a relative href resolves
+         against the current route, so /libraries/Movies asked the server for
+         /libraries/Movies/favicon.svg and got a 404. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Cineva Admin</title>
   </head>
   <body>

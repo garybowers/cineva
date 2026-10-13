@@ -1,0 +1,93 @@
+diff --git a/internal/builder/digests.go b/internal/builder/digests.go
+index 287ff0c..9307a6c 100644
+--- a/internal/builder/digests.go
++++ b/internal/builder/digests.go
+@@ -41,7 +41,7 @@ import (
+ //     checksums, so cross-checking may require a clean second fetch.
+ var archiveDigests = map[string]string{
+ 	"https://bitbucket.org/multicoreware/x265_git/get/4.2.tar.bz2":                                                                                     "04978f795943e49fcea76eb5ede9c1bd0fe9b6c073518897be6fc43b44f60850",
+-	"https://code.videolan.org/videolan/dav1d/-/archive/1.5.3/dav1d-1.5.3.tar.bz2":                                                                     "e099f53253f6c247580c554d53a13f1040638f2066edc3c740e4c2f15174ce22",
++	"https://downloads.videolan.org/pub/videolan/dav1d/1.5.3/dav1d-1.5.3.tar.xz":                                                                       "732010aa5ef461fa93355ed2c6c5fedb48ddc4b74e697eaabe8907eaeb943011",
+ 	"https://code.videolan.org/videolan/x264/-/archive/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.bz2": "f05c59f2e83d494c36307025dca2d3afc6b4d185f3a3453d06cc4fecd7094057",
+ 	"https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.3.tar.xz":                                                                            "78262a6e7ac170d6528ebfe2efccdf220191a5af6a6cd61ea4a9a9a5042c7a07",
+ 	"https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz":                                                                      "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
+diff --git a/internal/builder/ffmpeg_args.go b/internal/builder/ffmpeg_args.go
+index c33d537..ae6aa08 100644
+--- a/internal/builder/ffmpeg_args.go
++++ b/internal/builder/ffmpeg_args.go
+@@ -96,7 +96,7 @@ var commonFFmpegFeatureSets = []ffmpegFeatureSet{
+ 	},
+ 	{
+ 		Encoders: []string{"dvbsub", "dvdsub"},
+-		Decoders: []string{"dvbsub", "dvdsub"},
++		Decoders: []string{"dvbsub", "dvdsub", "pgssub"},
+ 	},
+ 	{
+ 		Encoders: []string{"exr"},
+@@ -301,14 +301,17 @@ var linuxFFmpegFeatureSets = []ffmpegFeatureSet{
+ 	{
+ 		Encoders: []string{"av1_nvenc", "av1_qsv", "av1_vaapi"},
+ 		Decoders: []string{"av1_cuvid", "av1_qsv"},
++		HWAccels: []string{"av1_vaapi"},
+ 	},
+ 	{
+ 		Encoders: []string{"h264_nvenc", "h264_qsv", "h264_vaapi"},
+ 		Decoders: []string{"h264_cuvid", "h264_qsv"},
++		HWAccels: []string{"h264_vaapi"},
+ 	},
+ 	{
+ 		Encoders: []string{"hevc_nvenc", "hevc_qsv", "hevc_vaapi"},
+ 		Decoders: []string{"hevc_cuvid", "hevc_qsv"},
++		HWAccels: []string{"hevc_vaapi"},
+ 	},
+ 	{
+ 		Encoders: []string{"mjpeg_qsv", "mjpeg_vaapi"},
+@@ -317,16 +320,19 @@ var linuxFFmpegFeatureSets = []ffmpegFeatureSet{
+ 	{
+ 		Encoders: []string{"mpeg2_qsv", "mpeg2_vaapi"},
+ 		Decoders: []string{"mpeg2_cuvid", "mpeg2_qsv"},
++		HWAccels: []string{"mpeg2_vaapi"},
+ 	},
+ 	{Decoders: []string{"mpeg4_cuvid"}},
+ 	{Decoders: []string{"vc1_cuvid", "vc1_qsv"}},
+ 	{
+ 		Encoders: []string{"vp8_vaapi"},
+ 		Decoders: []string{"vp8_cuvid", "vp8_qsv"},
++		HWAccels: []string{"vp8_vaapi"},
+ 	},
+ 	{
+ 		Encoders: []string{"vp9_qsv", "vp9_vaapi"},
+ 		Decoders: []string{"vp9_cuvid", "vp9_qsv"},
++		HWAccels: []string{"vp9_vaapi"},
+ 	},
+ 	{Decoders: []string{"vvc_qsv"}},
+ }
+diff --git a/internal/builder/libraries.go b/internal/builder/libraries.go
+index a4141c3..6b01583 100644
+--- a/internal/builder/libraries.go
++++ b/internal/builder/libraries.go
+@@ -588,6 +588,15 @@ var x265 = &Library{
+ 			"-DENABLE_SHARED=OFF",
+ 			"-DENABLE_TESTS=OFF",      // Don't build test suite
+ 			"-DLOGGED_PRIMITIVES=OFF", // Reduce logging overhead
++			// x265 auto-detects libnuma. On a build host that has it
++			// (Arch, Fedora) the static archive gains undefined numa_*
++			// references from threadpool.cpp that nothing links, so the
++			// library cannot be used without -lnuma — while the same source
++			// built on a host without it links fine. Off, so the archive
++			// does not depend on what happened to be installed where it was
++			// built. The option is ENABLE_LIBNUMA; CMake silently ignores a
++			// misspelt -D rather than failing.
++			"-DENABLE_LIBNUMA=OFF",
+ 		}
+ 	},
+ 	LinkLibs: []string{"libx265"},
+@@ -596,7 +605,7 @@ var x265 = &Library{
+ // dav1d - AV1 video decoder
+ var dav1d = &Library{
+ 	Name:          "dav1d",
+-	URL:           "https://code.videolan.org/videolan/dav1d/-/archive/1.5.3/dav1d-1.5.3.tar.bz2",
++	URL:           "https://downloads.videolan.org/pub/videolan/dav1d/1.5.3/dav1d-1.5.3.tar.xz",
+ 	FFmpegEnables: []string{"libdav1d"},
+ 	BuildSystem:   &MesonBuild{},
+ 	ConfigureArgs: func(os string) []string {

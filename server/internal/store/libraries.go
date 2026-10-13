@@ -35,6 +35,9 @@ type Library struct {
 	Paths     []string  `json:"paths"`
 	CreatedAt string    `json:"createdAt"`
 	UpdatedAt string    `json:"updatedAt"`
+	// Restricted libraries are seen only by the users and groups their
+	// access names (see LibraryAccess); open ones by everyone.
+	Restricted bool `json:"restricted"`
 }
 
 // LibraryRepo is what services depend on; *Store implements it.
@@ -84,7 +87,7 @@ func (s *Store) CreateLibrary(ctx context.Context, name string, mediaType MediaT
 
 func (s *Store) Libraries(ctx context.Context) ([]Library, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, media_type, source, created_at, updated_at FROM libraries ORDER BY name`)
+		`SELECT id, name, media_type, source, created_at, updated_at, restricted FROM libraries ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list libraries: %w", err)
 	}
@@ -93,7 +96,7 @@ func (s *Store) Libraries(ctx context.Context) ([]Library, error) {
 	libs := []Library{}
 	for rows.Next() {
 		var l Library
-		if err := rows.Scan(&l.ID, &l.Name, &l.MediaType, &l.Source, &l.CreatedAt, &l.UpdatedAt); err != nil {
+		if err := rows.Scan(&l.ID, &l.Name, &l.MediaType, &l.Source, &l.CreatedAt, &l.UpdatedAt, &l.Restricted); err != nil {
 			return nil, fmt.Errorf("scan library: %w", err)
 		}
 		libs = append(libs, l)
@@ -112,8 +115,8 @@ func (s *Store) Libraries(ctx context.Context) ([]Library, error) {
 func (s *Store) Library(ctx context.Context, id string) (Library, error) {
 	var l Library
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, media_type, source, created_at, updated_at FROM libraries WHERE id = ?`, id).
-		Scan(&l.ID, &l.Name, &l.MediaType, &l.Source, &l.CreatedAt, &l.UpdatedAt)
+		`SELECT id, name, media_type, source, created_at, updated_at, restricted FROM libraries WHERE id = ?`, id).
+		Scan(&l.ID, &l.Name, &l.MediaType, &l.Source, &l.CreatedAt, &l.UpdatedAt, &l.Restricted)
 	if err != nil {
 		return Library{}, fmt.Errorf("load library %s: %w", id, err)
 	}

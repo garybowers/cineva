@@ -3,12 +3,14 @@
   import Hls from 'hls.js'
   import {
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
+    PLAYBACK_STOPPED,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
+    type SubtitleTrack,
   } from './lib/api'
   import { onDismiss } from './lib/dismiss'
   import { pref } from './lib/prefs'
   import {
-    Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize,
+    Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize, Expand, Shrink,
     Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge,
   } from '@lucide/svelte'
 
@@ -22,6 +24,7 @@
     onended,
     onquality,
     onaudiotrack,
+    onburnsubtitle,
     onexpand,
     ontime,
   }: {
@@ -37,12 +40,19 @@
     onended: () => void
     onquality: (q: PlayQuality) => void
     onaudiotrack: (streamIndex: number) => void
+    /** Restart playback with an image subtitle painted in. */
+    onburnsubtitle: (streamIndex: number) => void
     onexpand: () => void
     ontime?: (secs: number) => void
   } = $props()
 
-  // v1 credits window heuristic — replaced by credits *detection* later.
+  // Where the up-next card appears: at the episode's detected credits, or,
+  // for an episode with none detected, this many seconds from the end.
   const CREDITS_WINDOW = 40
+  // With detected credits the next episode starts this long after they do,
+  // rather than after the whole credit roll; without, it starts at the end
+  // of the file, so a guessed window can never cut a scene short.
+  const CREDITS_COUNTDOWN = 15
 
   let box: HTMLElement
   let video: HTMLVideoElement
@@ -68,11 +78,16 @@
   let seeking = $state(false) // true while the seek thumb is being dragged
 
   let dismissed = false
+  // Set once autoplay has moved on, so the next timeupdate cannot do it twice.
+  let advanced = false
   let lastPosted = -100
   let idleTimer: ReturnType<typeof setTimeout> | undefined
 
   const textSubs = info.subtitles?.filter((t) => t.url) ?? []
-  const subLabel = (t: (typeof textSubs)[number]) =>
+  // Bitmap tracks cannot be overlaid; they are offered separately because
+  // choosing one restarts playback as a re-encode.
+  const burnSubs = info.subtitles?.filter((t) => t.burnIn) ?? []
+  const subLabel = (t: SubtitleTrack) =>
     t.title || t.language?.toUpperCase() || t.codec
 
   function readVolume(): number {
@@ -121,10 +136,29 @@
     }
   })
 
+  // Set when the server answers a heartbeat with 409: an administrator ended
+  // this playback. The video is paused and the viewer told, rather than the
+  // picture simply freezing with no explanation.
+  let stoppedByAdmin = $state(false)
+
+  function onProgressError(err: unknown) {
+    if (!(err instanceof Error) || err.message !== PLAYBACK_STOPPED || stoppedByAdmin) return
+    stoppedByAdmin = true
+    if (video) {
+      video.pause()
+      // Release the stream as well as stopping the picture: a direct play
+      // holds its range request open, which is the thing the administrator
+      // was trying to reclaim.
+      video.removeAttribute('src')
+      video.load()
+    }
+    hls?.destroy()
+  }
+
   // Heartbeat keeps the admin Activity entry alive while paused (no
   // timeupdate events fire then); the server drops silent clients.
   const heartbeat = setInterval(() => {
-    if (video) postProgress(item.id, Math.floor(video.currentTime), video.paused).catch(() => {})
+    if (video && !stoppedByAdmin) postProgress(item.id, Math.floor(video.currentTime), video.paused).catch(onProgressError)
   }, 15000)
 
   const onHide = () => beaconStop(item.id)
@@ -151,11 +185,11 @@
   })
 
   function reportProgress(force = false) {
-    if (!video) return
+    if (!video || stoppedByAdmin) return
     const t = Math.floor(video.currentTime)
     if (force || Math.abs(t - lastPosted) >= 10) {
       lastPosted = t
-      postProgress(item.id, t, video.paused).catch(() => {})
+      postProgress(item.id, t, video.paused).catch(onProgressError)
     }
   }
 
@@ -167,9 +201,17 @@
     reportProgress()
     if (!duration) return
     const left = duration - current
-    if (next && !dismissed && left <= CREDITS_WINDOW) {
+    const creditsAt = credits ? credits.startSecs : duration - CREDITS_WINDOW
+    if (next && !dismissed && current >= creditsAt) {
       showNext = true
-      remaining = Math.max(0, Math.ceil(left))
+      const startsAt = credits ? Math.min(duration, credits.startSecs + CREDITS_COUNTDOWN) : duration
+      remaining = Math.max(0, Math.ceil(startsAt - current))
+      // A file without detected credits rolls on from onEnded instead.
+      if (credits && remaining === 0 && left > 1 && !advanced && autoplayNext()) {
+        advanced = true
+        reportProgress(true)
+        onnext(next)
+      }
     } else {
       showNext = false
     }
@@ -177,6 +219,7 @@
 
   function onEnded() {
     reportProgress(true)
+    if (advanced) return
     if (next && !dismissed && autoplayNext()) {
       onnext(next)
     } else {
@@ -188,6 +231,16 @@
     if (video.paused) video.play().catch(() => {})
     else video.pause()
   }
+
+  // ---- Skip intro ----
+  // Offered while playback is inside the episode's detected intro, and gone
+  // a couple of seconds before its end, when skipping would save nothing.
+  const intro = $derived(info.segments?.find((s) => s.kind === 'intro'))
+  const inIntro = $derived(!!intro && current >= intro.startSecs && current < intro.endSecs - 2)
+  function skipIntro() {
+    if (intro) seekTo(intro.endSecs)
+  }
+  const credits = $derived(info.segments?.find((s) => s.kind === 'credits'))
 
   function skip(secs: number) {
     seekTo(video.currentTime + secs)
@@ -235,12 +288,48 @@
     else box.requestFullscreen?.().catch(() => {})
   }
 
+  // ---- Fill the window ----
+  // Between the inline player and fullscreen: the video takes the whole
+  // browser window, with the tabs, the address bar and the rest of the
+  // desktop still there. The page behind it does not scroll while it is up.
+  let windowed = $state(false)
+  function toggleWindowed() {
+    windowed = !windowed
+    wake()
+  }
+  $effect(() => {
+    if (!windowed) return
+    const before = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    document.body.classList.add('player-windowed')
+    return () => {
+      document.body.style.overflow = before
+      document.body.classList.remove('player-windowed')
+    }
+  })
+
+  // ---- Controls over the picture ----
+  // They fade three seconds after the pointer last moved, while playing.
+  // Paused, with a menu open, or with the pointer over the controls
+  // themselves, they stay.
+  let overControls = false
   function wake() {
     idle = false
     clearTimeout(idleTimer)
     idleTimer = setTimeout(() => {
-      if (document.fullscreenElement && !video.paused) idle = true
+      if (!compact && video && !video.paused && openMenu === null && !overControls) idle = true
     }, 3000)
+  }
+  const holdControls = (on: boolean) => () => {
+    overControls = on
+    wake()
+  }
+  // A tap on a touch screen, where there is no hover, brings hidden
+  // controls back rather than pausing behind them.
+  function onVideoClick() {
+    if (compact) return onexpand()
+    if (idle) return wake()
+    togglePlay()
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -264,6 +353,13 @@
         break
       case 'f':
         toggleFullscreen()
+        break
+      case 't':
+        toggleWindowed()
+        break
+      case 'Escape':
+        // Fullscreen handles its own Escape; this one leaves the window mode.
+        if (windowed && !document.fullscreenElement) windowed = false
         break
       case 'm':
         toggleMute()
@@ -289,6 +385,17 @@
     wake()
   }
 
+  /**
+   * Picking a bitmap subtitle cannot just switch a text track on: it has to
+   * be painted into the picture, which means restarting playback as a
+   * re-encode. Handled by the host, like a quality change.
+   */
+  function selectBurnIn(track: SubtitleTrack) {
+    openMenu = null
+    reportProgress(true) // the new session resumes at the same spot
+    onburnsubtitle(track.streamIndex ?? 0)
+  }
+
   function selectSubtitle(id: string) {
     subtitle = id
     for (const track of video.textTracks) {
@@ -302,6 +409,70 @@
     if (q === quality) return
     reportProgress(true) // so the new session resumes at the same spot
     onquality(q)
+  }
+
+  // ---- Seek previews (trickplay) ----
+  //
+  // One sprite sheet plus a WebVTT index of regions within it. Parsed once
+  // per item; a 404 simply means the server has not generated them yet (the
+  // request itself starts that off), in which case the scrub bar behaves as
+  // it always did.
+  type TrickCue = { from: number; to: number; x: number; y: number; w: number; h: number }
+  let trickCues: TrickCue[] = $state([])
+  let hoverSecs = $state(-1)
+  let hoverX = $state(0)
+  let seekEl: HTMLElement | undefined = $state()
+
+  const trickSheet = $derived(`/api/v1/items/${item.id}/trickplay.jpg`)
+
+  $effect(() => {
+    const id = item.id
+    trickCues = []
+    fetch(`/api/v1/items/${id}/trickplay.vtt`)
+      // 202 means the sheet is being generated now; there are no cues to
+      // read yet and the next load will have them.
+      .then((r) => (r.ok && r.status !== 202 ? r.text() : null))
+      .then((text) => {
+        if (text && item.id === id) trickCues = parseTrickVTT(text)
+      })
+      .catch(() => {})
+  })
+
+  function parseTrickVTT(text: string): TrickCue[] {
+    const out: TrickCue[] = []
+    const lines = text.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const range = lines[i].match(/^(\d\d):(\d\d):(\d\d)\.\d+ --> (\d\d):(\d\d):(\d\d)\.\d+/)
+      if (!range) continue
+      const xywh = lines[i + 1]?.match(/#xywh=(\d+),(\d+),(\d+),(\d+)/)
+      if (!xywh) continue
+      const secs = (h: string, m: string, sec: string) => +h * 3600 + +m * 60 + +sec
+      out.push({
+        from: secs(range[1], range[2], range[3]),
+        to: secs(range[4], range[5], range[6]),
+        x: +xywh[1], y: +xywh[2], w: +xywh[3], h: +xywh[4],
+      })
+    }
+    return out
+  }
+
+  /** The cue covering a time, or the nearest one before it. */
+  const cueAt = (t: number) => {
+    let found: TrickCue | null = null
+    for (const c of trickCues) {
+      if (c.from <= t) found = c
+      else break
+    }
+    return found
+  }
+  const hoverCue = $derived(hoverSecs >= 0 ? cueAt(hoverSecs) : null)
+
+  function onSeekHover(e: PointerEvent) {
+    if (!seekEl || !duration) return
+    const r = seekEl.getBoundingClientRect()
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
+    hoverSecs = frac * duration
+    hoverX = frac * r.width
   }
 
   // ---- Chapters ----
@@ -332,7 +503,16 @@
     seekTo(chapters[target].startSecs)
   }
 
-  const chapterLabel = (c: Chapter, i: number) => c.title?.trim() || `Chapter ${i + 1}`
+  // Many rips name their chapters with a timestamp ("00:08:30.260"), which
+  // next to the actual start time reads as the same number printed twice.
+  // A title that is only a timestamp carries no information, so it is
+  // treated as no title at all.
+  const timestampOnly = /^\d{1,2}:\d{2}(:\d{2})?([.,]\d+)?$/
+  const chapterLabel = (c: Chapter, i: number) => {
+    const t = c.title?.trim() ?? ''
+    if (t === '' || timestampOnly.test(t)) return `Chapter ${i + 1}`
+    return t
+  }
 
   // ---- Playback speed ----
   // Audiobook-style speeds are not useful for film, but 1.25x/1.5x are for
@@ -412,6 +592,32 @@
     return parts.join(' · ')
   }
 
+  // ---- Frame delivery ----
+  // Whether the browser is keeping up with the picture. When it is not, the
+  // sound carries on and the picture falls behind until a pause lets it
+  // catch up, which looks like a sync fault in the stream but is not one.
+  // Sampled once a second while the overlay is open: shown frames per
+  // second against the source rate says it at a glance.
+  let shownFps = $state(0)
+  let droppedFrames = $state(0)
+  let totalFrames = $state(0)
+  $effect(() => {
+    if (!showInfo || !video?.getVideoPlaybackQuality) return
+    let last = video.getVideoPlaybackQuality()
+    let lastAt = performance.now()
+    const id = setInterval(() => {
+      const q = video.getVideoPlaybackQuality()
+      const now = performance.now()
+      const shown = q.totalVideoFrames - q.droppedVideoFrames - (last.totalVideoFrames - last.droppedVideoFrames)
+      shownFps = video.paused ? 0 : Math.round((shown * 1000) / (now - lastAt))
+      droppedFrames = q.droppedVideoFrames
+      totalFrames = q.totalVideoFrames
+      last = q
+      lastAt = now
+    }, 1000)
+    return () => clearInterval(id)
+  })
+
   // ---- Live bitrate ----
   // Measured from the segments hls.js actually fetched: bytes over the media
   // time they cover. That is the number that says whether the link will keep
@@ -463,13 +669,13 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<section class="nowplaying" class:idle class:compact bind:this={box} onmousemove={wake}>
+<section class="nowplaying" class:idle class:compact class:windowed bind:this={box} onmousemove={wake} onpointerdown={wake}>
   {#if compact}
     <div class="mini-progress"><div style="width: {pct(current)}%"></div></div>
   {/if}
 
   {#if !compact}
-    <div class="bar">
+    <div class="bar" role="toolbar" tabindex="-1" onmouseenter={holdControls(true)} onmouseleave={holdControls(false)}>
       <span class="bartitle">
         {item.title}
         {#if item.kind === 'episode'}<span class="sub">{epCode(item)}</span>{/if}
@@ -487,8 +693,8 @@
       ontimeupdate={onTimeUpdate}
       onended={onEnded}
       onplay={() => { paused = false; wake() }}
-      onpause={() => (paused = true)}
-      onclick={() => (compact ? onexpand() : togglePlay())}
+      onpause={() => { paused = true; idle = false }}
+      onclick={onVideoClick}
       ondblclick={() => !compact && toggleFullscreen()}
     >
       {#each textSubs as t (t.id)}
@@ -522,6 +728,13 @@
             <dt>Why</dt>
             <dd>{info.reason}</dd>
           {/if}
+          {#if totalFrames > 0}
+            <dt>Frames</dt>
+            <dd>
+              {shownFps} fps shown
+              · {droppedFrames} dropped ({((droppedFrames / totalFrames) * 100).toFixed(1)}%)
+            </dd>
+          {/if}
           <dt>Buffer</dt>
           <dd>
             {Math.max(0, Math.round(bufferedEnd - current))}s ahead
@@ -531,9 +744,19 @@
       </div>
     {/if}
 
+    {#if stoppedByAdmin}
+      <div class="stopped" role="alert">
+        <div class="stopped-title">Playback stopped</div>
+        <p class="stopped-body">An administrator ended this stream. Your place has been saved.</p>
+        <button class="primary" onclick={onclose}>Close</button>
+      </div>
+    {/if}
+    {#if inIntro && !compact}
+      <button class="skipintro" onclick={skipIntro}>Skip intro</button>
+    {/if}
     {#if showNext && next && !compact}
       <div class="upnext">
-        <div class="upnext-label">Up next · starts in {remaining}s</div>
+        <div class="upnext-label">Up next{#if autoplayNext()} · starts in {remaining}s{/if}</div>
         <div class="upnext-title">
           {next.title}
           <span class="sub2">{epCode(next)}</span>
@@ -570,8 +793,27 @@
       <button class="ctl" onclick={onclose} title="Stop playback"><X size={17} /></button>
     </div>
   {:else}
-    <div class="controls">
-      <div class="seekwrap">
+    <div class="controls" role="toolbar" tabindex="-1" onmouseenter={holdControls(true)} onmouseleave={holdControls(false)}>
+      <div
+        class="seekwrap"
+        bind:this={seekEl}
+        onpointermove={onSeekHover}
+        onpointerleave={() => (hoverSecs = -1)}
+      >
+        {#if hoverCue}
+          <!-- Clamped to the bar so the preview never hangs off the edge at
+               the very start or end of a film. -->
+          <div
+            class="preview"
+            style="left: {Math.min(Math.max(hoverX, hoverCue.w / 2), (seekEl?.clientWidth ?? 0) - hoverCue.w / 2)}px; width: {hoverCue.w}px; height: {hoverCue.h}px;"
+          >
+            <div
+              class="preview-img"
+              style="width: {hoverCue.w}px; height: {hoverCue.h}px; background-image: url({trickSheet}); background-position: -{hoverCue.x}px -{hoverCue.y}px;"
+            ></div>
+            <span class="preview-time">{fmt(hoverSecs)}</span>
+          </div>
+        {/if}
         <div class="seek-buffered" style="width: {pct(bufferedEnd)}%"></div>
         <div class="seek-played" style="width: {pct(current)}%"></div>
         <input
@@ -620,7 +862,7 @@
             {/if}
           </div>
         {/if}
-        {#if textSubs.length > 0}
+        {#if textSubs.length > 0 || burnSubs.length > 0}
           <div class="menuwrap">
             <button
               class="ctl" class:on={openMenu === 'cc' || subtitle !== 'off'}
@@ -640,6 +882,16 @@
                     role="menuitemradio" aria-checked={subtitle === t.id}
                     onclick={() => selectSubtitle(t.id)}>{subLabel(t)}</button>
                 {/each}
+                {#if burnSubs.length > 0}
+                  <div class="menu-head">Burned in</div>
+                  {#each burnSubs as t (t.id)}
+                    <button
+                      class="menu-item"
+                      role="menuitem"
+                      title="Painted into the picture — restarts playback"
+                      onclick={() => selectBurnIn(t)}>{subLabel(t)}</button>
+                  {/each}
+                {/if}
               </div>
             {/if}
           </div>
@@ -652,7 +904,7 @@
               title="Chapters" aria-label="Chapters"
               aria-haspopup="menu" aria-expanded={openMenu === 'chapters'}><List size={16} /></button>
             {#if openMenu === 'chapters'}
-              <div class="menu" role="menu">
+              <div class="menu chapters" role="menu">
                 <div class="menu-head">Chapters</div>
                 {#each chapters as c, i (c.startSecs)}
                   <button
@@ -710,6 +962,9 @@
           title="Playback info"
           aria-label="Playback info"
           aria-pressed={showInfo}><Info size={16} /></button>
+        <button class="ctl" onclick={toggleWindowed} title={windowed ? 'Back to the page (t)' : 'Fill the window (t)'} aria-pressed={windowed}>
+          {#if windowed}<Shrink size={16} />{:else}<Expand size={16} />{/if}
+        </button>
         <button class="ctl" onclick={toggleFullscreen} title="Fullscreen (f)"><Maximize size={16} /></button>
       </div>
     </div>
@@ -721,7 +976,7 @@
      without hiding it. */
   .info {
     position: absolute;
-    top: 0.75rem;
+    top: 3.25rem; /* below the title bar */
     left: 0.75rem;
     max-width: min(22rem, calc(100% - 1.5rem));
     padding: 0.6rem 0.75rem;
@@ -763,10 +1018,41 @@
 
   /* .menu-item is display:block for the plain text rows; a chapter row needs
      two columns, so it opts into flex rather than changing the shared rule. */
-  .ch-row { display: flex; align-items: center; }
+  .ch-row { display: flex; align-items: center; gap: 0.5rem; }
+  /* Chapter rows carry a name and a time, so the menu is given room for
+     both rather than the narrow width the single-column menus need. */
+  .menu.chapters { min-width: 15rem; }
   /* A chapter row is a name and its timestamp, the name taking the slack. */
   .ch-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ch-at { opacity: 0.6; font-variant-numeric: tabular-nums; margin-left: 0.75rem; }
+
+  /* The hover preview sits above the scrub bar, pointer-transparent so it
+     never swallows the drag it is describing. */
+  .preview {
+    position: absolute;
+    bottom: calc(100% + 0.5rem);
+    transform: translateX(-50%);
+    pointer-events: none;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid rgb(255 255 255 / 0.2);
+    box-shadow: 0 6px 18px rgb(0 0 0 / 0.5);
+    background: #000;
+    z-index: 5;
+  }
+  .preview-img { background-repeat: no-repeat; }
+  .preview-time {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    text-align: center;
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+    background: linear-gradient(to top, rgb(0 0 0 / 0.8), transparent);
+    padding: 0.5rem 0 0.15rem;
+  }
 
   .menuwrap { position: relative; display: flex; }
   .menu {
@@ -776,6 +1062,9 @@
     min-width: 11rem;
     max-height: 15rem;
     overflow-y: auto;
+    /* Rows ellipsise rather than widening the menu; without this a long
+       chapter name gave the popup a horizontal scrollbar. */
+    overflow-x: hidden;
     padding: 0.3rem;
     border-radius: 10px;
     border: 1px solid rgb(255 255 255 / 0.14);
@@ -817,21 +1106,67 @@
     overflow: hidden;
     margin-bottom: 1.5rem;
   }
+  /* ---- Controls over the picture (every mode but compact) ----
+     The title bar and the controls float over the video on dark gradients,
+     and fade when idle. Their colours are fixed rather than themed: they sit
+     on the picture, which is never the theme's background. */
+  .nowplaying:not(.compact) { position: relative; background: #000; }
+  .nowplaying:not(.compact) .bar,
+  .nowplaying:not(.compact) .controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 3;
+    color: #fff;
+    transition: opacity 0.25s ease;
+  }
+  .nowplaying:not(.compact) .bar {
+    top: 0;
+    border-bottom: none;
+    padding-bottom: 1.6rem;
+    background: linear-gradient(to bottom, rgb(0 0 0 / 0.72), transparent);
+  }
+  .nowplaying:not(.compact) .controls {
+    bottom: 0;
+    padding-top: 1.8rem;
+    background: linear-gradient(to top, rgb(0 0 0 / 0.82), rgb(0 0 0 / 0.45) 60%, transparent);
+  }
+  .nowplaying:not(.compact) .ctl { color: rgb(255 255 255 / 0.88); }
+  .nowplaying:not(.compact) .ctl:hover { background: rgb(255 255 255 / 0.14); color: #fff; }
+  .nowplaying:not(.compact) .time,
+  .nowplaying:not(.compact) .sub { color: rgb(255 255 255 / 0.75); }
+  .nowplaying:not(.compact) .mode { color: rgb(255 255 255 / 0.75); border-color: rgb(255 255 255 / 0.3); }
+  .nowplaying:not(.compact) .seekwrap::before { background: rgb(255 255 255 / 0.25); }
+  .nowplaying:not(.compact) .seek-buffered { background: rgb(255 255 255 / 0.4); }
+  .nowplaying.idle .bar,
+  .nowplaying.idle .controls { opacity: 0; pointer-events: none; }
+  .nowplaying.idle { cursor: none; }
+
+  /* Filling the window, and fullscreen: the picture takes all the room. */
+  .nowplaying.windowed {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  /* <main> isolates its own stacking context (for the page backdrop), which
+     would trap the player under the app's header however high its z-index;
+     lifting <main> itself while the player fills the window frees it. */
+  :global(body.player-windowed main) { z-index: 300; }
   .nowplaying:fullscreen {
     border: none;
     border-radius: 0;
     display: flex;
     flex-direction: column;
-    background: #000;
   }
+  .nowplaying.windowed .stage,
   .nowplaying:fullscreen .stage { flex: 1; min-height: 0; }
-  .nowplaying:fullscreen video { max-height: none; height: 100%; }
-  .nowplaying:fullscreen .bar { background: rgba(16, 18, 24, 0.9); border-bottom: none; color: #fff; }
-  .nowplaying:fullscreen .controls { background: rgba(16, 18, 24, 0.9); }
-  .nowplaying:fullscreen.idle .bar,
-  .nowplaying:fullscreen.idle .controls { opacity: 0; pointer-events: none; }
-  .nowplaying:fullscreen.idle { cursor: none; }
-  .bar, .controls { transition: opacity 0.25s ease; }
+  .nowplaying.windowed video,
+  .nowplaying:fullscreen video { max-height: none; height: 100%; aspect-ratio: auto; object-fit: contain; }
 
   /* ---- Compact: Plex-style bottom now-playing bar ---- */
   .nowplaying.compact {
@@ -990,7 +1325,6 @@
   }
   .ctl:disabled { opacity: 0.35; cursor: default; }
   .ctl:hover { background: var(--bg); color: var(--text); }
-  .nowplaying:fullscreen .ctl { color: rgba(255, 255, 255, 0.85); }
   .playpause { font-size: 1.15rem; }
   .time { color: var(--muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; margin-left: 0.3rem; }
   .spacer { flex: 1; }
@@ -999,7 +1333,7 @@
   .upnext {
     position: absolute;
     right: 1rem;
-    bottom: 1rem;
+    bottom: 5.5rem; /* clear of the controls */
     background: rgba(16, 18, 24, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 12px;
@@ -1007,6 +1341,36 @@
     color: #fff;
     max-width: 19rem;
   }
+  /* Where the up-next card sits: the two never show together, since one
+     belongs to the start of an episode and the other to its end. */
+  .skipintro {
+    position: absolute;
+    right: 1rem;
+    bottom: 5.5rem; /* clear of the controls */
+    padding: 0.6rem 1.2rem;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    color: var(--text);
+    font-weight: 600;
+  }
+  .skipintro:hover { border-color: var(--accent); }
+  /* Centred rather than tucked in a corner like the up-next card: this one
+     is not an offer, it explains why the picture stopped. */
+  .stopped {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 0.2rem;
+    text-align: center;
+    padding: 1.5rem;
+    background: rgba(16, 18, 24, 0.86);
+    color: #fff;
+  }
+  .stopped-title { font-size: 1.1rem; font-weight: 600; }
+  .stopped-body { color: rgba(255, 255, 255, 0.75); margin: 0.3rem 0 0.9rem; max-width: 28rem; }
   .upnext-label { font-size: 0.78rem; color: rgba(255, 255, 255, 0.6); }
   .upnext-title { font-weight: 600; margin: 0.35rem 0 0.7rem; }
   .sub2 { color: rgba(255, 255, 255, 0.65); font-weight: 400; margin-left: 0.4rem; }

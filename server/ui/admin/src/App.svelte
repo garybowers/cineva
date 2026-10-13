@@ -2,7 +2,12 @@
   import { onMount } from 'svelte'
   import {
     getHealth, listLibraries, createLibrary, deleteLibrary, scanLibrary, listScans,
-    cancelScan, listSessions, stopSession, subscribeEvents, browseDirs, systemStats, playStats, diskStats, auditLog,
+    listGroups, createGroup, updateGroup, deleteGroup, getLibraryAccess, setLibraryAccess,
+    type UserGroup, type LibraryAccess,
+    listIntegrations, createIntegration, updateIntegration, deleteIntegration,
+    type Integration, type IntegrationKind, type IntegrationRequest,
+    pauseSegments, resumeSegments,
+    cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
     libraryItems, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
     updateLibrary,
     refreshLibrary, cancelRefresh, refreshStatus, type RefreshProgress,
@@ -11,7 +16,7 @@
     type Collection, type ItemEdit,
     authStatus, login, logout, listUsers, createUser, updateUser, deleteUser, UNAUTHORISED, getSettings, putSettings,
     type ServerSettings,
-    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type DiskVolume, type AuditEntry, type User, type UserRequest,
+    type Health, type Library, type Scan, type PlaySession, type DirListing, type SystemSample, type PlayDay, type PlayTotals, type DiskVolume, type AuditEntry, type User, type UserRequest,
   } from './lib/api'
   import LineChart from './LineChart.svelte'
   import BarChart from './BarChart.svelte'
@@ -19,20 +24,45 @@
 
   /** Write a browsed path back into whichever row opened the browser. */
   function setBrowsePath(p: string) {
-    const list = editLib ? editPaths : newPaths
-    const next = [...list]
-    next[browseTarget] = p
-    if (editLib) editPaths = next
-    else newPaths = next
+    setBrowsePaths([p])
   }
 
-  type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'logs' | 'settings'
+  /**
+   * Write one or more browsed paths back, starting at the row that opened
+   * the browser. Extra selections become rows after it, in the order they
+   * were ticked, so a library of several folders is one trip through the
+   * picker rather than one trip each.
+   *
+   * Paths the library already holds are dropped rather than duplicated, and
+   * blank rows are cleared out once there is something real to show.
+   */
+  function setBrowsePaths(paths: string[]) {
+    const list = editLib ? editPaths : newPaths
+    const next = [...list]
+    const existing = new Set(next.map((p) => p.trim()).filter(Boolean))
+    // The row that opened the browser is being replaced, so whatever it held
+    // must not block a selection of the same path.
+    existing.delete((next[browseTarget] ?? '').trim())
+    const fresh = paths.filter((p) => !existing.has(p.trim()))
+    if (fresh.length === 0) {
+      return
+    }
+    next[browseTarget] = fresh[0]
+    if (fresh.length > 1) next.splice(browseTarget + 1, 0, ...fresh.slice(1))
+    const trimmed = next.filter((p) => p.trim() !== '')
+    const final = trimmed.length > 0 ? trimmed : ['']
+    if (editLib) editPaths = final
+    else newPaths = final
+  }
+
+  type Page = 'dashboard' | 'libraries' | 'users' | 'activity' | 'logs' | 'integrations' | 'settings'
   const pages: { id: Page; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'libraries', label: 'Libraries' },
     { id: 'users', label: 'Users' },
     { id: 'activity', label: 'Activity' },
     { id: 'logs', label: 'Logs' },
+    { id: 'integrations', label: 'Integrations' },
     { id: 'settings', label: 'Settings' },
   ]
   const mediaTypes = ['movies', 'tv', 'music', 'audiobooks', 'podcasts', 'books']
@@ -111,6 +141,30 @@
     }
   }
 
+  async function setDetectionRate(mb: number) {
+    const before = settings
+    if (settings) settings = { ...settings, detectionRateMB: mb } // optimistic
+    try {
+      settings = await putSettings({ detectionRateMB: mb })
+    } catch (err) {
+      settings = before
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  async function toggleDetectionPause() {
+    try {
+      intro = intro?.paused && intro.pauseReason === 'manual' ? await resumeSegments() : await pauseSegments()
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+    }
+  }
+  const pauseText: Record<string, string> = {
+    manual: 'Paused — resume when you are ready.',
+    playing: 'Paused while something is playing; carries on a minute after it stops.',
+    scanning: 'Paused while a library scans; carries on a minute after it finishes.',
+  }
+
   async function setLoginMode(mode: 'picker' | 'form') {
     try {
       settings = await putSettings({ loginMode: mode })
@@ -126,18 +180,159 @@
   let userErr = $state('')
   let userSaving = $state(false)
   function newUser() {
-    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false, libraryIds: [] }
+    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false }
     userErr = ''
   }
   function editUser(u: User) {
-    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled, libraryIds: [...u.libraryIds] }
+    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled }
     userErr = ''
   }
-  function toggleGrant(id: string) {
-    if (!editing) return
-    const set = new Set(editing.libraryIds ?? [])
+  // ---- Groups ----
+  // Named sets of users, for restricting a library without listing every
+  // account. Kept with the users, since that is who they group.
+  let groups: UserGroup[] = $state([])
+  const loadGroups = () => listGroups().then((g) => (groups = g)).catch(() => {})
+  let editingGroup: { id?: string; name: string; memberIds: string[] } | null = $state(null)
+  let groupErr = $state('')
+  let groupSaving = $state(false)
+  function newGroup() {
+    editingGroup = { name: '', memberIds: [] }
+    groupErr = ''
+  }
+  function editGroup(g: UserGroup) {
+    editingGroup = { id: g.id, name: g.name, memberIds: [...g.memberIds] }
+    groupErr = ''
+  }
+  function toggleMember(id: string) {
+    if (!editingGroup) return
+    const set = new Set(editingGroup.memberIds)
     if (set.has(id)) set.delete(id); else set.add(id)
-    editing.libraryIds = [...set]
+    editingGroup.memberIds = [...set]
+  }
+  async function saveGroup(e: Event) {
+    e.preventDefault()
+    if (!editingGroup) return
+    groupSaving = true
+    groupErr = ''
+    try {
+      const g = editingGroup
+      if (g.id) await updateGroup(g.id, g.name, g.memberIds)
+      else await createGroup(g.name, g.memberIds)
+      editingGroup = null
+      loadGroups()
+    } catch (err) {
+      groupErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      groupSaving = false
+    }
+  }
+  async function removeGroup(g: UserGroup) {
+    if (!confirm(`Delete the group "${g.name}"? Libraries restricted to it will no longer be visible to its members.`)) return
+    try {
+      await deleteGroup(g.id)
+      loadGroups()
+    } catch (err) {
+      error = String(err instanceof Error ? err.message : err)
+    }
+  }
+  // ---- Integrations: Sonarr and Radarr ----
+  // Saving registers Cineva's webhook in the instance, which tests it by
+  // calling back before it answers — hence "Connecting…" rather than a
+  // plain save, and the instance's own error when it cannot reach us.
+  let integrations: Integration[] = $state([])
+  let editingInt: (IntegrationRequest & { id?: string; kind: IntegrationKind }) | null = $state(null)
+  let intErr = $state('')
+  let intNote = $state('')
+  let intSaving = $state(false)
+  const kindLabel = (k: IntegrationKind) => (k === 'radarr' ? 'Radarr' : 'Sonarr')
+  async function loadIntegrations() {
+    try {
+      integrations = await listIntegrations()
+    } catch {
+      /* the page shows what it last had */
+    }
+  }
+  function newIntegration(kind: IntegrationKind) {
+    editingInt = { kind, name: kindLabel(kind), url: '', apiKey: '', callbackUrl: location.origin }
+    intErr = ''
+    intNote = ''
+  }
+  function editIntegration(i: Integration) {
+    editingInt = { id: i.id, kind: i.kind, name: i.name, url: i.url, apiKey: '', callbackUrl: i.callbackUrl }
+    intErr = ''
+    intNote = ''
+  }
+  async function saveIntegration(e: Event) {
+    e.preventDefault()
+    if (!editingInt) return
+    intSaving = true
+    intErr = ''
+    try {
+      const { id, ...body } = editingInt
+      if (id) await updateIntegration(id, body)
+      else await createIntegration(body)
+      editingInt = null
+      loadIntegrations()
+    } catch (err) {
+      intErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      intSaving = false
+    }
+  }
+  async function removeIntegration(i: Integration) {
+    if (!confirm(`Disconnect ${i.name}? Cineva removes its webhook there, and new imports wait for the next scheduled rescan.`)) return
+    intNote = ''
+    try {
+      const res = await deleteIntegration(i.id)
+      if (res?.warning) intNote = res.warning
+      loadIntegrations()
+    } catch (err) {
+      intNote = String(err instanceof Error ? err.message : err)
+    }
+  }
+
+  const userName = (id: string) => {
+    const u = users.find((x) => x.id === id)
+    return u ? u.displayName || u.username : id.slice(0, 8)
+  }
+  const groupName = (id: string) => groups.find((g) => g.id === id)?.name ?? id.slice(0, 8)
+
+  // ---- Library access ----
+  // Open to everyone until restricted to chosen users and groups.
+  let accessLib: Library | null = $state(null)
+  let access: LibraryAccess = $state({ restricted: false, userIds: [], groupIds: [] })
+  let accessErr = $state('')
+  let accessBusy = $state(false)
+  async function openAccess(lib: Library) {
+    accessErr = ''
+    accessLib = lib
+    loadUsers()
+    loadGroups()
+    try {
+      access = await getLibraryAccess(lib.id)
+    } catch (err) {
+      accessErr = String(err instanceof Error ? err.message : err)
+    }
+  }
+  // The picker's value is "u:<id>" or "g:<id>".
+  function addPrincipal(v: string) {
+    const [kind, id] = [v.slice(0, 1), v.slice(2)]
+    if (kind === 'u' && !access.userIds.includes(id)) access.userIds = [...access.userIds, id]
+    if (kind === 'g' && !access.groupIds.includes(id)) access.groupIds = [...access.groupIds, id]
+  }
+  async function saveAccess() {
+    if (!accessLib) return
+    accessBusy = true
+    accessErr = ''
+    try {
+      await setLibraryAccess(accessLib.id, access)
+      accessLib = null
+      listLibraries().then((l) => (libraries = l)).catch(() => {})
+    } catch (err) {
+      accessErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      accessBusy = false
+    }
   }
   async function saveUser(e: Event) {
     e.preventDefault()
@@ -276,11 +471,39 @@
     }
   }
 
-  async function startScan(lib: Library) {
+  // Intro detection runs on its own after TV scans and at startup. Its
+  // status arrives over the event stream; the clock only ticks so elapsed
+  // and remaining time move between events.
+  let intro = $state<IntroStatus | null>(null)
+  let now = $state(Date.now())
+  $effect(() => {
+    if (!intro?.running) return
+    const id = setInterval(() => (now = Date.now()), 5000)
+    return () => clearInterval(id)
+  })
+  // "1 h 40 min", "12 min", "40 s".
+  const span = (secs: number) => {
+    secs = Math.max(0, Math.round(secs))
+    if (secs < 60) return `${secs} s`
+    const m = Math.round(secs / 60)
+    return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`
+  }
+  const introElapsed = $derived(intro?.startedAt ? (now - Date.parse(intro.startedAt)) / 1000 : 0)
+  // Extrapolated from the episodes done so far; withheld until there are
+  // enough of them for the rate to mean something.
+  const introLeft = $derived(
+    intro && intro.episodesDone >= 5 && intro.episodesTotal > intro.episodesDone
+      ? (introElapsed / intro.episodesDone) * (intro.episodesTotal - intro.episodesDone)
+      : null,
+  )
+  const phaseLabel = { reading: 'reading audio', comparing: 'comparing', saving: 'saving' }
+  const epCode = (r: IntroResult) => `S${String(r.season).padStart(2, '0')}E${String(r.episode).padStart(2, '0')}`
+
+  async function startScan(lib: Library, full = false) {
     error = ''
     go('activity') // move there now; progress arrives over the stream
     try {
-      const s = await scanLibrary(lib.id)
+      const s = await scanLibrary(lib.id, full)
       if (!scans.some((x) => x.id === s.id)) scans = [s, ...scans]
     } catch (e) {
       error = String(e instanceof Error ? e.message : e)
@@ -609,6 +832,20 @@
     }
   }
 
+  // Ends any playback, transcoding or not. The row goes immediately; a
+  // direct-play client stops on its next heartbeat, so the stream itself
+  // can persist for a few seconds after the row disappears.
+  async function endPlayback(s: PlaySession) {
+    const before = sessions
+    sessions = sessions.filter((x) => x.id !== s.id)
+    try {
+      await stopPlayback(s.userId, s.itemId)
+    } catch (e) {
+      sessions = before
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
   // Cancelling takes until the scanner finishes the file it is on, so the
   // button reports "Cancelling…" straight away rather than claiming the scan
   // has already stopped. The scan event replaces it with the real status.
@@ -628,11 +865,13 @@
   let playDays = $state(30)
   let samples: SystemSample[] = $state([])
   let plays: PlayDay[] = $state([])
+  let totals: PlayTotals | null = $state(null)
 
   async function loadStats() {
     try {
       samples = await systemStats(sysRange)
       plays = await playStats(playDays)
+      totals = await playTotals(playDays)
     } catch {
       /* dashboard is best-effort; the poll will retry */
     }
@@ -644,6 +883,7 @@
   function setPlayDays(d: number) {
     playDays = d
     playStats(d).then((x) => (plays = x)).catch(() => {})
+    playTotals(d).then((x) => (totals = x)).catch(() => {})
   }
   // Live sample from the event stream: the 1h view takes every sample; the
   // 24h view keeps one a minute to match the server's coarse ring.
@@ -704,6 +944,21 @@
 
   const playsToday = $derived(plays.length ? plays[plays.length - 1].movies + plays[plays.length - 1].episodes + plays[plays.length - 1].tracks : 0)
   const playsTotal = $derived(plays.reduce((n, d) => n + d.movies + d.episodes + d.tracks, 0))
+  // Watch time reads better as hours once there are more than a couple.
+  const watchTime = $derived.by(() => {
+    const s = totals?.secs ?? 0
+    if (s < 60) return null
+    const h = Math.floor(s / 3600)
+    const m = Math.round((s % 3600) / 60)
+    return h > 0 ? `${h}h ${m}m` : `${m}m`
+  })
+  // Share of plays that reached the end. Only meaningful once something has
+  // been measured — history recorded before durations existed counts as
+  // neither watched nor completed, so a library with only old rows shows
+  // nothing rather than a misleading 0%.
+  const completionPct = $derived(
+    totals && totals.plays > 0 ? Math.round((totals.completed / totals.plays) * 100) : null,
+  )
 
   // Folder picker for the path field: browses the server's filesystem one
   // level at a time (directories only).
@@ -711,6 +966,13 @@
   let listing: DirListing | null = $state(null)
   let browseErr = $state('')
   let showHidden = $state(false)
+  // Folders ticked in the picker. An array rather than a Set so the order
+  // they were chosen in is the order they are added.
+  let picked: string[] = $state([])
+
+  function togglePick(path: string) {
+    picked = picked.includes(path) ? picked.filter((p) => p !== path) : [...picked, path]
+  }
 
   async function browse(path: string) {
     browseErr = ''
@@ -724,6 +986,7 @@
   function openBrowser(row = 0) {
     browseTarget = row
     browsing = true
+    picked = []
     const cur = (editLib ? editPaths : newPaths)[browseTarget] ?? ''
     const start = cur.trim() && cur.startsWith('/') ? cur.trim() : '/'
     browse(start)
@@ -731,6 +994,11 @@
 
   function chooseFolder() {
     if (listing) setBrowsePath(listing.path)
+    browsing = false
+  }
+
+  function choosePicked() {
+    if (picked.length > 0) setBrowsePaths(picked)
     browsing = false
   }
 
@@ -788,11 +1056,15 @@
     loadDisks()
     loadLogs()
     loadUsers()
+    loadGroups()
+    loadIntegrations()
     loadSettings()
+    segmentStatus().then((s) => (intro = s)).catch(() => {})
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
         scan: onScanEvent,
+        segments: (data) => (intro = data as IntroStatus | null),
         refresh: (data) => {
           const p = data as RefreshProgress | null
           if (!p || !manage || p.libraryId !== manage.id) return
@@ -816,7 +1088,7 @@
         },
         stats: onSample,
         logs: () => { if (!logsLoading) loadLogs() },
-        users: loadUsers,
+        users: () => { loadUsers(); loadGroups() },
         settings: loadSettings,
         sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
@@ -860,7 +1132,7 @@
       const rest = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
       const parts = rest.split('/').filter(Boolean).map(decodeURIComponent)
       const [first, second] = parts
-      const pages: Page[] = ['dashboard', 'libraries', 'users', 'activity', 'logs', 'settings']
+      const pages: Page[] = ['dashboard', 'libraries', 'users', 'activity', 'logs', 'integrations', 'settings']
       const target = pages.includes(first as Page) ? (first as Page) : 'dashboard'
       page = target
       if (target === 'libraries' && second) {
@@ -955,7 +1227,12 @@
             <li><button type="button" onclick={() => browse(listing!.parent!)}>‥ up</button></li>
           {/if}
           {#each listing?.dirs ?? [] as d (d.path)}
-            <li><button type="button" onclick={() => browse(d.path)}>{d.name}</button></li>
+            <li class="dirrow">
+              <label class="pick" title="Add {d.name} to this library">
+                <input type="checkbox" checked={picked.includes(d.path)} onchange={() => togglePick(d.path)} />
+              </label>
+              <button type="button" class="dirname" onclick={() => browse(d.path)}>{d.name}</button>
+            </li>
           {/each}
           {#if listing && listing.dirs.length === 0}
             <li class="muted small">No subfolders</li>
@@ -965,7 +1242,13 @@
           <span class="muted small">{listing?.path ?? ''}</span>
           <span>
             <button type="button" onclick={() => (browsing = false)}>Cancel</button>
-            <button type="button" class="primary" disabled={!listing} onclick={chooseFolder}>Select this folder</button>
+            {#if picked.length > 0}
+              <button type="button" class="primary" onclick={choosePicked}>
+                Add {picked.length} folder{picked.length === 1 ? '' : 's'}
+              </button>
+            {:else}
+              <button type="button" class="primary" disabled={!listing} onclick={chooseFolder}>Select this folder</button>
+            {/if}
           </span>
         </div>
       </div>
@@ -1022,7 +1305,11 @@
         <div class="card wide">
           <div class="k">Plays</div>
           <div class="v">{playsToday}</div>
-          <div class="sub">today · {playsTotal} in the last {playDays} days</div>
+          <div class="sub">
+            today · {playsTotal} in the last {playDays} days{#if watchTime}
+              · {watchTime} watched{/if}{#if completionPct !== null}
+              · {completionPct}% finished{/if}
+          </div>
           <BarChart bars={playBars} series={['Movies', 'Episodes', 'Tracks']} />
         </div>
         <div class="card wide">
@@ -1387,23 +1674,75 @@
           </form>
         </div>
       {/if}
+      {#if accessLib}
+        {@const chosenU = new Set(access.userIds)}
+        {@const chosenG = new Set(access.groupIds)}
+        <div class="lib-modal-back" role="presentation" onclick={() => (accessLib = null)}></div>
+        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Library access">
+          <h2>Who can see “{accessLib.name}”</h2>
+          <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveAccess() }}>
+            <label class="check"><input type="radio" name="access" checked={!access.restricted} onchange={() => (access.restricted = false)} /> Everyone</label>
+            <label class="check"><input type="radio" name="access" checked={access.restricted} onchange={() => (access.restricted = true)} /> Only these people and groups</label>
+            {#if access.restricted}
+              <div class="principals">
+                {#each access.groupIds as id (id)}
+                  <span class="chip sel">{groupName(id)} <span class="muted small">group</span>
+                    <button type="button" class="chipx" aria-label="Remove {groupName(id)}" onclick={() => (access.groupIds = access.groupIds.filter((x) => x !== id))}>✕</button></span>
+                {/each}
+                {#each access.userIds as id (id)}
+                  <span class="chip sel">{userName(id)}
+                    <button type="button" class="chipx" aria-label="Remove {userName(id)}" onclick={() => (access.userIds = access.userIds.filter((x) => x !== id))}>✕</button></span>
+                {/each}
+                <select onchange={(e) => { const el = e.target as HTMLSelectElement; if (el.value) addPrincipal(el.value); el.value = '' }}>
+                  <option value="">+ Add a user or group…</option>
+                  {#if groups.some((g) => !chosenG.has(g.id))}
+                    <optgroup label="Groups">
+                      {#each groups.filter((g) => !chosenG.has(g.id)) as g (g.id)}<option value="g:{g.id}">{g.name}</option>{/each}
+                    </optgroup>
+                  {/if}
+                  <optgroup label="Users">
+                    {#each users.filter((u) => u.role !== 'admin' && !chosenU.has(u.id)) as u (u.id)}<option value="u:{u.id}">{u.displayName || u.username}</option>{/each}
+                  </optgroup>
+                </select>
+              </div>
+              {#if access.userIds.length === 0 && access.groupIds.length === 0}
+                <p class="hint">Nobody listed: only admins will see this library.</p>
+              {/if}
+            {/if}
+            <p class="hint">Admins always see every library.</p>
+            {#if accessErr}<div class="error slim">{accessErr}</div>{/if}
+            <div class="formrow">
+              <button class="primary" type="submit" disabled={accessBusy}>{accessBusy ? 'Saving…' : 'Save'}</button>
+              <button type="button" onclick={() => (accessLib = null)}>Cancel</button>
+            </div>
+          </form>
+        </div>
+      {/if}
       {#if libraries.length === 0}
         <div class="empty">No libraries yet.</div>
       {:else}
         <div class="tablewrap">
           <table>
-            <thead><tr><th>Name</th><th>Type</th><th>Paths</th><th>Items</th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Type</th><th>Paths</th><th>Items</th><th>Access</th><th></th></tr></thead>
             <tbody>
               {#each libraries as lib (lib.id)}
                 <tr>
-                  <td>{lib.name}</td>
+                  <td>
+                    {lib.name}
+                    {#if lib.storage && !lib.storage.available}
+                      <div class="storage-down">Storage unreachable{#if lib.storage.since} (went down {since(lib.storage.since)}){/if}: {lib.storage.path} — {lib.storage.error}</div>
+                    {/if}
+                  </td>
                   <td><span class="tag">{lib.mediaType}</span></td>
                   <td class="muted">{lib.paths.join(', ')}</td>
                   <td>{lib.itemCount}</td>
+                  <td>{#if lib.restricted}<span class="tag">restricted</span>{:else}<span class="muted">everyone</span>{/if}</td>
                   <td class="actions">
                     <button onclick={() => { openManage(lib); syncURL() }}>Manage</button>
                     <button onclick={() => startEditLibrary(lib)}>Edit…</button>
-                    <button onclick={() => startScan(lib)}>Scan</button>
+                    <button onclick={() => openAccess(lib)}>Access…</button>
+                    <button onclick={() => startScan(lib)} title="Read new and changed files">Scan</button>
+                    <button onclick={() => startScan(lib, true)} title="Reread and rematch every file — slow, but picks up new metadata">Full rescan</button>
                     <button class="danger" onclick={() => removeLibrary(lib)}>Delete</button>
                   </td>
                 </tr>
@@ -1436,13 +1775,7 @@
             <select bind:value={editing.role}><option value="user">user</option><option value="admin">admin</option></select>
           </label>
           {#if editing.role !== 'admin'}
-            <fieldset class="grants">
-              <legend>Libraries this user can see</legend>
-              {#each libraries as lib (lib.id)}
-                <label class="check"><input type="checkbox" checked={editing.libraryIds?.includes(lib.id)} onchange={() => toggleGrant(lib.id)} /> {lib.name} <span class="muted small">({lib.mediaType})</span></label>
-              {/each}
-              {#if libraries.length === 0}<span class="muted small">No libraries yet.</span>{/if}
-            </fieldset>
+            <p class="hint">Sees every library unless a library is restricted — set that from a library's Access… button on the Libraries page, or add them to a group.</p>
           {:else}
             <p class="hint">Admins see every library and can manage the server.</p>
           {/if}
@@ -1477,6 +1810,102 @@
             {/each}
           </tbody>
         </table>
+      </div>
+
+      <div class="titlerow grouphead">
+        <h2>Groups</h2>
+        <button onclick={newGroup}>+ Add group</button>
+      </div>
+      <p class="hint">Groups let you restrict a library to, say, the grown-ups without listing every account.</p>
+      {#if editingGroup}
+        <form class="panel form wide" onsubmit={saveGroup}>
+          <label>Name <input bind:value={editingGroup.name} required placeholder="Grown-ups" /></label>
+          <fieldset class="grants">
+            <legend>Members</legend>
+            {#each users as u (u.id)}
+              <label class="check"><input type="checkbox" checked={editingGroup.memberIds.includes(u.id)} onchange={() => toggleMember(u.id)} /> {u.displayName || u.username} <span class="muted small">{u.username}</span></label>
+            {/each}
+          </fieldset>
+          {#if groupErr}<div class="error slim">{groupErr}</div>{/if}
+          <div class="formrow">
+            <button class="primary" type="submit" disabled={groupSaving}>{groupSaving ? 'Saving…' : editingGroup.id ? 'Save' : 'Create'}</button>
+            <button type="button" onclick={() => (editingGroup = null)}>Cancel</button>
+          </div>
+        </form>
+      {/if}
+      {#if groups.length > 0}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Group</th><th>Members</th><th></th></tr></thead>
+            <tbody>
+              {#each groups as g (g.id)}
+                <tr>
+                  <td>{g.name}</td>
+                  <td class="muted">{g.memberIds.map(userName).join(', ') || 'nobody yet'}</td>
+                  <td class="actions">
+                    <button onclick={() => editGroup(g)}>Edit</button>
+                    <button class="danger" onclick={() => removeGroup(g)}>Delete</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {:else if page === 'integrations'}
+      <div class="titlerow">
+        <h1>Integrations</h1>
+        <div class="formrow addrow">
+          <button class="primary" onclick={() => newIntegration('sonarr')}>+ Add Sonarr</button>
+          <button class="primary" onclick={() => newIntegration('radarr')}>+ Add Radarr</button>
+        </div>
+      </div>
+      <p class="hint intro">Cineva registers a webhook in each connected Sonarr or Radarr, so an episode or film they import is scanned in within seconds rather than at the next scheduled rescan.</p>
+      {#if intNote}<div class="error slim">{intNote}</div>{/if}
+      {#if editingInt}
+        <form class="panel form wide" onsubmit={saveIntegration}>
+          <h2>{editingInt.id ? `Edit ${editingInt.name}` : `Connect ${kindLabel(editingInt.kind)}`}</h2>
+          <label>Name <input bind:value={editingInt.name} placeholder={kindLabel(editingInt.kind)} /></label>
+          <label>{kindLabel(editingInt.kind)} URL
+            <input type="url" bind:value={editingInt.url} required placeholder={editingInt.kind === 'radarr' ? 'http://radarr.lan:7878' : 'http://sonarr.lan:8989'} />
+          </label>
+          <label>{editingInt.id ? 'API key (leave blank to keep)' : 'API key'}
+            <input type="password" bind:value={editingInt.apiKey} required={!editingInt.id} autocomplete="off" />
+          </label>
+          <p class="hint">In {kindLabel(editingInt.kind)}: Settings → General → Security → API Key.</p>
+          <label>Cineva address, as {kindLabel(editingInt.kind)} reaches it
+            <input type="url" bind:value={editingInt.callbackUrl} required />
+          </label>
+          <p class="hint">Change this when {kindLabel(editingInt.kind)} runs in a container or on another machine and reaches Cineva at a different address, such as http://192.168.1.10:4747.</p>
+          {#if intErr}<div class="error slim">{intErr}</div>{/if}
+          <div class="formrow">
+            <button class="primary" type="submit" disabled={intSaving}>{intSaving ? 'Connecting…' : editingInt.id ? 'Save' : 'Connect'}</button>
+            <button type="button" onclick={() => (editingInt = null)}>Cancel</button>
+          </div>
+        </form>
+      {/if}
+      {#if integrations.length === 0 && !editingInt}
+        <div class="panel muted">Nothing connected yet. Add Sonarr for TV and Radarr for films.</div>
+      {/if}
+      <div class="intgrid">
+        {#each integrations as i (i.id)}
+          <div class="panel intcard">
+            <div class="inthead">
+              <span class="tag">{kindLabel(i.kind)}</span>
+              <strong>{i.name}</strong>
+            </div>
+            <div class="muted small inturl">{i.url}</div>
+            <div class="small">
+              {#if i.notificationId > 0}<span class="tag ok">Webhook registered</span>{:else}<span class="tag bad">No webhook</span>{/if}
+              {#if i.version}<span class="muted"> v{i.version}</span>{/if}
+            </div>
+            <div class="muted small inturl">Calls back to {i.callbackUrl}</div>
+            <div class="formrow">
+              <button onclick={() => editIntegration(i)}>Edit</button>
+              <button class="danger" onclick={() => removeIntegration(i)}>Disconnect</button>
+            </div>
+          </div>
+        {/each}
       </div>
     {:else if page === 'activity'}
       <div class="titlerow">
@@ -1516,6 +1945,13 @@
                     {#if s.sessionId}
                       <button class="danger" onclick={() => stopTranscode(s.sessionId!)}>Stop transcode</button>
                     {/if}
+                    <button
+                      class="danger"
+                      onclick={() => endPlayback(s)}
+                      title={s.sessionId
+                        ? 'Stop the stream and tell the client to stop playing'
+                        : 'Tell the client to stop playing (direct play has no stream to cut)'}
+                    >Stop playback</button>
                   </td>
                 </tr>
               {/each}
@@ -1523,6 +1959,62 @@
           </table>
         </div>
       {/if}
+      <div class="titlerow grouphead">
+        <h2>Intro &amp; credits detection</h2>
+        {#if intro && intro.enabled !== false}
+          <button onclick={toggleDetectionPause}>{intro.paused && intro.pauseReason === 'manual' ? 'Resume' : 'Pause'}</button>
+        {/if}
+      </div>
+      <div class="introjob">
+        {#if intro?.paused && intro.pauseReason}
+          <div class="pausenote">{pauseText[intro.pauseReason] ?? 'Paused.'}</div>
+        {/if}
+        {#if intro && intro.enabled === false}
+          <div class="muted">Turned off — set <code>libraries.intro_detection</code> to enable it.</div>
+        {:else if intro?.running}
+          <div>
+            Analysing {libName(intro.libraryId ?? '')}
+            <span class="muted">· {intro.episodesDone} of {intro.episodesTotal} checks · {intro.introsFound} intros, {intro.creditsFound} credits found{#if intro.unreadable} · {intro.unreadable} unreadable{/if}</span>
+          </div>
+          <div class="scanbar"><div class="scanbar-fill" style="width: {intro.episodesTotal ? (intro.episodesDone / intro.episodesTotal) * 100 : 0}%"></div></div>
+          {#if intro.current}
+            <div class="small">
+              {intro.current.series || 'Unknown series'} · Season {intro.current.season}
+              <span class="muted">— {intro.current.kind === 'credits' ? 'credits' : 'intros'}: {phaseLabel[intro.current.phase]} {intro.current.done} of {intro.current.total}</span>
+            </div>
+          {/if}
+          <div class="muted small">
+            Season {intro.seasonsDone + 1} of {intro.seasonsTotal} · running {span(introElapsed)}{#if introLeft !== null} · about {span(introLeft)} left{/if}
+          </div>
+        {:else if intro?.last}
+          <div>
+            {intro.last.cancelled ? 'Stopped' : 'Finished'} {since(intro.last.finishedAt)}
+            <span class="muted">· {libName(intro.last.libraryId)} · {intro.last.episodes} checks in {intro.last.seasons} seasons · {intro.last.introsFound} intros, {intro.last.creditsFound} credits found{#if intro.last.unreadable} · {intro.last.unreadable} unreadable{/if} · took {span(intro.last.seconds)}</span>
+          </div>
+        {:else}
+          <div class="muted">Idle. Runs after each TV library scan, on episodes not yet analysed for intros and credits.</div>
+        {/if}
+        {#if intro?.recent?.length}
+          <table class="introrecent">
+            <thead><tr><th>Latest episodes</th><th>Looked for</th><th>Found</th></tr></thead>
+            <tbody>
+              {#each intro.recent as r (r.itemId + r.kind)}
+                <tr>
+                  <td>{r.series} <span class="muted">{epCode(r)}</span></td>
+                  <td class="muted">{r.kind}</td>
+                  <td>
+                    {#if r.found && r.startSecs !== undefined && r.endSecs !== undefined}
+                      {clock(r.startSecs)} – {clock(r.endSecs)} <span class="muted">({Math.round(r.endSecs - r.startSecs)} s)</span>
+                    {:else}
+                      <span class="muted">none found</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      </div>
       <h2>Scans</h2>
       {#if scans.length === 0}
         <div class="empty slim">No scans yet — trigger one from the Libraries page.</div>
@@ -1537,6 +2029,10 @@
                   <td>
                     <span class="tag" class:ok={s.status === 'completed'} class:bad={s.status === 'failed'}>{s.status}</span>
                     {#if s.error}<div class="muted small">{s.error}</div>{/if}
+                    <!-- Before the first progress report the scanner is still
+                         walking the folders, which on a large share takes a
+                         while and otherwise looks like a stalled "0 files". -->
+                    {#if s.status === 'running' && !scanTotals.get(s.id)}<div class="muted small">Checking files…</div>{/if}
                     {#if pct(s) !== null}
                       <div class="scanbar"><div class="scanbar-fill" style="width: {pct(s)}%"></div></div>
                     {/if}
@@ -1636,6 +2132,27 @@
           >
             {#each settings?.certRegions ?? [] as r (r)}
               <option value={r}>{regionName(r)}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="setting">
+          <span>
+            Intro &amp; credits detection speed
+            <span class="muted small">
+              — how fast detection may read from your media storage. It reads
+              part of every episode, which at full speed can fill the link to
+              a NAS. It always pauses while anything plays or scans; a cap
+              also keeps it gentle the rest of the time.
+            </span>
+          </span>
+          <select
+            class="setting-select"
+            value={String(settings?.detectionRateMB ?? 0)}
+            onchange={(e) => setDetectionRate(Number((e.currentTarget as HTMLSelectElement).value))}
+            aria-label="Detection read speed"
+          >
+            {#each settings?.detectionRateOptions ?? [0] as mb (mb)}
+              <option value={String(mb)}>{mb === 0 ? 'Unlimited' : `Up to ${mb} MB/s`}</option>
             {/each}
           </select>
         </div>
@@ -1783,6 +2300,12 @@
   .grants legend { color: var(--muted); font-size: 0.8rem; padding: 0 0.3rem; }
   .check { flex-direction: row !important; align-items: center; gap: 0.5rem !important; color: var(--text) !important; }
   .formrow { display: flex; gap: 0.6rem; }
+  .addrow { flex-wrap: wrap; justify-content: flex-end; }
+  .intro { margin-bottom: 1rem; }
+  .intgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); gap: 1rem; }
+  .intcard { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0; }
+  .inthead { display: flex; align-items: center; gap: 0.5rem; }
+  .inturl { overflow-wrap: anywhere; }
   .formrow button:not(.primary) { color: var(--muted); }
   .who { color: var(--muted); font-size: 0.85rem; display: flex; gap: 0.6rem; align-items: center; }
   .who button { color: var(--accent-2); }
@@ -1837,6 +2360,17 @@
   }
   .dirs li button:hover { background: var(--bg); }
   .dirs li.muted { padding: 0.6rem; }
+  /* A row does two things: the checkbox adds the folder, the name navigates
+     into it. The checkbox gets its own hit area so a mis-tap on a phone
+     navigates rather than silently ticking something. */
+  .dirrow { display: flex; align-items: center; gap: 0.1rem; }
+  .pick {
+    display: grid; place-items: center;
+    padding: 0.45rem 0.5rem; border-radius: 6px; cursor: pointer;
+  }
+  .pick:hover { background: var(--bg); }
+  .pick input { cursor: pointer; }
+  .dirrow .dirname { flex: 1; }
   .error.slim { margin: 0.5rem 1rem; padding: 0.4rem 0.7rem; }
 
   /* ---- Library contents management ---- */
@@ -2081,6 +2615,12 @@
     color: var(--muted);
     font-size: 0.85rem;
   }
+  .pausenote { color: var(--accent-2); font-size: 0.88rem; }
+  .storage-down { color: var(--err); font-size: 0.8rem; margin-top: 0.2rem; }
+  .principals { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+  .chipx { margin-left: 0.3rem; color: var(--muted); font-size: 0.75rem; }
+  .chipx:hover { color: var(--err); }
+  .grouphead { margin-top: 1.5rem; }
   .chip.sel {
     border-color: var(--accent);
     color: var(--text);
@@ -2111,4 +2651,11 @@
     aside nav button { text-align: left; }
     .back { margin: auto 0 0; padding-top: 1rem; }
   }
+  .introjob {
+    display: flex; flex-direction: column; gap: 0.4rem;
+    margin-bottom: 1rem; padding: 0.75rem 1rem;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .introrecent { margin-top: 0.5rem; }
+  .introrecent td, .introrecent th { padding-left: 0; }
 </style>

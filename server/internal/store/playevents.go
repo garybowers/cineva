@@ -14,19 +14,73 @@ type PlayDay struct {
 }
 
 type PlayEventRepo interface {
-	RecordPlay(ctx context.Context, userID, itemID string, kind ItemKind) error
+	RecordPlay(ctx context.Context, userID, itemID string, kind ItemKind) (int64, error)
+	FinishPlay(ctx context.Context, id int64, secs int, completed bool) error
 	PlaysByDay(ctx context.Context, days int) ([]PlayDay, error)
+	PlayTotals(ctx context.Context, days int) (PlayTotals, error)
+}
+
+// PlayTotals summarises a window of history: how many plays, how long they
+// ran in total, and how many reached the end.
+type PlayTotals struct {
+	Plays     int `json:"plays"`
+	Completed int `json:"completed"`
+	Secs      int `json:"secs"`
 }
 
 var _ PlayEventRepo = (*Store)(nil)
 
-func (s *Store) RecordPlay(ctx context.Context, userID, itemID string, kind ItemKind) error {
-	if _, err := s.db.ExecContext(ctx,
+// RecordPlay opens a history row and returns its id, which FinishPlay
+// closes once the playback ends.
+func (s *Store) RecordPlay(ctx context.Context, userID, itemID string, kind ItemKind) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO play_events (user_id, item_id, kind) VALUES (?, ?, ?)`,
-		userID, itemID, string(kind)); err != nil {
-		return fmt.Errorf("record play: %w", err)
+		userID, itemID, string(kind))
+	if err != nil {
+		return 0, fmt.Errorf("record play: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("record play id: %w", err)
+	}
+	return id, nil
+}
+
+// FinishPlay closes a history row with how long it ran and whether it
+// finished.
+//
+// Only ever written once: a playback that is stopped and resumed opens a new
+// row, so a late duplicate — a reap racing an explicit stop — must not
+// overwrite a longer measured session with a shorter one.
+func (s *Store) FinishPlay(ctx context.Context, id int64, secs int, completed bool) error {
+	if secs < 0 {
+		secs = 0
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE play_events
+		 SET ended_at = datetime('now'), secs = ?, completed = ?
+		 WHERE id = ? AND ended_at IS NULL`,
+		secs, completed, id); err != nil {
+		return fmt.Errorf("finish play %d: %w", id, err)
 	}
 	return nil
+}
+
+// PlayTotals aggregates the last n days of history.
+func (s *Store) PlayTotals(ctx context.Context, days int) (PlayTotals, error) {
+	if days < 1 {
+		days = 1
+	}
+	var t PlayTotals
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(completed), 0), COALESCE(SUM(secs), 0)
+		 FROM play_events
+		 WHERE started_at >= datetime('now', ?)`,
+		fmt.Sprintf("-%d days", days)).Scan(&t.Plays, &t.Completed, &t.Secs)
+	if err != nil {
+		return PlayTotals{}, fmt.Errorf("play totals: %w", err)
+	}
+	return t, nil
 }
 
 // PlaysByDay returns one entry per day for the last `days` days (oldest

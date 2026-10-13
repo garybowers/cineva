@@ -26,6 +26,9 @@ type HLSJob struct {
 
 	VideoHeight      int // 0 = copy the video stream
 	VideoBitrateKbps int
+	// FilterSpecOverride replaces the filter chain videoFilterSpec would
+	// build. For measuring one chain against another; empty in normal use.
+	FilterSpecOverride string
 
 	// HW, when set, encodes on the GPU: frames are scaled on the CPU, then
 	// uploaded into a device frame pool and handed to the vendor encoder.
@@ -39,6 +42,13 @@ type HLSJob struct {
 	// and the picture comes out washed out, dark and flat. Ignored when the
 	// video is copied, which preserves the HDR stream as it is.
 	HDR string
+
+	// BurnSubtitle is the stream index of an image-based subtitle track to
+	// paint into the picture, or 0 for none. PGS and VobSub are bitmaps
+	// with no text to hand a player, so burning them in is the only way to
+	// show them — and only possible when the video is being re-encoded, as
+	// nothing can be drawn on a copied stream.
+	BurnSubtitle int
 
 	// AudioTrack is the stream index to play. -1 (or an index that is not
 	// an audio stream) falls back to whichever stream ffmpeg rates best,
@@ -174,6 +184,36 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	// Device frame pool, non-nil only when encoding on the GPU. It must
 	// outlive the encoder that draws from it.
 	var hwFrames *ffmpeg.AVBufferRef
+	// Non-nil when image subtitles are being painted into the picture.
+	var burner *subBurner
+	// Set during setup; read by the packet loop, which is outside that
+	// block. onGPU means the decoder emits device surfaces.
+	//
+	// Those surfaces are brought back to system memory before scaling.
+	// Scaling on the device would avoid the round trip, but it needs a
+	// filter graph fed by a hardware buffer source, and that cannot be
+	// built with this binding: a parsed graph's `buffer` filter rejects a
+	// hardware pixel format at init (it needs hw_frames_ctx, which can only
+	// be set after parsing), and building the graph by hand needs
+	// avfilter_link and avfilter_inout_alloc, neither of which is bound.
+	//
+	// The round trip is memory bandwidth, not compute, and decode is the
+	// expensive half — so this still removes the bulk of the CPU cost.
+	var onGPU bool
+	// Reusable system-memory frame the device surface is copied into, and
+	// the graph that scales it — built from the first downloaded frame,
+	// since only then is the real format known.
+	var swFrame *ffmpeg.AVFrame
+	var dlGraph *parsedGraph
+	defer func() {
+		if dlGraph != nil {
+			dlGraph.Close()
+		}
+		if swFrame != nil {
+			ffmpeg.AVFrameFree(&swFrame)
+		}
+	}()
+	var srcW, srcH, outW, outH int
 	defer func() {
 		if hwFrames != nil {
 			ffmpeg.AVBufferUnref(&hwFrames)
@@ -181,18 +221,22 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	}()
 
 	if job.VideoHeight > 0 {
-		vdec, err = newThreadedDecoder(vStream)
+		// Decoding on the device is the larger saving: with encode on the
+		// GPU and decode still on the CPU, a 4K HEVC source spends most of
+		// a machine's cores on decode alone. newDecoder falls back to
+		// software by itself if the device cannot take the stream.
+		vdec, err = newDecoder(vStream, job.HW)
 		if err != nil {
 			return fmt.Errorf("hls video decoder: %w", err)
 		}
 		defer vdec.Close()
 
-		srcW, srcH := vStream.Codecpar().Width(), vStream.Codecpar().Height()
-		outH := job.VideoHeight
+		srcW, srcH = vStream.Codecpar().Width(), vStream.Codecpar().Height()
+		outH = job.VideoHeight
 		if outH > srcH {
 			outH = srcH // never upscale
 		}
-		outW := srcW * outH / srcH / 2 * 2 // keep aspect, force even
+		outW = srcW * outH / srcH / 2 * 2 // keep aspect, force even
 
 		// The device frame pool is built first, because whether it succeeds
 		// decides the format the filter graph has to produce: NV12 for a
@@ -205,17 +249,58 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 				hwFrames = nil
 			}
 		}
-		filterFmt := ffmpeg.AVPixFmtYuv420P
-		if hwFrames != nil {
-			filterFmt = ffmpeg.AVPixFmtNv12
+		// Decoding on the device emits device surfaces, which a software
+		// filter cannot take. They are downloaded to system memory first
+		// and scaled on the CPU (see downloadFrame), so HDR tone mapping
+		// works on a hardware decode exactly as it does on a software one
+		// — the chain just runs after the download rather than instead of
+		// it.
+		//
+		// The graph cannot be built here: libavcodec allocates the
+		// decoder's frame pool lazily, during the first get_format call,
+		// so hw_frames_ctx is still nil until a frame has been decoded.
+		// It is built on the first downloaded frame instead.
+		onGPU = vdec.HardwarePixFmt() != ffmpeg.AVPixFmtNone && hwFrames != nil
+		if vdec.HardwarePixFmt() != ffmpeg.AVPixFmtNone && !onGPU {
+			// The device decodes but cannot encode, and feeding a software
+			// encoder from a device surface would download every frame for
+			// no gain over decoding on the CPU in the first place. Reopen
+			// on the CPU rather than fail.
+			log.Printf("hls: %s cannot encode here — decoding on the CPU too", job.HW.Kind)
+			vdec.Close()
+			vdec, err = newDecoder(vStream, nil)
+			if err != nil {
+				return fmt.Errorf("hls video decoder: %w", err)
+			}
 		}
 
-		vfilter, err = av.NewVideoFilterGraphFromContext(vdec.Raw(),
-			videoFilterSpec(job.HDR, outW, outH), filterFmt)
-		if err != nil {
-			return fmt.Errorf("hls video filter: %w", err)
+		if !onGPU {
+			filterFmt := ffmpeg.AVPixFmtYuv420P
+			if hwFrames != nil {
+				filterFmt = ffmpeg.AVPixFmtNv12
+			}
+			vfilter, err = av.NewVideoFilterGraphFromContext(vdec.Raw(),
+				job.filterSpec(outW, outH), filterFmt)
+			if err != nil {
+				return fmt.Errorf("hls video filter: %w", err)
+			}
+			defer vfilter.Close()
 		}
-		defer vfilter.Close()
+
+		// Image subtitles are painted onto the scaled frame on its way to
+		// the encoder. A failure to open the decoder loses the subtitles,
+		// not the playback.
+		if job.BurnSubtitle > 0 {
+			if st := streamByIndex(in, job.BurnSubtitle); st != nil {
+				if b, err := newSubBurner(st, srcW, srcH, outW, outH); err == nil {
+					burner = b
+					defer burner.Close()
+					log.Printf("hls: burning in subtitle stream %d", job.BurnSubtitle)
+				} else {
+					log.Printf("hls: subtitle burn-in unavailable: %v", err)
+				}
+			}
+		}
 
 		// Keyframe every segment so the HLS muxer can cut clean boundaries.
 		//
@@ -379,11 +464,18 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 
 	encodeVideoFrame := func(frame *ffmpeg.AVFrame) error {
 		frame.SetPictType(ffmpeg.AVPictureTypeNone) // let the encoder decide
+		// Painted after scaling and before the GPU upload: the frame is
+		// still in system memory here, and at output resolution, which is
+		// what the burner maps its coordinates onto.
+		if burner != nil {
+			burner.Paint(frame, ffmpeg.AVRescaleQ(frame.Pts(),
+				vStream.TimeBase(), ffmpeg.AVMakeQ(1, ffmpeg.AVTimeBase)))
+		}
 		if hwFrames == nil {
 			return venc.Encode(frame, writeVideoPacket)
 		}
-		// GPU path: the scaled NV12 frame is in system memory, so it has to
-		// be copied onto a device surface before the encoder will take it.
+		// The scaled NV12 frame is in system memory and has to be copied
+		// onto a device surface before the encoder will take it.
 		if _, err := ffmpeg.AVHWFrameGetBuffer(hwFrames, hwFrame, 0); err != nil {
 			return fmt.Errorf("hw frame from pool: %w", err)
 		}
@@ -414,6 +506,12 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 			return fmt.Errorf("hls read: %w", err)
 		}
 
+		if burner != nil && pkt.StreamIndex() == job.BurnSubtitle {
+			if err := burner.Feed(pkt); err != nil {
+				log.Printf("hls: subtitle: %v", err)
+			}
+			continue
+		}
 		switch pkt.StreamIndex() {
 		case vStream.Index():
 			if job.Throttle != nil && pkt.Pts() != ffmpeg.AVNoptsValue {
@@ -425,6 +523,26 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 			if venc != nil {
 				err = vdec.Decode(pkt, func(frame *ffmpeg.AVFrame) error {
 					frame.SetPts(frame.BestEffortTimestamp())
+					if onGPU {
+						var derr error
+						frame, derr = downloadFrame(&swFrame, frame)
+						if derr != nil {
+							return derr
+						}
+						if dlGraph == nil {
+							dlGraph, derr = newParsedGraph(
+								job.filterSpec(outW, outH)+",format="+encoderPixFmtName(hwFrames != nil),
+								frame, vStream.TimeBase())
+							if derr != nil {
+								return fmt.Errorf("hls download filter: %w", derr)
+							}
+							log.Printf("hls: decoding on %s, scaling on the CPU", job.HW.Kind)
+						}
+						if err := dlGraph.Push(frame); err != nil {
+							return err
+						}
+						return dlGraph.Pull(encodeVideoFrame)
+					}
 					if err := vfilter.Push(frame); err != nil {
 						return err
 					}
@@ -460,6 +578,19 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 	if venc != nil {
 		if err := vdec.Flush(func(frame *ffmpeg.AVFrame) error {
 			frame.SetPts(frame.BestEffortTimestamp())
+			if onGPU {
+				if dlGraph == nil {
+					return nil // nothing was decoded, so nothing to drain
+				}
+				frame, derr := downloadFrame(&swFrame, frame)
+				if derr != nil {
+					return derr
+				}
+				if err := dlGraph.Push(frame); err != nil {
+					return err
+				}
+				return dlGraph.Pull(encodeVideoFrame)
+			}
 			if err := vfilter.Push(frame); err != nil {
 				return err
 			}
@@ -467,8 +598,14 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 		}); err != nil {
 			return fmt.Errorf("hls flush video decoder: %w", err)
 		}
-		if err := vfilter.Push(nil); err == nil {
-			_ = vfilter.Pull(encodeVideoFrame)
+		if dlGraph != nil {
+			if err := dlGraph.Push(nil); err == nil {
+				_ = dlGraph.Pull(encodeVideoFrame)
+			}
+		} else if vfilter != nil {
+			if err := vfilter.Push(nil); err == nil {
+				_ = vfilter.Pull(encodeVideoFrame)
+			}
 		}
 		if err := venc.Flush(writeVideoPacket); err != nil {
 			return fmt.Errorf("hls flush video encoder: %w", err)
@@ -521,6 +658,14 @@ func RunHLS(ctx context.Context, job HLSJob) error {
 //
 // npl=100 is the target display peak in nits; it is the SDR reference white
 // that the HDR range is compressed into, not a property of the source.
+// filterSpec is the chain this job will use, honouring an override.
+func (j HLSJob) filterSpec(outW, outH int) string {
+	if j.FilterSpecOverride != "" {
+		return j.FilterSpecOverride
+	}
+	return videoFilterSpec(j.HDR, outW, outH)
+}
+
 func videoFilterSpec(hdr string, outW, outH int) string {
 	scale := fmt.Sprintf("scale=%d:%d", outW, outH)
 	tin := ""
@@ -532,12 +677,79 @@ func videoFilterSpec(hdr string, outW, outH int) string {
 	default:
 		return scale // SDR: nothing to map
 	}
-	// Scaling last, so the tone map works on the full-resolution picture and
-	// the downscale averages already-mapped values.
-	return "zscale=tin=" + tin + ":t=linear:npl=100," +
+	// Scaling first. Tone mapping runs on every pixel through a float
+	// conversion, so doing it at 4K costs four times what it costs at 1080p
+	// — measured at 0.76x realtime against 1.61x, which is the difference
+	// between a stream that stalls and one with headroom. The picture is
+	// the same to 0.28/255 mean luma difference, against roughly 5/255 for
+	// the tone map itself, so the earlier worry about downscaling
+	// already-mapped values costs nothing anyone can see.
+	//
+	// The input colour properties are stated outright because swscale does
+	// not carry HDR metadata through: without them zimg is handed a frame
+	// it cannot classify and refuses it with "no path between colorspaces",
+	// which is a stall rather than a wrong picture, but a stall either way.
+	return scale + "," +
+		"zscale=tin=" + tin + ":min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=100," +
 		"format=gbrpf32le," +
 		"zscale=p=bt709," +
 		"tonemap=tonemap=hable:desat=0," +
-		"zscale=t=bt709:m=bt709:r=tv," +
-		scale
+		"zscale=t=bt709:m=bt709:r=tv"
+}
+
+// streamByIndex finds a stream by its index in the container.
+func streamByIndex(in *av.Input, index int) *ffmpeg.AVStream {
+	streams := in.Streams()
+	for i := uint(0); i < in.NbStreams(); i++ {
+		st := streams.Get(uintptr(i))
+		if st != nil && st.Index() == index {
+			return st
+		}
+	}
+	return nil
+}
+
+// downloadFrame copies a decoded device surface into system memory, so the
+// software filter graph can scale it.
+//
+// Needed because a hardware filter graph cannot be built with this binding
+// (see the note on onGPU in RunHLS). The destination frame is reused across
+// calls — allocating one per frame would churn a few megabytes at 24 frames
+// a second.
+func downloadFrame(dst **ffmpeg.AVFrame, src *ffmpeg.AVFrame) (*ffmpeg.AVFrame, error) {
+	if *dst == nil {
+		*dst = ffmpeg.AVFrameAlloc()
+		if *dst == nil {
+			return nil, fmt.Errorf("allocate download frame")
+		}
+	}
+	out := *dst
+	ffmpeg.AVFrameUnref(out)
+	if _, err := ffmpeg.AVHWFrameTransferData(out, src, 0); err != nil {
+		return nil, fmt.Errorf("download frame from device: %w", err)
+	}
+	// The transfer copies pixels and nothing else. Timestamps matter for
+	// muxing; the colour properties matter because the tone-mapping chain
+	// reads the transfer function and primaries off the frame, and zimg
+	// fails outright on a frame that claims none.
+	out.SetPts(src.Pts())
+	out.SetBestEffortTimestamp(src.BestEffortTimestamp())
+	out.SetColorRange(src.ColorRange())
+	out.SetColorPrimaries(src.ColorPrimaries())
+	out.SetColorTrc(src.ColorTrc())
+	out.SetColorspace(src.Colorspace())
+	out.SetChromaLocation(src.ChromaLocation())
+	return out, nil
+}
+
+// encoderPixFmtName is the pixel format the video encoder is fed. A
+// hardware encoder takes NV12 surfaces; libx264 takes YUV420P. The
+// download path pins this explicitly because its filter chain ends in
+// whatever the last filter negotiates — for HDR that is a zscale output,
+// not necessarily anything an encoder accepts.
+func encoderPixFmtName(hardware bool) string {
+	if hardware {
+		return "nv12"
+	}
+	return "yuv420p"
 }

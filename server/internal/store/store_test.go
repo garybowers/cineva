@@ -5,7 +5,10 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -125,12 +128,111 @@ func TestContinueWatchingSurvivesSchema(t *testing.T) {
 	if _, err := s.SetProgress(ctx, LocalUser, item.ID, 600, item.RuntimeSecs); err != nil {
 		t.Fatalf("set progress: %v", err)
 	}
-	got, err := s.ContinueWatching(ctx, LocalUser, 10)
+	got, err := s.ContinueWatching(ctx, LocalUser, nil, 10)
 	if err != nil {
 		t.Fatalf("continue watching: %v", err)
 	}
 	if len(got) != 1 || got[0].ID != item.ID || got[0].PositionSecs != 600 {
 		t.Fatalf("continue watching = %+v, want the single in-progress item at 600s", got)
+	}
+}
+
+// An episode's title alone does not say which show it is, so the resume row
+// carries its series' title; a film carries none.
+func TestContinueWatchingNamesTheSeries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	lib, err := s.CreateLibrary(ctx, "TV", MediaTV, []string{"/tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(it Item) Item {
+		t.Helper()
+		it.LibraryID = lib.ID
+		saved, err := s.UpsertItem(ctx, it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	series := save(Item{Kind: KindSeries, Title: "The Big Bang Theory", Path: "/tv/tbbt"})
+	season := save(Item{Kind: KindSeason, ParentID: series.ID, Path: "/tv/tbbt/s1"})
+	ep := save(Item{Kind: KindEpisode, ParentID: season.ID, Title: "The Big Bran Hypothesis",
+		Path: "/tv/tbbt/s1/e2.mkv", RuntimeSecs: 1300})
+	film := save(Item{Kind: KindMovie, Title: "Film", Path: "/tv/film.mkv", RuntimeSecs: 5400})
+	for _, id := range []string{ep.ID, film.ID} {
+		if _, err := s.SetProgress(ctx, LocalUser, id, 300, 5400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ContinueWatching(ctx, LocalUser, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titles := map[string]string{}
+	for _, r := range got {
+		titles[r.ID] = r.SeriesTitle
+	}
+	if titles[ep.ID] != "The Big Bang Theory" || titles[film.ID] != "" {
+		t.Fatalf("series titles = %v, want the episode's series and nothing for the film", titles)
+	}
+}
+
+// Continue Watching shows only the libraries a viewer may see, and the
+// limit counts only those: items from a hidden library, however recent,
+// must not push the visible ones off the row.
+func TestContinueWatchingScopedToLibraries(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	kids, err := s.CreateLibrary(ctx, "Kids", MediaMovies, []string{"/kids"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grown, err := s.CreateLibrary(ctx, "Grown-ups", MediaMovies, []string{"/grown"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := func(lib Library, name, at string) Item {
+		t.Helper()
+		it, err := s.UpsertItem(ctx, Item{LibraryID: lib.ID, Kind: KindMovie, Title: name, Path: "/" + name + ".mkv", RuntimeSecs: 5400})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.SetProgress(ctx, LocalUser, it.ID, 600, it.RuntimeSecs); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE play_state SET updated_at = ? WHERE item_id = ?`, at, it.ID); err != nil {
+			t.Fatal(err)
+		}
+		return it
+	}
+	cartoon := start(kids, "cartoon", "2026-01-01 00:00:00")
+	start(grown, "thriller", "2026-02-01 00:00:00")
+	start(grown, "horror", "2026-03-01 00:00:00")
+
+	for _, tc := range []struct {
+		name  string
+		libs  []string
+		limit int
+		want  []string
+	}{
+		{"every library", nil, 10, []string{"horror", "thriller", "cartoon"}},
+		{"one library, limit after scoping", []string{kids.ID}, 1, []string{cartoon.Title}},
+		{"no libraries at all", []string{}, 10, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.ContinueWatching(ctx, LocalUser, tc.libs, tc.limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			names := []string{}
+			for _, r := range got {
+				names = append(names, r.Title)
+			}
+			if strings.Join(names, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("continue watching = %v, want %v", names, tc.want)
+			}
+		})
 	}
 }
 
@@ -146,7 +248,7 @@ func TestPlaysByDayHasContinuousSpine(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := s.RecordPlay(ctx, LocalUser, item.ID, KindMovie); err != nil {
+		if _, err := s.RecordPlay(ctx, LocalUser, item.ID, KindMovie); err != nil {
 			t.Fatalf("record play: %v", err)
 		}
 	}
@@ -603,45 +705,87 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		Rating: 8.2, VoteCount: 24000, Tagline: "Welcome to the Real World.",
 		Backdrop: "/artwork/b.jpg", CollectionID: 2344,
 		CollectionName: "The Matrix Collection", Certification: "15",
+		SeasonNum: 1, EpisodeNum: 2, DiscNum: 1, TrackNum: 3, Artist: "n/a",
+		Status: "Ended", Network: "HBO", AirDate: "1999-03-31",
+		SeasonCount: 5, EpisodeCount: 62,
+		LastAirDate: "2013-09-29", NextAirDate: "2026-01-01",
+		OriginalTitle: "Breaking Bad (original)", Country: "US",
 	}
+	// Upserted twice on purpose, with *different* values the second time.
+	// The first call inserts, the second takes the UPDATE branch — the one
+	// every rescan uses, and the one a single upsert leaves untested. The
+	// values have to differ or the test proves nothing: the UPDATE keeps the
+	// existing value when handed an empty one, so re-upserting the same item
+	// passes whether or not the column is in the statement at all.
+	first, err := st.UpsertItem(ctx, want)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Kept for the zero-check below: bumpFields makes every field non-zero,
+	// so checking after it would pass for a field this test never set — the
+	// exact vacuous-pass this guard exists to prevent.
+	seeded := want
+	want = bumpFields(want)
 	saved, err := st.UpsertItem(ctx, want)
 	if err != nil {
-		t.Fatalf("upsert: %v", err)
+		t.Fatalf("update: %v", err)
+	}
+	if saved.ID != first.ID {
+		t.Fatalf("second upsert created a second row (%s then %s)", first.ID, saved.ID)
 	}
 	got, err := st.Item(ctx, saved.ID)
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}
-	checks := []struct {
-		field string
-		got   any
-		want  any
-	}{
-		{"Title", got.Title, want.Title},
-		{"Year", got.Year, want.Year},
-		{"Path", got.Path, want.Path},
-		{"SizeBytes", got.SizeBytes, want.SizeBytes},
-		{"RuntimeSecs", got.RuntimeSecs, want.RuntimeSecs},
-		{"Container", got.Container, want.Container},
-		{"VideoCodec", got.VideoCodec, want.VideoCodec},
-		{"AudioCodec", got.AudioCodec, want.AudioCodec},
-		{"Width", got.Width, want.Width},
-		{"Height", got.Height, want.Height},
-		{"TmdbID", got.TmdbID, want.TmdbID},
-		{"Overview", got.Overview, want.Overview},
-		{"Poster", got.Poster, want.Poster},
-		{"Rating", got.Rating, want.Rating},
-		{"VoteCount", got.VoteCount, want.VoteCount},
-		{"Tagline", got.Tagline, want.Tagline},
-		{"Backdrop", got.Backdrop, want.Backdrop},
-		{"CollectionID", got.CollectionID, want.CollectionID},
-		{"CollectionName", got.CollectionName, want.CollectionName},
-		{"Certification", got.Certification, want.Certification},
+	// Walked by reflection rather than listed by hand. The hand-written
+	// list this replaced went on passing when `status`, `network`,
+	// `air_date`, `season_count` and `episode_count` were added — a test
+	// that cannot fail for the thing it exists to catch is worse than none,
+	// because it is believed.
+	//
+	// Anything not set by the caller is skipped and named, so a new field
+	// has to be deliberately classified rather than silently ignored.
+	serverSet := map[string]bool{
+		"ID": true, "LibraryID": true, "AddedAt": true, "UpdatedAt": true,
+		"Kind": true, "ParentID": true, "Path": true,
 	}
-	for _, c := range checks {
-		if c.got != c.want {
-			t.Errorf("%s = %v, want %v — stored but not read back?", c.field, c.got, c.want)
+	elsewhere := map[string]bool{
+		"LockedFields": true, // its own CSV column, checked below
+		"Genres":       true, // its own table, see ReplaceGenres
+		"Watched":      true, // per-user play state, not an item column
+		"PositionSecs": true,
+		"WatchedAt":    true,
+		"VersionOf":    true, // set by version grouping, not the caller
+		"FileMtime":    true, // write-only; read back through FileStamps, below
+	}
+	wv, gv := reflect.ValueOf(want), reflect.ValueOf(got)
+	typ := wv.Type()
+	var checked int
+	for i := 0; i < typ.NumField(); i++ {
+		name := typ.Field(i).Name
+		if serverSet[name] || elsewhere[name] {
+			continue
 		}
+		if reflect.ValueOf(seeded).Field(i).IsZero() {
+			t.Errorf("%s was left zero by this test's fixture, so it proves nothing about that column", name)
+			continue
+		}
+		if !reflect.DeepEqual(wv.Field(i).Interface(), gv.Field(i).Interface()) {
+			t.Errorf("%s = %v, want %v — stored but not read back?", name, gv.Field(i).Interface(), wv.Field(i).Interface())
+		}
+		checked++
+	}
+	if checked < 20 {
+		t.Errorf("only %d fields checked; the walk is not reaching the struct", checked)
+	}
+
+	// The file stamp a rescan compares against is read back separately.
+	stamps, err := st.FileStamps(ctx, saved.LibraryID)
+	if err != nil {
+		t.Fatalf("file stamps: %v", err)
+	}
+	if want.FileMtime == 0 || stamps[saved.Path].FileMtime != want.FileMtime {
+		t.Errorf("FileMtime = %d, want %d", stamps[saved.Path].FileMtime, want.FileMtime)
 	}
 
 	// Locked fields round-trip through their own CSV column.
@@ -834,7 +978,7 @@ func TestPruneHistory(t *testing.T) {
 	}
 	// Two of each: one recent, one aged past any sane retention window.
 	for i := 0; i < 2; i++ {
-		if err := st.RecordPlay(ctx, u.ID, it.ID, KindMovie); err != nil {
+		if _, err := st.RecordPlay(ctx, u.ID, it.ID, KindMovie); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.RecordAudit(ctx, AuditEntry{UserID: u.ID, Action: "test"}); err != nil {
@@ -876,4 +1020,102 @@ func TestPruneHistory(t *testing.T) {
 	if n != 1 {
 		t.Errorf("%d play rows left, want 1", n)
 	}
+}
+
+// Dashboard samples are persisted so the charts survive a restart.
+func TestStatsSamplesRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second)
+
+	for i, cpu := range []float64{10.5, 20.25, 30} {
+		if err := st.AppendStatsSample(ctx, StatsSample{
+			At: base.Add(time.Duration(i) * time.Minute), CPUPct: cpu,
+			MemUsed: 1 << 30, MemTotal: 8 << 30, ProcRSS: 1 << 20, NumCPU: 16,
+		}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	got, err := st.StatsSamplesSince(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d samples, want 3", len(got))
+	}
+	// Oldest first, and the float survives the round trip.
+	if got[0].CPUPct != 10.5 || got[2].CPUPct != 30 {
+		t.Errorf("values out of order or mangled: %v", got)
+	}
+	if !got[0].At.Equal(base) {
+		t.Errorf("time round-tripped as %v, want %v", got[0].At, base)
+	}
+	if got[0].MemTotal != 8<<30 || got[0].NumCPU != 16 {
+		t.Errorf("fields lost: %+v", got[0])
+	}
+
+	// `since` is a real filter, not decoration.
+	recent, err := st.StatsSamplesSince(ctx, base.Add(90*time.Second))
+	if err != nil {
+		t.Fatalf("filtered read: %v", err)
+	}
+	if len(recent) != 1 || recent[0].CPUPct != 30 {
+		t.Errorf("since filter returned %v", recent)
+	}
+
+	// Same minute twice replaces rather than duplicating.
+	if err := st.AppendStatsSample(ctx, StatsSample{At: base, CPUPct: 99, NumCPU: 16}); err != nil {
+		t.Fatalf("re-append: %v", err)
+	}
+	got, _ = st.StatsSamplesSince(ctx, base.Add(-time.Hour))
+	if len(got) != 3 {
+		t.Fatalf("duplicate inserted: %d rows", len(got))
+	}
+	if got[0].CPUPct != 99 {
+		t.Errorf("conflicting insert did not update: %v", got[0].CPUPct)
+	}
+
+	n, err := st.PruneStatsSamples(ctx, base.Add(90*time.Second))
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("pruned %d rows, want 2", n)
+	}
+	left, _ := st.StatsSamplesSince(ctx, base.Add(-time.Hour))
+	if len(left) != 1 {
+		t.Errorf("%d rows survived the prune, want 1", len(left))
+	}
+}
+
+// bumpFields returns a copy of an item with every refreshable field changed,
+// so an update can be told apart from the insert that preceded it. Identity
+// and server-set fields are left alone: changing Path would address a
+// different row entirely.
+func bumpFields(it Item) Item {
+	out := it
+	v := reflect.ValueOf(&out).Elem()
+	typ := v.Type()
+	keep := map[string]bool{
+		"ID": true, "LibraryID": true, "Kind": true, "ParentID": true, "Path": true,
+		"AddedAt": true, "UpdatedAt": true, "VersionOf": true,
+		"LockedFields": true, "Genres": true,
+		"Watched": true, "PositionSecs": true, "WatchedAt": true,
+	}
+	for i := 0; i < typ.NumField(); i++ {
+		if keep[typ.Field(i).Name] {
+			continue
+		}
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			f.SetString(f.String() + "-v2")
+		case reflect.Int, reflect.Int64:
+			f.SetInt(f.Int() + 7)
+		case reflect.Float64:
+			f.SetFloat(f.Float() + 0.5)
+		}
+	}
+	return out
 }

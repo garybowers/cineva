@@ -3,6 +3,7 @@ package api
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,10 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/store"
@@ -38,6 +41,10 @@ type capabilities struct {
 	AudioTrack *int `json:"audioTrack"`
 	// FromStart ignores the stored resume position and plays from 00:00.
 	FromStart bool `json:"fromStart"`
+	// BurnSubtitle is the stream index of an image-based subtitle (PGS,
+	// VobSub) to paint into the picture. Forces a re-encode, since nothing
+	// can be drawn on a copied stream.
+	BurnSubtitle int `json:"burnSubtitle"`
 }
 
 // qualityLevels maps the selectable transcode levels to encode parameters.
@@ -154,7 +161,10 @@ type playInfo struct {
 	Reason       string `json:"reason,omitempty"`
 	// Chapters are the file's own marks, for the player's chapter list and
 	// skip. Read from the probe already done here, so they cost nothing.
-	Chapters  []media.Chapter `json:"chapters,omitempty"` // why transcoding was chosen
+	Chapters []media.Chapter `json:"chapters,omitempty"` // why transcoding was chosen
+	// Segments are the parts the player can offer to skip — an episode's
+	// intro, found by intro detection. Absent until one has been found.
+	Segments  []store.Segment `json:"segments,omitempty"`
 	Subtitles []subtitleInfo  `json:"subtitles"`
 	// Audio lists the file's audio streams so the player can offer a
 	// picker; AudioTrack is the stream index actually being played.
@@ -212,12 +222,19 @@ func (s *server) playItem(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := s.storageReady(c.Request().Context(), item); err != nil {
+		return err
+	}
 	// Play history for the dashboard; a failure here must not block playback.
-	if err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind); err != nil {
+	// The id closes the row when the playback ends (see onPlaybackEnd); zero
+	// means the row was never opened, and ending is then a no-op.
+	eventID, err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind)
+	if err != nil {
 		log.Printf("record play: %v", err)
 	} else {
 		s.events.Publish(events.Event{Type: "plays"})
 	}
+	c.Set(playEventKey, eventID)
 	s.audit(c, "play.start", string(item.Kind), item.ID, item.Title, "")
 	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
 	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)
@@ -254,7 +271,10 @@ func (s *server) playItem(c echo.Context) error {
 	// Vision profile, HDR transfer), so the file is probed once here. It is
 	// a header read, and only on starting playback. A failure is not fatal:
 	// the zero Info reads as "no Dolby Vision", which is the common case.
-	vinfo, err := media.Probe(item.Path)
+	vinfo, err := library.Within(mediaTimeout, func() (media.Info, error) { return media.Probe(item.Path) })
+	if errors.Is(err, library.ErrNotResponding) {
+		return s.storageFailed(c.Request().Context(), item, err)
+	}
 	if err != nil {
 		log.Printf("play %s: probe: %v", item.Title, err)
 	}
@@ -270,6 +290,12 @@ func (s *server) playItem(c echo.Context) error {
 	// and the next play takes the cheap path.
 	if len(audio) == 0 {
 		audio = s.backfillAudioTracks(c, item)
+	}
+	// Not worth failing a playback over: without them the player simply
+	// offers no skip.
+	segs, err := s.store.Segments(c.Request().Context(), item.ID)
+	if err != nil {
+		log.Printf("play %s: segments: %v", item.Title, err)
 	}
 	// The requested track, defaulting to the file's own default.
 	chosen := defaultAudioTrack(audio)
@@ -290,7 +316,7 @@ func (s *server) playItem(c echo.Context) error {
 		Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
 		DurationSecs: item.RuntimeSecs, PositionSecs: resume,
 		Subtitles: subs, Audio: audio, AudioTrack: chosen,
-		Chapters: vinfo.Chapters,
+		Chapters: vinfo.Chapters, Segments: segs,
 		Source: func() Source {
 			d := src
 			d.Video, d.Audio, d.AudioCodec = "direct", "direct", item.AudioCodec
@@ -321,6 +347,12 @@ func (s *server) playItem(c echo.Context) error {
 		// autoVideoQuality caps at 1080p, so a 4K source is downscaled.
 		sessionQuality = autoVideoQuality(item)
 		reason = item.VideoCodec + " cannot be remuxed to fMP4 — re-encoding"
+	case body.BurnSubtitle > 0:
+		// Burning in a bitmap subtitle means drawing on the picture, which
+		// only the re-encode path can do. Said plainly in the reason, so a
+		// viewer who picks one understands why the quality changed.
+		sessionQuality = autoVideoQuality(item)
+		reason = "burning in image-based subtitles"
 	case quality == "" || quality == "auto":
 		if reason = directPlayReason(item, caps); reason == "" {
 			return c.JSON(http.StatusOK, direct)
@@ -361,6 +393,7 @@ func (s *server) playItem(c echo.Context) error {
 		// than accumulating rounding error across a long film.
 		FrameRateNum: vinfo.FrameRateNum,
 		FrameRateDen: vinfo.FrameRateDen,
+		BurnSubtitle: body.BurnSubtitle,
 	})
 	if err != nil {
 		return err
@@ -378,8 +411,8 @@ func (s *server) playItem(c echo.Context) error {
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
 		Reason: reason, Subtitles: subs, Audio: audio, AudioTrack: chosen,
-		Chapters: vinfo.Chapters,
-		Source:   src,
+		Chapters: vinfo.Chapters, Segments: segs,
+		Source: src,
 	})
 }
 
@@ -399,6 +432,14 @@ func (s *server) streamItem(c echo.Context) error {
 			return err
 		}
 		return c.File(path)
+	}
+	// The file is opened by c.File; checking it answers first keeps a hung
+	// share from holding the request (and a browser connection) open.
+	if err := s.storageReady(c.Request().Context(), item); err != nil {
+		return err
+	}
+	if _, err := library.Within(mediaTimeout, func() (os.FileInfo, error) { return os.Stat(item.Path) }); errors.Is(err, library.ErrNotResponding) {
+		return s.storageFailed(c.Request().Context(), item, err)
 	}
 	return c.File(item.Path)
 }
@@ -592,6 +633,33 @@ func (s *server) stopSession(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// DELETE /playbacks/:userId/:itemId — an administrator ends a playback.
+//
+// Works for direct play as well as transcodes, which is the point: a direct
+// play is the server handing out byte ranges, so there is no session to
+// kill. The playback is dropped from the registry and marked stopped, and
+// the client is told on its next progress heartbeat. A transcode is also
+// torn down immediately, since that part the server does control.
+func (s *server) stopPlaybackAdmin(c echo.Context) error {
+	uid, itemID := c.Param("userId"), c.Param("itemId")
+	var title string
+	for _, p := range s.playbacks.List() {
+		if p.UserID == uid && p.ItemID == itemID {
+			title = p.Title
+			break
+		}
+	}
+	sid, ok := s.playbacks.StopByAdmin(uid, itemID)
+	if !ok && title == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "no such playback")
+	}
+	if sid != "" {
+		s.sessions.Stop(sid)
+	}
+	s.audit(c, "playback.stop", "playback", itemID, title, "stopped from admin")
+	return c.NoContent(http.StatusNoContent)
+}
+
 // registerPlayback records a play on the activity registry with what the
 // request reveals about the client.
 func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality, sessionID string) {
@@ -601,6 +669,10 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 		UserID: userID(c), ItemID: item.ID, Title: item.Title, Kind: string(item.Kind),
 		Mode: mode, Quality: quality, SessionID: sessionID, DurationSecs: item.RuntimeSecs,
 		Client: playback.Client{IP: c.RealIP(), Browser: browser, OS: osName, UserAgent: ua},
+	}
+	// Set by playItem, the only caller that opens a history row.
+	if id, ok := c.Get(playEventKey).(int64); ok {
+		p.EventID = id
 	}
 	// Context line: "Series · S01E02" for episodes, "Artist · Album" for tracks.
 	switch item.Kind {
@@ -687,6 +759,19 @@ func (s *server) postProgress(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
+	// An administrator ended this playback. Said once, to the heartbeat that
+	// follows the stop: the client stops on 409, and because re-registering
+	// is what the next branch would otherwise do, this check has to come
+	// first. The position reported with this beat is still worth keeping, so
+	// resume lands where the viewer actually got to.
+	if s.playbacks.Stopped(userID(c), item.ID) {
+		if item.Kind != store.KindTrack {
+			if _, err := s.store.SetProgress(c.Request().Context(), userID(c), item.ID, req.PositionSecs, item.RuntimeSecs); err != nil {
+				log.Printf("progress on admin stop: %v", err)
+			}
+		}
+		return echo.NewHTTPError(http.StatusConflict, "playback was stopped by an administrator")
+	}
 	// Heartbeat for the activity registry. A client whose entry was reaped
 	// (or that predates a restart) is re-registered so it shows up again.
 	if !s.playbacks.Touch(userID(c), item.ID, req.PositionSecs, req.Paused) {
@@ -735,9 +820,11 @@ func (s *server) prevEpisode(c echo.Context) error {
 	return c.JSON(http.StatusOK, prev)
 }
 
-// GET /continue-watching — resume row for the home screen.
+// GET /continue-watching — resume row for the home screen, limited to the
+// libraries the viewer may see.
 func (s *server) continueWatching(c echo.Context) error {
-	items, err := s.store.ContinueWatching(c.Request().Context(), userID(c), 20)
+	me := currentUser(c)
+	items, err := s.store.ContinueWatching(c.Request().Context(), me.ID, visibleLibraryIDs(me), 20)
 	if err != nil {
 		return err
 	}
@@ -748,7 +835,7 @@ func (s *server) continueWatching(c echo.Context) error {
 // them, for items scanned before they were catalogued. Best effort: a
 // failure just means the picker stays empty, which is where it already was.
 func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.AudioTrack {
-	streams, err := media.ProbeAudioTracks(item.Path)
+	streams, err := library.Within(mediaTimeout, func() ([]media.AudioStream, error) { return media.ProbeAudioTracks(item.Path) })
 	if err != nil || len(streams) == 0 {
 		return nil
 	}
@@ -763,4 +850,53 @@ func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.Au
 		log.Printf("backfill audio tracks for %s: %v", item.Title, err)
 	}
 	return tracks
+}
+
+// playEventKey carries the open play_events row id from the handler that
+// opened it to registerPlayback, which stores it on the registry entry.
+const playEventKey = "cineva.playEventID"
+
+// onPlaybackEnd closes a playback's history row.
+//
+// Called for every way a playback can finish, including going idle, because
+// browsers close tabs without telling the server and an unclosed row would
+// claim a play that never ended. Duration is wall-clock time the playback
+// was open rather than playhead movement: someone who skips about has still
+// spent that long watching, which is what the dashboard is reporting.
+func (s *server) onPlaybackEnd(p playback.Playback) {
+	if p.EventID == 0 {
+		return // no row was opened for this playback
+	}
+	secs := int(p.LastSeenAt.Sub(p.StartedAt).Seconds())
+	completed := p.DurationSecs > 0 &&
+		float64(p.PositionSecs) >= float64(p.DurationSecs)*playCompleteFraction
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.store.FinishPlay(ctx, p.EventID, secs, completed); err != nil {
+		log.Printf("finish play %d: %v", p.EventID, err)
+	}
+	s.events.Publish(events.Event{Type: "plays"})
+}
+
+// playCompleteFraction is the share of the runtime that counts as having
+// finished something. The same 0.9 the watch-state threshold uses, so the
+// dashboard and the watched flag never disagree about what "completed"
+// means.
+const playCompleteFraction = 0.9
+
+// GET /items/:id/next-up — the episode a series or season should play next.
+//
+// Server-side on purpose (see CLAUDE.md): the web client and the native apps
+// have to agree on where someone is up to in a series, and that decision has
+// to survive a client that was never updated. 204 when the item has no
+// episodes, or is not a series or season at all.
+func (s *server) nextUpFor(c echo.Context) error {
+	up, ok, err := s.store.NextUp(c.Request().Context(), userID(c), c.Param("id"))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.NoContent(http.StatusNoContent)
+	}
+	return c.JSON(http.StatusOK, up)
 }

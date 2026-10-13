@@ -34,3 +34,23 @@ func (s *server) playStats(c echo.Context) error {
 	}
 	return c.JSON(http.StatusOK, out)
 }
+
+// GET /stats/plays/totals?days=30 — how much was actually watched.
+//
+// Separate from /stats/plays rather than folded into it: that endpoint
+// returns a bare array and the contract is that a response shape does not
+// change within a version.
+func (s *server) playTotals(c echo.Context) error {
+	days, _ := strconv.Atoi(c.QueryParam("days"))
+	if days <= 0 {
+		days = 30
+	}
+	if days > 365 {
+		days = 365
+	}
+	out, err := s.store.PlayTotals(c.Request().Context(), days)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, out)
+}

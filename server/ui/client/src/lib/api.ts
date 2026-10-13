@@ -13,6 +13,17 @@ export interface Library {
   itemCount: number
   /** A scan is running. One bit, with none of the admin-only progress detail. */
   scanning?: boolean
+  /** Whether the library's folders can be reached right now. */
+  storage?: StorageStatus
+}
+
+export interface StorageStatus {
+  available: boolean
+  /** When it last changed. */
+  since?: string
+  /** The folder that failed, and how. */
+  path?: string
+  error?: string
 }
 
 export interface Item {
@@ -36,6 +47,22 @@ export interface Item {
   collectionName?: string
   /** Content rating for the server's configured region ("15", "PG-13"). */
   certification?: string
+  /** Series only: "Ended", "Returning Series", "Canceled" — TMDB's wording. */
+  status?: string
+  /** Series only: the broadcaster it began on. */
+  network?: string
+  /** Series only: when it last aired, and when the next episode is due. */
+  lastAirDate?: string
+  nextAirDate?: string
+  /** The name in the work's own language, present only when it differs. */
+  originalTitle?: string
+  /** ISO 3166-1 country of origin. */
+  country?: string
+  /** Broadcast date of an episode, or a season's premiere ("2008-01-20"). */
+  airDate?: string
+  /** What the provider says the series has, which is not what is on disk. */
+  seasonCount?: number
+  episodeCount?: number
   genres?: string[]
   videoCodec?: string
   audioCodec?: string
@@ -67,7 +94,16 @@ export interface SubtitleTrack {
   title?: string
   codec: string
   forced?: boolean
-  url?: string // absent for image-based tracks (burn-in not yet available)
+  /** Set only for text tracks, which the player overlays as WebVTT. */
+  url?: string
+  /**
+   * PGS/VobSub: a bitmap with no text to hand the player, so it can only be
+   * shown by painting it into the picture. Selecting one restarts playback
+   * as a re-encode.
+   */
+  burnIn?: boolean
+  /** Identifies the track to the transcoder when burning in. */
+  streamIndex?: number
 }
 
 export interface PlayState {
@@ -89,7 +125,16 @@ export interface PlayInfo {
   audioTrack: number
   /** The file's own chapter marks, in order. Absent for files with none. */
   chapters?: Chapter[]
+  /** Parts the player can offer to skip, such as a detected intro. */
+  segments?: Segment[]
   source: PlaySource
+}
+
+/** A part of an item that is not the item itself, in seconds from the start. */
+export interface Segment {
+  kind: 'intro' | 'credits'
+  startSecs: number
+  endSecs: number
 }
 
 export interface Chapter {
@@ -135,7 +180,31 @@ const caps = detectCaps()
 
 export interface ResumeItem extends Item {
   positionSecs: number
+  /** An episode's series, since its own title does not say which show. Its
+   *  artwork comes too: an episode's own image is a landscape still. */
+  seriesId?: string
+  seriesTitle?: string
+  seriesPoster?: string
+  seriesBackdrop?: string
 }
+
+/** One row on the home screen, from one library. */
+export interface HomeShelf {
+  libraryId: string
+  libraryName: string
+  /** "recent", or a recommendation row's kind. */
+  kind: string
+  title: string
+  genre?: string
+  items: Item[]
+}
+export interface HomeFeed {
+  continueWatching: ResumeItem[]
+  /** The next unstarted episode of each series being watched. */
+  nextUp: ResumeItem[]
+  shelves: HomeShelf[]
+}
+export const homeFeed = () => get<HomeFeed>('/home')
 
 // Accounts (milestone 4). A 401 anywhere means the session is gone: the
 // app listens for this event and shows the sign-in screen.
@@ -163,6 +232,13 @@ export interface APIKey {
   lastUsedAt?: string
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
+
+// Thrown by postProgress when the server answers 409: an administrator ended
+// this playback. The heartbeat is the only channel for this — a direct play
+// is the server handing out byte ranges, so there is nothing it can cut off
+// at its end, and the event stream is broadcast to every client, which would
+// tell everyone who was watching what.
+export const PLAYBACK_STOPPED = 'cineva:playbackStopped'
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api/v1${path}`, init)
@@ -237,7 +313,7 @@ export interface GenreCount { genre: string; count: number }
 
 /** One shelf on the Recommended tab, decided server-side. */
 export interface RecRow {
-  kind: 'because' | 'toprated' | 'genre' | 'unwatched'
+  kind: 'recent' | 'because' | 'toprated' | 'genre' | 'unwatched'
   title: string
   /** Set on a genre row, so its heading can open the full genre listing. */
   genre?: string
@@ -303,8 +379,13 @@ export interface PlaySource {
   audioCodec?: string
 }
 
-export const playItem = (id: string, quality: PlayQuality = 'auto', fromStart = false, audioTrack?: number) =>
-  post<PlayInfo>(`/items/${id}/play`, { ...caps, quality, fromStart, audioTrack })
+export const playItem = (
+  id: string,
+  quality: PlayQuality = 'auto',
+  fromStart = false,
+  audioTrack?: number,
+  burnSubtitle?: number,
+) => post<PlayInfo>(`/items/${id}/play`, { ...caps, quality, fromStart, audioTrack, burnSubtitle })
 /** Mark an item watched or unwatched by hand; both directions clear resume. */
 export const setWatched = (id: string, watched: boolean) =>
   req<PlayState>(`/items/${id}/watched`, {
@@ -312,8 +393,16 @@ export const setWatched = (id: string, watched: boolean) =>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ watched }),
   })
-export const postProgress = (id: string, positionSecs: number, paused = false) =>
-  post<void>(`/items/${id}/progress`, { positionSecs, paused })
+export async function postProgress(id: string, positionSecs: number, paused = false): Promise<void> {
+  const res = await fetch(`/api/v1/items/${id}/progress`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ positionSecs, paused }),
+  })
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORISED))
+  if (res.status === 409) throw new Error(PLAYBACK_STOPPED)
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+}
 // Tells the server this client has stopped playing the item (drops it from
 // the admin Activity page straight away instead of after the idle timeout).
 export const stopPlayback = (id: string) => fetch(`/api/v1/items/${id}/playback`, { method: 'DELETE' })
@@ -333,6 +422,21 @@ export async function nextUp(id: string): Promise<Item | null> {
   const res = await fetch(`/api/v1/items/${id}/next`)
   if (res.status === 204 || !res.ok) return null
   return res.json() as Promise<Item>
+}
+
+/**
+ * Where to carry on in a series or season.
+ *
+ * `reason` says which promise the button should make: "resume" carries on
+ * part-way through, "next" starts one never begun, "restart" offers the
+ * first episode again because everything is watched.
+ */
+export type NextUpInfo = { item: Item; positionSecs: number; reason: 'resume' | 'next' | 'restart' }
+
+export async function seriesNextUp(id: string): Promise<NextUpInfo | null> {
+  const res = await fetch(`/api/v1/items/${id}/next-up`)
+  if (res.status === 204 || !res.ok) return null
+  return res.json() as Promise<NextUpInfo>
 }
 
 // Live event stream: the server pushes state changes (scan progress, library
