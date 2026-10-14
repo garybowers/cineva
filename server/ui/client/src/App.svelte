@@ -3744,7 +3744,7 @@
                       <span class="eptitle"><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
                       {#if live}<span class="ep-live" title="Now playing"><AudioLines size={15} /></span>{/if}
                       <span class="epmeta muted">
-                        {runtime(child.runtimeSecs)}{#if child.airDate}<span class="epair" title="First broadcast"> · {airLabel(child.airDate)}</span>{/if}{#if resumeAt && !live && child.runtimeSecs} · {Math.max(1, Math.round((child.runtimeSecs - (child.positionSecs ?? 0)) / 60))} min left{/if}
+                        {runtime(child.runtimeSecs)}{#if child.airDate}<span class="epair" title="First broadcast">{' · '}{airLabel(child.airDate)}</span>{/if}{#if resumeAt && !live && child.runtimeSecs}{' · '}{Math.max(1, Math.round((child.runtimeSecs - (child.positionSecs ?? 0)) / 60))} min left{/if}
                       </span>
                     </div>
                     {#if child.overview}
@@ -4334,13 +4334,15 @@
       {#if np.durationSecs}<div class="ew-progress"><div style="width: {Math.min(100, (at / np.durationSecs) * 100)}%"></div></div>{/if}
       {@render thumb(np.item)}
       <div class="ew-body">
-        <span class="ew-title">
-          {#if np.seriesTitle}{np.seriesTitle} · {/if}{#if np.item.kind === 'episode'}S{String(np.item.seasonNum).padStart(2, '0')}E{String(np.item.episodeNum).padStart(2, '0')} · {/if}{np.item.title}
-        </span>
+        <span class="ew-title">{[
+          np.seriesTitle,
+          np.item.kind === 'episode' ? `S${String(np.item.seasonNum).padStart(2, '0')}E${String(np.item.episodeNum).padStart(2, '0')}` : '',
+          np.item.title,
+        ].filter(Boolean).join(' · ')}</span>
         <span class="ew-where"><MonitorSmartphone size={13} /> Playing on {deviceTitle(elsewhere)} · {clock(at)}</span>
       </div>
-      <button class="ew-go" disabled={continuing} onclick={() => elsewhere && continueHere(elsewhere)}>
-        <Play size={15} /> {continuing ? 'Pausing it…' : 'Continue here'}
+      <button class="ew-go" disabled={continuing} aria-label="Continue here" onclick={() => elsewhere && continueHere(elsewhere)}>
+        <Play size={15} /> <span class="ew-label">{continuing ? 'Pausing it…' : 'Continue here'}</span>
       </button>
     </div>
   {/if}
@@ -4772,7 +4774,10 @@
   }
   .ew-go:disabled { opacity: 0.7; }
   @media (max-width: 767px) {
-    .elsewhere { bottom: 3.35rem; gap: 0.6rem; }
+    .elsewhere { bottom: 3.35rem; gap: 0.6rem; --thumb-h: 2.5rem; }
+    /* The words go: a phone needs the room for what is playing where. */
+    .ew-label { display: none; }
+    .ew-go { width: 2.75rem; height: 2.75rem; padding: 0; justify-content: center; }
   }
   .side-item {
     position: relative;

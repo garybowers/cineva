@@ -12,7 +12,15 @@
     onclose,
     children,
     foot,
-  }: { title: string; onclose: () => void; children: Snippet; foot?: Snippet } = $props()
+    wide = false,
+  }: {
+    title: string
+    onclose: () => void
+    children: Snippet
+    foot?: Snippet
+    /** Room for a longer form or a list of results. */
+    wide?: boolean
+  } = $props()
 
   const titleId = `modal-${Math.random().toString(36).slice(2)}`
   let box: HTMLDivElement
@@ -34,7 +42,7 @@
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
 
 <div class="back" role="presentation"></div>
-<div class="box" role="dialog" aria-modal="true" aria-labelledby={titleId} bind:this={box}>
+<div class="box" class:wide role="dialog" aria-modal="true" aria-labelledby={titleId} bind:this={box}>
   <header>
     <h2 id={titleId}>{title}</h2>
     <button type="button" class="close" aria-label="Close" onclick={onclose}><X size={18} /></button>
@@ -65,6 +73,7 @@
     border-radius: 12px;
     box-shadow: 0 1.5rem 3rem rgb(0 0 0 / 0.35);
   }
+  .box.wide { width: min(44rem, calc(100vw - 2rem)); }
   header {
     display: flex;
     align-items: center;

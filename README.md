@@ -9,28 +9,81 @@ client and the admin UI are built in, and there is nothing else to install.
 It is written in Go for Linux, and is under active development. Video and
 music are in daily use; audiobooks, podcasts and books are on the way.
 
+![Cineva's home screen](docs/screenshots/home.webp)
+
 ## What it does
+
+### Watching and listening
 
 - **Libraries** — Movies, TV and Music, each pointing at one or more folders.
   Scans are incremental and run every 15 minutes by default, so new files
-  appear on their own.
+  appear on their own; Sonarr, Radarr and Lidarr can trigger one the moment
+  they import something.
 - **Metadata** — posters, backdrops, synopses, cast and episode details from
   TMDB; music from embedded tags, MusicBrainz and the Cover Art Archive.
+  Search ignores case and accents: "amelie" finds *Amélie*.
 - **Playback** — direct play when the browser can handle the file, otherwise
   HLS transcoding with seeking; hardware transcoding through VA-API (AMD and
-  Intel) where available. Text subtitles are served as WebVTT.
-- **TV** — next-up tracking, intro and credits detection with "Skip intro",
-  and an up-next card that autoplays the next episode.
-- **People** — accounts with passwords or a quick PIN, a "Who's watching?"
-  profile picker with photos, per-library access for users and groups, and a
-  list of each user's signed-in devices that can be signed out remotely.
-- **Queue** — line titles up, and hand the queue from one device to another:
-  send it to the TV, or pick up on the laptop what the phone was playing.
-- **Downloads** — any title can be downloaded for offline viewing.
-- **Sonarr and Radarr** — connect them in the admin UI and Cineva picks up
-  each import within seconds.
+  Intel) where available. Text subtitles are served as WebVTT, and the seek
+  bar shows preview pictures.
+- **Series** — next-up tracking, intro and credits detection from the audio
+  episodes share (with "Skip intro", and times that can be corrected by
+  hand), and an up-next card that autoplays the next episode.
+- **Music** — albums and artists, gapless playback, play counts, star
+  ratings, and playlists: made by hand, or smart playlists that fill
+  themselves from rules ("rated four stars or more, not played in a month").
+- **Continue here** — while one of your devices plays, the others offer to
+  carry on: pick up on your phone what the TV is playing, and the TV pauses.
+  A queue can also be sent the other way ("Play on…").
+- **TV mode** — the same client sized for across the room and worked with a
+  remote: arrow keys move between posters, Back goes back, and the player
+  takes the remote. It switches on by itself in a television's own browser
+  (Fire TV, Android TV, LG, Samsung).
+- **Downloads** — any title can be downloaded for offline viewing; albums and
+  artists as a ZIP, original or transcoded.
 - **Installable** — the web client works at phone width and installs as an
-  app (PWA).
+  app (PWA). Three themes, each a preference that follows you.
+
+### Your household
+
+- **People** — accounts with passwords or a quick PIN, a "Who's watching?"
+  profile picker with photos, groups, and per-library access. Everyone has
+  their own preferences (audio and subtitle languages, quality, intro
+  skipping, autoplay); an admin sets the defaults and can lock what is
+  theirs to decide.
+- **Devices** — every screen is a device you can name ("Living-room TV") and
+  sign out remotely. A shared screen can sign itself in as a chosen profile,
+  with "Switch user" a PIN away. The admin pages are never offered on a TV.
+- **Home Assistant** — rooms, lights, blinds, the amplifier and cameras in
+  Cineva, exposed only to the people the admin chooses. Modes such as "Movie
+  mode" dim the lights, close the blinds, set the amplifier and start the
+  film in one press, and the player shows the controls of the room it is in.
+- **Requests** — people ask for films and series that are not there yet; an
+  admin approves them (or lets some people skip that), and Sonarr or Radarr
+  fetches them.
+- **Notifications** — to ntfy, Gotify, Discord, Telegram or a webhook: for
+  the household (a request waiting, something new, storage down) and for
+  each person (their requests, new episodes of what they are watching).
+- **Moving in** — bring watch history, music playlists and favourites over
+  from Plex or Jellyfin.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![A film's page](docs/screenshots/film.webp) | ![A season, with the next episode to resume](docs/screenshots/season.webp) |
+| A film | A season, ready to resume |
+| ![An album with star ratings](docs/screenshots/album.webp) | ![Theme previews in Settings](docs/screenshots/themes.webp) |
+| An album, with ratings | Themes |
+| ![TV mode, focus on a poster](docs/screenshots/tv.webp) | ![The phone offering to continue what the TV plays](docs/screenshots/phone.webp) |
+| TV mode, worked with a remote | Continue on the phone what the TV is playing |
+| ![The player with the room's controls and modes](docs/screenshots/player-room.webp) | ![Rooms: modes, controls and cameras](docs/screenshots/rooms.webp) |
+| The living room's controls, from the player | Rooms, modes and cameras from Home Assistant |
+| ![Building modes in the admin UI](docs/screenshots/admin-modes.webp) | |
+| Modes in the admin UI | |
+
+The Home Assistant pictures are of a demonstration instance, not a real
+house.
 
 ## Requirements
 
@@ -200,14 +253,29 @@ scripts can use too: create an API key under Account settings and send it as
 `http://<server>:4747/api/docs`, and the OpenAPI 3.1 specification it is built
 from at `/api/v1/openapi.yaml`, for generating client libraries.
 
-## Sonarr and Radarr
+## Integrations
 
-In the admin UI, open **Integrations** and add Sonarr or Radarr with its URL
-and API key (in Sonarr: Settings, General, Security). Cineva registers a
-webhook called "Cineva" in it, and from then on each import, upgrade, rename
-or deletion triggers a rescan of the affected library. If Sonarr runs in a
-container or on another machine, set "Cineva address" to the address Sonarr
-can reach Cineva on.
+All of these are set up in the admin UI, under **Integrations**.
+
+- **Sonarr, Radarr and Lidarr** — add each with its URL and API key (in
+  Sonarr: Settings, General, Security). Cineva registers a webhook called
+  "Cineva" in it, and from then on each import, upgrade, rename or deletion
+  triggers a rescan of the affected library. If it runs in a container or
+  on another machine, set "Cineva address" to the address it can reach
+  Cineva on. Sonarr and Radarr also take the requests people make, each
+  with a default quality profile and folder.
+- **Home Assistant** — add its address and a long-lived access token (made
+  on your profile page in Home Assistant). Then, on **Smart home**: expose
+  the entities Cineva may use and choose who may use each (cameras start
+  admins-only), put devices in rooms, and build modes. Cineva also fires
+  `cineva_playback_*` events into Home Assistant, for automations such as
+  raising the lights on pause.
+- **Notifications** — household destinations are added under
+  **Notifications**; each person adds their own in Settings.
+- **Plex and Jellyfin** — **Users**, then "Import from Plex or Jellyfin":
+  match the old server's users to Cineva's (or create them), run a dry run
+  to see what does not match, then import. Running it twice changes
+  nothing, and newer Cineva state is never overwritten.
 
 ## Building from source
 

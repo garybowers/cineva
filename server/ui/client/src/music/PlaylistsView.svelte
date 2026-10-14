@@ -13,6 +13,7 @@
   import TrackMenu from './TrackMenu.svelte'
   import Stars from './Stars.svelte'
   import SmartEditor from './SmartEditor.svelte'
+  import Sheet from '../Sheet.svelte'
 
   let { playlistId, onopen }: { playlistId: string | null; onopen: (id: string | null) => void } = $props()
 
@@ -231,15 +232,18 @@
   <header class="listhead">
     <h1>Playlists</h1>
     <div class="acts">
-      <button class="btn" onclick={() => (creating = !creating)}><Plus size={15} /> New playlist</button>
+      <button class="btn" onclick={() => { newName = ''; creating = true }}><Plus size={15} /> New playlist</button>
       <button class="btn" onclick={() => (editing = { name: '', rules: blankRules() })}><Sparkles size={15} /> New smart playlist</button>
     </div>
   </header>
   {#if creating}
-    <form class="newform" onsubmit={createManual}>
-      <input bind:value={newName} placeholder="Name" aria-label="New playlist name" maxlength="120" />
-      <button type="submit" class="primary" disabled={!newName.trim()}>Create</button>
-    </form>
+    <Sheet title="New playlist" onclose={() => (creating = false)}>
+      <form class="newform" onsubmit={createManual}>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input bind:value={newName} placeholder="Name" aria-label="New playlist name" maxlength="120" autofocus />
+        <button type="submit" class="primary" disabled={!newName.trim()}>Create</button>
+      </form>
+    </Sheet>
   {/if}
   {#if loaded && lists.length === 0}
     <div class="empty">
@@ -286,7 +290,8 @@
   .btn.danger { color: var(--err); border-color: var(--err); }
   .primary:disabled, .btn:disabled { opacity: 0.5; cursor: default; }
   .rename, .newform { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
-  .newform { justify-content: flex-start; margin-bottom: 1rem; }
+  .newform { justify-content: flex-start; }
+  .newform input { max-width: none; }
   .rename input, .newform input {
     background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
     padding: 0.45rem 0.7rem; font: inherit; font-size: 1rem; min-width: 0; flex: 1 1 12rem; max-width: 24rem;

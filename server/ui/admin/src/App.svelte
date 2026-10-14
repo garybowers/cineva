@@ -344,8 +344,38 @@
       groupSaving = false
     }
   }
+  // ---- Asking ----
+  // A question in a dialogue of the page's own, where the browser's
+  // confirm() and prompt() would break in with theirs: "Delete Kids?",
+  // "Name for the new collection". confirmIn resolves true for the action,
+  // askText to the text entered (null when cancelled).
+  type Asking = {
+    title: string
+    body?: string
+    action: string
+    danger: boolean
+    input?: { label: string; value: string }
+    resolve: (answer: string | null) => void
+  }
+  let asking: Asking | null = $state(null)
+  function confirmIn(title: string, body: string, action: string, danger = true): Promise<boolean> {
+    return new Promise((resolve) => {
+      asking = { title, body, action, danger, resolve: (a) => resolve(a !== null) }
+    })
+  }
+  function askText(title: string, label: string, value = '', action = 'Save'): Promise<string | null> {
+    return new Promise((resolve) => {
+      asking = { title, action, danger: false, input: { label, value }, resolve }
+    })
+  }
+  function answer(a: string | null) {
+    const q = asking
+    asking = null
+    q?.resolve(a)
+  }
+
   async function removeGroup(g: UserGroup) {
-    if (!confirm(`Delete the group "${g.name}"? Libraries restricted to it will no longer be visible to its members.`)) return
+    if (!(await confirmIn(`Delete ${g.name}?`, 'Libraries restricted to this group will no longer be visible to its members.', 'Delete group'))) return
     try {
       await deleteGroup(g.id)
       loadGroups()
@@ -643,7 +673,7 @@
     }
   }
   async function removeRequest(r: MediaRequest) {
-    if (!confirm(`Remove the request for ${r.title}? Nothing is changed in ${r.mediaType === 'movie' ? 'Radarr' : 'Sonarr'}.`)) return
+    if (!(await confirmIn(`Remove the request for ${r.title}?`, `It goes from this list only; nothing is changed in ${r.mediaType === 'movie' ? 'Radarr' : 'Sonarr'}.`, 'Remove'))) return
     try {
       await deleteRequest(r.id)
       loadRequests()
@@ -708,7 +738,7 @@
     }
   }
   async function removeUser(u: User) {
-    if (!confirm(`Delete user "${u.username}"? Their watch history, sessions and API keys go with them.`)) return
+    if (!(await confirmIn(`Delete ${u.displayName || u.username}?`, 'Their watch history, sessions and API keys go with them.', 'Delete user'))) return
     const before = users
     users = users.filter((x) => x.id !== u.id)
     try {
@@ -814,7 +844,7 @@
   // waiting on a round-trip. The server's "libraries" event reconciles; a
   // failure restores the row and reports why.
   async function removeLibrary(lib: Library) {
-    if (!confirm(`Delete library "${lib.name}"? Scanned items are removed; media files on disk are untouched.`)) return
+    if (!(await confirmIn(`Delete ${lib.name}?`, 'Its scanned items are removed from Cineva. The media files on disk are not touched.', 'Delete library'))) return
     const before = libraries
     libraries = libraries.filter((l) => l.id !== lib.id)
     try {
@@ -892,7 +922,9 @@
   async function redetectAsking(send: (includeLocked: boolean) => Promise<RedetectResult>): Promise<string> {
     let res = await send(false)
     let replaced = false
-    if (res.locked > 0 && confirm(`Also replace ${res.locked} ${res.locked === 1 ? 'title' : 'titles'} whose times were set by hand?`)) {
+    if (res.locked > 0 && (await confirmIn('Replace times set by hand?',
+      `${res.locked} ${res.locked === 1 ? 'title has' : 'titles have'} intro or credits times someone set by hand. Detection leaves them alone unless you say so.`,
+      `Replace ${res.locked === 1 ? 'it' : 'them'} too`, false))) {
       res = await send(true)
       replaced = true
     }
@@ -1231,7 +1263,7 @@
 
   async function newCollection() {
     if (!manage) return
-    const name = prompt('Name for the new collection')
+    const name = await askText('New collection', 'Name', '', 'Create')
     if (!name?.trim()) return
     try {
       const c = await createCollection(manage.id, name.trim())
@@ -1246,7 +1278,7 @@
     const msg = c.tmdbId
       ? `Discard your changes to “${c.name}” and go back to the provider's own grouping?`
       : `Delete the collection “${c.name}”? The films themselves are not touched.`
-    if (!manage || !confirm(msg)) return
+    if (!manage || !(await confirmIn(c.tmdbId ? `Revert ${c.name}?` : `Delete ${c.name}?`, msg, c.tmdbId ? 'Revert to provider' : 'Delete collection'))) return
     try {
       await deleteCollection(manage.id, c.key)
       if (editingColl?.key === c.key) editingColl = null
@@ -1291,7 +1323,7 @@
   }
 
   async function unlockItem(it: Item) {
-    if (!confirm(`Let the metadata provider manage “${it.title}” again? Your edits stay until the next refresh.`)) return
+    if (!(await confirmIn(`Unlock ${it.title}?`, 'The metadata provider manages it again. Your edits stay until the next refresh.', 'Unlock', false))) return
     try {
       await clearItemLocks(it.id)
       items = items.map((i) => (i.id === it.id ? { ...i, lockedFields: [] } : i))
@@ -1976,7 +2008,7 @@
             <strong>{editingColl.name}</strong>
             {#if editingColl.managed}<span class="tag ok">edited</span>{:else}<span class="tag">from provider</span>{/if}
             <span class="lib-spacer"></span>
-            <button onclick={() => { const n = prompt('Collection name', editingColl?.name); if (n) renameColl(n) }}>Rename…</button>
+            <button onclick={async () => { const n = await askText('Rename collection', 'Name', editingColl?.name ?? ''); if (n?.trim()) renameColl(n.trim()) }}>Rename…</button>
             {#if editingColl.managed}
               <button class="lib-btn danger" onclick={() => editingColl && removeCollection(editingColl)}>
                 {editingColl.tmdbId ? 'Revert to provider' : 'Delete'}
@@ -2186,15 +2218,13 @@
       {/if}
 
       {#if editItem}
-        <div class="lib-modal-back" role="presentation" onclick={() => (editItem = null)}></div>
-        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Edit metadata">
-          <h2>Edit “{editItem.title}”</h2>
+        <Modal title="Edit {editItem.title}" wide onclose={() => (editItem = null)}>
           <p class="hint">
             Every field you change is locked, so scans and metadata refreshes
             leave it alone. Fields you do not touch stay the provider's to
             update.
           </p>
-          <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveEdit() }}>
+          <form id="edit-item-form" class="form modalform" onsubmit={(e) => { e.preventDefault(); saveEdit() }}>
             <label>Title
               <input bind:value={editForm.title} required />
             </label>
@@ -2229,18 +2259,16 @@
                 <input bind:value={editForm.backdrop} placeholder="/artwork/… or https://…" />
               </label>
             </div>
-            <div class="formrow">
-              <button class="primary" type="submit" disabled={editBusy}>{editBusy ? 'Saving…' : 'Save'}</button>
-              <button type="button" onclick={() => (editItem = null)}>Cancel</button>
-            </div>
           </form>
-        </div>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (editItem = null)}>Cancel</button>
+            <button class="primary" type="submit" form="edit-item-form" disabled={editBusy}>{editBusy ? 'Saving…' : 'Save'}</button>
+          {/snippet}
+        </Modal>
       {/if}
 
       {#if matchFor}
-        <div class="lib-modal-back" role="presentation" onclick={() => (matchFor = null)}></div>
-        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Fix match">
-          <h2>Fix match</h2>
+        <Modal title="Fix match" wide onclose={() => (matchFor = null)}>
           <p class="muted small">{matchFor.path}</p>
           <form class="lib-matchbar" onsubmit={(e) => { e.preventDefault(); runMatchSearch() }}>
             <input bind:value={matchQuery} placeholder="Search TMDB by title…" />
@@ -2260,17 +2288,20 @@
               </li>
             {/each}
           </ul>
-          <div class="lib-modal-foot"><button class="lib-btn" onclick={() => (matchFor = null)}>Close</button></div>
-        </div>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (matchFor = null)}>Close</button>
+          {/snippet}
+        </Modal>
       {/if}
 
     {:else if page === 'libraries'}
       <h1>Libraries</h1>
       <div class="bar">
-        <button class="primary" onclick={() => (showAdd = !showAdd)}>{showAdd ? 'Cancel' : '+ Add library'}</button>
+        <button class="primary" onclick={() => (showAdd = true)}>+ Add library</button>
       </div>
       {#if showAdd}
-        <form class="panel form" onsubmit={(e) => { e.preventDefault(); submitLibrary() }}>
+        <Modal title="Add a library" onclose={() => (showAdd = false)}>
+        <form id="add-library-form" class="form modalform" onsubmit={(e) => { e.preventDefault(); submitLibrary() }}>
           <label>Name <input bind:value={newName} placeholder="Movies" required /></label>
           <label>Media type
             <select bind:value={newType}>
@@ -2290,15 +2321,17 @@
             {/each}
             <button type="button" class="addpath" onclick={() => (newPaths = [...newPaths, ''])}>+ Add another path</button>
           </label>
-          <button class="primary" disabled={saving} type="submit">{saving ? 'Creating…' : 'Create'}</button>
           <p class="hint">One media type per library, chosen now and immutable. Paths can be changed later.</p>
         </form>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (showAdd = false)}>Cancel</button>
+            <button class="primary" type="submit" form="add-library-form" disabled={saving}>{saving ? 'Creating…' : 'Create'}</button>
+          {/snippet}
+        </Modal>
       {/if}
       {#if editLib}
-        <div class="lib-modal-back" role="presentation" onclick={() => (editLib = null)}></div>
-        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Edit library">
-          <h2>Edit “{editLib.name}”</h2>
-          <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveLibraryEdit() }}>
+        <Modal title="Edit {editLib.name}" onclose={() => (editLib = null)}>
+          <form id="edit-library-form" class="form modalform" onsubmit={(e) => { e.preventDefault(); saveLibraryEdit() }}>
             <label>Name <input bind:value={editName} required /></label>
             <label>
               Paths
@@ -2318,27 +2351,25 @@
               Removing a path does not delete its items here; the next scan prunes whatever it
               no longer finds.
             </p>
-            <div class="formrow">
-              <button class="primary" type="submit" disabled={libEditBusy}>{libEditBusy ? 'Saving…' : 'Save'}</button>
-              <button type="button" onclick={() => (editLib = null)}>Cancel</button>
-            </div>
           </form>
-        </div>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (editLib = null)}>Cancel</button>
+            <button class="primary" type="submit" form="edit-library-form" disabled={libEditBusy}>{libEditBusy ? 'Saving…' : 'Save'}</button>
+          {/snippet}
+        </Modal>
       {/if}
       {#if accessLib}
-        <div class="lib-modal-back" role="presentation" onclick={() => (accessLib = null)}></div>
-        <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Library access">
-          <h2>Who can see “{accessLib.name}”</h2>
-          <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveAccess() }}>
+        <Modal title="Who can see {accessLib.name}" onclose={() => (accessLib = null)}>
+          <form id="library-access-form" class="form modalform" onsubmit={(e) => { e.preventDefault(); saveAccess() }}>
             <AccessPicker bind:access {users} {groups} noun="library" />
             <p class="hint">Admins always see every library.</p>
             {#if accessErr}<div class="error slim">{accessErr}</div>{/if}
-            <div class="formrow">
-              <button class="primary" type="submit" disabled={accessBusy}>{accessBusy ? 'Saving…' : 'Save'}</button>
-              <button type="button" onclick={() => (accessLib = null)}>Cancel</button>
-            </div>
           </form>
-        </div>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (accessLib = null)}>Cancel</button>
+            <button class="primary" type="submit" form="library-access-form" disabled={accessBusy}>{accessBusy ? 'Saving…' : 'Save'}</button>
+          {/snippet}
+        </Modal>
       {/if}
       {#if libraries.length === 0}
         <div class="empty">No libraries yet.</div>
@@ -2405,7 +2436,8 @@
         <ImportWizard {users} live={importRun} onclose={() => (importOpen = false)} />
       {/if}
       {#if editing}
-        <form class="panel form wide" onsubmit={saveUser}>
+        <Modal title={editing.id ? `Edit ${editingUser?.displayName || editingUser?.username || 'user'}` : 'Add a user'} onclose={() => (editing = null)}>
+        <form id="user-form" class="form modalform" onsubmit={saveUser}>
           {#if !editing.id}
             <label>Username <input bind:value={editing.username} required autocomplete="off" /></label>
           {/if}
@@ -2440,7 +2472,7 @@
             <input type="password" bind:value={editing.password} minlength="8" required={!editing.id && (editing.role === 'admin' || !editing.pin)} autocomplete="new-password" />
           </label>
           <label>{editing.id ? `Quick sign-in PIN (${editing.hasPin ? 'set — enter a new one to change' : 'not set'})` : 'Quick sign-in PIN (optional, 4–6 digits)'}
-            <input type="password" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" bind:value={editing.pin} autocomplete="off" placeholder="Household sign-in: tap name, enter PIN" />
+            <input type="password" inputmode="numeric" pattern={"[0-9]{4,6}"} maxlength="6" bind:value={editing.pin} autocomplete="off" placeholder="Household sign-in: tap name, enter PIN" />
           </label>
           {#if editing.id && editing.hasPin}
             <label class="check"><input type="checkbox" bind:checked={editing.clearPin} /> Remove PIN</label>
@@ -2490,11 +2522,12 @@
             </div>
           {/if}
           {#if userErr}<div class="error slim">{userErr}</div>{/if}
-          <div class="formrow">
-            <button class="primary" type="submit" disabled={userSaving}>{userSaving ? 'Saving…' : editing.id ? 'Save' : 'Create'}</button>
-            <button type="button" onclick={() => (editing = null)}>Cancel</button>
-          </div>
         </form>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (editing = null)}>Cancel</button>
+            <button class="primary" type="submit" form="user-form" disabled={userSaving}>{userSaving ? 'Saving…' : editing?.id ? 'Save' : 'Create'}</button>
+          {/snippet}
+        </Modal>
       {/if}
       <div class="tablewrap">
         <table>
@@ -2531,7 +2564,8 @@
       </div>
       <p class="hint">Groups let you restrict a library to, say, the grown-ups without listing every account.</p>
       {#if editingGroup}
-        <form class="panel form wide" onsubmit={saveGroup}>
+        <Modal title={editingGroup.id ? `Edit ${editingGroup.name || 'group'}` : 'Add a group'} onclose={() => (editingGroup = null)}>
+        <form id="group-form" class="form modalform" onsubmit={saveGroup}>
           <label>Name <input bind:value={editingGroup.name} required placeholder="Grown-ups" /></label>
           <fieldset class="grants">
             <legend>Members</legend>
@@ -2540,11 +2574,12 @@
             {/each}
           </fieldset>
           {#if groupErr}<div class="error slim">{groupErr}</div>{/if}
-          <div class="formrow">
-            <button class="primary" type="submit" disabled={groupSaving}>{groupSaving ? 'Saving…' : editingGroup.id ? 'Save' : 'Create'}</button>
-            <button type="button" onclick={() => (editingGroup = null)}>Cancel</button>
-          </div>
         </form>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (editingGroup = null)}>Cancel</button>
+            <button class="primary" type="submit" form="group-form" disabled={groupSaving}>{groupSaving ? 'Saving…' : editingGroup?.id ? 'Save' : 'Create'}</button>
+          {/snippet}
+        </Modal>
       {/if}
       {#if groups.length > 0}
         <div class="tablewrap">
@@ -2590,52 +2625,57 @@
               <div class="reqtitle"><strong>{r.title}</strong>{#if r.year}{' '}<span class="muted">({r.year})</span>{/if}</div>
               <div class="muted small">{scopeLabel(r)} · asked by {r.userName || userName(r.userId)} {since(utc(r.createdAt))}</div>
               {#if r.error}<div class="reqerr small">Could not be sent: {r.error}</div>{/if}
-              {#if deciding?.id === r.id}
-                <form class="form reqform" onsubmit={submitDecision}>
-                  {#if deciding.mode === 'approve'}
-                    {@const conns = connsFor(r)}
-                    {@const st = checked(deciding.connectionId)}
-                    {#if conns.length > 1}
-                      <label>Send to
-                        <select value={deciding.connectionId} onchange={(e) => pickDecisionConn((e.currentTarget as HTMLSelectElement).value)}>
-                          {#each conns as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
-                        </select>
-                      </label>
-                    {/if}
-                    <label>Quality profile
-                      <select bind:value={deciding.qualityProfileId}>
-                        <option value={0}>The connection's default</option>
-                        {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
-                      </select>
-                    </label>
-                    <label>Folder
-                      <select bind:value={deciding.rootFolder}>
-                        <option value="">The connection's default</option>
-                        {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path}</option>{/each}
-                      </select>
-                    </label>
-                    {#if intStatus[deciding.connectionId] === 'checking'}<span class="hint">Asking {conns.find((c) => c.id === deciding?.connectionId)?.name ?? 'the instance'} for its profiles…</span>{/if}
-                  {/if}
-                  <label>Note <span class="muted small">— optional, shown to {r.userName || 'them'}</span>
-                    <input bind:value={deciding.note} placeholder={deciding.mode === 'approve' ? 'Enjoy' : 'Already on the shelf'} />
-                  </label>
-                  <div class="formrow">
-                    <button class="primary" type="submit" disabled={reqBusy}>
-                      {reqBusy ? (deciding.mode === 'approve' ? 'Sending…' : 'Declining…') : deciding.mode === 'approve' ? 'Approve and send' : 'Decline'}
-                    </button>
-                    <button type="button" onclick={() => (deciding = null)}>Cancel</button>
-                  </div>
-                </form>
-              {:else}
-                <div class="formrow wrap">
-                  <button class="primary" onclick={() => startDecision(r, 'approve')}>{r.error ? 'Try again' : 'Approve'}</button>
-                  <button onclick={() => startDecision(r, 'decline')}>Decline</button>
-                </div>
-              {/if}
+              <div class="formrow wrap">
+                <button class="primary" onclick={() => startDecision(r, 'approve')}>{r.error ? 'Try again' : 'Approve'}</button>
+                <button onclick={() => startDecision(r, 'decline')}>Decline</button>
+              </div>
             </div>
           </div>
         {/each}
       </div>
+      {#if deciding}
+        {@const r = pendingRequests.find((p) => p.id === deciding?.id)}
+        {#if r}
+          <Modal title="{deciding.mode === 'approve' ? 'Approve' : 'Decline'} {r.title}{r.year ? ` (${r.year})` : ''}" onclose={() => (deciding = null)}>
+            <p class="muted small">{scopeLabel(r)} · asked by {r.userName || userName(r.userId)} {since(utc(r.createdAt))}</p>
+            <form id="decision-form" class="form modalform" onsubmit={submitDecision}>
+              {#if deciding.mode === 'approve'}
+                {@const conns = connsFor(r)}
+                {@const st = checked(deciding.connectionId)}
+                {#if conns.length > 1}
+                  <label>Send to
+                    <select value={deciding.connectionId} onchange={(e) => pickDecisionConn((e.currentTarget as HTMLSelectElement).value)}>
+                      {#each conns as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
+                    </select>
+                  </label>
+                {/if}
+                <label>Quality profile
+                  <select bind:value={deciding.qualityProfileId}>
+                    <option value={0}>The connection's default</option>
+                    {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
+                  </select>
+                </label>
+                <label>Folder
+                  <select bind:value={deciding.rootFolder}>
+                    <option value="">The connection's default</option>
+                    {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path}</option>{/each}
+                  </select>
+                </label>
+                {#if intStatus[deciding.connectionId] === 'checking'}<span class="hint">Asking {conns.find((c) => c.id === deciding?.connectionId)?.name ?? 'the instance'} for its profiles…</span>{/if}
+              {/if}
+              <label>Note <span class="muted small">— optional, shown to {r.userName || 'them'}</span>
+                <input bind:value={deciding.note} placeholder={deciding.mode === 'approve' ? 'Enjoy' : 'Already on the shelf'} />
+              </label>
+            </form>
+            {#snippet foot()}
+              <button type="button" class="lib-btn" onclick={() => (deciding = null)}>Cancel</button>
+              <button class={deciding?.mode === 'approve' ? 'primary' : 'lib-btn danger'} type="submit" form="decision-form" disabled={reqBusy}>
+                {reqBusy ? (deciding?.mode === 'approve' ? 'Sending…' : 'Declining…') : deciding?.mode === 'approve' ? 'Approve and send' : 'Decline'}
+              </button>
+            {/snippet}
+          </Modal>
+        {/if}
+      {/if}
       {#if pastRequests.length > 0}
         <h2>Recent</h2>
         <div class="tablewrap">
@@ -3318,6 +3358,27 @@
   <AvatarCrop file={crop.file} busy={avatarBusy} oncrop={sendUserAvatar} oncancel={() => (crop = null)} />
 {/if}
 
+{#if asking}
+  {@const q = asking}
+  <Modal title={q.title} onclose={() => answer(null)}>
+    {#if q.input}
+      <form id="ask-form" class="form modalform" onsubmit={(e) => { e.preventDefault(); answer(q.input?.value.trim() || null) }}>
+        <label>{q.input.label} <input bind:value={q.input.value} required /></label>
+      </form>
+    {:else if q.body}
+      <p>{q.body}</p>
+    {/if}
+    {#snippet foot()}
+      <button type="button" class="lib-btn" onclick={() => answer(null)}>Cancel</button>
+      {#if q.input}
+        <button class="primary" type="submit" form="ask-form">{q.action}</button>
+      {:else}
+        <button type="button" class={q.danger ? 'lib-btn danger' : 'primary'} onclick={() => answer('yes')}>{q.action}</button>
+      {/if}
+    {/snippet}
+  </Modal>
+{/if}
+
 <style>
   .shell { display: flex; min-height: 100vh; flex-direction: column; }
 
@@ -3487,7 +3548,6 @@
   .reqbody { display: flex; flex-direction: column; gap: 0.45rem; min-width: 0; flex: 1; }
   .reqtitle { overflow-wrap: anywhere; }
   .reqerr { color: var(--err); }
-  .reqform { max-width: none; margin-top: 0.25rem; }
   .maprow { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
   .maprow input {
     flex: 1 1 9rem; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
@@ -3637,7 +3697,6 @@
   .lib-btn:hover { border-color: var(--accent); }
   .lib-btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
   .lib-btn:disabled { opacity: 0.5; }
-  .lib-modal-foot { display: flex; justify-content: flex-end; margin-top: 0.8rem; }
   .lib-pager { display: flex; align-items: center; justify-content: center; gap: 0.8rem; margin: 0.6rem 0; }
   .lib-spacer { flex: 1; }
   .lib-bulk {
@@ -3685,26 +3744,6 @@
   .tag.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
   .tag.warn { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
 
-  .lib-modal-back {
-    position: fixed;
-    inset: 0;
-    background: rgb(0 0 0 / 0.55);
-    z-index: 20;
-  }
-  .lib-modal {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: min(38rem, calc(100vw - 2rem));
-    max-height: min(42rem, calc(100vh - 3rem));
-    overflow-y: auto;
-    padding: 1rem 1.1rem;
-    border-radius: 12px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    z-index: 21;
-  }
   .lib-matchbar { display: flex; gap: 0.5rem; margin: 0.6rem 0; }
   .lib-matchbar input { flex: 1; }
   .lib-cands { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
