@@ -180,3 +180,18 @@ func TestAdminStopIsScopedToOnePlayback(t *testing.T) {
 		t.Errorf("%d playbacks left, want 1", len(r.List()))
 	}
 }
+
+// A heartbeat that flips paused reports it once; one that does not, never.
+func TestOnPause(t *testing.T) {
+	r := NewRegistry(time.Minute)
+	var got []bool
+	r.OnPause = func(p Playback) { got = append(got, p.Paused) }
+	r.Start(Playback{UserID: "u", ItemID: "a"})
+	r.Touch("u", "a", 10, false)
+	r.Touch("u", "a", 11, true)
+	r.Touch("u", "a", 11, true)
+	r.Touch("u", "a", 12, false)
+	if len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("pauses reported = %v, want [true false]", got)
+	}
+}

@@ -8,9 +8,11 @@
     listIntegrations, createIntegration, updateIntegration, deleteIntegration,
     type Integration, type IntegrationKind, type IntegrationRequest,
     integrationStatus, setIntegrationOptions, type IntegrationStatus, type PathMap,
+    getHomeAssistant, putHomeAssistant, deleteHomeAssistant, type HAConnection,
     listRequests, approveRequest, declineRequest, deleteRequest, type MediaRequest, type RequestLevel, type RequestState,
     pauseSegments, resumeSegments, runSegments, previewStatus, type PreviewStatus,
-    cancelScan, segmentStatus, type IntroStatus, type IntroResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
+    cancelScan, segmentStatus, type IntroStatus, type IntroResult,
+    redetectLibrary, redetectSelection, segmentReports, resolveSegmentReport, type SegmentReport, type RedetectResult, listSessions, stopSession, stopPlayback, subscribeEvents, browseDirs, systemStats, playStats, playTotals, diskStats, auditLog,
     libraryManage, type ManageFilter, itemMatches, applyMatch, refreshItem, type Item, type MatchCandidate,
     updateLibrary,
     refreshLibrary, cancelRefresh, refreshStatus, type RefreshProgress,
@@ -25,6 +27,14 @@
   import LineChart from './LineChart.svelte'
   import AvatarCrop from './AvatarCrop.svelte'
   import BarChart from './BarChart.svelte'
+  import Modal from './Modal.svelte'
+  import AccessPicker from './AccessPicker.svelte'
+  import SmartHome from './SmartHome.svelte'
+  import Devices from './Devices.svelte'
+  import {
+    Plus, Tv, Film, House, ChevronRight, RefreshCw, SlidersHorizontal, Pencil, Unplug, TriangleAlert, X,
+  } from '@lucide/svelte'
+  import Defaults from './Defaults.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
 
   /** Write a browsed path back into whichever row opened the browser. */
@@ -60,15 +70,18 @@
     else newPaths = final
   }
 
-  type Page = 'dashboard' | 'libraries' | 'users' | 'requests' | 'activity' | 'logs' | 'integrations' | 'settings'
+  type Page = 'dashboard' | 'libraries' | 'users' | 'devices' | 'defaults' | 'requests' | 'activity' | 'logs' | 'integrations' | 'smarthome' | 'settings'
   const pages: { id: Page; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'libraries', label: 'Libraries' },
     { id: 'users', label: 'Users' },
+    { id: 'devices', label: 'Devices' },
+    { id: 'defaults', label: 'Defaults' },
     { id: 'requests', label: 'Requests' },
     { id: 'activity', label: 'Activity' },
     { id: 'logs', label: 'Logs' },
     { id: 'integrations', label: 'Integrations' },
+    { id: 'smarthome', label: 'Smart home' },
     { id: 'settings', label: 'Settings' },
   ]
   const mediaTypes = ['movies', 'tv', 'music', 'audiobooks', 'podcasts', 'books']
@@ -220,11 +233,11 @@
   let userErr = $state('')
   let userSaving = $state(false)
   function newUser() {
-    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false, requestLevel: settings?.requestDefaultLevel ?? 'approval' }
+    editing = { username: '', displayName: '', password: '', pin: '', role: 'user', disabled: false, requestLevel: settings?.requestDefaultLevel ?? 'approval', segmentEditor: false }
     userErr = ''
   }
   function editUser(u: User) {
-    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled, requestLevel: u.requestLevel }
+    editing = { id: u.id, displayName: u.displayName, password: '', pin: '', hasPin: u.hasPin, clearPin: false, role: u.role, disabled: u.disabled, requestLevel: u.requestLevel, segmentEditor: !!u.segmentEditor }
     userErr = ''
     editDevices = []
     userDevices(u.id).then((d) => (editDevices = d)).catch(() => {})
@@ -332,16 +345,35 @@
       error = String(err instanceof Error ? err.message : err)
     }
   }
-  // ---- Integrations: Sonarr and Radarr ----
+  // ---- Integrations ----
+  // Each kind Cineva can connect, in the order the Add dialogue offers them;
+  // a new kind is an entry here alongside its server side. A connection is
+  // known by its name, unique across them all, so two of one kind (Sonarr
+  // and Sonarr 4K) are told apart here and when approving a request.
+  //
   // Saving registers Cineva's webhook in the instance, which tests it by
   // calling back before it answers — hence "Connecting…" rather than a
   // plain save, and the instance's own error when it cannot reach us.
+  const integrationKinds: Record<IntegrationKind, { label: string; blurb: string; url: string; icon: typeof Tv }> = {
+    sonarr: {
+      label: 'Sonarr', icon: Tv, url: 'http://sonarr.lan:8989',
+      blurb: 'Series. Episodes it imports are scanned in within seconds, and requests for series are sent to it.',
+    },
+    radarr: {
+      label: 'Radarr', icon: Film, url: 'http://radarr.lan:7878',
+      blurb: 'Films. Films it imports are scanned in within seconds, and requests for films are sent to it.',
+    },
+  }
+  const kindLabel = (k: IntegrationKind) => integrationKinds[k].label
   let integrations: Integration[] = $state([])
-  let editingInt: (IntegrationRequest & { id?: string; kind: IntegrationKind }) | null = $state(null)
+  // The Add dialogue's first step, choosing the kind; editingInt is the
+  // second, and editing an existing connection.
+  let pickingKind = $state(false)
+  let editingInt: (IntegrationRequest & { id?: string; kind: IntegrationKind; title: string }) | null = $state(null)
+  let disconnecting: Integration | null = $state(null)
   let intErr = $state('')
   let intNote = $state('')
   let intSaving = $state(false)
-  const kindLabel = (k: IntegrationKind) => (k === 'radarr' ? 'Radarr' : 'Sonarr')
   async function loadIntegrations() {
     try {
       integrations = await listIntegrations()
@@ -349,13 +381,22 @@
       /* the page shows what it last had */
     }
   }
+  // The kind's own name if no connection has it yet, else "Sonarr 2" and on.
+  function freeName(label: string): string {
+    const taken = new Set(integrations.map((i) => i.name.toLowerCase()))
+    for (let n = 1; ; n++) {
+      const name = n === 1 ? label : `${label} ${n}`
+      if (!taken.has(name.toLowerCase())) return name
+    }
+  }
   function newIntegration(kind: IntegrationKind) {
-    editingInt = { kind, name: kindLabel(kind), url: '', apiKey: '', callbackUrl: location.origin }
+    pickingKind = false
+    editingInt = { kind, title: `Connect ${kindLabel(kind)}`, name: freeName(kindLabel(kind)), url: '', apiKey: '', callbackUrl: location.origin }
     intErr = ''
     intNote = ''
   }
   function editIntegration(i: Integration) {
-    editingInt = { id: i.id, kind: i.kind, name: i.name, url: i.url, apiKey: '', callbackUrl: i.callbackUrl }
+    editingInt = { id: i.id, kind: i.kind, title: `Edit ${i.name}`, name: i.name, url: i.url, apiKey: '', callbackUrl: i.callbackUrl }
     intErr = ''
     intNote = ''
   }
@@ -365,7 +406,8 @@
     intSaving = true
     intErr = ''
     try {
-      const { id, ...body } = editingInt
+      const { id, kind, name, url, apiKey, callbackUrl } = editingInt
+      const body = { kind, name, url, apiKey, callbackUrl }
       if (id) await updateIntegration(id, body)
       else await createIntegration(body)
       editingInt = null
@@ -377,14 +419,74 @@
     }
   }
   async function removeIntegration(i: Integration) {
-    if (!confirm(`Disconnect ${i.name}? Cineva removes its webhook there, and new imports wait for the next scheduled rescan.`)) return
     intNote = ''
+    intSaving = true
     try {
       const res = await deleteIntegration(i.id)
       if (res?.warning) intNote = res.warning
       loadIntegrations()
     } catch (err) {
       intNote = String(err instanceof Error ? err.message : err)
+    } finally {
+      intSaving = false
+      disconnecting = null
+    }
+  }
+
+  // ---- Home Assistant ----
+  // A single connection, unlike Sonarr and Radarr: GET answers configured
+  // false when there is none, and PUT both connects and changes it. Saving
+  // opens Home Assistant's websocket and signs in before anything is kept,
+  // so a wrong address or token comes back with Home Assistant's reason.
+  // What it exposes, the rooms and the modes live on the Smart home page.
+  const haKind = {
+    label: 'Home Assistant', icon: House, url: 'http://homeassistant.local:8123',
+    blurb: 'Rooms, controls, cameras and modes. People work the lights and amplifier of the room they watch in, look at the cameras, and start a mode that sets the room up and plays.',
+  }
+  let ha: HAConnection | null = $state(null)
+  let editingHA: { name: string; url: string; token: string; playbackEvents: boolean; existing: boolean } | null = $state(null)
+  let disconnectingHA = $state(false)
+  let haErr = $state('')
+  let haSaving = $state(false)
+  let smartHome: ReturnType<typeof SmartHome> | undefined = $state()
+  let devicesPage: ReturnType<typeof Devices> | undefined = $state()
+  const loadHA = () => getHomeAssistant().then((c) => (ha = c)).catch(() => {})
+  function connectHA() {
+    pickingKind = false
+    editingHA = { name: 'Home Assistant', url: '', token: '', playbackEvents: false, existing: false }
+    haErr = ''
+  }
+  function editHA() {
+    if (!ha?.configured) return
+    editingHA = { name: ha.name ?? 'Home Assistant', url: ha.url ?? '', token: '', playbackEvents: !!ha.playbackEvents, existing: true }
+    haErr = ''
+  }
+  async function saveHA(e: Event) {
+    e.preventDefault()
+    if (!editingHA) return
+    haSaving = true
+    haErr = ''
+    try {
+      const { name, url, token, playbackEvents } = editingHA
+      ha = await putHomeAssistant({ name: name.trim() || 'Home Assistant', url: url.trim(), token: token.trim() || undefined, playbackEvents })
+      editingHA = null
+    } catch (err) {
+      haErr = String(err instanceof Error ? err.message : err)
+    } finally {
+      haSaving = false
+    }
+  }
+  async function removeHA() {
+    intNote = ''
+    haSaving = true
+    try {
+      await deleteHomeAssistant()
+      ha = { configured: false }
+    } catch (err) {
+      intNote = String(err instanceof Error ? err.message : err)
+    } finally {
+      haSaving = false
+      disconnectingHA = false
     }
   }
 
@@ -420,6 +522,7 @@
   let optsFor: { id: string; qualityProfileId: number; rootFolder: string; pathMaps: PathMap[] } | null = $state(null)
   let optsErr = $state('')
   let optsSaving = $state(false)
+  const optsConn = $derived(optsFor ? integrations.find((i) => i.id === optsFor?.id) ?? null : null)
   function editOptions(i: Integration) {
     optsFor = { id: i.id, qualityProfileId: i.qualityProfileId, rootFolder: i.rootFolder, pathMaps: i.pathMaps.map((m) => ({ ...m })) }
     optsErr = ''
@@ -538,7 +641,6 @@
     const u = users.find((x) => x.id === id)
     return u ? u.displayName || u.username : id.slice(0, 8)
   }
-  const groupName = (id: string) => groups.find((g) => g.id === id)?.name ?? id.slice(0, 8)
 
   // ---- Library access ----
   // Open to everyone until restricted to chosen users and groups.
@@ -556,12 +658,6 @@
     } catch (err) {
       accessErr = String(err instanceof Error ? err.message : err)
     }
-  }
-  // The picker's value is "u:<id>" or "g:<id>".
-  function addPrincipal(v: string) {
-    const [kind, id] = [v.slice(0, 1), v.slice(2)]
-    if (kind === 'u' && !access.userIds.includes(id)) access.userIds = [...access.userIds, id]
-    if (kind === 'g' && !access.groupIds.includes(id)) access.groupIds = [...access.groupIds, id]
   }
   async function saveAccess() {
     if (!accessLib) return
@@ -767,6 +863,81 @@
   )
   const phaseLabel = { reading: 'reading audio', comparing: 'comparing', saving: 'saving' }
   const epCode = (r: IntroResult) => `S${String(r.season).padStart(2, '0')}E${String(r.episode).padStart(2, '0')}`
+  // Films count alongside episodes: one check each, for their credits.
+  const introDone = $derived(intro ? intro.episodesDone + (intro.filmsDone ?? 0) : 0)
+  const introTotal = $derived(intro ? intro.episodesTotal + (intro.filmsTotal ?? 0) : 0)
+
+  // ---- Detecting again: a library, or a selection in its Manage list ----
+
+  /**
+   * Run a re-detection, asking first whether times set by hand should be
+   * replaced too, and say what came of it. send is called again with
+   * includeLocked when the answer is yes.
+   */
+  async function redetectAsking(send: (includeLocked: boolean) => Promise<RedetectResult>): Promise<string> {
+    let res = await send(false)
+    let replaced = false
+    if (res.locked > 0 && confirm(`Also replace ${res.locked} ${res.locked === 1 ? 'title' : 'titles'} whose times were set by hand?`)) {
+      res = await send(true)
+      replaced = true
+    }
+    const kept = res.locked > 0 && !replaced ? ` · ${res.locked} set by hand kept` : ''
+    return `${res.items} ${res.items === 1 ? 'title' : 'titles'} sent to detection${kept}.`
+  }
+
+  let detectNote: { libraryId: string; text: string } | null = $state(null)
+  async function detectLibrary(lib: Library) {
+    error = ''
+    try {
+      const text = await redetectAsking((includeLocked) => redetectLibrary(lib.id, { includeLocked }))
+      detectNote = { libraryId: lib.id, text }
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
+  // ---- Reports of wrong intro and credits times ----
+  let reports: SegmentReport[] = $state([])
+  const loadReports = () => segmentReports().then((r) => (reports = r)).catch(() => {})
+  let resolving: string[] = $state([])
+  async function resolveReports(ids: string[]) {
+    resolving = [...resolving, ...ids]
+    try {
+      for (const id of ids) await resolveSegmentReport(id)
+      reports = reports.filter((r) => !ids.includes(r.id))
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    } finally {
+      resolving = resolving.filter((id) => !ids.includes(id))
+    }
+  }
+  // Seasons with three or more open reports: better detected again than
+  // corrected episode by episode.
+  const crowdedSeasons = $derived.by(() => {
+    const out: { seasonId: string; label: string; ids: string[] }[] = []
+    for (const r of reports) {
+      if (!r.seasonId || r.seasonOpen < 3 || out.some((x) => x.seasonId === r.seasonId)) continue
+      out.push({
+        seasonId: r.seasonId,
+        label: `${r.seriesTitle || 'Unknown series'} · Season ${r.seasonNum ?? 0}`,
+        ids: reports.filter((x) => x.seasonId === r.seasonId).map((x) => x.id),
+      })
+    }
+    return out
+  })
+  async function redetectReported(season: { seasonId: string; ids: string[] }) {
+    error = ''
+    try {
+      await redetectAsking((includeLocked) => redetectSelection([season.seasonId], { includeLocked }))
+      await resolveReports(season.ids)
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+  const reportLabel = (r: SegmentReport) =>
+    r.itemKind === 'episode'
+      ? `${r.seriesTitle || 'Unknown series'} S${String(r.seasonNum ?? 0).padStart(2, '0')}E${String(r.episodeNum ?? 0).padStart(2, '0')}`
+      : r.title
 
   async function startScan(lib: Library, full = false) {
     error = ''
@@ -832,6 +1003,26 @@
   let collBusy = $state(false)
   let addFilmQuery = $state('')
 
+  // Rows ticked for a bulk action, on the page on screen; a new page or
+  // filter starts with none.
+  let selected: string[] = $state([])
+  let bulkNote = $state('')
+  const canDetect = $derived(!!manage && (manage.mediaType === 'tv' || manage.mediaType === 'movies') && intro?.enabled !== false)
+  function toggleSelected(id: string) {
+    selected = selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]
+  }
+  async function detectSelected() {
+    error = ''
+    bulkNote = ''
+    const ids = selected
+    try {
+      bulkNote = await redetectAsking((includeLocked) => redetectSelection(ids, { includeLocked }))
+      selected = []
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e)
+    }
+  }
+
   // Manual metadata edit.
   let editItem: Item | null = $state(null)
   let editForm: ItemEdit = $state({})
@@ -851,6 +1042,8 @@
     metaRefresh = null
     editingColl = null
     collections = []
+    selected = []
+    bulkNote = ''
     try {
       await loadItems()
       const st = await refreshStatus(lib.id)
@@ -882,6 +1075,8 @@
         r = await libraryManage(lib.id, f, Math.ceil(r.total / r.size), ITEM_PAGE_SIZE)
       }
       if (seq !== itemsSeq || manage?.id !== lib.id) return
+      // Keep the ticks only on rows still on screen.
+      selected = selected.filter((id) => r.items.some((it) => it.id === id))
       items = r.items
       itemPage = r.page
       itemTotal = r.total
@@ -1284,6 +1479,7 @@
   const logFilters = [
     { id: '', label: 'All' }, { id: 'play.', label: 'Playback' }, { id: 'download', label: 'Downloads' },
     { id: 'scan.', label: 'Scans' }, { id: 'library.', label: 'Libraries' }, { id: 'transcode.', label: 'Transcodes' },
+    { id: 'segments.', label: 'Intro & credits' },
   ]
   async function loadLogs(more = false) {
     logsLoading = true
@@ -1303,7 +1499,9 @@
   const actionLabel = (a: string) =>
     ({ 'play.start': 'Played', download: 'Downloaded', 'scan.start': 'Started scan', 'scan.cancel': 'Cancelled scan',
       'scan.completed': 'Scan completed', 'scan.failed': 'Scan failed', 'library.create': 'Created library',
-      'library.delete': 'Deleted library', 'transcode.stop': 'Stopped transcode' })[a] ?? a
+      'library.delete': 'Deleted library', 'transcode.stop': 'Stopped transcode',
+      'segments.set': 'Set intro/credits', 'segments.clear': 'Handed back to detection',
+      'segments.redetect': 'Detect again', 'segments.report.resolve': 'Resolved report' })[a] ?? a
   const when = (iso: string) => {
     const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z')
     return d.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -1425,15 +1623,18 @@
     loadUsers()
     loadGroups()
     loadIntegrations()
+    loadHA()
     loadRequests()
     loadSettings()
     segmentStatus().then((s) => (intro = s)).catch(() => {})
+    loadReports()
     previewStatus().then((p) => (previews = p)).catch(() => {})
     // Live updates over SSE; the slow poll is only a fallback for missed events.
     const closeEvents = subscribeEvents(
       {
         scan: onScanEvent,
         segments: (data) => (intro = data as IntroStatus | null),
+        segmentReports: loadReports,
         previews: (data) => (previews = data as PreviewStatus | null),
         refresh: (data) => {
           const p = data as RefreshProgress | null
@@ -1461,6 +1662,19 @@
         users: () => { loadUsers(); loadGroups() },
         requests: loadRequests,
         integrations: loadIntegrations,
+        // States that changed carry entities and only matter to the Smart
+        // home page; no data means the connection, exposure, rooms or
+        // modes changed.
+        homeassistant: (data) => {
+          if (Array.isArray((data as { entities?: unknown } | null)?.entities)) {
+            smartHome?.onEvent(data)
+            return
+          }
+          loadHA()
+          smartHome?.onEvent(data)
+          devicesPage?.refresh()
+        },
+        devices: () => devicesPage?.refresh(),
         settings: loadSettings,
         sessions: () => listSessions().then((x) => (sessions = x)).catch(() => {}),
         plays: () => playStats(playDays).then((x) => (plays = x)).catch(() => {}),
@@ -1504,7 +1718,7 @@
       const rest = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
       const parts = rest.split('/').filter(Boolean).map(decodeURIComponent)
       const [first, second] = parts
-      const pages: Page[] = ['dashboard', 'libraries', 'users', 'requests', 'activity', 'logs', 'integrations', 'settings']
+      const pages: Page[] = ['dashboard', 'libraries', 'users', 'devices', 'defaults', 'requests', 'activity', 'logs', 'integrations', 'smarthome', 'settings']
       const target = pages.includes(first as Page) ? (first as Page) : 'dashboard'
       page = target
       if (target === 'libraries' && second) {
@@ -1580,7 +1794,7 @@
   <aside>
     <div class="logo">Cineva <span>admin</span></div>
     <nav>
-      {#each pages as p (p.id)}
+      {#each pages.filter((p) => p.id !== 'smarthome' || ha?.configured || page === 'smarthome') as p (p.id)}
         <button class:active={page === p.id} onclick={() => go(p.id)}>
           {p.label}{#if p.id === 'requests' && pendingRequests.length > 0}<span class="navcount" title="{pendingRequests.length} waiting for a decision">{pendingRequests.length}</span>{/if}
         </button>
@@ -1888,12 +2102,37 @@
           {/if}
         {/snippet}
         {@render pager()}
+        {#if canDetect && (selected.length > 0 || bulkNote)}
+          <div class="lib-bulk" role="status">
+            {#if selected.length > 0}
+              <span>{selected.length} selected</span>
+              <button class="primary" onclick={detectSelected}>{manage?.mediaType === 'movies' ? 'Detect credits' : 'Detect intro & credits'}</button>
+              <button class="lib-btn" onclick={() => (selected = [])}>Clear</button>
+            {:else}
+              <span class="muted small">{bulkNote} Progress is on the Activity page.</span>
+            {/if}
+          </div>
+        {/if}
         <div class="tablewrap">
           <table class="lib-table">
-            <thead><tr><th></th><th>Title</th><th>Year</th><th>Metadata</th><th>File</th><th></th></tr></thead>
+            <thead><tr>
+              {#if canDetect}
+                <th class="lib-check">
+                  <input type="checkbox" aria-label="Select every row on this page"
+                    checked={items.length > 0 && items.every((it) => selected.includes(it.id))}
+                    onchange={(e) => (selected = (e.currentTarget as HTMLInputElement).checked ? items.map((it) => it.id) : [])} />
+                </th>
+              {/if}
+              <th></th><th>Title</th><th>Year</th><th>Metadata</th><th>File</th><th></th>
+            </tr></thead>
             <tbody>
               {#each items as it (it.id)}
-                <tr>
+                <tr class:lib-sel={selected.includes(it.id)}>
+                  {#if canDetect}
+                    <td class="lib-check">
+                      <input type="checkbox" aria-label="Select {it.title}" checked={selected.includes(it.id)} onchange={() => toggleSelected(it.id)} />
+                    </td>
+                  {/if}
                   <td class="lib-pcell">
                     {#if it.poster}<img class="lib-poster" src={it.poster} alt="" loading="lazy" />{:else}<span class="lib-poster ph"></span>{/if}
                   </td>
@@ -2071,40 +2310,11 @@
         </div>
       {/if}
       {#if accessLib}
-        {@const chosenU = new Set(access.userIds)}
-        {@const chosenG = new Set(access.groupIds)}
         <div class="lib-modal-back" role="presentation" onclick={() => (accessLib = null)}></div>
         <div class="lib-modal" role="dialog" aria-modal="true" aria-label="Library access">
           <h2>Who can see “{accessLib.name}”</h2>
           <form class="form wide" onsubmit={(e) => { e.preventDefault(); saveAccess() }}>
-            <label class="check"><input type="radio" name="access" checked={!access.restricted} onchange={() => (access.restricted = false)} /> Everyone</label>
-            <label class="check"><input type="radio" name="access" checked={access.restricted} onchange={() => (access.restricted = true)} /> Only these people and groups</label>
-            {#if access.restricted}
-              <div class="principals">
-                {#each access.groupIds as id (id)}
-                  <span class="chip sel">{groupName(id)} <span class="muted small">group</span>
-                    <button type="button" class="chipx" aria-label="Remove {groupName(id)}" onclick={() => (access.groupIds = access.groupIds.filter((x) => x !== id))}>✕</button></span>
-                {/each}
-                {#each access.userIds as id (id)}
-                  <span class="chip sel">{userName(id)}
-                    <button type="button" class="chipx" aria-label="Remove {userName(id)}" onclick={() => (access.userIds = access.userIds.filter((x) => x !== id))}>✕</button></span>
-                {/each}
-                <select onchange={(e) => { const el = e.target as HTMLSelectElement; if (el.value) addPrincipal(el.value); el.value = '' }}>
-                  <option value="">+ Add a user or group…</option>
-                  {#if groups.some((g) => !chosenG.has(g.id))}
-                    <optgroup label="Groups">
-                      {#each groups.filter((g) => !chosenG.has(g.id)) as g (g.id)}<option value="g:{g.id}">{g.name}</option>{/each}
-                    </optgroup>
-                  {/if}
-                  <optgroup label="Users">
-                    {#each users.filter((u) => u.role !== 'admin' && !chosenU.has(u.id)) as u (u.id)}<option value="u:{u.id}">{u.displayName || u.username}</option>{/each}
-                  </optgroup>
-                </select>
-              </div>
-              {#if access.userIds.length === 0 && access.groupIds.length === 0}
-                <p class="hint">Nobody listed: only admins will see this library.</p>
-              {/if}
-            {/if}
+            <AccessPicker bind:access {users} {groups} noun="library" />
             <p class="hint">Admins always see every library.</p>
             {#if accessErr}<div class="error slim">{accessErr}</div>{/if}
             <div class="formrow">
@@ -2131,6 +2341,9 @@
                     {#if lib.fullScanQueued}
                       <div class="muted small">Full rescan queued for the background work window</div>
                     {/if}
+                    {#if detectNote?.libraryId === lib.id}
+                      <div class="muted small detectnote">{detectNote.text} Progress is on the Activity page.</div>
+                    {/if}
                   </td>
                   <td><span class="tag">{lib.mediaType}</span></td>
                   <td class="muted">{lib.paths.join(', ')}</td>
@@ -2148,6 +2361,14 @@
                         ? 'Take the queued full rescan off the queue'
                         : 'Start a full rescan in the background work window, once nothing is playing'}
                     >{lib.fullScanQueued ? 'Cancel tonight’s rescan' : 'Full rescan tonight'}</button>
+                    {#if (lib.mediaType === 'tv' || lib.mediaType === 'movies') && intro?.enabled !== false}
+                      <button
+                        onclick={() => detectLibrary(lib)}
+                        title={lib.mediaType === 'tv'
+                          ? 'Detect every episode’s intro and credits again, starting now whatever the schedule says'
+                          : 'Read every film’s chapters for its credits again, starting now whatever the schedule says'}
+                      >{lib.mediaType === 'tv' ? 'Detect intro & credits' : 'Detect credits'}</button>
+                    {/if}
                     <button class="danger" onclick={() => removeLibrary(lib)}>Delete</button>
                   </td>
                 </tr>
@@ -2222,6 +2443,10 @@
           {:else}
             <p class="hint">Admins' requests always go straight to Sonarr or Radarr.</p>
           {/if}
+          {#if editing.role !== 'admin'}
+            <label class="check"><input type="checkbox" bind:checked={editing.segmentEditor} /> Intro &amp; credits editor</label>
+            <p class="hint">A trusted editor can correct intro and credits times and start their detection on the titles they can see, without being an admin. Detecting a whole library stays with admins, and the log records who changed what.</p>
+          {/if}
           {#if editing.id && editing.id !== me?.id}
             <label class="check"><input type="checkbox" bind:checked={editing.disabled} /> Disabled (cannot sign in)</label>
           {/if}
@@ -2264,7 +2489,7 @@
                     </div>
                   </div>
                 </td>
-                <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span>{#if u.hasPin}<span class="tag pin">PIN</span>{/if}{#if !u.hasPassword}<span class="muted small"> no password</span>{/if}</td>
+                <td><span class="tag" class:ok={u.role === 'admin'}>{u.role}</span>{#if u.role !== 'admin' && u.segmentEditor}<span class="tag pin" title="Corrects intro and credits times">editor</span>{/if}{#if u.hasPin}<span class="tag pin">PIN</span>{/if}{#if !u.hasPassword}<span class="muted small"> no password</span>{/if}</td>
                 <td class="muted">{u.role === 'admin' ? 'all' : u.libraryIds.map(libName).join(', ') || 'none'}</td>
                 <td class="muted nowrap">{u.role === 'admin' ? levelLabel.auto : levelLabel[u.requestLevel] ?? u.requestLevel}</td>
                 <td class="muted">{u.createdAt.slice(0, 10)}</td>
@@ -2318,6 +2543,8 @@
           </table>
         </div>
       {/if}
+    {:else if page === 'defaults'}
+      <Defaults {themes} />
     {:else if page === 'requests'}
       <div class="titlerow">
         <h1>Requests</h1>
@@ -2412,127 +2639,269 @@
     {:else if page === 'integrations'}
       <div class="titlerow">
         <h1>Integrations</h1>
-        <div class="formrow addrow">
-          <button class="primary" onclick={() => newIntegration('sonarr')}>+ Add Sonarr</button>
-          <button class="primary" onclick={() => newIntegration('radarr')}>+ Add Radarr</button>
-        </div>
+        <button class="primary ibtn addint" onclick={() => (pickingKind = true)}><Plus size={16} /> Add integration</button>
       </div>
-      <p class="hint intro">Cineva registers a webhook in each connected Sonarr or Radarr, so an episode or film they import is scanned in within seconds rather than at the next scheduled rescan. They also take the requests people make for titles not in the library.</p>
       {#if settings && !settings.tmdbConfigured}
         <div class="error slim">No TMDB key is configured, so requests are off: titles outside the library cannot be looked up. Set metadata.tmdb.api_key (CINEVA_METADATA_TMDB_API_KEY) and restart.</div>
       {/if}
       {#if intNote}<div class="error slim">{intNote}</div>{/if}
-      {#if editingInt}
-        <form class="panel form wide" onsubmit={saveIntegration}>
-          <h2>{editingInt.id ? `Edit ${editingInt.name}` : `Connect ${kindLabel(editingInt.kind)}`}</h2>
-          <label>Name <input bind:value={editingInt.name} placeholder={kindLabel(editingInt.kind)} /></label>
-          <label>{kindLabel(editingInt.kind)} URL
-            <input type="url" bind:value={editingInt.url} required placeholder={editingInt.kind === 'radarr' ? 'http://radarr.lan:7878' : 'http://sonarr.lan:8989'} />
-          </label>
-          <label>{editingInt.id ? 'API key (leave blank to keep)' : 'API key'}
-            <input type="password" bind:value={editingInt.apiKey} required={!editingInt.id} autocomplete="off" />
-          </label>
-          <p class="hint">In {kindLabel(editingInt.kind)}: Settings → General → Security → API Key.</p>
-          <label>Cineva address, as {kindLabel(editingInt.kind)} reaches it
-            <input type="url" bind:value={editingInt.callbackUrl} required />
-          </label>
-          <p class="hint">Change this when {kindLabel(editingInt.kind)} runs in a container or on another machine and reaches Cineva at a different address, such as http://192.168.1.10:4747.</p>
-          {#if intErr}<div class="error slim">{intErr}</div>{/if}
-          <div class="formrow">
-            <button class="primary" type="submit" disabled={intSaving}>{intSaving ? 'Connecting…' : editingInt.id ? 'Save' : 'Connect'}</button>
-            <button type="button" onclick={() => (editingInt = null)}>Cancel</button>
-          </div>
-        </form>
-      {/if}
-      {#if integrations.length === 0 && !editingInt}
-        <div class="panel muted">Nothing connected yet. Add Sonarr for TV and Radarr for films.</div>
+      {#if integrations.length === 0 && !ha?.configured}
+        <div class="empty slim">Nothing connected yet. Add Sonarr for series, Radarr for films, and Home Assistant for the rooms you watch in.</div>
       {/if}
       <div class="intgrid">
         {#each integrations as i (i.id)}
+          {@const st = checked(i.id)}
+          {@const warnings = st?.health.filter((h) => h.type !== 'ok') ?? []}
+          {@const KindIcon = integrationKinds[i.kind].icon}
           <div class="panel intcard">
             <div class="inthead">
-              <span class="tag">{kindLabel(i.kind)}</span>
-              <strong>{i.name}</strong>
+              <h3 class="intname">{i.name}</h3>
+              <span class="tag kindtag"><KindIcon size={13} /> {kindLabel(i.kind)}</span>
             </div>
-            <div class="muted small inturl">{i.url}</div>
-            <div class="small">
-              {#if i.notificationId > 0}<span class="tag ok">Webhook registered</span>{:else}<span class="tag bad">No webhook</span>{/if}
-              {#if i.version}<span class="muted"> v{i.version}</span>{/if}
-            </div>
-            <div class="muted small inturl">Calls back to {i.callbackUrl}</div>
-            {#if intStatus[i.id] === 'checking'}
-              <div class="muted small">Checking…</div>
-            {:else if checked(i.id)}
-              {@const st = checked(i.id) as IntegrationStatus}
-              <div class="small">
+            <div class="muted small inturl">{i.url}{#if i.version}{' · '}v{i.version}{/if}</div>
+            <div class="intchips">
+              {#if intStatus[i.id] === 'checking'}
+                <span class="tag">Checking…</span>
+              {:else if st}
                 {#if st.reachable}<span class="tag ok">Reachable</span>{:else}<span class="tag bad">Unreachable</span>{/if}
-              </div>
-              {#if st.error}<div class="small reqerr inturl">{st.error}</div>{/if}
-              {#each st.health.filter((h) => h.type !== 'ok') as h (h.source + h.message)}
-                <div class="small inturl"><span class="tag" class:bad={h.type === 'error'}>{h.type}</span> <span class="muted">{h.message}</span></div>
-              {/each}
-            {/if}
-            <div class="muted small">
-              {#if i.lastEventAt}
-                Last event: {i.lastEvent}{#if i.lastEventTitle}{' · '}{i.lastEventTitle}{/if}{' · '}{since(utc(i.lastEventAt))}
-              {:else}
-                No events received yet
               {/if}
+              {#if i.notificationId > 0}<span class="tag ok">Webhook registered</span>{:else}<span class="tag bad">No webhook</span>{/if}
             </div>
-            <div class="muted small inturl">
-              Requests: {checked(i.id)?.qualityProfiles.find((q) => q.id === i.qualityProfileId)?.name ?? (i.qualityProfileId ? `profile ${i.qualityProfileId}` : 'first quality profile')}
-              · {i.rootFolder || 'first root folder'}{#if i.pathMaps.length > 0}{' · '}paths mapped: {i.pathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}{/if}
-            </div>
-            {#if optsFor?.id === i.id}
-              {@const st = checked(i.id)}
-              <form class="form reqform" onsubmit={saveOptions}>
-                <label>Quality profile for requests
-                  <select bind:value={optsFor.qualityProfileId}>
-                    <option value={0}>The first one ({st?.qualityProfiles[0]?.name ?? `as ${kindLabel(i.kind)} lists them`})</option>
-                    {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
-                  </select>
-                </label>
-                <label>Folder for requests
-                  <select bind:value={optsFor.rootFolder}>
-                    <option value="">The first one ({st?.rootFolders[0]?.path ?? 'as listed'})</option>
-                    {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path} · {freeSpace(f.freeSpace)}</option>{/each}
-                  </select>
-                </label>
-                <div class="facefield">
-                  <span class="facelabel">Path mapping <span class="muted small">— when {kindLabel(i.kind)} sees the media at other paths than Cineva, as it does in a container</span></span>
-                  {#each optsFor.pathMaps as m, mi (mi)}
-                    <div class="maprow">
-                      <input bind:value={m.from} placeholder="{kindLabel(i.kind)}'s path, e.g. /tv" aria-label="{kindLabel(i.kind)}'s path" />
-                      <span class="muted">→</span>
-                      <input bind:value={m.to} placeholder="Cineva's path, e.g. /mnt/media/TV" aria-label="Cineva's path" />
-                      <button type="button" class="danger" aria-label="Remove this mapping" onclick={() => optsFor && (optsFor.pathMaps = optsFor.pathMaps.filter((_, x) => x !== mi))}>Remove</button>
-                    </div>
-                  {/each}
-                  <div class="formrow wrap">
-                    <button type="button" onclick={() => optsFor && (optsFor.pathMaps = [...optsFor.pathMaps, { from: '', to: '' }])}>+ Add mapping</button>
-                    {#if st && st.suggestedPathMaps.some((sm) => !optsFor?.pathMaps.some((m) => m.from === sm.from))}
-                      <button type="button" onclick={() => st && addSuggested(st.suggestedPathMaps)}>
-                        Use suggested: {st.suggestedPathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}
-                      </button>
-                    {/if}
-                  </div>
-                </div>
-                {#if optsErr}<div class="error slim">{optsErr}</div>{/if}
-                <div class="formrow">
-                  <button class="primary" type="submit" disabled={optsSaving}>{optsSaving ? 'Saving…' : 'Save'}</button>
-                  <button type="button" onclick={() => (optsFor = null)}>Cancel</button>
-                </div>
-              </form>
+            {#if st?.error}<div class="small reqerr inturl">{st.error}</div>{/if}
+            {#if warnings.length > 0}
+              <ul class="intwarns">
+                {#each warnings as h (h.source + h.message)}
+                  <li class="small" class:bad={h.type === 'error'}><TriangleAlert size={14} /><span>{h.message}</span></li>
+                {/each}
+              </ul>
             {/if}
-            <div class="formrow wrap">
-              <button onclick={() => testIntegration(i)} disabled={intStatus[i.id] === 'checking'}>Test</button>
-              <button onclick={() => editOptions(i)}>Requests &amp; paths</button>
-              <button onclick={() => editIntegration(i)}>Edit</button>
-              <button class="danger" onclick={() => removeIntegration(i)}>Disconnect</button>
+            <dl class="intfacts small">
+              <dt>Last event</dt>
+              <dd>
+                {#if i.lastEventAt}
+                  {i.lastEvent}{#if i.lastEventTitle}{' · '}{i.lastEventTitle}{/if}{' · '}{since(utc(i.lastEventAt))}
+                {:else}
+                  None received yet
+                {/if}
+              </dd>
+              <dt>Requests</dt>
+              <dd>
+                {st?.qualityProfiles.find((q) => q.id === i.qualityProfileId)?.name ?? (i.qualityProfileId ? `Profile ${i.qualityProfileId}` : 'First quality profile')}
+                · {i.rootFolder || 'first root folder'}
+              </dd>
+              {#if i.pathMaps.length > 0}
+                <dt>Paths</dt>
+                <dd>{i.pathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}</dd>
+              {/if}
+              <dt>Calls back to</dt>
+              <dd>{i.callbackUrl}</dd>
+            </dl>
+            <div class="intactions">
+              <button class="lib-btn ibtn" onclick={() => testIntegration(i)} disabled={intStatus[i.id] === 'checking'}>
+                <RefreshCw size={15} class={intStatus[i.id] === 'checking' ? 'spin' : ''} /> Test
+              </button>
+              <button class="lib-btn ibtn" onclick={() => editOptions(i)}><SlidersHorizontal size={15} /> Requests &amp; paths</button>
+              <button class="lib-btn ibtn" onclick={() => editIntegration(i)}><Pencil size={15} /> Edit</button>
+              <button class="lib-btn ibtn danger push" onclick={() => (disconnecting = i)}><Unplug size={15} /> Disconnect</button>
             </div>
           </div>
         {/each}
+        {#if ha?.configured}
+          <div class="panel intcard">
+            <div class="inthead">
+              <h3 class="intname">{ha.name || haKind.label}</h3>
+              <span class="tag kindtag"><House size={13} /> {haKind.label}</span>
+            </div>
+            <div class="muted small inturl">{ha.url}{#if ha.version}{' · '}v{ha.version}{/if}</div>
+            <div class="intchips">
+              {#if ha.connected}<span class="tag ok">Connected</span>{:else}<span class="tag bad">Unreachable</span>{/if}
+              {#if ha.isAdmin}<span class="tag ok">Admin user</span>{:else}<span class="tag">Not an admin user</span>{/if}
+            </div>
+            {#if ha.error}<div class="small reqerr inturl">{ha.error}</div>{/if}
+            <dl class="intfacts small">
+              <dt>Entities</dt>
+              <dd>{ha.exposed ?? 0} exposed of {ha.entities ?? 0}</dd>
+              <dt>Playback events</dt>
+              <dd>
+                {#if ha.playbackEvents}On: plays, pauses and stops are sent to Home Assistant{:else if ha.isAdmin}Off{:else}Off: they need Cineva's Home Assistant user to be an administrator there{/if}
+              </dd>
+            </dl>
+            <div class="intactions">
+              <button class="lib-btn ibtn" onclick={() => go('smarthome')}><SlidersHorizontal size={15} /> Manage</button>
+              <button class="lib-btn ibtn" onclick={editHA}><Pencil size={15} /> Edit</button>
+              <button class="lib-btn ibtn danger push" onclick={() => (disconnectingHA = true)}><Unplug size={15} /> Disconnect</button>
+            </div>
+          </div>
+        {/if}
       </div>
+
+      {#if pickingKind}
+        <Modal title="Add an integration" onclose={() => (pickingKind = false)}>
+          <div class="kindlist">
+            {#each Object.entries(integrationKinds) as [kind, k] (kind)}
+              {@const Icon = k.icon}
+              <button class="kindopt" onclick={() => newIntegration(kind as IntegrationKind)}>
+                <span class="kindicon"><Icon size={20} /></span>
+                <span class="kindtext">
+                  <strong>{k.label}</strong>
+                  <span class="muted small">{k.blurb}</span>
+                </span>
+                <ChevronRight size={18} class="kindgo" />
+              </button>
+            {/each}
+            {#if ha && !ha.configured}
+              <button class="kindopt" onclick={connectHA}>
+                <span class="kindicon"><House size={20} /></span>
+                <span class="kindtext">
+                  <strong>{haKind.label}</strong>
+                  <span class="muted small">{haKind.blurb}</span>
+                </span>
+                <ChevronRight size={18} class="kindgo" />
+              </button>
+            {/if}
+          </div>
+        </Modal>
+      {/if}
+
+      {#if editingInt}
+        {@const label = kindLabel(editingInt.kind)}
+        <Modal title={editingInt.title} onclose={() => (editingInt = null)}>
+          <form id="int-form" class="form modalform" onsubmit={saveIntegration}>
+            <label>Name
+              <input bind:value={editingInt.name} required placeholder="{label} 4K" />
+            </label>
+            <p class="hint">How this connection is shown here and when approving requests. No two can share a name.</p>
+            <label>{label} URL
+              <input type="url" bind:value={editingInt.url} required placeholder={integrationKinds[editingInt.kind].url} />
+            </label>
+            <label>{editingInt.id ? 'API key (leave blank to keep)' : 'API key'}
+              <input type="password" bind:value={editingInt.apiKey} required={!editingInt.id} autocomplete="off" />
+            </label>
+            <p class="hint">In {label}: Settings → General → Security → API Key.</p>
+            <label>Cineva address, as {label} reaches it
+              <input type="url" bind:value={editingInt.callbackUrl} required />
+            </label>
+            <p class="hint">Change this when {label} runs in a container or on another machine and reaches Cineva at a different address, such as http://192.168.1.10:4747.</p>
+            {#if intErr}<div class="error slim">{intErr}</div>{/if}
+          </form>
+          {#snippet foot()}
+            {#if editingInt && !editingInt.id}
+              <button type="button" class="lib-btn push-end" onclick={() => { editingInt = null; pickingKind = true }}>Back</button>
+            {/if}
+            <button type="button" class="lib-btn" onclick={() => (editingInt = null)}>Cancel</button>
+            <button class="primary" type="submit" form="int-form" disabled={intSaving}>{intSaving ? 'Connecting…' : editingInt?.id ? 'Save' : 'Connect'}</button>
+          {/snippet}
+        </Modal>
+      {/if}
+
+      {#if optsFor && optsConn}
+        {@const st = checked(optsConn.id)}
+        {@const label = kindLabel(optsConn.kind)}
+        <Modal title="Requests and paths · {optsConn.name}" onclose={() => (optsFor = null)}>
+          <form id="opts-form" class="form modalform" onsubmit={saveOptions}>
+            {#if intStatus[optsConn.id] === 'checking'}<p class="hint">Asking {optsConn.name} for its profiles and folders…</p>{/if}
+            <label>Quality profile for requests
+              <select bind:value={optsFor.qualityProfileId}>
+                <option value={0}>The first one ({st?.qualityProfiles[0]?.name ?? `as ${label} lists them`})</option>
+                {#each st?.qualityProfiles ?? [] as q (q.id)}<option value={q.id}>{q.name}</option>{/each}
+              </select>
+            </label>
+            <label>Folder for requests
+              <select bind:value={optsFor.rootFolder}>
+                <option value="">The first one ({st?.rootFolders[0]?.path ?? 'as listed'})</option>
+                {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path} · {freeSpace(f.freeSpace)}</option>{/each}
+              </select>
+            </label>
+            <div class="facefield">
+              <span>Path mapping</span>
+              <p class="hint">For when {label} sees the media at other paths than Cineva does, as it does in a container.</p>
+              {#each optsFor.pathMaps as m, mi (mi)}
+                <div class="maprow">
+                  <input bind:value={m.from} placeholder="{label}'s path, e.g. /tv" aria-label="{label}'s path" />
+                  <span class="muted">→</span>
+                  <input bind:value={m.to} placeholder="Cineva's path, e.g. /mnt/media/TV" aria-label="Cineva's path" />
+                  <button type="button" class="lib-btn ibtn danger iconly" aria-label="Remove this mapping" onclick={() => optsFor && (optsFor.pathMaps = optsFor.pathMaps.filter((_, x) => x !== mi))}><X size={15} /></button>
+                </div>
+              {/each}
+              <div class="formrow wrap">
+                <button type="button" class="lib-btn ibtn" onclick={() => optsFor && (optsFor.pathMaps = [...optsFor.pathMaps, { from: '', to: '' }])}><Plus size={15} /> Add mapping</button>
+                {#if st && st.suggestedPathMaps.some((sm) => !optsFor?.pathMaps.some((m) => m.from === sm.from))}
+                  <button type="button" class="lib-btn" onclick={() => st && addSuggested(st.suggestedPathMaps)}>
+                    Use suggested: {st.suggestedPathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}
+                  </button>
+                {/if}
+              </div>
+            </div>
+            {#if optsErr}<div class="error slim">{optsErr}</div>{/if}
+          </form>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (optsFor = null)}>Cancel</button>
+            <button class="primary" type="submit" form="opts-form" disabled={optsSaving}>{optsSaving ? 'Saving…' : 'Save'}</button>
+          {/snippet}
+        </Modal>
+      {/if}
+
+      {#if editingHA}
+        <Modal title={editingHA.existing ? `Edit ${editingHA.name || haKind.label}` : `Connect ${haKind.label}`} onclose={() => (editingHA = null)}>
+          <form id="ha-form" class="form modalform" onsubmit={saveHA}>
+            <label>Name
+              <input bind:value={editingHA.name} required placeholder={haKind.label} />
+            </label>
+            <label>Home Assistant URL
+              <input type="url" bind:value={editingHA.url} required placeholder={haKind.url} />
+            </label>
+            <label>{editingHA.existing ? 'Long-lived access token (leave blank to keep)' : 'Long-lived access token'}
+              <input type="password" bind:value={editingHA.token} required={!editingHA.existing} autocomplete="off" />
+            </label>
+            <p class="hint">Create one on your user profile page in Home Assistant, on the Security tab. A Home Assistant user of its own for Cineva is best, so its access can be seen and taken away on its own.</p>
+            <label class="check"><input type="checkbox" bind:checked={editingHA.playbackEvents} /> Send playback events to Home Assistant</label>
+            <p class="hint">Plays, pauses, resumes and stops become events on Home Assistant's event bus, for automations such as raising the lights on pause. Firing events needs Cineva's Home Assistant user to be an administrator there{#if editingHA.existing && ha && !ha.isAdmin}, which the current one is not{/if}.</p>
+            {#if haErr}<div class="error slim">{haErr}</div>{/if}
+          </form>
+          {#snippet foot()}
+            {#if editingHA && !editingHA.existing}
+              <button type="button" class="lib-btn push-end" onclick={() => { editingHA = null; pickingKind = true }}>Back</button>
+            {/if}
+            <button type="button" class="lib-btn" onclick={() => (editingHA = null)}>Cancel</button>
+            <button class="primary" type="submit" form="ha-form" disabled={haSaving}>{haSaving ? 'Connecting…' : editingHA?.existing ? 'Save' : 'Connect'}</button>
+          {/snippet}
+        </Modal>
+      {/if}
+
+      {#if disconnectingHA && ha?.configured}
+        {@const name = ha.name || haKind.label}
+        <Modal title="Disconnect {name}?" onclose={() => (disconnectingHA = false)}>
+          <p>Cineva closes its connection to {name}, and the rooms, controls, cameras and modes leave the player until it is connected again. Which entities are exposed and to whom, the devices' rooms and the modes are all kept, so connecting the same instance again restores them.</p>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (disconnectingHA = false)}>Cancel</button>
+            <button type="button" class="lib-btn ibtn danger solid" disabled={haSaving} onclick={removeHA}>
+              <Unplug size={15} /> {haSaving ? 'Disconnecting…' : 'Disconnect'}
+            </button>
+          {/snippet}
+        </Modal>
+      {/if}
+
+      {#if disconnecting}
+        {@const conn = disconnecting}
+        <Modal title="Disconnect {conn.name}?" onclose={() => (disconnecting = null)}>
+          <p>Cineva removes its webhook from {conn.name}, and what it imports waits for the next scheduled rescan. Requests can no longer be sent to it.</p>
+          {#snippet foot()}
+            <button type="button" class="lib-btn" onclick={() => (disconnecting = null)}>Cancel</button>
+            <button type="button" class="lib-btn ibtn danger solid" disabled={intSaving} onclick={() => removeIntegration(conn)}>
+              <Unplug size={15} /> {intSaving ? 'Disconnecting…' : 'Disconnect'}
+            </button>
+          {/snippet}
+        </Modal>
+      {/if}
+    {:else if page === 'devices'}
+      <Devices bind:this={devicesPage} {users} homeAssistant={!!ha?.configured} />
+    {:else if page === 'smarthome'}
+      {#if ha?.configured}
+        <SmartHome bind:this={smartHome} connection={ha} {users} {groups} />
+      {:else}
+        <h1>Smart home</h1>
+        <div class="empty">{ha ? 'Home Assistant is not connected.' : 'Loading…'} Connect it on the <button class="linkbtn" onclick={() => go('integrations')}>Integrations</button> page to choose what Cineva can see of the house, put devices in rooms and build modes.</div>
+      {/if}
     {:else if page === 'activity'}
       <div class="titlerow">
         <h1>Activity</h1>
@@ -2604,39 +2973,54 @@
         {/if}
         {#if intro && intro.enabled === false}
           <div class="muted">Turned off — set <code>libraries.intro_detection</code> to enable it.</div>
-        {:else if intro?.running}
-          <div>
-            Analysing {libName(intro.libraryId ?? '')}
-            <span class="muted">· {intro.episodesDone} of {intro.episodesTotal} checks · {intro.introsFound} intros, {intro.creditsFound} credits found{#if intro.unreadable} · {intro.unreadable} unreadable{/if}</span>
-          </div>
-          <div class="scanbar"><div class="scanbar-fill" style="width: {intro.episodesTotal ? (intro.episodesDone / intro.episodesTotal) * 100 : 0}%"></div></div>
-          {#if intro.current}
-            <div class="small">
-              {intro.current.series || 'Unknown series'} · Season {intro.current.season}
-              <span class="muted">— {intro.current.kind === 'credits' ? 'credits' : 'intros'}: {phaseLabel[intro.current.phase]} {intro.current.done} of {intro.current.total}</span>
+        {:else}
+          {#if intro?.targets?.length}
+            <!-- Asked for by name ("Detect intro & credits"), ahead of any
+                 library and whatever the schedule says. -->
+            <div class="targets">
+              <div class="small">Asked for</div>
+              {#each intro.targets as t (t.itemId)}
+                <div class="small">
+                  {t.title || 'Unknown'}{#if t.kind === 'season'} · Season {t.season ?? 0}{:else} <span class="muted">(film)</span>{/if}
+                  <span class="muted">— {t.working ? (intro.current ? `${intro.current.kind === 'credits' ? 'credits' : 'intros'}: ${phaseLabel[intro.current.phase]} ${intro.current.done} of ${intro.current.total}` : 'working') : 'waiting'}</span>
+                </div>
+              {/each}
             </div>
           {/if}
-          <div class="muted small">
-            Season {intro.seasonsDone + 1} of {intro.seasonsTotal} · running {span(introElapsed)}{#if introLeft !== null} · about {span(introLeft)} left{/if}
-          </div>
-        {:else if intro?.last}
-          <div>
-            {intro.last.cancelled ? 'Stopped' : 'Finished'} {since(intro.last.finishedAt)}
-            <span class="muted">· {libName(intro.last.libraryId)} · {intro.last.episodes} checks in {intro.last.seasons} seasons · {intro.last.introsFound} intros, {intro.last.creditsFound} credits found{#if intro.last.unreadable} · {intro.last.unreadable} unreadable{/if} · took {span(intro.last.seconds)}</span>
-          </div>
-        {:else}
-          <div class="muted">Idle. Runs after each TV library scan, on episodes not yet analysed for intros and credits.</div>
+          {#if intro?.running}
+            <div>
+              Analysing {libName(intro.libraryId ?? '')}
+              <span class="muted">· {introDone} of {introTotal} checks · {intro.introsFound} intros, {intro.creditsFound} credits found{#if intro.unreadable} · {intro.unreadable} unreadable{/if}</span>
+            </div>
+            <div class="scanbar"><div class="scanbar-fill" style="width: {introTotal ? (introDone / introTotal) * 100 : 0}%"></div></div>
+            {#if intro.current && !intro.targets?.some((t) => t.working)}
+              <div class="small">
+                {#if intro.current.film}{intro.current.series || 'Unknown film'}{:else}{intro.current.series || 'Unknown series'} · Season {intro.current.season}{/if}
+                <span class="muted">— {intro.current.kind === 'credits' ? 'credits' : 'intros'}: {phaseLabel[intro.current.phase]} {intro.current.done} of {intro.current.total}</span>
+              </div>
+            {/if}
+            <div class="muted small">
+              {#if intro.seasonsTotal > 0}Season {Math.min(intro.seasonsDone + 1, intro.seasonsTotal)} of {intro.seasonsTotal} · {/if}{#if intro.filmsTotal}{intro.filmsDone ?? 0} of {intro.filmsTotal} films · {/if}running {span(introElapsed)}{#if introLeft !== null} · about {span(introLeft)} left{/if}
+            </div>
+          {:else if intro?.last}
+            <div>
+              {intro.last.cancelled ? 'Stopped' : 'Finished'} {since(intro.last.finishedAt)}
+              <span class="muted">· {libName(intro.last.libraryId)} · {intro.last.episodes} checks in {intro.last.seasons} seasons{#if intro.last.films} · {intro.last.films} films{/if} · {intro.last.introsFound} intros, {intro.last.creditsFound} credits found{#if intro.last.unreadable} · {intro.last.unreadable} unreadable{/if} · took {span(intro.last.seconds)}</span>
+            </div>
+          {:else if !intro?.targets?.length}
+            <div class="muted">Idle. Runs after each film or TV library scan, on episodes not yet analysed for intros and credits, and films not yet looked at for credits.</div>
+          {/if}
         {/if}
         {#if previewLine}
           <div class="previewline small">Seek-bar previews <span class="muted">· {previewLine}</span></div>
         {/if}
         {#if intro?.recent?.length}
           <table class="introrecent">
-            <thead><tr><th>Latest episodes</th><th>Looked for</th><th>Found</th></tr></thead>
+            <thead><tr><th>Latest checked</th><th>Looked for</th><th>Found</th></tr></thead>
             <tbody>
               {#each intro.recent as r (r.itemId + r.kind)}
                 <tr>
-                  <td>{r.series} <span class="muted">{epCode(r)}</span></td>
+                  <td>{r.series}{#if !r.film} <span class="muted">{epCode(r)}</span>{/if}</td>
                   <td class="muted">{r.kind}</td>
                   <td>
                     {#if r.found && r.startSecs !== undefined && r.endSecs !== undefined}
@@ -2651,6 +3035,42 @@
           </table>
         {/if}
       </div>
+      <div class="titlerow grouphead">
+        <h2>Wrong times reported</h2>
+      </div>
+      {#if reports.length === 0}
+        <div class="empty slim">No open reports. Viewers report a misplaced intro or credits skip from the player's menu.</div>
+      {:else}
+        {#each crowdedSeasons as cs (cs.seasonId)}
+          <div class="reportprompt">
+            <span>{cs.ids.length} open reports on {cs.label}: detecting the season again may fix them together.</span>
+            <button class="primary" disabled={cs.ids.some((id) => resolving.includes(id))} onclick={() => redetectReported(cs)}>Detect season again</button>
+          </div>
+        {/each}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Title</th><th>Wrong</th><th>At</th><th>Reported by</th><th></th></tr></thead>
+            <tbody>
+              {#each reports as r (r.id)}
+                <tr>
+                  <td>
+                    <div>{reportLabel(r)}</div>
+                    {#if r.itemKind === 'episode' && r.title}<div class="muted small">{r.title}</div>{/if}
+                    {#if r.note}<div class="small reportnote">“{r.note}”</div>{/if}
+                  </td>
+                  <td class="muted">{r.kind}</td>
+                  <td class="muted nowrap">{clock(r.positionSecs)}</td>
+                  <td class="muted">{r.userName}<div class="small">{r.createdAt.slice(0, 16)} UTC</div></td>
+                  <td class="actions">
+                    <a class="lib-btn" href="/items/{r.itemId}/segments" target="_blank" rel="noopener" title="Open the intro and credits editor in the web client">Edit times…</a>
+                    <button disabled={resolving.includes(r.id)} onclick={() => resolveReports([r.id])}>Resolve</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
       <h2>Scans</h2>
       {#if scans.length === 0}
         <div class="empty slim">No scans yet — trigger one from the Libraries page.</div>
@@ -3032,7 +3452,7 @@
     background: var(--accent); color: var(--bg);
   }
   .linkbtn { color: var(--accent-2); text-decoration: underline; }
-  .reqlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr)); gap: 1rem; }
+  .reqlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 27rem), 1fr)); gap: 1rem; }
   .reqcard { display: flex; gap: 0.9rem; margin-bottom: 0; align-items: flex-start; }
   .reqposter { width: 4.5rem; aspect-ratio: 2 / 3; flex: none; border-radius: 8px; object-fit: cover; background: var(--bg); }
   .reqbody { display: flex; flex-direction: column; gap: 0.45rem; min-width: 0; flex: 1; }
@@ -3044,10 +3464,52 @@
     flex: 1 1 9rem; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
     color: var(--text); padding: 0.4rem 0.6rem; font: inherit;
   }
-  .intgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); gap: 1rem; }
-  .intcard { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0; }
-  .inthead { display: flex; align-items: center; gap: 0.5rem; }
+  /* Integrations: a card per connection, headed by its name, with the
+     actions as a bar of bordered buttons along the bottom. */
+  .intgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 27rem), 1fr)); gap: 1rem; }
+  .intcard { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0; }
+  .inthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+  .intname { font-size: 1.05rem; font-weight: 600; overflow-wrap: anywhere; }
+  .kindtag { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--muted); flex: none; }
   .inturl { overflow-wrap: anywhere; }
+  .intchips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .intwarns { list-style: none; display: flex; flex-direction: column; gap: 0.3rem; }
+  .intwarns li { display: flex; gap: 0.4rem; align-items: flex-start; color: var(--muted); overflow-wrap: anywhere; }
+  .intwarns li :global(svg) { flex: none; margin-top: 0.1rem; color: var(--accent-2); }
+  .intwarns li.bad, .intwarns li.bad :global(svg) { color: var(--err); }
+  .intfacts { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.9rem; }
+  .intfacts dt { color: var(--muted); white-space: nowrap; }
+  .intfacts dd { overflow-wrap: anywhere; }
+  .intactions {
+    display: flex; flex-wrap: wrap; gap: 0.5rem;
+    margin-top: auto; padding-top: 0.85rem; border-top: 1px solid var(--border);
+  }
+  .intactions .push { margin-left: auto; }
+  /* A button with an icon before its label. */
+  .ibtn { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .lib-btn.ibtn { padding: 0.4rem 0.75rem; font-size: 0.875rem; }
+  .lib-btn.iconly { padding: 0.4rem; }
+  .lib-btn.danger:hover { border-color: var(--err); }
+  .lib-btn.danger.solid { background: var(--err); border-color: var(--err); color: var(--bg); }
+  .lib-btn :global(.spin) { animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .addint { margin-bottom: 1rem; flex: none; }
+  /* The Add dialogue's first step: one row per kind. */
+  .kindlist { display: flex; flex-direction: column; gap: 0.5rem; }
+  .kindopt {
+    display: flex; align-items: center; gap: 0.85rem; text-align: left;
+    padding: 0.8rem 0.9rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+  }
+  .kindopt:hover, .kindopt:focus-visible { border-color: var(--accent); }
+  .kindicon {
+    display: grid; place-items: center; width: 2.4rem; height: 2.4rem; flex: none;
+    border-radius: 8px; background: var(--panel); color: var(--accent-2);
+  }
+  .kindtext { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; min-width: 0; }
+  .kindopt :global(.kindgo) { flex: none; color: var(--muted); }
+  .modalform { max-width: none; }
+  .modalform .error.slim { margin: 0; }
+  .push-end { margin-right: auto; }
   .formrow button:not(.primary) { color: var(--muted); }
   .who { color: var(--muted); font-size: 0.85rem; display: flex; gap: 0.6rem; align-items: center; }
   .who button { color: var(--accent-2); }
@@ -3149,6 +3611,14 @@
   .lib-modal-foot { display: flex; justify-content: flex-end; margin-top: 0.8rem; }
   .lib-pager { display: flex; align-items: center; justify-content: center; gap: 0.8rem; margin: 0.6rem 0; }
   .lib-spacer { flex: 1; }
+  .lib-bulk {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.8rem;
+    margin: 0.6rem 0; padding: 0.5rem 0.8rem;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .lib-check { width: 2rem; }
+  .lib-check input { width: 1.1rem; height: 1.1rem; }
+  tr.lib-sel td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   .lib-progress { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.7rem; }
   .lib-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--bg); overflow: hidden; }
   .lib-bar-fill { height: 100%; background: var(--accent); transition: width 0.2s linear; }
@@ -3361,9 +3831,6 @@
   }
   .pausenote { color: var(--accent-2); font-size: 0.88rem; }
   .storage-down { color: var(--err); font-size: 0.8rem; margin-top: 0.2rem; }
-  .principals { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
-  .chipx { margin-left: 0.3rem; color: var(--muted); font-size: 0.75rem; }
-  .chipx:hover { color: var(--err); }
   .grouphead { margin-top: 1.5rem; }
   .chip.sel {
     border-color: var(--accent);
@@ -3404,4 +3871,15 @@
   .previewline { border-top: 1px solid var(--border); padding-top: 0.4rem; }
   .introrecent { margin-top: 0.5rem; }
   .introrecent td, .introrecent th { padding-left: 0; }
+  .targets { display: flex; flex-direction: column; gap: 0.2rem; padding-bottom: 0.4rem; border-bottom: 1px solid var(--border); }
+  /* Several reports on one season: a nudge to detect it again, above the
+     list. Wraps under the text at phone width. */
+  .reportprompt {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem;
+    margin-bottom: 0.75rem; padding: 0.6rem 0.9rem;
+    border: 1px solid var(--accent-2); border-radius: 10px; font-size: 0.9rem;
+  }
+  .reportnote { margin-top: 0.2rem; overflow-wrap: anywhere; }
+  a.lib-btn { text-decoration: none; display: inline-block; }
+  .detectnote { margin-top: 0.2rem; }
 </style>

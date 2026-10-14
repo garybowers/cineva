@@ -180,3 +180,35 @@ func TestPolicyPace(t *testing.T) {
 		})
 	}
 }
+
+// Work asked for by name ignores the schedule but not a pause or playback.
+func TestGateWaitNow(t *testing.T) {
+	noon := func() time.Time { return time.Date(2026, 10, 13, 12, 0, 0, 0, time.Local) }
+	for _, tc := range []struct {
+		name  string
+		setup func(*Gate, *atomic.Value)
+		holds bool
+	}{
+		{"outside the window", func(g *Gate, _ *atomic.Value) {
+			g.Policy.SetSchedule(Schedule{Mode: ModeWindow, Start: 2 * 60, End: 6 * 60})
+		}, false},
+		{"on demand", func(g *Gate, _ *atomic.Value) { g.Policy.SetSchedule(Schedule{Mode: ModeManual}) }, false},
+		{"paused by an admin", func(g *Gate, _ *atomic.Value) { g.Policy.SetPaused(true) }, true},
+		{"playing", func(_ *Gate, b *atomic.Value) { b.Store("playing") }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGate(NewPolicy())
+			g.Now, g.Poll, g.Cooldown = noon, 10*time.Millisecond, 0
+			var busy atomic.Value
+			busy.Store("")
+			g.Busy = func() string { return busy.Load().(string) }
+			tc.setup(g, &busy)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			err := g.WaitNow(ctx, nil, nil)
+			if held := err != nil; held != tc.holds {
+				t.Fatalf("WaitNow = %v; want held %v", err, tc.holds)
+			}
+		})
+	}
+}

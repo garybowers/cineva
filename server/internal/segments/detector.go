@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -100,8 +101,18 @@ type Status struct {
 	// carries on a minute after they stop).
 	Paused      bool   `json:"paused"`
 	PauseReason string `json:"pauseReason,omitempty"`
-	// Current is the season being worked on.
+	// FilmsDone and FilmsTotal count a library's films looked at for end
+	// credits (by their chapter names) against those waiting when the run
+	// began.
+	FilmsDone  int `json:"filmsDone"`
+	FilmsTotal int `json:"filmsTotal"`
+	// Current is the season — or film — being worked on.
 	Current *SeasonProgress `json:"current,omitempty"`
+	// Targets are the seasons and films someone asked for by name ("Detect
+	// intro & credits" on a series), analysed ahead of any library, in
+	// order; the first is being worked on when its Working is set. The
+	// library run, if there is one, carries on after them.
+	Targets []Target `json:"targets,omitempty"`
 	// Recent is what the last episodes analysed came to, newest first —
 	// which also gives anyone testing an episode to try.
 	Recent []Result `json:"recent,omitempty"`
@@ -110,11 +121,44 @@ type Status struct {
 	Last *RunSummary `json:"last,omitempty"`
 }
 
-// SeasonProgress is where the detector is within one season.
+// Reading reports whether detection is reading media right now — a library
+// run or a targeted one, not held — which other background work gives way
+// to.
+func (s Status) Reading() bool {
+	if s.Paused {
+		return false
+	}
+	return s.Running || slices.ContainsFunc(s.Targets, func(t Target) bool { return t.Working })
+}
+
+// Target is a season or film asked for by name.
+type Target struct {
+	// ItemID is the season's or the film's.
+	ItemID    string `json:"itemId"`
+	Kind      string `json:"kind"` // "season" or "film"
+	LibraryID string `json:"libraryId"`
+	// SeriesID is the season's series, so a series page can show progress
+	// for any of its seasons.
+	SeriesID string `json:"seriesId,omitempty"`
+	// Title is the series' or the film's.
+	Title   string `json:"title"`
+	Season  int    `json:"season,omitempty"`
+	Working bool   `json:"working"`
+}
+
+// Target kinds.
+const (
+	TargetSeason = "season"
+	TargetFilm   = "film"
+)
+
+// SeasonProgress is where the detector is within one season, or one film.
 type SeasonProgress struct {
 	Series string `json:"series"`
 	Season int    `json:"season"`
-	Kind   string `json:"kind"`
+	// Film is set when Series names a film rather than a series.
+	Film bool   `json:"film,omitempty"`
+	Kind string `json:"kind"`
 	// Phase is "reading" (decoding audio), "comparing" or "saving".
 	Phase string `json:"phase"`
 	Done  int    `json:"done"`
@@ -123,11 +167,13 @@ type SeasonProgress struct {
 
 // Result is one episode's outcome.
 type Result struct {
-	ItemID    string  `json:"itemId"`
-	Kind      string  `json:"kind"`
-	Series    string  `json:"series"`
-	Season    int     `json:"season"`
-	Episode   int     `json:"episode"`
+	ItemID  string `json:"itemId"`
+	Kind    string `json:"kind"`
+	Series  string `json:"series"`
+	Season  int    `json:"season"`
+	Episode int    `json:"episode"`
+	// Film is set when Series names a film rather than a series.
+	Film      bool    `json:"film,omitempty"`
 	Found     bool    `json:"found"`
 	StartSecs float64 `json:"startSecs,omitempty"`
 	EndSecs   float64 `json:"endSecs,omitempty"`
@@ -140,6 +186,7 @@ type RunSummary struct {
 	Seconds      int       `json:"seconds"`
 	Seasons      int       `json:"seasons"`
 	Episodes     int       `json:"episodes"`
+	Films        int       `json:"films"`
 	IntrosFound  int       `json:"introsFound"`
 	CreditsFound int       `json:"creditsFound"`
 	Unreadable   int       `json:"unreadable"`
@@ -156,15 +203,21 @@ const recentResults = 12
 // admin page.
 const progressEvery = 500 * time.Millisecond
 
-// Detector finds intros in TV libraries in the background, one library at a
-// time. Work is incremental: only episodes whose current file has not been
-// analysed are, so after the first pass over a library a run costs the new
-// episodes and the neighbours they are compared with.
+// Detector finds intros and end credits in the background: in TV libraries
+// by comparing episodes, in film libraries from the films' chapter names.
+// It works one library at a time, except that seasons and films asked for
+// by name go first (Prioritise). Work is incremental: only episodes and
+// films whose current file has not been analysed are, so after the first
+// pass over a library a run costs the new episodes and the neighbours they
+// are compared with.
 type Detector struct {
 	Store *store.Store
 	// Fingerprint reads a stretch of a file's audio; media.FingerprintFile
 	// outside tests.
 	Fingerprint func(ctx context.Context, path string, start, dur float64) (media.Fingerprint, error)
+	// Probe reads a film's chapter marks (and the rest of its technical
+	// details); media.Probe outside tests.
+	Probe func(path string) (media.Info, error)
 	// OnProgress, when set, is called as the status changes.
 	OnProgress func(Status)
 	// Available, when set, says whether a library's storage can be reached;
@@ -183,13 +236,20 @@ type Detector struct {
 
 	mu       sync.Mutex
 	queue    []string
+	targets  []Target
 	status   Status
 	wake     chan struct{}
 	notified time.Time
+	// reading is the library whose storage is being read, which the gate
+	// checks is still there.
+	reading string
+	// preempt, while a library's season or film is being worked on, stops
+	// it so targeted work can go first (see maybePreempt).
+	preempt context.CancelFunc
 }
 
 func NewDetector(st *store.Store) *Detector {
-	return &Detector{Store: st, Fingerprint: media.FingerprintFile,
+	return &Detector{Store: st, Fingerprint: media.FingerprintFile, Probe: media.Probe,
 		Gate:          background.NewGate(background.NewPolicy()),
 		DecodeTimeout: decodeTimeout, wake: make(chan struct{}, 1)}
 }
@@ -225,20 +285,49 @@ func (d *Detector) SetRateLimit(bytesPerSec int64) { d.Gate.Policy.SetRateLimit(
 // schedule, or while something else needs the storage, and returns when it
 // may read — or errStorageGone once the library's share stops answering.
 // Why it waits goes into the status.
-func (d *Detector) gate(ctx context.Context) error {
+func (d *Detector) gate(ctx context.Context) error { return d.gateFor(ctx, false) }
+
+// gateFor is gate for targeted work too, which ignores the schedule.
+func (d *Detector) gateFor(ctx context.Context, targeted bool) error {
 	var available func() bool
 	if d.Available != nil {
 		available = func() bool {
-			lib := d.Status().LibraryID
+			d.mu.Lock()
+			lib := d.reading
+			if lib == "" {
+				lib = d.status.LibraryID
+			}
+			d.mu.Unlock()
 			return lib == "" || d.Available(lib)
 		}
 	}
-	return d.Gate.Wait(ctx, available, func(reason string) {
-		if st := d.Status(); st.Paused == (reason != "") && st.PauseReason == reason {
-			return
+	report := func(reason string) {
+		if st := d.Status(); st.Paused != (reason != "") || st.PauseReason != reason {
+			d.setStatus(true, func(s *Status) { s.Paused, s.PauseReason = reason != "", reason })
 		}
-		d.setStatus(true, func(s *Status) { s.Paused, s.PauseReason = reason != "", reason })
-	})
+		d.mu.Lock()
+		d.maybePreempt()
+		d.mu.Unlock()
+	}
+	if targeted {
+		return d.Gate.WaitNow(ctx, available, report)
+	}
+	return d.Gate.Wait(ctx, available, report)
+}
+
+// maybePreempt stops the library work in hand when targeted work is waiting
+// and the library work is only being held by the schedule — which could be
+// hours. Work that is reading, or held by playback or a pause (which would
+// hold the targeted work as well), finishes its season first. d.mu must be
+// held.
+func (d *Detector) maybePreempt() {
+	if d.preempt == nil || len(d.targets) == 0 {
+		return
+	}
+	if r := d.status.PauseReason; r == "schedule" || r == "on-demand" {
+		d.preempt()
+		d.preempt = nil
+	}
 }
 
 // pace sleeps after reading a file for long enough that detection averages
@@ -272,6 +361,55 @@ func (d *Detector) Enqueue(libraryID string) {
 	}
 }
 
+// Prioritise asks for seasons and films to be analysed ahead of any library,
+// in the order given, whatever the schedule says (a manual pause, playback
+// and scans still hold it). Each is analysed as far as its analyses are due:
+// the caller reopens them first (store.RedetectItemSegments). One already
+// waiting is not queued twice.
+func (d *Detector) Prioritise(ctx context.Context, seasonIDs, filmIDs []string) {
+	var add []Target
+	for _, id := range seasonIDs {
+		add = append(add, d.describe(ctx, id, TargetSeason))
+	}
+	for _, id := range filmIDs {
+		add = append(add, d.describe(ctx, id, TargetFilm))
+	}
+	if len(add) == 0 {
+		return
+	}
+	d.mu.Lock()
+	for _, t := range add {
+		if !slices.ContainsFunc(d.targets, func(q Target) bool { return q.ItemID == t.ItemID && !q.Working }) {
+			d.targets = append(d.targets, t)
+		}
+	}
+	d.maybePreempt()
+	d.mu.Unlock()
+	d.setStatus(true, func(*Status) {})
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
+// describe labels a target for the status. Best effort: a lookup failure
+// leaves the label blank rather than the request refused.
+func (d *Detector) describe(ctx context.Context, id, kind string) Target {
+	t := Target{ItemID: id, Kind: kind}
+	it, err := d.Store.Item(ctx, id)
+	if err != nil {
+		return t
+	}
+	t.LibraryID, t.Title, t.Season = it.LibraryID, it.Title, it.SeasonNum
+	if kind == TargetSeason {
+		t.SeriesID = it.ParentID
+		if series, err := d.Store.Item(ctx, it.ParentID); err == nil {
+			t.Title = series.Title
+		}
+	}
+	return t
+}
+
 func (d *Detector) Status() Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -286,19 +424,27 @@ func (d *Detector) snapshot() Status {
 		s.Current = &c
 	}
 	s.Recent = append([]Result(nil), s.Recent...)
+	s.Targets = append([]Target(nil), d.targets...)
 	return s
 }
 
 // Run works through the queue until ctx is cancelled.
 func (d *Detector) Run(ctx context.Context) {
 	for {
+		if err := d.runTargets(ctx); err != nil {
+			return
+		}
 		d.mu.Lock()
 		var lib string
 		if len(d.queue) > 0 {
 			lib, d.queue = d.queue[0], d.queue[1:]
 		}
+		pending := len(d.targets) > 0
 		d.mu.Unlock()
 		if lib == "" {
+			if pending {
+				continue // asked for while the last target was being worked on
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -337,6 +483,12 @@ func (d *Detector) setStatus(force bool, fn func(*Status)) {
 	}
 }
 
+// unit is one piece of a library run: a season (both kinds) or a film.
+type unit struct {
+	season string
+	film   *store.SegmentFilm
+}
+
 func (d *Detector) analyseLibrary(ctx context.Context, libraryID string) error {
 	if d.Available != nil && !d.Available(libraryID) {
 		// Debug: the storage monitor has already warned once that the share is down.
@@ -345,7 +497,7 @@ func (d *Detector) analyseLibrary(ctx context.Context, libraryID string) error {
 	}
 	// Every season needing either kind, each once and in the order first
 	// seen, so a season is finished — intro and credits — before the next.
-	var seasons []string
+	var units []unit
 	seen := map[string]bool{}
 	total := 0
 	for _, sp := range specs {
@@ -356,7 +508,7 @@ func (d *Detector) analyseLibrary(ctx context.Context, libraryID string) error {
 		for _, id := range ids {
 			if !seen[id] {
 				seen[id] = true
-				seasons = append(seasons, id)
+				units = append(units, unit{season: id})
 			}
 		}
 		n, err := d.Store.CountEpisodesNeedingSegments(ctx, libraryID, sp.kind)
@@ -365,29 +517,69 @@ func (d *Detector) analyseLibrary(ctx context.Context, libraryID string) error {
 		}
 		total += n
 	}
-	if len(seasons) == 0 {
+	seasons := len(units)
+	// Then the films, whose credits come from their chapter names.
+	films, err := d.Store.FilmsNeedingCredits(ctx, libraryID)
+	if err != nil {
+		return err
+	}
+	for i := range films {
+		units = append(units, unit{film: &films[i]})
+	}
+	if len(units) == 0 {
 		return nil
 	}
 	started := time.Now()
+	d.mu.Lock()
+	d.reading = libraryID
+	d.mu.Unlock()
 	d.setStatus(true, func(s *Status) {
 		*s = Status{Running: true, LibraryID: libraryID, StartedAt: started,
-			SeasonsTotal: len(seasons), EpisodesTotal: total, Last: s.Last,
+			SeasonsTotal: seasons, EpisodesTotal: total, FilmsTotal: len(films), Last: s.Last,
 			Paused: s.Paused, PauseReason: s.PauseReason}
 	})
 	var runErr error
-seasons:
-	for _, season := range seasons {
-		for _, sp := range specs {
-			if runErr = d.analyseSeason(ctx, season, sp); runErr != nil {
-				break seasons
-			}
+	for i := 0; i < len(units); {
+		// Anything asked for by name goes first.
+		if runErr = d.runTargets(ctx); runErr != nil {
+			break
 		}
-		d.setStatus(true, func(s *Status) { s.SeasonsDone++; s.Current = nil })
+		// Each unit can be stopped for targeted work while the schedule
+		// holds it (see maybePreempt); it is then done again afterwards,
+		// having saved nothing.
+		uctx, cancel := context.WithCancel(ctx)
+		d.mu.Lock()
+		d.preempt = cancel
+		d.mu.Unlock()
+		err := d.analyseUnit(uctx, units[i], false)
+		preempted := uctx.Err() != nil && ctx.Err() == nil
+		d.mu.Lock()
+		d.preempt = nil
+		d.mu.Unlock()
+		cancel()
+		if err != nil && preempted {
+			continue // stopped for targeted work
+		}
+		if runErr = err; runErr != nil {
+			break
+		}
+		d.setStatus(true, func(s *Status) {
+			if units[i].film != nil {
+				s.FilmsDone++
+			} else {
+				s.SeasonsDone++
+			}
+			s.Current = nil
+		})
+		i++
 	}
+	d.mu.Lock()
+	d.reading = ""
+	d.mu.Unlock()
 	d.setStatus(true, func(s *Status) {
 		s.Last = &RunSummary{
 			LibraryID: libraryID, FinishedAt: time.Now(), Seconds: int(time.Since(started).Seconds()),
-			Seasons: s.SeasonsDone, Episodes: s.EpisodesDone,
+			Seasons: s.SeasonsDone, Episodes: s.EpisodesDone, Films: s.FilmsDone,
 			IntrosFound: s.IntrosFound, CreditsFound: s.CreditsFound, Unreadable: s.Unreadable,
 			Cancelled: runErr != nil,
 		}
@@ -401,8 +593,152 @@ seasons:
 	if runErr != nil {
 		return runErr
 	}
-	logger.Info("detection finished", "library_id", libraryID, "seasons", len(seasons), "took", time.Since(started).Round(time.Second))
+	logger.Info("detection finished", "library_id", libraryID, "seasons", seasons, "films", len(films),
+		"took", time.Since(started).Round(time.Second))
 	return nil
+}
+
+// analyseUnit works through one season, both kinds, or one film.
+func (d *Detector) analyseUnit(ctx context.Context, u unit, targeted bool) error {
+	if u.film != nil {
+		return d.analyseFilm(ctx, *u.film, targeted)
+	}
+	for _, sp := range specs {
+		if err := d.analyseSeason(ctx, u.season, sp, targeted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runTargets works through the seasons and films asked for by name, until
+// none is left. Only the context ending stops it: a target that cannot be
+// finished — its share gone — is dropped, and its analyses stay due for the
+// library queue to take up.
+func (d *Detector) runTargets(ctx context.Context) error {
+	for {
+		d.mu.Lock()
+		if len(d.targets) == 0 {
+			d.mu.Unlock()
+			return nil
+		}
+		d.targets[0].Working = true
+		t := d.targets[0]
+		prev := d.reading
+		d.reading = t.LibraryID
+		d.mu.Unlock()
+		d.setStatus(true, func(*Status) {})
+
+		err := d.analyseTarget(ctx, t)
+
+		d.mu.Lock()
+		d.reading = prev
+		if len(d.targets) > 0 && d.targets[0].ItemID == t.ItemID && d.targets[0].Working {
+			d.targets = d.targets[1:]
+		}
+		d.mu.Unlock()
+		d.setStatus(true, func(s *Status) { s.Current = nil })
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			logger.Warn("detection of a title asked for stopped", "item_id", t.ItemID, "title", t.Title, "err", err)
+		}
+	}
+}
+
+// analyseTarget analyses one season or film asked for by name.
+func (d *Detector) analyseTarget(ctx context.Context, t Target) error {
+	if d.Available != nil && t.LibraryID != "" && !d.Available(t.LibraryID) {
+		return errStorageGone
+	}
+	if t.Kind == TargetFilm {
+		f, err := d.Store.FilmCreditsState(ctx, t.ItemID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil // deleted since
+		}
+		if err != nil {
+			return err
+		}
+		return d.analyseFilm(ctx, f, true)
+	}
+	return d.analyseUnit(ctx, unit{season: t.ItemID}, true)
+}
+
+// analyseFilm finds a film's end credits from its chapter names (see
+// media.CreditsChapter). Opening the file reads only its header, so this
+// costs a fraction of what an episode's comparison does.
+func (d *Detector) analyseFilm(ctx context.Context, f store.SegmentFilm, targeted bool) error {
+	if f.Analysed {
+		return nil
+	}
+	d.setStatus(true, func(s *Status) {
+		s.Current = &SeasonProgress{Series: f.Title, Film: true, Kind: store.SegmentCredits, Phase: "reading", Total: 1}
+	})
+	if err := d.gateFor(ctx, targeted); err != nil {
+		return err
+	}
+	timeout := d.DecodeTimeout
+	if timeout <= 0 {
+		timeout = decodeTimeout
+	}
+	info, err := library.Within(timeout, func() (media.Info, error) { return d.Probe(f.Path) })
+	if errors.Is(err, library.ErrNotResponding) {
+		logger.Warn("file not responding, stopping until the share is back", "path", f.Path)
+		return errStorageGone
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Left unanalysed, to be tried again on the next pass.
+		logger.Warn("reading chapters failed", "path", f.Path, "err", err)
+		d.setStatus(false, func(s *Status) { s.Unreadable++ })
+		return nil
+	}
+	runtime := f.RuntimeSecs
+	if runtime <= 0 {
+		runtime = info.RuntimeSecs
+	}
+	var seg *store.Segment
+	if start, end, ok := media.CreditsChapter(info.Chapters, runtime); ok {
+		seg = &store.Segment{Kind: store.SegmentCredits, StartSecs: start, EndSecs: end}
+	}
+	if err := d.Store.SaveSegmentAnalysis(ctx, f.ID, store.SegmentCredits, f.FileMtime, seg); err != nil {
+		return err
+	}
+	r := Result{ItemID: f.ID, Kind: store.SegmentCredits, Series: f.Title, Film: true, Found: seg != nil}
+	if seg != nil {
+		r.StartSecs, r.EndSecs = seg.StartSecs, seg.EndSecs
+	}
+	d.record(r, targeted)
+	return nil
+}
+
+// record adds an outcome to the status. Targeted work is not part of the
+// library run whose counts the status carries, so it only joins the list
+// of recent outcomes.
+func (d *Detector) record(r Result, targeted bool) {
+	d.setStatus(false, func(s *Status) {
+		if !targeted {
+			if !r.Film {
+				s.EpisodesDone++
+			}
+			switch {
+			case r.Found && r.Kind == store.SegmentIntro:
+				s.IntrosFound++
+			case r.Found:
+				s.CreditsFound++
+			}
+		}
+		s.Recent = append([]Result{r}, s.Recent...)
+		if len(s.Recent) > recentResults {
+			s.Recent = s.Recent[:recentResults]
+		}
+		if s.Current != nil {
+			s.Current.Done++
+		}
+	})
 }
 
 // analyseSeason finds one kind of segment for a season's unanalysed
@@ -412,7 +748,10 @@ seasons:
 // (each once, however many episodes it is compared with), then each
 // unanalysed episode is compared with its neighbours in parallel, then the
 // results are saved one by one, SQLite taking a single writer.
-func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) error {
+//
+// targeted is set for a season asked for by name, which goes ahead whatever
+// the schedule says and is not counted in a library run's progress.
+func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec, targeted bool) error {
 	eps, err := d.Store.SeasonSegmentState(ctx, seasonID, sp.kind)
 	if err != nil {
 		return err
@@ -496,7 +835,7 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 		if stopped() != nil {
 			return
 		}
-		if err := d.gate(ctx); err != nil {
+		if err := d.gateFor(ctx, targeted); err != nil {
 			stop(err)
 			return
 		}
@@ -579,22 +918,7 @@ func (d *Detector) analyseSeason(ctx context.Context, seasonID string, sp spec) 
 		if seg := segs[k]; seg != nil {
 			r.Found, r.StartSecs, r.EndSecs = true, seg.StartSecs, seg.EndSecs
 		}
-		d.setStatus(false, func(s *Status) {
-			s.EpisodesDone++
-			switch {
-			case r.Found && r.Kind == store.SegmentIntro:
-				s.IntrosFound++
-			case r.Found:
-				s.CreditsFound++
-			}
-			s.Recent = append([]Result{r}, s.Recent...)
-			if len(s.Recent) > recentResults {
-				s.Recent = s.Recent[:recentResults]
-			}
-			if s.Current != nil {
-				s.Current.Done++
-			}
-		})
+		d.record(r, targeted)
 	}
 	return nil
 }

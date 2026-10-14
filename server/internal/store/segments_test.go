@@ -211,8 +211,8 @@ func TestManualSegments(t *testing.T) {
 
 	// Re-detecting the season reopens nothing locked, and a replaced file
 	// does not unlock it either.
-	if n, err := s.RedetectSeasonSegments(ctx, season.ID); err != nil || n != 0 {
-		t.Fatalf("redetect = %d, %v; want 0 reopened (both locked)", n, err)
+	if r, err := s.RedetectItemSegments(ctx, []string{season.ID}, RedetectOptions{}); err != nil || r.Reopened != 0 || r.Locked != 2 {
+		t.Fatalf("redetect = %+v, %v; want 0 reopened and 2 kept (both locked)", r, err)
 	}
 	upsert(Item{Kind: KindEpisode, ParentID: season.ID, EpisodeNum: 1, Path: "/tv/Show/S1/e1.mkv", FileMtime: 200})
 	if n := needing(); n != 0 {
@@ -241,8 +241,8 @@ func TestManualSegments(t *testing.T) {
 	}
 
 	// Re-detection reopens the detected one and keeps serving it meanwhile.
-	if n, err := s.RedetectSeasonSegments(ctx, season.ID); err != nil || n != 1 {
-		t.Fatalf("redetect = %d, %v; want 1 reopened", n, err)
+	if r, err := s.RedetectItemSegments(ctx, []string{season.ID}, RedetectOptions{}); err != nil || r.Reopened != 1 {
+		t.Fatalf("redetect = %+v, %v; want 1 reopened", r, err)
 	}
 	if got := state(ep1.ID, SegmentIntro); !got.Found || got.Analysed {
 		t.Fatalf("after redetect = %+v, want the old segment, due for analysis", got)

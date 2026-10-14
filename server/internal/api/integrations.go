@@ -58,6 +58,9 @@ func (s *server) createIntegration(c echo.Context) error {
 		return err
 	}
 	ctx := c.Request().Context()
+	if err := s.uniqueIntegrationName(ctx, conn); err != nil {
+		return err
+	}
 	client := arr.New(conn.Kind, conn.URL, conn.APIKey)
 	st, err := client.Status(ctx)
 	if err != nil {
@@ -108,6 +111,9 @@ func (s *server) updateIntegration(c echo.Context) error {
 	}
 	conn := old
 	if err := applyArrRequest(c, &conn, req); err != nil {
+		return err
+	}
+	if err := s.uniqueIntegrationName(ctx, conn); err != nil {
 		return err
 	}
 	client := arr.New(conn.Kind, conn.URL, conn.APIKey)
@@ -261,6 +267,22 @@ func applyArrRequest(c echo.Context, conn *store.ArrConnection, req arrRequest) 
 	}
 	if conn.APIKey == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "apiKey is required")
+	}
+	return nil
+}
+
+// uniqueIntegrationName refuses a name another connection already has,
+// ignoring case: the name is how an admin tells two instances of the same
+// kind apart, on the Integrations page and when approving a request.
+func (s *server) uniqueIntegrationName(ctx context.Context, conn store.ArrConnection) error {
+	conns, err := s.store.ArrConnections(ctx)
+	if err != nil {
+		return err
+	}
+	for _, o := range conns {
+		if o.ID != conn.ID && strings.EqualFold(o.Name, conn.Name) {
+			return echo.NewHTTPError(http.StatusConflict, "an integration called "+o.Name+" already exists")
+		}
 	}
 	return nil
 }

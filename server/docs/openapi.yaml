@@ -37,6 +37,8 @@ tags:
     description: "Accounts and groups (admin)"
   - name: Integrations
     description: "Sonarr and Radarr"
+  - name: Home Assistant
+    description: "Rooms, controls, cameras and modes, through the household's Home Assistant"
   - name: Requests
     description: "Finding titles outside the library on TMDB, asking for them, the admin's queue, and what a series is missing"
   - name: Administration
@@ -103,6 +105,12 @@ paths:
   /auth/status:
     get:
       summary: Setup state and the caller's identity (public)
+      description: >
+        On a device an admin has set to sign in by itself (PATCH
+        /devices/{id}, autoUserId), a browser nobody is signed in on is
+        signed in here as that user, as the client opens. This is the only
+        place it happens, so a device never changes person in the middle of
+        anything.
       operationId: authStatus
       tags: [Account]
       security: []
@@ -117,6 +125,12 @@ paths:
                   setupRequired: { type: boolean }
                   loginMode: { type: string, enum: [picker, form], description: What the sign-in screen shows (admin setting) }
                   user: { $ref: "#/components/schemas/User" }
+                  autoUser:
+                    type: object
+                    description: Who this device signs in as when nobody is signed in on it, for "Back to ..." on the profile picker
+                    properties:
+                      id: { type: string }
+                      displayName: { type: string }
   /auth/setup:
     post:
       summary: Create the first admin (public; 409 once any user exists)
@@ -275,15 +289,12 @@ paths:
         "403": { description: Current password incorrect }
   /auth/prefs:
     get:
-      summary: Your own interface preferences
+      summary: Your own layer of preferences, as stored
       description: >
-        Theme, quality, autoplay and the like, kept on the server so every
-        device you sign in on agrees. Keys and values are strings the client
-        defines. The server reads three when playback starts:
-        `audio-lang` (ISO 639-1 code of the preferred audio language),
-        `sub-mode` (`off`, `forced` for signs and foreign dialogue only,
-        `foreign` for a full subtitle when the audio is in another language,
-        or `always`) and `sub-lang` (ISO 639-1; defaults to `audio-lang`).
+        The values you have set yourself, without your administrator's
+        defaults or locks and without any device's own values. Kept for
+        clients written before preferences had layers: GET /auth/me/prefs is
+        the resolved view, with the registry that says what each key means.
       operationId: getPrefs
       tags: [Account]
       responses:
@@ -293,11 +304,13 @@ paths:
             application/json:
               schema: { type: object, additionalProperties: { type: string } }
     put:
-      summary: Change some of your preferences
+      summary: Change some of your own stored preferences
       description: >
         Merged into what is stored: only the keys sent change, and an empty
         value removes one. At most 50 keys, keys up to 64 characters and
-        values up to 512.
+        values up to 512. Written as sent: an administrator's lock still wins
+        when the value is resolved, and a value that does not suit its key is
+        ignored there. PUT /auth/me/prefs checks both and says so.
       operationId: putPrefs
       tags: [Account]
       requestBody:
@@ -312,6 +325,56 @@ paths:
             application/json:
               schema: { type: object, additionalProperties: { type: string } }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/me/prefs:
+    get:
+      summary: Your preferences as they apply to you
+      description: >
+        Every preference's value on this device, the layer it came from and
+        whether your administrator has locked it, with the registry of
+        preferences the server knows, so a client can draw its Settings page
+        without hardcoding the keys. A value resolves through this device's
+        own value (device preferences only), then yours, then your groups'
+        defaults in the administrator's order, then the server's default,
+        then the built-in one; a lock at a group or the server wins over you
+        and your device. Keys the registry does not know are returned from
+        your own layer as they are.
+      operationId: getMyPrefs
+      tags: [Account]
+      parameters:
+        - name: device
+          in: query
+          description: Resolve for another of your devices (a session id) rather than this one
+          schema: { type: string }
+      responses:
+        "200":
+          description: Resolved preferences
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MyPrefs" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Set your own preferences
+      description: >
+        A string sets a key (an empty string is a value: "the file's own
+        audio track"); null clears it, handing it back to the default. A
+        registered key must suit its type. Keys the registry does not know
+        are stored as they are, within the same limits as /auth/prefs.
+        Setting a key your administrator has locked is a 409 naming the lock.
+      operationId: putMyPrefs
+      tags: [Account]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: { type: [string, "null"] } }
+      responses:
+        "200":
+          description: Your preferences, resolved after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MyPrefs" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/PrefLocked" }
   /auth/keys:
     get:
       summary: List own API keys
@@ -411,8 +474,10 @@ paths:
               schema: { type: array, items: { $ref: "#/components/schemas/Device" } }
   /auth/sessions/current:
     patch:
-      summary: Name this device ("Living-room TV")
-      description: Only for a browser session; a request made with an API key belongs to no device (400).
+      summary: Name this device ("Living-room TV"), or put it in a room
+      description: >
+        Only for a browser session; a request made with an API key belongs
+        to no device (400). Fields left out are kept.
       operationId: nameDevice
       tags: [Devices]
       requestBody:
@@ -423,6 +488,7 @@ paths:
               type: object
               properties:
                 name: { type: string, maxLength: 40, description: Empty to go back to the browser's name }
+                areaId: { type: string, description: 'The Home Assistant area this device is in; "" for none' }
       responses:
         "204": { description: Named }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -460,15 +526,19 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
   /auth/sessions/{id}:
     delete:
-      summary: Sign one of your other devices out
+      summary: Sign one of your other devices out, or forget a device
       description: >
         It is signed out at once: its event stream receives "revoked" and
-        closes, and its next request is refused. This device is signed out
-        with POST /auth/logout instead (400 here).
+        closes, and its next request is refused. The device itself stays
+        known, with its name, room and preferences (see docs/devices.md).
+        This device is signed out with POST /auth/logout instead (400
+        here). With forget=true the device is removed altogether, this one
+        included.
       operationId: revokeDevice
       tags: [Devices]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: forget, in: query, required: false, schema: { type: boolean }, description: Remove the device, not just sign it out }
       responses:
         "204": { description: Signed out }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -510,6 +580,49 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: The device is not connected }
+  /auth/sessions/{id}/prefs:
+    get:
+      summary: One of your devices' own preferences
+      description: >
+        The values set on that device alone (`current` for this one), before
+        resolution. Only device preferences, such as video quality, are kept
+        per device.
+      operationId: getDevicePrefs
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, description: "A session id, or current", schema: { type: string } }
+      responses:
+        "200":
+          description: The device's values
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { type: string } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Set preferences on one of your devices
+      description: >
+        Only keys the registry marks as device preferences belong here. A
+        string sets a key; null clears it, so the device follows your own
+        value again. Setting a key your administrator has locked is a 409.
+      operationId: putDevicePrefs
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, description: "A session id, or current", schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: { type: [string, "null"] } }
+      responses:
+        "200":
+          description: Your preferences, resolved for that device
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MyPrefs" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/PrefLocked" }
   /settings:
     get:
       summary: Runtime settings (admin)
@@ -594,14 +707,65 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/Device" } }
         "404": { $ref: "#/components/responses/NotFound" }
+  /devices:
+    get:
+      summary: Every device, signed in on or not (admin)
+      description: >
+        A device is a screen: a browser, later a native app. It outlives
+        the sessions signed in on it and holds one at a time.
+      operationId: listAllDevices
+      tags: [Devices]
+      responses:
+        "200":
+          description: Devices, most recently seen first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/AdminDevice" } }
+  /devices/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Name a device, set its room, or have it sign in by itself (admin)
+      description: >
+        Fields left out are kept. autoUserId makes the device sign in as
+        that user whenever nobody is signed in on it, with the profile
+        picker still there to switch; "" turns it off. An admin account is
+        refused: whoever is in front of the device would have the admin
+        pages. On such a device the device cookie signs someone in, so it
+        is as sensitive as a remembered sign-in.
+      operationId: updateDevice
+      tags: [Devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 40 }
+                areaId: { type: string, description: 'A Home Assistant area; "" for none' }
+                autoUserId: { type: string, description: 'Who it signs in as; "" for nobody' }
+      responses:
+        "200": { description: The device, content: { application/json: { schema: { $ref: "#/components/schemas/AdminDevice" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Forget a device (admin)
+      description: Its name, room and preferences go, and whoever is signed in on it is signed out.
+      operationId: forgetDevice
+      tags: [Devices]
+      responses:
+        "204": { description: Forgotten }
+        "404": { $ref: "#/components/responses/NotFound" }
   /users/{id}/sessions/{sid}:
     delete:
-      summary: Sign one of a user's devices out (admin)
+      summary: Sign one of a user's devices out, or forget it (admin)
       operationId: revokeUserDevice
       tags: [Users]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: sid, in: path, required: true, schema: { type: string } }
+        - { name: forget, in: query, required: false, schema: { type: boolean }, description: Remove the device, not just sign it out }
       responses:
         "204": { description: Signed out }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -633,12 +797,16 @@ paths:
   /groups:
     get:
       summary: List user groups (admin)
-      description: Named sets of this server's users ("Kids", "Grown-ups"), for restricting libraries without listing every account.
+      description: >
+        Named sets of this server's users ("Kids", "Grown-ups"), for
+        restricting libraries without listing every account and for setting
+        preference defaults. Listed in priority order: where groups' defaults
+        conflict, the first wins.
       operationId: listGroups
       tags: [Users]
       responses:
         "200":
-          description: Groups, by name
+          description: Groups, in priority order
           content:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/UserGroup" } }
@@ -687,6 +855,106 @@ paths:
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/order:
+    put:
+      summary: Order the groups by priority (admin)
+      description: >
+        Where a user is in several groups that set the same preference, the
+        first group in this order wins: "Kids" above "Grown-ups" for a child
+        in both. The list must name every group exactly once.
+      operationId: setGroupOrder
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupIds]
+              properties:
+                groupIds: { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: Every group, in the new order
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/UserGroup" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /groups/{id}/prefs:
+    get:
+      summary: A group's preference defaults (admin)
+      operationId: getGroupPrefs
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The group's defaults, by key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { $ref: "#/components/schemas/PrefSetting" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Set a group's preference defaults (admin)
+      description: >
+        Merged into the group's defaults: a setting sets a key, null clears
+        it. Only registered keys can have a default, a value must suit its
+        type, and only a lockable key can be locked. A locked default applies
+        to the group's members whatever they choose.
+      operationId: putGroupPrefs
+      tags: [Users]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PrefDefaultsRequest" }
+      responses:
+        "200":
+          description: The group's defaults after the change
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { $ref: "#/components/schemas/PrefSetting" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /prefs/defaults:
+    get:
+      summary: Every preference default (admin)
+      description: >
+        The registry, the server's defaults and every group's, groups in
+        priority order: everything the Defaults table in the admin UI draws.
+      operationId: getPrefDefaults
+      tags: [Administration]
+      responses:
+        "200":
+          description: Defaults
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrefDefaults" }
+    put:
+      summary: Set the server's preference defaults (admin)
+      description: >
+        Merged into the server's defaults, which apply to every user who has
+        not chosen otherwise and whose groups set nothing. A setting sets a
+        key, null clears it; a locked default applies to everyone.
+      operationId: putPrefDefaults
+      tags: [Administration]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PrefDefaultsRequest" }
+      responses:
+        "200":
+          description: Every default after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrefDefaults" }
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /libraries/{id}/access:
     get:
@@ -813,6 +1081,32 @@ paths:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /libraries/{id}/segments/redetect:
+    post:
+      summary: Detect a whole library's intros and credits again (admin)
+      description: >
+        Every episode and film of a film or TV library, except times set by
+        hand unless includeLocked is true. It goes through the library
+        queue rather than ahead of it, starting straight away whatever the
+        schedule says, as POST /segments/run does; it still gives way to
+        playback, scans and a manual pause. 409 when detection is turned
+        off.
+      operationId: redetectLibrary
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/RedetectKinds"
+        - $ref: "#/components/parameters/RedetectIncludeLocked"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RedetectRequest" }
+      responses:
+        "202": { description: Queued, content: { application/json: { schema: { $ref: "#/components/schemas/RedetectResult" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Intro detection is turned off }
   /libraries/{id}/scan:
     post:
       summary: Start a background scan of the library
@@ -1033,12 +1327,15 @@ paths:
 
   /segments/status:
     get:
-      summary: Progress of background intro and credits detection (admin)
+      summary: Progress of background intro and credits detection (admins and trusted editors)
       description: >
-        Detection runs over TV libraries after each completed scan and once
-        at startup, analysing only episodes not yet analysed for each kind.
-        Counts are of checks: an episode is checked once for its intro and
-        once for its credits. The same status is pushed over /events as
+        Detection runs over film and TV libraries after each completed scan
+        and once at startup, analysing only episodes not yet analysed for
+        each kind, and films not yet looked at for end credits (read from
+        their chapter names). Counts are of checks: an episode is checked
+        once for its intro and once for its credits. Seasons and films
+        asked for by name (the redetect endpoints) are listed in targets
+        and analysed first. The same status is pushed over /events as
         "segments" while it runs.
       operationId: segmentStatus
       tags: [Administration]
@@ -1058,6 +1355,8 @@ paths:
                   seasonsTotal: { type: integer }
                   episodesDone: { type: integer }
                   episodesTotal: { type: integer, description: Episodes waiting when the run began }
+                  filmsDone: { type: integer }
+                  filmsTotal: { type: integer, description: Films waiting to be looked at for end credits when the run began }
                   introsFound: { type: integer, description: Episodes given an intro in this run }
                   creditsFound: { type: integer, description: Episodes given end credits in this run }
                   unreadable: { type: integer, description: Files whose audio could not be decoded }
@@ -1068,10 +1367,11 @@ paths:
                     description: manual = paused by an admin until resumed; playing / scanning = giving way, resuming a minute after they stop; schedule = outside the detection window; on-demand = detectionMode is manual and nobody has pressed Analyse now
                   current:
                     type: object
-                    description: The season being worked on
+                    description: The season, or film, being worked on
                     properties:
-                      series: { type: string }
+                      series: { type: string, description: The series' title, or the film's }
                       season: { type: integer }
+                      film: { type: boolean }
                       kind: { type: string, enum: [intro, credits] }
                       phase: { type: string, enum: [reading, comparing, saving] }
                       done: { type: integer }
@@ -1087,6 +1387,7 @@ paths:
                         series: { type: string }
                         season: { type: integer }
                         episode: { type: integer }
+                        film: { type: boolean, description: series is a film's title }
                         found: { type: boolean }
                         startSecs: { type: number }
                         endSecs: { type: number }
@@ -1099,10 +1400,85 @@ paths:
                       seconds: { type: integer }
                       seasons: { type: integer }
                       episodes: { type: integer }
+                      films: { type: integer }
                       introsFound: { type: integer }
                       creditsFound: { type: integer }
                       unreadable: { type: integer }
                       cancelled: { type: boolean }
+                  targets:
+                    type: array
+                    description: >
+                      Seasons and films asked for by name, in the order they
+                      are analysed, ahead of any library and whatever the
+                      schedule says; the first is being worked on when
+                      working is set.
+                    items: { $ref: "#/components/schemas/DetectionTarget" }
+
+  /segments/redetect:
+    post:
+      summary: Detect a selection's intros and credits again (admins and trusted editors)
+      description: >
+        Any mix of episodes, seasons, series and films, up to 1000. Each
+        episode is analysed alone, still compared with its season; a season
+        or series covers its episodes; a film's credits are read from its
+        chapter names again. Times set by hand are kept unless
+        includeLocked is true; the response says how many were kept, so the
+        caller can offer to replace them. The seasons and films go ahead of
+        every library's queue, whatever the schedule says, still giving way
+        to playback, scans and a manual pause. What was found before is
+        served until it is replaced. 409 when detection is turned off.
+      operationId: redetectSelection
+      tags: [Administration]
+      parameters:
+        - $ref: "#/components/parameters/RedetectKinds"
+        - $ref: "#/components/parameters/RedetectIncludeLocked"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/RedetectRequest"
+                - type: object
+                  required: [items]
+                  properties:
+                    items: { type: array, maxItems: 1000, items: { type: string } }
+      responses:
+        "202": { description: Queued, content: { application/json: { schema: { $ref: "#/components/schemas/RedetectResult" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Neither an administrator nor a trusted editor }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Intro detection is turned off }
+
+  /segments/reports:
+    get:
+      summary: Reports of wrong intro and credits times (admin)
+      description: >
+        Newest first, at most 200: the open ones, or with all=true the
+        resolved ones too. Each says how many open reports its season (a
+        film's, the film) has: three or more suggest detecting the season
+        again. Changes are announced over /events as "segmentReports".
+      operationId: listSegmentReports
+      tags: [Administration]
+      parameters:
+        - { name: all, in: query, schema: { type: boolean }, description: Include resolved reports }
+      responses:
+        "200":
+          description: The reports
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/SegmentReport" } }
+
+  /segments/reports/{id}/resolve:
+    post:
+      summary: Resolve a report of wrong times (admin)
+      operationId: resolveSegmentReport
+      tags: [Administration]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Resolved (or already was) }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /segments/pause:
     post:
@@ -1393,11 +1769,22 @@ paths:
         "items" (data: {libraryId} — that library's contents changed,
         published repeatedly during a scan as items land so open views fill
         in live), "libraries" (no data — an invalidation hint: refetch
-        library lists and counts), and, sent only to the user concerned,
+        library lists and counts), "prefs" (no data — preferences or their
+        defaults changed: refetch /auth/me/prefs; sent to everyone when an
+        administrator changes defaults, otherwise only to the user
+        concerned), and, sent only to the user concerned,
         "devices" (no data — refetch /auth/sessions), "handoff" (to one
         device: {from, items, index} — a queue sent by POST
         /auth/sessions/{id}/play; start playing it) and "revoked" (to one
-        device, which is signed out; the stream closes after it). Events are advisory; clients refetch what
+        device, which is signed out; the stream closes after it),
+        "homeassistant" (data: {entities: [HAEntity]} — states that changed,
+        each sent only to users who may see that entity; or no data —
+        refetch /homeassistant/rooms and /homeassistant/modes, as the
+        connection, exposure, access, rooms or modes changed) and "mode-run"
+        (to the user who started it: {runId, modeId, modeName, status:
+        running|done|failed, step, steps, error, playedOn, playedOnName} —
+        playedOn is the device the title was sent to, empty when that
+        device was already playing it). Events are advisory; clients refetch what
         they display on receipt, and a dropped event costs staleness until
         the next one, not correctness.
       operationId: eventStream
@@ -1424,11 +1811,12 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /items/{id}/segments:
     get:
-      summary: An episode's intro and credits, for correcting them (admin)
+      summary: An episode's intro and credits, or a film's credits, for correcting them (admins and trusted editors)
       description: >
-        Each kind of segment, found or not, with whether detection has
-        looked at the current file and whether an administrator set it by
-        hand (locked: re-detection leaves it alone until cleared).
+        Each kind of segment the item can have, found or not, with whether
+        detection has looked at the current file and whether someone set it
+        by hand (locked: re-detection leaves it alone until cleared). A
+        film has credits only.
       operationId: itemSegments
       tags: [Administration]
       parameters:
@@ -1439,13 +1827,13 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /items/{id}/segments/{kind}:
     put:
-      summary: Set an episode's intro or credits by hand (admin)
+      summary: Set an episode's intro or credits, or a film's credits, by hand (admins and trusted editors)
       description: >
         Sets the segment's start and end in seconds from the start of the
-        file, or with none true says the episode has no segment of this
-        kind. Either way the value is locked: detection, a season's
-        re-detection and a replaced file all leave it alone until it is
-        cleared.
+        file, or with none true says the item has no segment of this kind.
+        Either way the value is locked: detection, re-detection without
+        includeLocked and a replaced file all leave it alone until it is
+        cleared. 400 for a film's intro.
       operationId: putItemSegment
       tags: [Administration]
       parameters:
@@ -1466,10 +1854,10 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
-      summary: Hand an episode's intro or credits back to detection (admin)
+      summary: Hand an item's intro or credits back to detection (admins and trusted editors)
       description: >
         Removes a value set by hand, segment and lock, so detection looks at
-        the episode again on its next pass. A detected value is left as it is.
+        the item again on its next pass. A detected value is left as it is.
       operationId: clearItemSegment
       tags: [Administration]
       parameters:
@@ -1481,29 +1869,61 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /items/{id}/segments/redetect:
     post:
-      summary: Detect a season's intros and credits again (admin)
+      summary: Detect an episode, season, series or film again (admins and trusted editors)
       description: >
-        Takes a season, or any episode of it. Every episode's analysis is
-        reopened except values set by hand, and detection starts straight
-        away whatever its schedule says — still giving way to playback,
-        scans and a manual pause. What was found before is served until the
-        new analysis replaces it. 409 when intro detection is turned off.
+        An episode is analysed alone, still compared with the rest of its
+        season (whose episodes are read as partners only); a season covers
+        its episodes, a series every season's; a film's credits are read
+        from its chapter names again. Times set by hand are kept unless
+        includeLocked is true. The seasons and films go ahead of every
+        library's queue, whatever the schedule says, still giving way to
+        playback, scans and a manual pause. What was found before is served
+        until it is replaced. 409 when intro detection is turned off.
       operationId: redetectSegments
       tags: [Administration]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/RedetectKinds"
+        - $ref: "#/components/parameters/RedetectIncludeLocked"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RedetectRequest" }
       responses:
-        "202":
-          description: Queued
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  reopened: { type: integer, description: Analyses sent back to detection }
+        "202": { description: Queued, content: { application/json: { schema: { $ref: "#/components/schemas/RedetectResult" } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Neither an administrator nor a trusted editor }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Intro detection is turned off }
+  /items/{id}/segments/reports:
+    post:
+      summary: Report wrong intro or credits times
+      description: >
+        Anyone who can see an episode or film can say its intro or credits
+        skip is in the wrong place, with where playback was and an
+        optional note (at most 500 characters). A user's open report on the
+        same item and kind is updated rather than repeated. Administrators
+        see reports on the Activity page (GET /segments/reports).
+      operationId: createSegmentReport
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [intro, credits], description: A film has credits only }
+                positionSecs: { type: number, minimum: 0 }
+                note: { type: string, maxLength: 500 }
+      responses:
+        "201": { description: Recorded, content: { application/json: { schema: { $ref: "#/components/schemas/SegmentReport" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /items/{id}/trickplay.vtt:
     get:
       summary: Seek-bar preview cues for a video
@@ -2081,6 +2501,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Integration" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: Another integration already has this name }
         "502": { $ref: "#/components/responses/UpstreamFailed" }
 
   /integrations/{id}:
@@ -2109,6 +2530,7 @@ paths:
               schema: { $ref: "#/components/schemas/Integration" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Another integration already has this name }
         "502": { $ref: "#/components/responses/UpstreamFailed" }
     delete:
       summary: Disconnect, removing Cineva's webhook from the instance (admin)
@@ -2228,6 +2650,284 @@ paths:
         "401": { description: Missing or wrong webhook credentials }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /homeassistant:
+    get:
+      summary: The Home Assistant connection and its live status (admin)
+      description: >
+        Answers 200 with configured false when no instance is connected. The
+        access token is never returned.
+      operationId: getHomeAssistant
+      tags: [Home Assistant]
+      responses:
+        "200": { description: The connection, content: { application/json: { schema: { $ref: "#/components/schemas/HAConnection" } } } }
+    put:
+      summary: Connect Home Assistant, or change the connection (admin)
+      description: >
+        Opens the websocket and authenticates before anything is saved, so a
+        wrong URL or token is refused with Home Assistant's own reason. A
+        blank token keeps the current one. playbackEvents is refused (400)
+        when the token's user is not an administrator in Home Assistant,
+        which firing events requires.
+      operationId: putHomeAssistant
+      tags: [Home Assistant]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HAConnectionRequest" }
+      responses:
+        "200": { description: Connected, content: { application/json: { schema: { $ref: "#/components/schemas/HAConnection" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/HAUnreachable" }
+    delete:
+      summary: Disconnect Home Assistant (admin)
+      description: >
+        Removes the connection only. Exposed entities, their access, rooms
+        and modes are kept, so connecting the same instance again restores
+        them.
+      operationId: deleteHomeAssistant
+      tags: [Home Assistant]
+      responses:
+        "204": { description: Disconnected }
+  /homeassistant/entities:
+    get:
+      summary: Every entity Cineva can work with, exposed or not (admin)
+      description: Entities in the supported domains, with their area, state, exposure and access. Empty while disconnected.
+      operationId: listHAEntities
+      tags: [Home Assistant]
+      responses:
+        "200":
+          description: Entities, by area then name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/HAEntityAdmin" } }
+  /homeassistant/entities/{entityId}:
+    put:
+      summary: Expose or hide an entity, and set who can use it (admin)
+      description: >
+        A camera exposed without an access object is restricted with nobody
+        listed, so only admins see it until someone is granted it.
+      operationId: putHAEntity
+      tags: [Home Assistant]
+      parameters:
+        - { name: entityId, in: path, required: true, schema: { type: string }, example: light.lounge }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [exposed]
+              properties:
+                exposed: { type: boolean }
+                access: { $ref: "#/components/schemas/LibraryAccess" }
+      responses:
+        "200": { description: Saved, content: { application/json: { schema: { $ref: "#/components/schemas/HAEntityAdmin" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /homeassistant/entities/{entityId}/action:
+    post:
+      summary: Work a control (turn a light on, set the volume)
+      description: >
+        Only the services and fields listed for the entity's domain in
+        docs/homeassistant.md are accepted, on an exposed entity the caller
+        may see. Answers with the call accepted; the new state arrives as a
+        homeassistant event.
+      operationId: haEntityAction
+      tags: [Home Assistant]
+      parameters:
+        - { name: entityId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HAAction" }
+      responses:
+        "204": { description: Done }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/HAUnreachable" }
+  /homeassistant/devices:
+    get:
+      summary: Every user's devices and the rooms they are in (admin)
+      operationId: listHADevices
+      tags: [Home Assistant]
+      responses:
+        "200":
+          description: Devices, by user then name
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [id, userId, userName, name, online, areaId]
+                  properties:
+                    id: { type: string }
+                    userId: { type: string }
+                    userName: { type: string }
+                    name: { type: string, description: The device's name, or its browser and system when unnamed }
+                    online: { type: boolean }
+                    areaId: { type: string, description: Its room; "" for none }
+  /homeassistant/devices/{id}/area:
+    put:
+      summary: Put a device in a room, or take it out (admin)
+      operationId: putHADeviceArea
+      tags: [Home Assistant]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [areaId]
+              properties:
+                areaId: { type: string, description: A Home Assistant area id; "" for none }
+      responses:
+        "204": { description: Saved }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /homeassistant/rooms:
+    get:
+      summary: The rooms, controls and cameras the caller may see
+      description: >
+        Areas holding at least one exposed entity the caller may see, with
+        those entities' current state; entities with no area come under
+        an area with id "". Answers configured false when no instance is
+        connected, and connected false while it is unreachable (the last
+        known states are still listed).
+      operationId: haRooms
+      tags: [Home Assistant]
+      responses:
+        "200": { description: Rooms, content: { application/json: { schema: { $ref: "#/components/schemas/HARooms" } } } }
+  /homeassistant/cameras/{entityId}/snapshot:
+    get:
+      summary: A visible camera's current picture
+      operationId: haCameraSnapshot
+      tags: [Home Assistant]
+      parameters:
+        - { name: entityId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: The picture, content: { image/jpeg: { schema: { type: string, format: binary } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/HAUnreachable" }
+  /homeassistant/cameras/{entityId}/hls/{file}:
+    get:
+      summary: Live view of a visible camera (HLS playlist or init segment)
+      description: >
+        Home Assistant's own HLS stream, proxied. Start at
+        master_playlist.m3u8; the playlists' relative paths lead to the
+        rest. 404 for a camera that cannot stream.
+      operationId: haCameraHLS
+      tags: [Home Assistant]
+      parameters:
+        - { name: entityId, in: path, required: true, schema: { type: string } }
+        - { name: file, in: path, required: true, schema: { type: string }, example: master_playlist.m3u8 }
+      responses:
+        "200": { description: The file, content: { application/vnd.apple.mpegurl: {}, video/mp4: {} } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/HAUnreachable" }
+  /homeassistant/cameras/{entityId}/hls/{dir}/{file}:
+    get:
+      summary: Live view of a visible camera (segments and parts)
+      operationId: haCameraHLSPart
+      tags: [Home Assistant]
+      parameters:
+        - { name: entityId, in: path, required: true, schema: { type: string } }
+        - { name: dir, in: path, required: true, schema: { type: string, enum: [segment, part] } }
+        - { name: file, in: path, required: true, schema: { type: string }, example: 12.m4s }
+      responses:
+        "200": { description: The segment, content: { video/iso.segment: {} } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/HAUnreachable" }
+  /homeassistant/modes:
+    get:
+      summary: Modes the caller may run
+      description: An admin gets every mode, with its access list.
+      operationId: listHAModes
+      tags: [Home Assistant]
+      responses:
+        "200":
+          description: Modes, by name
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/HAMode" } }
+    post:
+      summary: Build a mode (admin)
+      operationId: createHAMode
+      tags: [Home Assistant]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HAModeRequest" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/HAMode" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: Another mode already has this name }
+  /homeassistant/modes/{id}:
+    patch:
+      summary: Change a mode (admin)
+      description: Fields left out keep their values; steps, when sent, replace all of them.
+      operationId: updateHAMode
+      tags: [Home Assistant]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HAModeRequest" }
+      responses:
+        "200": { description: Saved, content: { application/json: { schema: { $ref: "#/components/schemas/HAMode" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Another mode already has this name }
+    delete:
+      summary: Delete a mode (admin)
+      operationId: deleteHAMode
+      tags: [Home Assistant]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /homeassistant/modes/{id}/run:
+    post:
+      summary: Run a mode
+      description: >
+        Checked before anything runs: Home Assistant is connected, every
+        step's entity exists, a play step's device has Cineva open, and its
+        title (the one sent here, for a mode that plays the started-from
+        title) is visible to the caller and to the device's user. The steps
+        then run in the background; mode-run events report each one to the
+        caller. A play step whose device is already playing that title
+        leaves it playing, so a mode started from the player sets the room
+        around the film rather than starting it again.
+      operationId: runHAMode
+      tags: [Home Assistant]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                itemId: { type: string, description: The title it was started from; required when needsTitle }
+      responses:
+        "202":
+          description: Running
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId]
+                properties:
+                  runId: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Home Assistant is unreachable, or the play step's device does not have Cineva open }
   /fs/dirs:
     get:
       summary: List subdirectories of a server path (admin folder picker)
@@ -2900,6 +3600,17 @@ components:
       in: header
       name: X-Api-Key
       description: The same API key, for clients that cannot set Authorization.
+  parameters:
+    RedetectKinds:
+      name: kinds
+      in: query
+      description: Comma-separated kinds to detect again (intro, credits); every kind when absent. Overrides kinds in the body.
+      schema: { type: string, example: "intro,credits" }
+    RedetectIncludeLocked:
+      name: includeLocked
+      in: query
+      description: true replaces times set by hand as well, as includeLocked in the body does.
+      schema: { type: boolean }
   schemas:
     User:
       type: object
@@ -2915,6 +3626,7 @@ components:
         avatar: { type: string, description: The user's picture (an /artwork/ path); absent when they have none }
         avatarColour: { $ref: "#/components/schemas/AvatarColour" }
         requestLevel: { $ref: "#/components/schemas/RequestLevel" }
+        segmentEditor: { type: boolean, description: "A trusted editor: may correct intro and credits times and start their detection on the titles they can see, without being an admin" }
         libraryIds:
           type: array
           items: { type: string }
@@ -3148,7 +3860,7 @@ components:
       description: On create, kind, url and apiKey are required. On update, kind is ignored and blank fields keep their values.
       properties:
         kind: { type: string, enum: [sonarr, radarr] }
-        name: { type: string, description: Defaults to "Sonarr" or "Radarr" }
+        name: { type: string, description: 'Unique among integrations, ignoring case; defaults to "Sonarr" or "Radarr"' }
         url: { type: string }
         apiKey: { type: string, writeOnly: true }
         callbackUrl: { type: string }
@@ -3177,6 +3889,7 @@ components:
         expiresAt: { type: string }
         current: { type: boolean, description: The device making this request }
         online: { type: boolean, description: Has the app open now, so can be sent a queue }
+        areaId: { type: string, description: 'The Home Assistant area it is in (its room); "" for none' }
         queue:
           type: object
           description: Its play queue, when it has one
@@ -3186,6 +3899,21 @@ components:
             current: { $ref: "#/components/schemas/Item" }
             seriesTitle: { type: string, description: The current item's series, for an episode }
             updatedAt: { type: string }
+    AdminDevice:
+      type: object
+      required: [id, name, client, areaId, userId, autoUserId, online]
+      properties:
+        id: { type: string }
+        name: { type: string, description: Chosen name; "" when unnamed }
+        client: { type: string, description: 'Browser and system: "Chrome · Android"' }
+        clientIp: { type: string }
+        areaId: { type: string, description: Its Home Assistant room; "" for none }
+        createdAt: { type: string }
+        lastSeenAt: { type: string }
+        userId: { type: string, description: Who is signed in on it now; "" for nobody }
+        userName: { type: string }
+        autoUserId: { type: string, description: Who it signs in as when nobody is; "" for nobody }
+        online: { type: boolean, description: Has the app open now }
     QueueRequest:
       type: object
       required: [itemIds]
@@ -3208,18 +3936,239 @@ components:
         running: { type: boolean }
     UserGroup:
       type: object
-      required: [id, name, memberIds]
+      required: [id, name, priority, memberIds]
       properties:
         id: { type: string }
         name: { type: string }
+        priority: { type: integer, description: "Where groups' preference defaults conflict, the lowest number wins" }
         memberIds: { type: array, items: { type: string } }
         createdAt: { type: string }
+    PrefOption:
+      type: object
+      required: [value, label]
+      properties:
+        value: { type: string }
+        label: { type: string }
+        description: { type: string, description: "What choosing it does, shown while it is selected" }
+    PrefEntry:
+      type: object
+      description: One preference the server knows, as its registry describes it.
+      required: [key, type, default, scope, lockable, section, label, description]
+      properties:
+        key: { type: string }
+        type:
+          type: string
+          enum: [bool, enum, int, string, list]
+          description: "bool is on or off; enum is one of options; int is within min and max; list is a JSON array of strings"
+        default: { type: string, description: The built-in value }
+        scope: { type: string, enum: [person, device], description: "Whether it follows the person or stays with the device" }
+        lockable: { type: boolean, description: Whether an administrator may lock it }
+        section: { type: string, description: The Settings section it appears in }
+        label: { type: string }
+        description: { type: string }
+        options: { type: array, items: { $ref: "#/components/schemas/PrefOption" } }
+        min: { type: integer }
+        max: { type: integer }
+        hideWhen:
+          type: object
+          description: Hidden while another preference has this value
+          properties:
+            key: { type: string }
+            value: { type: string }
+    PrefSection:
+      type: object
+      required: [id, label]
+      properties:
+        id: { type: string }
+        label: { type: string }
+    PrefOrigin:
+      type: object
+      required: [value, source]
+      properties:
+        value: { type: string }
+        source: { type: string, enum: [device, user, group, server, builtin] }
+        groupId: { type: string }
+        groupName: { type: string }
+    ResolvedPref:
+      description: A preference's value for you, and where it came from.
+      allOf:
+        - { $ref: "#/components/schemas/PrefOrigin" }
+        - type: object
+          required: [locked]
+          properties:
+            locked: { type: boolean, description: "Set by your administrator: source and groupName say whose lock it is" }
+            default:
+              $ref: "#/components/schemas/PrefOrigin"
+              description: "What applies without your own choices: what Reset goes back to. Absent for keys the registry does not know."
+    MyPrefs:
+      type: object
+      required: [sections, registry, prefs]
+      properties:
+        device: { type: string, description: "The device resolved for; absent for an API key" }
+        sections: { type: array, items: { $ref: "#/components/schemas/PrefSection" } }
+        registry: { type: array, items: { $ref: "#/components/schemas/PrefEntry" } }
+        prefs: { type: object, additionalProperties: { $ref: "#/components/schemas/ResolvedPref" } }
+    PrefSetting:
+      type: object
+      required: [value]
+      properties:
+        value: { type: string }
+        locked: { type: boolean }
+    PrefDefaultsRequest:
+      type: object
+      description: "By key: a setting, or null to clear the key"
+      additionalProperties:
+        oneOf:
+          - { $ref: "#/components/schemas/PrefSetting" }
+          - { type: "null" }
+    PrefDefaults:
+      type: object
+      required: [sections, registry, server, groups]
+      properties:
+        sections: { type: array, items: { $ref: "#/components/schemas/PrefSection" } }
+        registry: { type: array, items: { $ref: "#/components/schemas/PrefEntry" } }
+        server: { type: object, additionalProperties: { $ref: "#/components/schemas/PrefSetting" } }
+        groups:
+          type: array
+          description: Every group, in priority order
+          items:
+            type: object
+            required: [id, name, priority, defaults]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              priority: { type: integer }
+              defaults: { type: object, additionalProperties: { $ref: "#/components/schemas/PrefSetting" } }
     UserGroupRequest:
       type: object
       required: [name]
       properties:
         name: { type: string }
         memberIds: { type: array, items: { type: string } }
+    HAConnectionRequest:
+      type: object
+      description: On first connect url and token are required. Blank fields keep their values.
+      properties:
+        name: { type: string, description: Defaults to "Home Assistant" }
+        url: { type: string, example: "http://homeassistant.local:8123" }
+        token: { type: string, writeOnly: true, description: A long-lived access token, made on the user's profile page in Home Assistant }
+        playbackEvents: { type: boolean, description: Fire cineva_playback_* events into Home Assistant; needs an admin user there }
+    HAConnection:
+      type: object
+      required: [configured]
+      properties:
+        configured: { type: boolean }
+        name: { type: string }
+        url: { type: string }
+        connected: { type: boolean, description: The websocket is open and authenticated }
+        version: { type: string, description: Home Assistant's version, from the last connect }
+        isAdmin: { type: boolean, description: The token's user is an administrator in Home Assistant }
+        playbackEvents: { type: boolean }
+        error: { type: string, description: Why it is not connected, when it is not }
+        entities: { type: integer, description: Entities in supported domains }
+        exposed: { type: integer, description: Of which exposed }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    HAEntity:
+      type: object
+      description: An entity's state, normalised. Fields that do not apply to its domain are left out.
+      required: [entityId, domain, name, areaId, state, available]
+      properties:
+        entityId: { type: string, example: light.lounge }
+        domain: { type: string, enum: [light, switch, fan, input_boolean, cover, media_player, scene, script, camera] }
+        name: { type: string, description: Its friendly name }
+        areaId: { type: string, description: Its area, or its device's; "" for none }
+        state: { type: string, description: 'Home Assistant''s state: "on", "off", "playing", "open", ...' }
+        available: { type: boolean, description: False when Home Assistant reports it unavailable or unknown }
+        on: { type: boolean, description: Lights, switches, fans, input booleans, media players }
+        dimmable: { type: boolean, description: A light that takes brightness_pct }
+        brightnessPct: { type: integer, minimum: 0, maximum: 100 }
+        volume: { type: number, minimum: 0, maximum: 1, description: A media player's volume }
+        muted: { type: boolean }
+        source: { type: string, description: A media player's input }
+        sources: { type: array, items: { type: string } }
+        mediaTitle: { type: string, description: What a media player says is playing }
+        position: { type: integer, minimum: 0, maximum: 100, description: A cover's position, 100 open }
+        stream: { type: boolean, description: A camera that can stream live }
+    HAEntityAdmin:
+      allOf:
+        - { $ref: "#/components/schemas/HAEntity" }
+        - type: object
+          required: [exposed, access]
+          properties:
+            exposed: { type: boolean }
+            access: { $ref: "#/components/schemas/LibraryAccess" }
+    HAArea:
+      type: object
+      required: [id, name, entities]
+      properties:
+        id: { type: string, description: Home Assistant's area id; "" for entities with no area }
+        name: { type: string }
+        entities: { type: array, items: { $ref: "#/components/schemas/HAEntity" } }
+    HARooms:
+      type: object
+      required: [configured, connected, areas, currentAreaId]
+      properties:
+        configured: { type: boolean }
+        connected: { type: boolean }
+        areas: { type: array, items: { $ref: "#/components/schemas/HAArea" }, description: By name; cameras are among their area's entities }
+        allAreas:
+          type: array
+          description: Every area in Home Assistant, for choosing this device's room
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { type: string }
+              name: { type: string }
+        currentAreaId: { type: string, description: This device's room; "" for none }
+        currentDeviceId: { type: string, description: This device's id, to tell whether a mode played here or sent the title elsewhere }
+    HAAction:
+      type: object
+      required: [service]
+      properties:
+        service: { type: string, example: turn_on, description: One allowed for the entity's domain }
+        brightnessPct: { type: integer, minimum: 0, maximum: 100, description: light.turn_on }
+        volume: { type: number, minimum: 0, maximum: 1, description: media_player.volume_set }
+        muted: { type: boolean, description: media_player.volume_mute }
+        source: { type: string, description: media_player.select_source; one of the entity's sources }
+    HAModeStep:
+      type: object
+      required: [type]
+      description: >
+        action: service on entityId with the HAAction fields. wait: seconds
+        (1 to 30). play: on deviceId, the title itemId, or the title the mode
+        is started from when itemId is empty.
+      properties:
+        type: { type: string, enum: [action, wait, play] }
+        entityId: { type: string }
+        service: { type: string }
+        brightnessPct: { type: integer, minimum: 0, maximum: 100 }
+        volume: { type: number, minimum: 0, maximum: 1 }
+        muted: { type: boolean }
+        source: { type: string }
+        seconds: { type: integer, minimum: 1, maximum: 30 }
+        deviceId: { type: string }
+        itemId: { type: string }
+    HAModeRequest:
+      type: object
+      description: On create name and steps are required.
+      properties:
+        name: { type: string, description: Unique among modes, ignoring case }
+        steps: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/HAModeStep" } }
+        access: { $ref: "#/components/schemas/LibraryAccess" }
+    HAMode:
+      type: object
+      required: [id, name, steps, needsTitle]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        steps: { type: array, items: { $ref: "#/components/schemas/HAModeStep" } }
+        needsTitle: { type: boolean, description: It plays the title it is started from, so running it needs itemId }
+        areaId: { type: string, description: The room its play step's device is in; "" when it plays nothing or the device has no room }
+        access: { $ref: "#/components/schemas/LibraryAccess" }
+        createdAt: { type: string }
+        updatedAt: { type: string }
     LibraryAccess:
       type: object
       required: [restricted, userIds, groupIds]
@@ -3238,6 +4187,7 @@ components:
         pin: { type: string, description: "Quick sign-in PIN (4–6 digits); on update, empty string removes it. A regular user may be PIN-only (no password); admins must have a password." }
         avatarColour: { $ref: "#/components/schemas/AvatarColour" }
         requestLevel: { $ref: "#/components/schemas/RequestLevel" }
+        segmentEditor: { type: boolean, description: Make the user a trusted editor of intro and credits times, or stop them being one }
     Settings:
       type: object
       properties:
@@ -3606,11 +4556,11 @@ components:
 
     SegmentState:
       type: object
-      description: Where one kind of segment stands for an episode.
+      description: Where one kind of segment stands for an episode or film.
       required: [kind, found, analysed, locked]
       properties:
         kind: { type: string, enum: [intro, credits] }
-        found: { type: boolean, description: The episode has this segment; startSecs and endSecs are its bounds }
+        found: { type: boolean, description: The item has this segment; startSecs and endSecs are its bounds }
         startSecs: { type: number }
         endSecs: { type: number }
         analysed: { type: boolean, description: Detection has looked at the current file, or the value was set by hand }
@@ -3620,11 +4570,61 @@ components:
       type: object
       required: [detection, runtimeSecs, segments]
       properties:
-        detection: { type: boolean, description: Intro detection is on, so a season can be re-detected }
+        detection: { type: boolean, description: Intro detection is on, so the item can be re-detected }
         runtimeSecs: { type: integer }
         segments:
           type: array
           items: { $ref: "#/components/schemas/SegmentState" }
+
+    DetectionTarget:
+      type: object
+      description: A season or film asked for by name, waiting for detection or being worked on.
+      required: [itemId, kind, title, working]
+      properties:
+        itemId: { type: string, description: The season's or film's id }
+        kind: { type: string, enum: [season, film] }
+        libraryId: { type: string }
+        seriesId: { type: string, description: A season's series }
+        title: { type: string, description: The series' title, or the film's }
+        season: { type: integer }
+        working: { type: boolean }
+
+    RedetectRequest:
+      type: object
+      properties:
+        kinds: { type: array, items: { type: string, enum: [intro, credits] }, description: Only these kinds; every kind when absent }
+        includeLocked: { type: boolean, description: Replace times set by hand as well }
+
+    RedetectResult:
+      type: object
+      required: [items, reopened, locked]
+      properties:
+        items: { type: integer, description: Episodes and films in scope }
+        reopened: { type: integer, description: Analyses sent back to detection; those never made are due already and not counted }
+        locked: { type: integer, description: Items whose hand-set times were kept (0 with includeLocked) }
+
+    SegmentReport:
+      type: object
+      required: [id, itemId, userId, kind, positionSecs, createdAt, itemKind, title, seasonOpen]
+      properties:
+        id: { type: string }
+        itemId: { type: string }
+        userId: { type: string }
+        userName: { type: string }
+        kind: { type: string, enum: [intro, credits] }
+        positionSecs: { type: number, description: Where playback was when it was reported }
+        note: { type: string }
+        createdAt: { type: string }
+        resolvedAt: { type: string, description: Absent while open }
+        resolvedBy: { type: string, description: The id of the user who resolved it }
+        itemKind: { type: string, enum: [episode, movie] }
+        title: { type: string }
+        libraryId: { type: string }
+        seriesTitle: { type: string }
+        seasonId: { type: string, description: An episode's season }
+        seasonNum: { type: integer }
+        episodeNum: { type: integer }
+        seasonOpen: { type: integer, description: Open reports on the same season (a film's, the film), this one included }
 
     AudioTrack:
       type: object
@@ -3738,6 +4738,14 @@ components:
             type: object
             properties:
               message: { type: string }
+    HAUnreachable:
+      description: Home Assistant could not be reached, refused the token, or refused the call (its own message is passed on)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
     UpstreamFailed:
       description: Sonarr or Radarr could not be reached, refused the API key, or refused the webhook (its own message is passed on)
       content:
@@ -3746,6 +4754,17 @@ components:
             type: object
             properties:
               message: { type: string }
+    PrefLocked:
+      description: The preference is locked by your administrator
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+              key: { type: string }
+              source: { type: string, enum: [group, server] }
+              groupName: { type: string }
     BadRequest:
       description: Invalid request
       content:

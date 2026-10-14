@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import {
     getHealth, listLibraries, libraryItems, libraryItemsSince, libraryGenres, type GenreCount,
     libraryCollections, collectionDetail, type CollectionInfo,
@@ -27,19 +27,24 @@
   import { setMusicActions, addToPlaylist, plays as playsLabel, type ItemRef } from './music/actions.svelte'
   import AvatarCrop from './AvatarCrop.svelte'
   import SegmentEditor from './SegmentEditor.svelte'
+  import DetectMenu from './DetectMenu.svelte'
+  import { setDetection, loadDetection, canEditSegments, detect } from './lib/detection.svelte'
   import Settings from './Settings.svelte'
+  import RoomsPage from './ha/RoomsPage.svelte'
+  import PlayInMode from './ha/PlayInMode.svelte'
+  import { loadHA, clearHA, haVisible, onHAEvent, onModeRun } from './lib/homeassistant.svelte'
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
-    RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
+    RotateCcw, AudioLines, LogOut, Users, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
     Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone,
-    Inbox, Plus, Clock, CalendarClock, ListMusic,
+    Inbox, Plus, Clock, CalendarClock, ListMusic, ScanSearch, Lamp,
   } from '@lucide/svelte'
 
   // 'requests' and 'discover' (a title outside the library) are reached from
   // the sidebar and from search; neither is one of the always-there tabs.
-  type Tab = 'home' | 'libraries' | 'queue' | 'settings' | 'requests' | 'discover' | 'playlists'
+  type Tab = 'home' | 'libraries' | 'queue' | 'settings' | 'requests' | 'discover' | 'playlists' | 'rooms'
   const tabs = [
     { id: 'home' as Tab, label: 'Home', icon: House },
     { id: 'libraries' as Tab, label: 'Libraries', icon: LibraryIcon },
@@ -187,9 +192,14 @@
       authBusy = false
     }
   }
+  // Who this device signs in as when nobody is signed in on it, when an
+  // admin has set one (the living-room TV): its menu offers "Switch user"
+  // rather than "Sign out", and the profile picker a way back to them.
+  let autoUser: { id: string; displayName: string } | null = $state(null)
   async function checkAuth() {
     try {
       const st = await authStatus()
+      autoUser = st.autoUser ?? null
       loginMode = st.loginMode ?? 'picker'
       if (st.setupRequired) gate = 'setup'
       else if (st.user) { me = st.user; gate = 'in' }
@@ -214,10 +224,20 @@
       authBusy = false
     }
   }
+  /** Sign this device back in as its own user (the status check does it). */
+  async function backToAutoUser() {
+    picked = null
+    usePassword = false
+    authErr = ''
+    await checkAuth()
+    if (gate === 'in') boot()
+    else if (loginMode === 'picker') await loadProfiles()
+  }
   async function signOut() {
     showUserMenu = false
     // The next person to sign in on this browser must not inherit these.
     clearPrefs()
+    clearHA()
     try { await logout() } catch { /* already gone */ }
     me = null
     playing = null
@@ -302,6 +322,7 @@
     if (tab === 'queue') return '/queue'
     if (tab === 'settings') return '/settings' + (settingsSection ? '/' + settingsSection : '')
     if (tab === 'requests') return '/requests'
+    if (tab === 'rooms') return '/rooms'
     if (tab === 'playlists') return '/playlists' + (playlistId ? '/' + playlistId : '')
     if (tab === 'discover' && discoverKey) return `/discover/${discoverKey.type}/${discoverKey.id}`
     let p = '/libraries'
@@ -355,6 +376,23 @@
         tab = 'queue'
         return
       }
+      // /items/<id>/segments: the intro and credits editor for an episode
+      // or film, which the admin's reports link to. The page underneath is
+      // the item's own (an episode's season), and the address becomes its.
+      if (parts[0] === 'items' && parts[1]) {
+        let target: Item
+        try {
+          if (libraries.length === 0) libraries = await listLibraries()
+          target = (await itemDetail(parts[1])).item
+          await showItem(target)
+        } catch {
+          tab = 'home' // gone, or not one this user can see
+          return
+        }
+        history.replaceState({}, '', buildPath())
+        if (parts[2] === 'segments' && canEditSegments(me)) segmentsFor = target
+        return
+      }
       if (parts[0] === 'playlists') {
         tab = 'playlists'
         playlistId = parts[1] ?? null
@@ -363,6 +401,10 @@
       if (parts[0] === 'requests') {
         tab = 'requests'
         loadMyRequests()
+        return
+      }
+      if (parts[0] === 'rooms') {
+        tab = 'rooms'
         return
       }
       if (parts[0] === 'discover' && (parts[1] === 'movie' || parts[1] === 'tv') && Number(parts[2]) > 0) {
@@ -485,15 +527,6 @@
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
   let music: { queue: Item[]; startIndex: number; shuffle: boolean; gen: number } | null = $state(null)
-  let autoplay = $state(readAutoplay())
-  // Music streaming quality: original file, or a server-side Opus transcode
-  // for slow connections. Takes effect from the next track.
-  type MusicQuality = 'original' | 'opus-128' | 'opus-64'
-  let musicQuality: MusicQuality = $state(pref('music-quality', 'original') as MusicQuality)
-  function setMusicQuality(q: MusicQuality) {
-    musicQuality = q
-    setPref('music-quality', q)
-  }
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
 
@@ -1328,11 +1361,22 @@
   const loadRequestStatus = () =>
     requestStatus().then((s) => (reqStatus = s)).catch(() => (reqStatus = null))
   // The phone's tab bar gains Requests for accounts that may request.
-  const navTabs = $derived.by(() =>
-    reqStatus && reqStatus.level !== 'none'
-      ? [...tabs.slice(0, 3), { id: 'requests' as Tab, label: 'Requests', icon: Inbox }, tabs[3]]
-      : tabs,
-  )
+  // It gains Rooms too, when Home Assistant has something for this user.
+  const navTabs = $derived.by(() => {
+    const extra = [
+      ...(reqStatus && reqStatus.level !== 'none' ? [{ id: 'requests' as Tab, label: 'Requests', icon: Inbox }] : []),
+      ...(haVisible() ? [{ id: 'rooms' as Tab, label: 'Rooms', icon: Lamp }] : []),
+    ]
+    return extra.length ? [...tabs.slice(0, 3), ...extra, tabs[3]] : tabs
+  })
+
+  // ---- Home Assistant: rooms, controls and modes ----
+  // Loaded for whoever is signed in, again when someone else signs in on
+  // this browser; the event stream keeps it current after that.
+  const haUser = $derived.by(() => (gate === 'in' ? (me?.id ?? '') : ''))
+  $effect(() => {
+    if (haUser) untrack(() => void loadHA())
+  })
   // "Not in your library": search results from TMDB.
   let discoverResults: DiscoverResult[] = $state([])
   const requestLabel: Record<RequestState, string> = {
@@ -1536,23 +1580,6 @@
       return (pref('quality', 'auto') as PlayQuality)
     } catch {
       return 'auto'
-    }
-  }
-
-  function readAutoplay(): boolean {
-    try {
-      return pref('autoplay', 'on') !== 'off'
-    } catch {
-      return true
-    }
-  }
-
-  function setAutoplay(on: boolean) {
-    autoplay = on
-    try {
-      setPref('autoplay', on ? 'on' : 'off')
-    } catch {
-      /* private browsing */
     }
   }
 
@@ -1951,8 +1978,25 @@
   let upNextHere: NextUpInfo | null = $state(null)
   // The row whose ⋯ menu is open, and the row showing its whole overview.
   let epMenu: string | null = $state(null)
-  // The episode whose intro and credits an administrator is correcting.
+  // The episode or film whose intro and credits an administrator or
+  // trusted editor is correcting.
   let segmentsFor: Item | null = $state(null)
+  // What came of "Detect intro & credits" on an episode row, shown in it.
+  let epDetect: { id: string; text: string } | null = $state(null)
+  // Where detection stands, for whoever can start it: a page opened while
+  // it runs shows its progress straight away.
+  $effect(() => {
+    if (canEditSegments(me)) loadDetection()
+  })
+  async function detectEpisode(ep: Item) {
+    epMenu = null
+    epDetect = { id: ep.id, text: 'Sending to detection…' }
+    try {
+      epDetect = { id: ep.id, text: await detect(ep) }
+    } catch (err) {
+      epDetect = { id: ep.id, text: err instanceof Error ? err.message : String(err) }
+    }
+  }
   let epOpen: string | null = $state(null)
 
   $effect(() => {
@@ -2212,9 +2256,9 @@
     // The account's own preferences, which may differ from this browser's
     // mirror — adopt them and re-apply anything already painted from the
     // local copy.
-    // Playback quality is read through pref() each time it is needed, so it
-    // picks the server's value up on its own; theme and music quality were
-    // already painted from the local mirror and need re-applying.
+    // Playback choices are read through pref() each time they are needed,
+    // so they pick the server's values up on their own; the theme was
+    // already painted from the local mirror and needs re-applying.
     //
     // The comparison is against what is *painted*, not against
     // currentTheme(): once loadPrefs has populated the cache that function
@@ -2223,13 +2267,13 @@
     // happened on a browser whose local mirror had been cleared.
     const painted = () =>
       document.getElementById('theme-css')?.getAttribute('href')?.match(/themes\/([^/]+)/)?.[1]
-    loadPrefs().then((p) => {
+    const adoptPrefs = () => loadPrefs().then((p) => {
       if (p.theme && p.theme !== painted()) {
         applyTheme(p.theme) // adopt, not re-choose
         theme = p.theme
       }
-      if (p['music-quality']) musicQuality = p['music-quality'] as MusicQuality
     }).catch(() => {})
+    adoptPrefs()
     poll()
     loadRequestStatus()
     applyRoute(location.pathname)
@@ -2258,8 +2302,21 @@
           if (tab === 'settings' || tab === 'queue') loadDevices()
         },
         handoff: receiveHandoff,
+        // Preferences changed on another device, or an admin changed a
+        // default or a lock.
+        prefs: adoptPrefs,
+        // Intro and credits detection moved on: the pages it was asked
+        // from show how it is getting on.
+        segments: (data) => setDetection(data as Parameters<typeof setDetection>[0]),
         // This device was signed out from another: back to the sign-in screen.
         revoked: () => window.dispatchEvent(new Event(UNAUTHORISED)),
+        // Home Assistant: changed states, or (no data) fetch everything again.
+        homeassistant: onHAEvent,
+        // A mode started from here moved on a step, finished or failed.
+        'mode-run': (data) => {
+          const n = onModeRun(data)
+          if (n) notify(n.kind, n.text, n.ms)
+        },
         // A request moved (made, approved, grabbed, found on disk): refresh
         // whatever shows one.
         requests: () => {
@@ -2295,7 +2352,16 @@
     listThemes().then((t) => (themes = t)).catch(() => {})
     checkAuth().then(() => { if (gate === 'in') boot() })
     // Any 401 from the API means the session ended: back to sign-in.
-    const onUnauthorised = () => { if (gate === 'in') { me = null; picked = null; gate = 'login'; loadProfiles() } }
+    const onUnauthorised = () => {
+      if (gate !== 'in') return
+      me = null
+      picked = null
+      gate = 'login'
+      // A device that signs in by itself goes back to its own user rather
+      // than leaving the TV on a sign-in screen.
+      if (autoUser) void backToAutoUser()
+      else loadProfiles()
+    }
     window.addEventListener(UNAUTHORISED, onUnauthorised)
     return () => {
       teardown?.()
@@ -2565,6 +2631,7 @@
           {/each}
         </div>
         <button class="link" onclick={() => (usePassword = true)}>Sign in with a username and password</button>
+        {#if autoUser}<button class="link" onclick={backToAutoUser}>Back to {autoUser.displayName}</button>{/if}
       </div>
     {:else if gate === 'login' && picked}
       <form class="pinpad" onsubmit={picked.hasPin ? submitPIN : submitPickedPassword}>
@@ -2580,6 +2647,7 @@
         {#if authErr}<span class="err">{authErr}</span>{/if}
         <button class="go" type="submit" disabled={authBusy || (picked.hasPin ? pin.length < 4 : !authPass)}>{authBusy ? '…' : 'Sign in'}</button>
         <button class="link" type="button" onclick={() => { picked = null; authErr = '' }}>Not you? Choose another profile</button>
+        {#if autoUser}<button class="link" type="button" onclick={backToAutoUser}>Back to {autoUser.displayName}</button>{/if}
         {#if picked.hasPin && picked.hasPassword}<button class="link" type="button" onclick={() => { authUser = picked?.username ?? ''; picked = null; usePassword = true }}>Use my password instead</button>{/if}
       </form>
     {:else}
@@ -2596,6 +2664,7 @@
         {#if authErr}<span class="err">{authErr}</span>{/if}
         <button class="go" type="submit" disabled={authBusy}>{authBusy ? '…' : gate === 'setup' ? 'Create admin account' : 'Sign in'}</button>
         {#if gate === 'login' && loginMode === 'picker' && profiles.length > 0}<button class="link" type="button" onclick={() => { usePassword = false; authErr = '' }}>Back to profiles</button>{/if}
+        {#if gate === 'login' && autoUser}<button class="link" type="button" onclick={backToAutoUser}>Back to {autoUser.displayName}</button>{/if}
       </form>
     {/if}
   </div>
@@ -2700,7 +2769,13 @@
           <div class="um-sub">{me.username} · {me.role}</div>
           {#if me.role === 'admin'}<a class="um-item" href="/admin/">Admin</a>{/if}
           <button class="um-item" onclick={() => { showUserMenu = false; setTab('settings') }}><KeyRound size={14} /> Account settings</button>
-          <button class="um-item" onclick={signOut}><LogOut size={14} /> Sign out</button>
+          <!-- On a device that signs in by itself, signing out just opens the
+               profile picker, so say what it is for. -->
+          {#if autoUser}
+            <button class="um-item" onclick={signOut}><Users size={14} /> Switch user</button>
+          {:else}
+            <button class="um-item" onclick={signOut}><LogOut size={14} /> Sign out</button>
+          {/if}
         </div>
       {/if}
     </div>
@@ -2741,6 +2816,11 @@
     {#if reqStatus && reqStatus.level !== 'none'}
       <button class="side-item" class:active={tab === 'requests'} title="Requests" onclick={() => { setTab('requests'); loadMyRequests() }}>
         <Inbox size={16} /> <span class="side-label">Requests</span>
+      </button>
+    {/if}
+    {#if haVisible()}
+      <button class="side-item" class:active={tab === 'rooms'} title="Rooms" onclick={() => setTab('rooms')}>
+        <Lamp size={16} /> <span class="side-label">Rooms</span>
       </button>
     {/if}
     <div class="tree">
@@ -2940,6 +3020,8 @@
       </section>
     {:else if tab === 'playlists'}
       <PlaylistsView {playlistId} onopen={openPlaylist} />
+    {:else if tab === 'rooms'}
+      <RoomsPage />
     {:else if tab === 'requests'}
       <h1>Requests</h1>
       {#if me?.role === 'admin'}
@@ -3319,7 +3401,7 @@
               {#if detail.item.year}<span class="muted">({detail.item.year})</span>{/if}
             </h1>
             {#if detail.item.kind === 'season' || detail.item.kind === 'series'}
-              <div class="actions">
+              <div class="actions wrap">
                 <!-- A series had no way to start watching at all: only a
                      download button, while a film gets Play and an album
                      gets Listen. The server decides which episode (see
@@ -3336,10 +3418,14 @@
                   <button class="dl" onclick={() => playSeriesFrom(up.item)} title="Play this and everything after it">
                     Play all
                   </button>
+                  <PlayInMode itemId={up.item.id} />
                 {/if}
                 <button class="dl" onclick={() => detail && downloadAll(detail.item)}>
                   <Download size={14} /> Download {detail.item.kind === 'season' ? 'season' : 'show'}
                 </button>
+                {#if canEditSegments(me)}
+                  <DetectMenu item={detail.item} />
+                {/if}
               </div>
             {/if}
             {#if detail.item.kind === 'album'}
@@ -3368,7 +3454,7 @@
             </p>
             {#if detail.item.overview}<p class="overview">{detail.item.overview}</p>{/if}
             {#if detail.item.kind === 'movie' || detail.item.kind === 'episode'}
-              <div class="actions">
+              <div class="actions wrap">
                 <button class="play" onclick={() => detail && startPlay(detail.item)}>
                   <Play size={15} /> {resumable ? 'Resume' : 'Play'}
                 </button>
@@ -3390,7 +3476,12 @@
                     Add to queue
                   </button>
                 {/if}
+                <PlayInMode itemId={detail.item.id} />
                 <a class="dl" href={downloadURL(detail.item.id)} download><Download size={14} /> Download</a>
+                {#if detail.item.kind === 'movie' && canEditSegments(me)}
+                  {@const film = detail.item}
+                  <DetectMenu item={film} onedit={() => (segmentsFor = film)} />
+                {/if}
               </div>
               {#if detail.versions && detail.versions.length > 1}
                 <div class="versions">
@@ -3546,6 +3637,9 @@
                         {child.overview}
                       </button>
                     {/if}
+                    {#if epDetect?.id === child.id}
+                      <p class="epdetect muted" role="status">{epDetect.text}</p>
+                    {/if}
                   </div>
                   <div class="epmenuwrap">
                     <button class="epmore" title="More" aria-haspopup="menu" onclick={() => (epMenu = epMenu === child.id ? null : child.id)}>
@@ -3564,9 +3658,12 @@
                         <a class="um-item" role="menuitem" href={downloadURL(child.id)} download onclick={() => (epMenu = null)}>
                           <Download size={14} /> Download
                         </a>
-                        {#if me?.role === 'admin'}
+                        {#if canEditSegments(me)}
                           <button class="um-item" role="menuitem" onclick={() => { epMenu = null; segmentsFor = child }}>
                             <Clock size={14} /> Intro &amp; credits…
+                          </button>
+                          <button class="um-item" role="menuitem" onclick={() => detectEpisode(child)}>
+                            <ScanSearch size={14} /> Detect intro &amp; credits
                           </button>
                         {/if}
                       </div>
@@ -4104,10 +4201,6 @@
           onpickavatar={(f) => { avatarMsg = ''; cropFile = f }}
           {avatarBusy}
           {avatarMsg}
-          {autoplay}
-          onautoplay={setAutoplay}
-          {musicQuality}
-          onmusicquality={setMusicQuality}
         />
       {/if}
     {/if}
@@ -4134,7 +4227,7 @@
   <AvatarCrop file={cropFile} busy={avatarBusy} oncrop={sendAvatar} oncancel={() => (cropFile = null)} />
 {/if}
 {#if segmentsFor}
-  <SegmentEditor episode={segmentsFor} onclose={() => (segmentsFor = null)} />
+  <SegmentEditor item={segmentsFor} onclose={() => (segmentsFor = null)} />
 {/if}
 
 <style>
@@ -5825,6 +5918,7 @@
     overflow-wrap: anywhere;
   }
   .epover.open { display: block; }
+  .epdetect { margin: 0.3rem 0 0; font-size: 0.82rem; }
   .epmenuwrap { position: relative; flex: none; }
   .epmore { display: grid; place-items: center; padding: 0.3rem; border-radius: 6px; color: var(--muted); }
   .epmore:hover { color: var(--text); background: var(--panel); }

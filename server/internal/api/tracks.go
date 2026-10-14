@@ -2,16 +2,17 @@ package api
 
 import (
 	"github.com/garybowers/cineva/server/internal/media"
+	"github.com/garybowers/cineva/server/internal/prefs"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
-// Track preferences, stored with the user's other preferences (GET/PUT
-// /auth/prefs) and applied when playback starts, so every client gets the
-// same tracks without choosing them itself.
+// Track preferences, resolved with the viewer's other preferences
+// (internal/prefs, so an admin's default applies) and applied when playback
+// starts, so every client gets the same tracks without choosing them itself.
 const (
-	prefAudioLang = "audio-lang" // ISO 639-1; "" = the file's default
-	prefSubMode   = "sub-mode"   // see the subMode* values
-	prefSubLang   = "sub-lang"   // ISO 639-1; "" = the audio preference, else any
+	prefAudioLang = prefs.AudioLang // ISO 639-1; "" = the file's default
+	prefSubMode   = prefs.SubMode   // see the subMode* values
+	prefSubLang   = prefs.SubLang   // ISO 639-1; "" = the audio preference, else any
 )
 
 // Subtitle modes, after Plex's: when a subtitle is switched on by itself.

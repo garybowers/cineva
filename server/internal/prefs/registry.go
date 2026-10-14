@@ -1,0 +1,262 @@
+// Package prefs is the registry of every preference the server knows about,
+// and the resolver that decides which layer's value applies: the device's,
+// the user's, their groups' defaults, the server's, or the built-in one.
+// See docs/personalisation.md, "Preferences".
+//
+// Values are strings at every layer, as they always were in user_prefs. The
+// registry says what a key's string means, so the server can validate a
+// value, hold an admin default for it, and describe it to a client that
+// draws its Settings page from the registry instead of hardcoding it.
+package prefs
+
+import (
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strconv"
+)
+
+// Type is how a preference's string is read.
+type Type string
+
+const (
+	TypeBool   Type = "bool"   // "on" or "off"
+	TypeEnum   Type = "enum"   // one of Options
+	TypeInt    Type = "int"    // a whole number within Min and Max
+	TypeString Type = "string" // free text, up to MaxValueLen
+	TypeList   Type = "list"   // a JSON array of strings
+)
+
+// Bool values. "on" and "off" rather than true and false because autoplay,
+// the first boolean preference, was stored that way before there was a
+// registry, and existing values must keep their meaning.
+const (
+	On  = "on"
+	Off = "off"
+)
+
+// Scope says whom a preference belongs to: the person, everywhere they sign
+// in, or the device in front of them.
+type Scope string
+
+const (
+	ScopePerson Scope = "person"
+	ScopeDevice Scope = "device"
+)
+
+// Limits on what can be stored, so preferences cannot be used as free
+// storage by a buggy or hostile client. The same limits applied to
+// /auth/prefs before there was a registry.
+const (
+	MaxKeys     = 50
+	MaxKeyLen   = 64
+	MaxValueLen = 512
+)
+
+// Option is one choice of an enum.
+type Option struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+	// Description says what choosing it does, where the label alone does
+	// not; shown under the control while it is selected.
+	Description string `json:"description,omitempty"`
+}
+
+// Condition hides a preference while another one has a value: subtitle
+// language means nothing while subtitles are off.
+type Condition struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// Pref describes one preference.
+type Pref struct {
+	Key     string `json:"key"`
+	Type    Type   `json:"type"`
+	Default string `json:"default"`
+	Scope   Scope  `json:"scope"`
+	// Lockable says whether an admin may lock it. False where a lock would
+	// only be petty, such as the theme.
+	Lockable bool `json:"lockable"`
+	// Section is the Settings section it appears in (see Sections), so
+	// every client lays out the same page.
+	Section     string     `json:"section"`
+	Label       string     `json:"label"`
+	Description string     `json:"description"`
+	Options     []Option   `json:"options,omitempty"`
+	Min         *int       `json:"min,omitempty"`
+	Max         *int       `json:"max,omitempty"`
+	HideWhen    *Condition `json:"hideWhen,omitempty"`
+}
+
+// Section is a Settings section, in the order a client shows them.
+type Section struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// Sections that preferences appear in. Settings has other sections too
+// (profile, devices, API keys) that hold no preferences.
+var Sections = []Section{
+	{ID: "playback", Label: "Playback"},
+	{ID: "appearance", Label: "Appearance"},
+}
+
+// Track preferences, read by the server when playback starts.
+const (
+	AudioLang = "audio-lang" // ISO 639-1; "" = the file's default
+	SubMode   = "sub-mode"   // off | forced | foreign | always
+	SubLang   = "sub-lang"   // ISO 639-1; "" = the audio preference, else any
+)
+
+// languages offered for audio and subtitles, by ISO 639-1 code. Adding one
+// is one line here; every client picks it up from the registry.
+var languages = []Option{
+	{Value: "ar", Label: "Arabic"}, {Value: "zh", Label: "Chinese"}, {Value: "cs", Label: "Czech"},
+	{Value: "da", Label: "Danish"}, {Value: "nl", Label: "Dutch"}, {Value: "en", Label: "English"},
+	{Value: "fi", Label: "Finnish"}, {Value: "fr", Label: "French"}, {Value: "de", Label: "German"},
+	{Value: "el", Label: "Greek"}, {Value: "he", Label: "Hebrew"}, {Value: "hi", Label: "Hindi"},
+	{Value: "hu", Label: "Hungarian"}, {Value: "is", Label: "Icelandic"}, {Value: "id", Label: "Indonesian"},
+	{Value: "ga", Label: "Irish"}, {Value: "it", Label: "Italian"}, {Value: "ja", Label: "Japanese"},
+	{Value: "ko", Label: "Korean"}, {Value: "ms", Label: "Malay"}, {Value: "no", Label: "Norwegian"},
+	{Value: "pl", Label: "Polish"}, {Value: "pt", Label: "Portuguese"}, {Value: "ro", Label: "Romanian"},
+	{Value: "ru", Label: "Russian"}, {Value: "sk", Label: "Slovak"}, {Value: "es", Label: "Spanish"},
+	{Value: "sv", Label: "Swedish"}, {Value: "th", Label: "Thai"}, {Value: "tr", Label: "Turkish"},
+	{Value: "uk", Label: "Ukrainian"}, {Value: "vi", Label: "Vietnamese"}, {Value: "cy", Label: "Welsh"},
+}
+
+func withFirst(first Option, rest []Option) []Option {
+	return append([]Option{first}, rest...)
+}
+
+const convertHint = "Always converts, to save bandwidth or suit a slow connection."
+
+// registry is every preference the server knows, in the order Settings
+// shows them within a section. Keys the client used before the registry
+// existed keep their names and values.
+var registry = []Pref{
+	{
+		Key: "quality", Type: TypeEnum, Default: "auto", Scope: ScopeDevice, Lockable: true,
+		Section: "playback", Label: "Video quality",
+		Description: "Changing it in the player changes it here too.",
+		Options: []Option{
+			{Value: "auto", Label: "Auto (recommended)", Description: "Plays the file as it is when this device can, and converts it only when it must."},
+			{Value: "original", Label: "Original", Description: "Always the untouched video. Some files will not play in some browsers."},
+			{Value: "1080p", Label: "1080p · 8 Mbps", Description: convertHint},
+			{Value: "720p", Label: "720p · 4 Mbps", Description: convertHint},
+			{Value: "480p", Label: "480p · 2.5 Mbps", Description: convertHint},
+		},
+	},
+	{
+		Key: AudioLang, Type: TypeEnum, Default: "", Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Audio language",
+		Description: "Played when a file has it; otherwise the file's own choice.",
+		Options:     withFirst(Option{Value: "", Label: "The file's default"}, languages),
+	},
+	{
+		Key: SubMode, Type: TypeEnum, Default: "off", Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Subtitles",
+		Options: []Option{
+			{Value: "off", Label: "Off", Description: "Switched on by hand in the player."},
+			{Value: "forced", Label: "Signs and foreign dialogue", Description: "Only the short tracks that translate signs and lines in another language."},
+			{Value: "foreign", Label: "When the audio is in another language", Description: "Full subtitles when a film is not in your language; otherwise only signs and foreign dialogue."},
+			{Value: "always", Label: "Always", Description: "Full subtitles whenever there are some in your language."},
+		},
+	},
+	{
+		Key: SubLang, Type: TypeEnum, Default: "", Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Subtitle language",
+		Description: "Picture-based subtitles, common on disc copies, are drawn into the video, which means converting it.",
+		Options:     withFirst(Option{Value: "", Label: "Same as the audio language"}, languages),
+		HideWhen:    &Condition{Key: SubMode, Value: "off"},
+	},
+	{
+		Key: "autoplay", Type: TypeBool, Default: On, Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Play the next episode",
+		Description: "Starts the next episode when one ends, after a short countdown you can stop.",
+	},
+	{
+		Key: "skip-intro", Type: TypeEnum, Default: "button", Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Intros",
+		Options: []Option{
+			{Value: "auto", Label: "Skip automatically", Description: "Jumps past a detected intro as it starts. Seek back into it to watch it after all."},
+			{Value: "button", Label: "Show a Skip intro button", Description: "Offers to skip while a detected intro plays."},
+			{Value: "off", Label: "Do nothing", Description: "Intros play like the rest of the episode."},
+		},
+	},
+	{
+		Key: "skip-credits", Type: TypeEnum, Default: "card", Scope: ScopePerson, Lockable: true,
+		Section: "playback", Label: "Credits",
+		Options: []Option{
+			{Value: "next", Label: "Go to the next episode", Description: "The next episode starts as soon as detected credits begin, when Play the next episode is on."},
+			{Value: "card", Label: "Show what is up next", Description: "A card offers the next episode when the credits begin, and plays it after a short countdown."},
+			{Value: "end", Label: "Play to the end", Description: "The credits play out, and the next episode follows when the file ends."},
+		},
+	},
+	{
+		Key: "music-quality", Type: TypeEnum, Default: "original", Scope: ScopeDevice, Lockable: true,
+		Section: "playback", Label: "Music quality",
+		Description: "Data saver streams a smaller copy, for phones on mobile data. From the next track.",
+		Options: []Option{
+			{Value: "original", Label: "Original"},
+			{Value: "opus-128", Label: "High (Opus 128k)"},
+			{Value: "opus-64", Label: "Data saver (Opus 64k)"},
+		},
+	},
+	{
+		Key: "theme", Type: TypeString, Default: "midnight", Scope: ScopePerson, Lockable: false,
+		Section: "appearance", Label: "Theme",
+		Description: "Follows you to every device you sign in on.",
+	},
+}
+
+var byKey = func() map[string]*Pref {
+	m := make(map[string]*Pref, len(registry))
+	for i := range registry {
+		m[registry[i].Key] = &registry[i]
+	}
+	return m
+}()
+
+// Registry is every registered preference, in Settings order. The slice is
+// a copy; the entries are shared and must not be changed.
+func Registry() []Pref { return slices.Clone(registry) }
+
+// Lookup returns a registered preference, or nil for a key the registry
+// does not know (which is still stored, as an opaque string).
+func Lookup(key string) *Pref { return byKey[key] }
+
+// Validate checks a value against the preference's type.
+func (p *Pref) Validate(v string) error {
+	if len(v) > MaxValueLen {
+		return fmt.Errorf("%s: a value is at most %d characters", p.Key, MaxValueLen)
+	}
+	switch p.Type {
+	case TypeBool:
+		if v != On && v != Off {
+			return fmt.Errorf("%s: must be %q or %q", p.Key, On, Off)
+		}
+	case TypeEnum:
+		if !slices.ContainsFunc(p.Options, func(o Option) bool { return o.Value == v }) {
+			return fmt.Errorf("%s: %q is not one of its choices", p.Key, v)
+		}
+	case TypeInt:
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("%s: must be a whole number", p.Key)
+		}
+		if (p.Min != nil && n < *p.Min) || (p.Max != nil && n > *p.Max) {
+			return fmt.Errorf("%s: %d is out of range", p.Key, n)
+		}
+	case TypeString:
+		if v == "" && p.Default != "" {
+			return fmt.Errorf("%s: cannot be empty", p.Key)
+		}
+	case TypeList:
+		var list []string
+		if err := json.Unmarshal([]byte(v), &list); err != nil {
+			return fmt.Errorf("%s: must be a JSON array of strings", p.Key)
+		}
+	}
+	return nil
+}

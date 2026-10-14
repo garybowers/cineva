@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,9 +43,17 @@ type User struct {
 	// in the library: RequestNone, RequestApproval or RequestAuto. An
 	// admin's stored level is ignored; see EffectiveRequestLevel.
 	RequestLevel string `json:"requestLevel"`
+	// SegmentEditor marks a trusted editor: a user who may correct intro
+	// and credits times and start their detection on the titles they can
+	// see. Admins may whatever it says; see CanEditSegments.
+	SegmentEditor bool `json:"segmentEditor"`
 }
 
 func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
+
+// CanEditSegments reports whether the user may set intro and credits times
+// by hand and send titles back to detection.
+func (u User) CanEditSegments() bool { return u.IsAdmin() || u.SegmentEditor }
 
 // EffectiveRequestLevel is the level that applies: admins are always
 // trusted to send requests straight to Sonarr and Radarr.
@@ -80,6 +86,12 @@ type Session struct {
 	// Queue is the device's play queue as JSON (see SessionQueue).
 	Queue          string `json:"-"`
 	QueueUpdatedAt string `json:"-"`
+	// AreaID is the Home Assistant area the device is in, its room; "" for
+	// none (see docs/homeassistant.md).
+	AreaID string `json:"areaId"`
+	// DeviceSecretHash is the hash of the device cookie's secret; '' until
+	// the browser has been given one. Never sent.
+	DeviceSecretHash string `json:"-"`
 }
 
 // SessionQueue is a device's video play queue, as stored on its session.
@@ -116,6 +128,7 @@ type UserRepo interface {
 	SetAvatar(ctx context.Context, id, path string) error
 	SetAvatarColour(ctx context.Context, id, colour string) error
 	SetRequestLevel(ctx context.Context, id, level string) error
+	SetSegmentEditor(ctx context.Context, id string, on bool) error
 	SetPasswordHash(ctx context.Context, id, hash string) error
 	SetPINHash(ctx context.Context, id, hash string) error
 	Profiles(ctx context.Context) ([]User, error)
@@ -143,13 +156,13 @@ type UserRepo interface {
 
 var _ UserRepo = (*Store)(nil)
 
-const userCols = `id, username, display_name, password_hash, pin_hash, role, disabled, created_at, avatar, avatar_colour, request_level`
+const userCols = `id, username, display_name, password_hash, pin_hash, role, disabled, created_at, avatar, avatar_colour, request_level, segment_editor`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var disabled int
 	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash, &u.PINHash, &u.Role, &disabled, &u.CreatedAt,
-		&u.Avatar, &u.AvatarColour, &u.RequestLevel)
+		&u.Avatar, &u.AvatarColour, &u.RequestLevel, &u.SegmentEditor)
 	u.Disabled = disabled == 1
 	u.HasPassword = u.PasswordHash != ""
 	u.HasPin = u.PINHash != ""
@@ -351,6 +364,19 @@ func (s *Store) SetRequestLevel(ctx context.Context, id, level string) error {
 	return s.setUserField(ctx, id, "request_level", level)
 }
 
+// SetSegmentEditor makes the user a trusted editor of intro and credits
+// times, or stops them being one.
+func (s *Store) SetSegmentEditor(ctx context.Context, id string, on bool) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET segment_editor = ? WHERE id = ?`, on, id)
+	if err != nil {
+		return fmt.Errorf("set segment editor: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetAvatarColour sets the token the initial is drawn on; ” is the default.
 func (s *Store) SetAvatarColour(ctx context.Context, id, colour string) error {
 	if colour != "" && !slices.Contains(AvatarColours, colour) {
@@ -372,28 +398,60 @@ func (s *Store) setUserField(ctx context.Context, id, column, value string) erro
 
 // ---- sessions ----
 
-const sessionCols = `id, token_hash, user_id, name, created_at, expires_at, last_seen_at, client, client_ip, queue, queue_updated_at`
+// A session is read with its device: the name and room are the screen's
+// (see docs/devices.md), and the session shares the device's id.
+const sessionCols = `s.id, s.token_hash, s.user_id, d.name, s.created_at, s.expires_at, s.last_seen_at,
+	s.client, s.client_ip, s.queue, s.queue_updated_at, d.ha_area, d.secret_hash`
+
+const sessionFrom = `sessions s JOIN devices d ON d.id = s.id`
 
 func scanSession(row interface{ Scan(...any) error }) (Session, error) {
 	var sess Session
 	err := row.Scan(&sess.ID, &sess.TokenHash, &sess.UserID, &sess.Name, &sess.CreatedAt, &sess.ExpiresAt,
-		&sess.LastSeenAt, &sess.Client, &sess.ClientIP, &sess.Queue, &sess.QueueUpdatedAt)
+		&sess.LastSeenAt, &sess.Client, &sess.ClientIP, &sess.Queue, &sess.QueueUpdatedAt, &sess.AreaID, &sess.DeviceSecretHash)
 	return sess, err
 }
 
-// CreateSession records a login. name carries a device's chosen name over
-// when its session is replaced (a password change signs everything out
-// and starts the caller a fresh one).
+// CreateSession signs a user in on a new device called name. Sign-in in a
+// browser goes through SignInOnDevice, onto the device its cookie names;
+// this is the shorthand for a device that is new anyway.
 func (s *Store) CreateSession(ctx context.Context, tokenHash, userID, expiresAt, client, ip, name string) (Session, error) {
-	id := make([]byte, 8)
-	if _, err := rand.Read(id); err != nil {
-		return Session{}, fmt.Errorf("session id: %w", err)
+	d, err := s.CreateDevice(ctx, "", client, ip)
+	if err != nil {
+		return Session{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO sessions (id, token_hash, user_id, expires_at, client, client_ip, name)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, hex.EncodeToString(id), tokenHash, userID, expiresAt, client, ip, name); err != nil {
+	if name != "" {
+		if _, err := s.db.ExecContext(ctx, `UPDATE devices SET name = ? WHERE id = ?`, strings.TrimSpace(name), d.ID); err != nil {
+			return Session{}, fmt.Errorf("name device: %w", err)
+		}
+	}
+	return s.SignInOnDevice(ctx, d.ID, tokenHash, userID, expiresAt, client, ip)
+}
+
+// SignInOnDevice starts a session on a device. A device holds one session
+// at a time, so whoever was signed in on it is signed out: choosing a
+// profile on the living-room TV replaces the last person's session there.
+func (s *Store) SignInOnDevice(ctx context.Context, deviceID, tokenHash, userID, expiresAt, client, ip string) (Session, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Session{}, fmt.Errorf("sign in: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, deviceID); err != nil {
+		return Session{}, fmt.Errorf("end the device's last session: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions (id, token_hash, user_id, expires_at, client, client_ip)
+		VALUES (?, ?, ?, ?, ?, ?)`, deviceID, tokenHash, userID, expiresAt, client, ip); err != nil {
 		return Session{}, fmt.Errorf("create session: %w", err)
 	}
-	sess, err := scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionCols+` FROM sessions WHERE token_hash = ?`, tokenHash))
+	if _, err := tx.ExecContext(ctx, `UPDATE devices SET client = ?, client_ip = ?, last_seen_at = datetime('now')
+		WHERE id = ?`, client, ip, deviceID); err != nil {
+		return Session{}, fmt.Errorf("update device: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Session{}, fmt.Errorf("sign in: %w", err)
+	}
+	sess, err := scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionCols+` FROM `+sessionFrom+` WHERE s.token_hash = ?`, tokenHash))
 	if err != nil {
 		return Session{}, fmt.Errorf("read new session: %w", err)
 	}
@@ -403,7 +461,7 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash, userID, expiresAt,
 // SessionByHash resolves a live (unexpired) session and its user.
 func (s *Store) SessionByHash(ctx context.Context, tokenHash string) (Session, User, error) {
 	sess, err := scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionCols+`
-		FROM sessions WHERE token_hash = ? AND expires_at > datetime('now')`, tokenHash))
+		FROM `+sessionFrom+` WHERE s.token_hash = ? AND s.expires_at > datetime('now')`, tokenHash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Session{}, User{}, ErrNotFound
 	}
@@ -412,6 +470,15 @@ func (s *Store) SessionByHash(ctx context.Context, tokenHash string) (Session, U
 	}
 	u, err := s.UserByID(ctx, sess.UserID)
 	return sess, u, err
+}
+
+// ExtendSession moves a session's expiry, for sliding expiry: a device in
+// use stays signed in.
+func (s *Store) ExtendSession(ctx context.Context, tokenHash, expiresAt string) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE token_hash = ?`, expiresAt, tokenHash); err != nil {
+		return fmt.Errorf("extend session: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) TouchSession(ctx context.Context, tokenHash string) error {
@@ -431,8 +498,8 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID string) error {
 
 // UserSessions lists a user's live sessions, most recently active first.
 func (s *Store) UserSessions(ctx context.Context, userID string) ([]Session, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionCols+` FROM sessions
-		WHERE user_id = ? AND expires_at > datetime('now') ORDER BY last_seen_at DESC, created_at DESC`, userID)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionCols+` FROM `+sessionFrom+`
+		WHERE s.user_id = ? AND s.expires_at > datetime('now') ORDER BY s.last_seen_at DESC, s.created_at DESC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("sessions: %w", err)
 	}
@@ -451,8 +518,8 @@ func (s *Store) UserSessions(ctx context.Context, userID string) ([]Session, err
 // UserSession is one of a user's live sessions by public id. Scoped to the
 // user, so one account can never address another's devices.
 func (s *Store) UserSession(ctx context.Context, userID, id string) (Session, error) {
-	sess, err := scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionCols+` FROM sessions
-		WHERE user_id = ? AND id = ? AND expires_at > datetime('now')`, userID, id))
+	sess, err := scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionCols+` FROM `+sessionFrom+`
+		WHERE s.user_id = ? AND s.id = ? AND s.expires_at > datetime('now')`, userID, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -485,10 +552,11 @@ func (s *Store) DeleteOtherSessions(ctx context.Context, userID, keepHash string
 	return int(n), err
 }
 
+// SetSessionName names the device a session is on.
 func (s *Store) SetSessionName(ctx context.Context, tokenHash, name string) error {
-	if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET name = ? WHERE token_hash = ?`,
-		strings.TrimSpace(name), tokenHash); err != nil {
-		return fmt.Errorf("name session: %w", err)
+	if _, err := s.db.ExecContext(ctx, `UPDATE devices SET name = ?
+		WHERE id = (SELECT id FROM sessions WHERE token_hash = ?)`, strings.TrimSpace(name), tokenHash); err != nil {
+		return fmt.Errorf("name device: %w", err)
 	}
 	return nil
 }

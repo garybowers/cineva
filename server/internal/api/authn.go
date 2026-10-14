@@ -15,14 +15,20 @@ import (
 	"github.com/garybowers/cineva/server/internal/auth"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/playback"
+	"github.com/garybowers/cineva/server/internal/prefs"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
 const (
 	sessionCookie = "cineva_session"
-	ctxUser       = "cineva.user"
-	ctxSession    = "cineva.session"   // token hash, when authenticated by cookie
-	ctxSessionID  = "cineva.sessionID" // the same session's public id
+	// deviceCookie names the screen a browser is (docs/devices.md). Not a
+	// credential: it signs no one in, only says which device a sign-in is
+	// on. Kept as long as browsers allow, and renewed on use.
+	deviceCookie    = "cineva_device"
+	deviceCookieAge = 400 * 24 * time.Hour
+	ctxUser         = "cineva.user"
+	ctxSession      = "cineva.session"   // token hash, when authenticated by cookie
+	ctxSessionID    = "cineva.sessionID" // the same session's public id, which is its device's (docs/devices.md)
 )
 
 // authenticate resolves the caller from the session cookie or an API key
@@ -50,6 +56,8 @@ func (s *server) authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 				return echo.NewHTTPError(http.StatusUnauthorized, "session expired")
 			}
 			_ = s.store.TouchSession(ctx, hash)
+			s.renewSession(c, hash, ck.Value, sess.ExpiresAt)
+			s.ensureDeviceCookie(c, sess)
 			c.Set(ctxUser, u)
 			c.Set(ctxSession, hash)
 			c.Set(ctxSessionID, sess.ID)
@@ -142,6 +150,90 @@ func visibleLibraryIDs(u store.User) []string {
 	return u.LibraryIDs
 }
 
+// sessionTimeLayout is how sessions' times are stored.
+const sessionTimeLayout = "2006-01-02 15:04:05"
+
+// renewSession slides a session's expiry: auth.session_days counts from
+// the last use, not from sign-in, so a device in regular use (the
+// living-room TV) never signs itself out, while one left unused still
+// does. Renewed at most once a day, so requests do not each rewrite the
+// row and the cookie. A failure costs only the renewal.
+func (s *server) renewSession(c echo.Context, hash, token, expiresAt string) {
+	exp, err := time.Parse(sessionTimeLayout, expiresAt)
+	if err != nil || time.Until(exp) > s.sessionTTL-24*time.Hour {
+		return
+	}
+	next := time.Now().UTC().Add(s.sessionTTL)
+	if err := s.store.ExtendSession(c.Request().Context(), hash, next.Format(sessionTimeLayout)); err != nil {
+		authLog.Warn("renewing a session failed", "err", err)
+		return
+	}
+	s.setSessionCookie(c, token, next)
+}
+
+// setDeviceCookie hands the browser its device's secret, or renews it.
+func (s *server) setDeviceCookie(c echo.Context, secret string) {
+	c.SetCookie(&http.Cookie{
+		Name: deviceCookie, Value: secret, Path: "/", MaxAge: int(deviceCookieAge.Seconds()),
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.cookieSecure(c),
+	})
+}
+
+// ensureDeviceCookie gives a signed-in browser its device's cookie when it
+// has none (a browser signed in before devices existed) or the wrong one,
+// and renews it about daily, alongside the session. A failure costs only
+// the cookie, which the next request tries again.
+func (s *server) ensureDeviceCookie(c echo.Context, sess store.Session) {
+	if ck, err := c.Cookie(deviceCookie); err == nil && ck.Value != "" && sess.DeviceSecretHash != "" &&
+		auth.HashToken(ck.Value) == sess.DeviceSecretHash {
+		if c.Response().Header().Get(echo.HeaderSetCookie) != "" { // the session was just renewed
+			s.setDeviceCookie(c, ck.Value)
+		}
+		return
+	}
+	secret, hash, err := auth.NewToken()
+	if err != nil {
+		return
+	}
+	if err := s.store.SetDeviceSecret(c.Request().Context(), sess.ID, hash); err != nil {
+		authLog.Warn("giving a device its cookie failed", "err", err)
+		return
+	}
+	s.setDeviceCookie(c, secret)
+}
+
+// deviceForSignIn is the device a sign-in happens on: the one this
+// browser's device cookie names, else the one it is still signed in on,
+// else a new one. The cookie is issued or renewed for it.
+func (s *server) deviceForSignIn(c echo.Context) (store.Device, error) {
+	ctx := c.Request().Context()
+	if ck, err := c.Cookie(deviceCookie); err == nil && ck.Value != "" {
+		if d, err := s.store.DeviceBySecret(ctx, auth.HashToken(ck.Value)); err == nil {
+			s.setDeviceCookie(c, ck.Value)
+			return d, nil
+		}
+	}
+	secret, hash, err := auth.NewToken()
+	if err != nil {
+		return store.Device{}, err
+	}
+	if ck, err := c.Cookie(sessionCookie); err == nil && ck.Value != "" {
+		if sess, _, err := s.store.SessionByHash(ctx, auth.HashToken(ck.Value)); err == nil {
+			if err := s.store.SetDeviceSecret(ctx, sess.ID, hash); err != nil {
+				return store.Device{}, err
+			}
+			s.setDeviceCookie(c, secret)
+			return s.store.Device(ctx, sess.ID)
+		}
+	}
+	d, err := s.store.CreateDevice(ctx, hash, clientLabel(c), c.RealIP())
+	if err != nil {
+		return store.Device{}, err
+	}
+	s.setDeviceCookie(c, secret)
+	return d, nil
+}
+
 func (s *server) setSessionCookie(c echo.Context, token string, expires time.Time) {
 	c.SetCookie(&http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", Expires: expires,
@@ -192,6 +284,14 @@ type authStatus struct {
 	SetupRequired bool        `json:"setupRequired"`
 	LoginMode     string      `json:"loginMode"`
 	User          *store.User `json:"user,omitempty"`
+	// AutoUser is who this device signs in as when nobody is signed in on
+	// it, for the client's "Back to ..." on the profile picker.
+	AutoUser *autoUser `json:"autoUser,omitempty"`
+}
+
+type autoUser struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
 }
 
 // GET /auth/status — public: does the server need its first admin, and
@@ -214,8 +314,51 @@ func (s *server) authStatusHandler(c echo.Context) error {
 				out.User = &u
 			}
 		}
+		auto, err := s.deviceAutoUser(c)
+		if err != nil {
+			return err
+		}
+		if auto != nil {
+			out.AutoUser = &autoUser{ID: auto.ID, DisplayName: auto.DisplayName}
+			if out.User == nil {
+				if _, err := s.startSession(c, *auto); err != nil {
+					return err
+				}
+				c.Set(ctxUser, *auto)
+				s.audit(c, "login.auto", "user", auto.ID, auto.Username, "")
+				out.User = auto
+			}
+		}
 	}
 	return c.JSON(http.StatusOK, out)
+}
+
+// deviceAutoUser is who this browser's device signs in as when nobody is
+// signed in on it, or nil. Only asked by the status check the client makes
+// when it opens, so a device never swaps people in the middle of anything.
+// A user who has since become an admin or been disabled is not signed in.
+func (s *server) deviceAutoUser(c echo.Context) (*store.User, error) {
+	ck, err := c.Cookie(deviceCookie)
+	if err != nil || ck.Value == "" {
+		return nil, nil
+	}
+	ctx := c.Request().Context()
+	d, err := s.store.DeviceBySecret(ctx, auth.HashToken(ck.Value))
+	if errors.Is(err, store.ErrNotFound) || (err == nil && d.AutoUserID == "") {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	u, err := s.store.UserByID(ctx, d.AutoUserID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	if u.Disabled || u.IsAdmin() {
+		return nil, nil
+	}
+	return &u, nil
 }
 
 type credentials struct {
@@ -250,7 +393,7 @@ func (s *server) authSetup(c echo.Context) error {
 	if err := s.store.AdoptLocalState(ctx, u.ID); err != nil {
 		return err
 	}
-	if err := s.startSession(c, u, ""); err != nil {
+	if _, err := s.startSession(c, u); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -295,7 +438,7 @@ func (s *server) authLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect username or password")
 	}
 	s.throttle.Reset(key)
-	if err := s.startSession(c, u, ""); err != nil {
+	if _, err := s.startSession(c, u); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -392,7 +535,7 @@ func (s *server) authPINLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect PIN")
 	}
 	s.throttle.Reset(key)
-	if err := s.startSession(c, u, ""); err != nil {
+	if _, err := s.startSession(c, u); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
@@ -448,20 +591,25 @@ func pinHash(pin string) (string, error) {
 	return auth.HashPassword(pin)
 }
 
-// startSession signs the browser in as u. name is the device name to carry
-// over when this replaces one of the caller's own sessions, ” otherwise.
-func (s *server) startSession(c echo.Context, u store.User, name string) error {
+// startSession signs the browser in as u, on the device it is. Whoever was
+// signed in on that device is signed out: a device holds one session.
+func (s *server) startSession(c echo.Context, u store.User) (store.Session, error) {
+	d, err := s.deviceForSignIn(c)
+	if err != nil {
+		return store.Session{}, err
+	}
 	token, hash, err := auth.NewToken()
 	if err != nil {
-		return err
+		return store.Session{}, err
 	}
 	expires := time.Now().UTC().Add(s.sessionTTL)
-	if _, err := s.store.CreateSession(c.Request().Context(), hash, u.ID,
-		expires.Format("2006-01-02 15:04:05"), clientLabel(c), c.RealIP(), name); err != nil {
-		return err
+	sess, err := s.store.SignInOnDevice(c.Request().Context(), d.ID, hash, u.ID,
+		expires.Format(sessionTimeLayout), clientLabel(c), c.RealIP())
+	if err != nil {
+		return store.Session{}, err
 	}
 	s.setSessionCookie(c, token, expires)
-	return nil
+	return sess, nil
 }
 
 // POST /auth/logout
@@ -536,14 +684,11 @@ func (s *server) authPassword(c echo.Context) error {
 	if err := s.store.SetPasswordHash(ctx, u.ID, hash); err != nil {
 		return err
 	}
-	name := ""
-	if hash, ok := c.Get(ctxSession).(string); ok {
-		if sess, _, err := s.store.SessionByHash(ctx, hash); err == nil {
-			name = sess.Name
-		}
-	}
+	// Every session ends. This device signs straight back in, and as a
+	// device outlives its sessions it keeps its name, room, preferences
+	// and modes.
 	_ = s.store.DeleteUserSessions(ctx, u.ID)
-	if err := s.startSession(c, u, name); err != nil {
+	if _, err := s.startSession(c, u); err != nil {
 		return err
 	}
 	s.audit(c, "user.password", "user", u.ID, u.Username, "changed own password")
@@ -607,6 +752,9 @@ type userRequest struct {
 	// RequestLevel, when present, sets what happens to the user's requests
 	// (one of store.RequestLevels). New users default to the server's.
 	RequestLevel *string `json:"requestLevel,omitempty"`
+	// SegmentEditor, when present, makes the user a trusted editor of
+	// intro and credits times, or stops them being one.
+	SegmentEditor *bool `json:"segmentEditor,omitempty"`
 }
 
 func (s *server) listUsers(c echo.Context) error {
@@ -672,7 +820,15 @@ func (s *server) createUser(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	u.RequestLevel = level
-	s.audit(c, "user.create", "user", u.ID, u.Username, u.Role)
+	detail := u.Role
+	if req.SegmentEditor != nil && *req.SegmentEditor {
+		if err := s.store.SetSegmentEditor(ctx, u.ID, true); err != nil {
+			return err
+		}
+		u.SegmentEditor = true
+		detail += " · intro & credits editor"
+	}
+	s.audit(c, "user.create", "user", u.ID, u.Username, detail)
 	s.events.Publish(events.Event{Type: "users"})
 	return c.JSON(http.StatusCreated, u)
 }
@@ -726,6 +882,16 @@ func (s *server) updateUser(c echo.Context) error {
 		}
 		detail += " · requests " + *req.RequestLevel
 	}
+	if req.SegmentEditor != nil && *req.SegmentEditor != u.SegmentEditor {
+		if err := s.store.SetSegmentEditor(ctx, u.ID, *req.SegmentEditor); err != nil {
+			return err
+		}
+		if *req.SegmentEditor {
+			detail += " · made an intro & credits editor"
+		} else {
+			detail += " · no longer an intro & credits editor"
+		}
+	}
 	if req.PIN != nil {
 		ph, err := pinHash(*req.PIN)
 		if err != nil {
@@ -766,46 +932,49 @@ func (s *server) deleteUser(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// GET /auth/prefs — this user's own UI preferences.
+// GET /auth/prefs — this user's own layer of preferences, as stored.
 //
-// Theme, quality, autoplay and the like. Kept server-side so the same
-// account agrees across a phone, a laptop and a future native client,
-// instead of each browser holding its own copy in localStorage.
+// The raw values the user has set, without the admin's defaults or locks
+// and without device values: GET /auth/me/prefs is the resolved view. Kept
+// for clients written before preferences had layers.
 func (s *server) getPrefs(c echo.Context) error {
-	prefs, err := s.store.Prefs(c.Request().Context(), userID(c))
+	values, err := s.store.Prefs(c.Request().Context(), userID(c))
 	if err != nil {
 		return err
 	}
-	return c.JSON(http.StatusOK, prefs)
+	return c.JSON(http.StatusOK, values)
 }
 
-// PUT /auth/prefs — merge preferences into this user's set.
+// PUT /auth/prefs — merge preferences into this user's own layer.
 //
-// Only the keys sent are touched, and an empty value clears one. Values are
-// opaque to the server: the client owns what they mean.
+// Only the keys sent are touched, and an empty value clears one. Written
+// as sent: a lock still wins when the value is resolved, and a value that
+// does not suit its key is ignored there, so nothing written here can
+// bypass either. PUT /auth/me/prefs is the checked way in.
 func (s *server) putPrefs(c echo.Context) error {
-	var prefs map[string]string
-	if err := c.Bind(&prefs); err != nil {
+	var raw map[string]string
+	if err := c.Bind(&raw); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
 	// A bound on what one account can store, so a buggy or hostile client
 	// cannot use preferences as free storage.
-	if len(prefs) > maxPrefKeys {
+	if len(raw) > prefs.MaxKeys {
 		return echo.NewHTTPError(http.StatusBadRequest, "too many preferences")
 	}
-	for k, v := range prefs {
-		if len(k) > maxPrefKeyLen || len(v) > maxPrefValueLen {
+	changes := make(map[string]*string, len(raw))
+	for k, v := range raw {
+		if len(k) > prefs.MaxKeyLen || len(v) > prefs.MaxValueLen {
 			return echo.NewHTTPError(http.StatusBadRequest, "preference key or value too long")
 		}
+		if v == "" {
+			changes[k] = nil
+		} else {
+			changes[k] = &v
+		}
 	}
-	if err := s.store.SetPrefs(c.Request().Context(), userID(c), prefs); err != nil {
+	if err := s.store.SetPrefs(c.Request().Context(), userID(c), changes); err != nil {
 		return err
 	}
+	s.events.Publish(events.Event{Type: "prefs", User: userID(c)})
 	return s.getPrefs(c)
 }
-
-const (
-	maxPrefKeys     = 50
-	maxPrefKeyLen   = 64
-	maxPrefValueLen = 512
-)

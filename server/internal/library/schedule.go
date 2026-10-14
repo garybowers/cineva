@@ -156,6 +156,11 @@ func (s *Scheduler) sweep(ctx context.Context) {
 	} else if n > 0 {
 		housekeepingLog.Info("expired sessions removed", "count", n)
 	}
+	if n, err := s.Store.PruneDevices(ctx); err != nil {
+		housekeepingLog.Error("device pruning failed", "err", err)
+	} else if n > 0 {
+		housekeepingLog.Info("unused devices forgotten", "count", n, "unused_for_days", store.DeviceUnusedDays)
+	}
 	if audit, plays, err := s.Store.PruneHistory(ctx, s.Retain); err != nil {
 		housekeepingLog.Error("history retention failed", "err", err)
 	} else if audit > 0 || plays > 0 {

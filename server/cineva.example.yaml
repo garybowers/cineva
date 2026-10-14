@@ -51,7 +51,9 @@ libraries:
   # player, and the up-next card and autoplay at the real credits. Each
   # episode's opening and closing stretch is decoded once and compared with
   # its neighbours'; the first pass over a large library reads a lot of
-  # disk.                                CINEVA_LIBRARIES_INTRO_DETECTION
+  # disk. Films get their end credits from a final chapter named for them
+  # ("End Credits", "Abspann"...), read during the scan at no extra cost.
+  # Turning this off stops both.         CINEVA_LIBRARIES_INTRO_DETECTION
   intro_detection: true
 
 transcode:
@@ -70,7 +72,9 @@ transcode:
   hwaccel: auto
 
 auth:
-  # How long a browser session lasts, in days.       CINEVA_AUTH_SESSION_DAYS
+  # How long a browser session lasts unused, in days: each day it is used
+  # pushes its end back, so a device in use stays signed in.
+  #                                               CINEVA_AUTH_SESSION_DAYS
   session_days: 30
   # Set true when served over HTTPS so session cookies carry Secure. Leave
   # false for plain HTTP or the browser discards them.

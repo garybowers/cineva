@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 )
 
 // Segment kinds.
@@ -66,7 +68,10 @@ type SegmentRepo interface {
 	SegmentStates(ctx context.Context, itemID string) ([]SegmentState, error)
 	SetManualSegment(ctx context.Context, itemID, kind string, seg *Segment) error
 	ClearManualSegment(ctx context.Context, itemID, kind string) error
-	RedetectSeasonSegments(ctx context.Context, seasonID string) (int64, error)
+	RedetectItemSegments(ctx context.Context, itemIDs []string, opts RedetectOptions) (RedetectResult, error)
+	RedetectLibrarySegments(ctx context.Context, libraryID string, opts RedetectOptions) (RedetectResult, error)
+	FilmsNeedingCredits(ctx context.Context, libraryID string) ([]SegmentFilm, error)
+	FilmCreditsState(ctx context.Context, filmID string) (SegmentFilm, error)
 }
 
 var _ SegmentRepo = (*Store)(nil)
@@ -313,21 +318,214 @@ func (s *Store) ClearManualSegment(ctx context.Context, itemID, kind string) err
 	return nil
 }
 
-// RedetectSeasonSegments marks every episode of a season due for detection
-// again, both kinds, except what an administrator set by hand. What was
-// found before stays served until the new analysis replaces it. Returns how
-// many analyses were reopened.
-func (s *Store) RedetectSeasonSegments(ctx context.Context, seasonID string) (int64, error) {
-	// -1 matches no file's mtime, so each episode reads as changed.
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE segment_analysis SET file_mtime = -1
-		 WHERE locked = 0 AND item_id IN (SELECT id FROM items WHERE parent_id = ? AND kind = 'episode')`,
-		seasonID)
-	if err != nil {
-		return 0, fmt.Errorf("redetect season %s: %w", seasonID, err)
+// RedetectOptions narrows a re-detection.
+type RedetectOptions struct {
+	// Kinds limits it to these kinds of segment; empty is every kind.
+	Kinds []string
+	// IncludeLocked reopens times set by hand as well, which otherwise
+	// stay as the person left them.
+	IncludeLocked bool
+}
+
+// RedetectResult is what a re-detection reopened.
+type RedetectResult struct {
+	// Items counts the episodes and films in its scope.
+	Items int `json:"items"`
+	// Reopened counts the analyses sent back to detection. Items never
+	// analysed are due already and are not among them.
+	Reopened int64 `json:"reopened"`
+	// Locked counts the items whose hand-set times were kept, so the
+	// person asking can be offered to replace them too.
+	Locked int `json:"locked"`
+	// Seasons and Films are what detection should take up first, seasons
+	// in series and season order. Left empty for a whole library, which
+	// goes through the library queue instead.
+	Seasons []string `json:"-"`
+	Films   []string `json:"-"`
+}
+
+// MaxRedetectItems bounds a selection sent back to detection in one go.
+const MaxRedetectItems = 1000
+
+// RedetectItemSegments sends titles back to detection: each item may be an
+// episode (that episode alone, still compared with its season), a season
+// (its episodes), a series (the episodes of every season) or a film (its
+// credits). Times set by hand are kept unless opts says otherwise, and what
+// was found before stays served until the new analysis replaces it.
+func (s *Store) RedetectItemSegments(ctx context.Context, itemIDs []string, opts RedetectOptions) (RedetectResult, error) {
+	if len(itemIDs) == 0 {
+		return RedetectResult{}, nil
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	if len(itemIDs) > MaxRedetectItems {
+		return RedetectResult{}, fmt.Errorf("redetect: %d items, at most %d at once", len(itemIDs), MaxRedetectItems)
+	}
+	in := placeholders(len(itemIDs))
+	where := `kind IN ('episode', 'movie') AND (id IN (` + in + `) OR parent_id IN (` + in + `)
+		OR parent_id IN (SELECT id FROM items WHERE kind = 'season' AND parent_id IN (` + in + `)))`
+	var args []any
+	for range 3 {
+		for _, id := range itemIDs {
+			args = append(args, id)
+		}
+	}
+	return s.redetect(ctx, where, args, opts, true)
+}
+
+// RedetectLibrarySegments sends every episode and film of a library back to
+// detection, as RedetectItemSegments does for named titles.
+func (s *Store) RedetectLibrarySegments(ctx context.Context, libraryID string, opts RedetectOptions) (RedetectResult, error) {
+	return s.redetect(ctx, `kind IN ('episode', 'movie') AND library_id = ?`, []any{libraryID}, opts, false)
+}
+
+// redetect reopens the analyses of the items matching where (a condition on
+// items, over args), for the kinds opts names. targets says whether to list
+// the seasons and films reopened.
+func (s *Store) redetect(ctx context.Context, where string, args []any, opts RedetectOptions, targets bool) (RedetectResult, error) {
+	kinds := opts.Kinds
+	if len(kinds) == 0 {
+		kinds = SegmentKinds
+	}
+	var kindArgs []any
+	for _, k := range kinds {
+		if !slices.Contains(SegmentKinds, k) {
+			return RedetectResult{}, fmt.Errorf("redetect: unknown segment kind %q", k)
+		}
+		kindArgs = append(kindArgs, k)
+	}
+	kindIn := placeholders(len(kindArgs))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RedetectResult{}, fmt.Errorf("redetect: %w", err)
+	}
+	defer tx.Rollback()
+
+	var res RedetectResult
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE `+where, args...).Scan(&res.Items); err != nil {
+		return RedetectResult{}, fmt.Errorf("redetect: count items: %w", err)
+	}
+	if !opts.IncludeLocked {
+		if err := tx.QueryRowContext(ctx,
+			`SELECT count(DISTINCT item_id) FROM segment_analysis
+			 WHERE locked = 1 AND kind IN (`+kindIn+`) AND item_id IN (SELECT id FROM items WHERE `+where+`)`,
+			append(slices.Clone(kindArgs), args...)...).Scan(&res.Locked); err != nil {
+			return RedetectResult{}, fmt.Errorf("redetect: count locked: %w", err)
+		}
+	}
+	// -1 matches no file's mtime, so each item reads as changed. A hand-set
+	// value reopened is unlocked too: detection's answer replaces it.
+	upd, err := tx.ExecContext(ctx,
+		`UPDATE segment_analysis SET file_mtime = -1, locked = 0
+		 WHERE kind IN (`+kindIn+`) AND (locked = 0 OR ?)
+		   AND item_id IN (SELECT id FROM items WHERE `+where+`)`,
+		append(append(slices.Clone(kindArgs), opts.IncludeLocked), args...)...)
+	if err != nil {
+		return RedetectResult{}, fmt.Errorf("redetect: %w", err)
+	}
+	res.Reopened, _ = upd.RowsAffected()
+	if targets {
+		if res.Seasons, err = queryStrings(ctx, tx,
+			`SELECT DISTINCT e.parent_id FROM items e JOIN items sn ON sn.id = e.parent_id
+			 WHERE e.kind = 'episode' AND e.id IN (SELECT id FROM items WHERE `+where+`)
+			 ORDER BY sn.parent_id, sn.season_num`, args...); err != nil {
+			return RedetectResult{}, fmt.Errorf("redetect: seasons: %w", err)
+		}
+		if res.Films, err = queryStrings(ctx, tx,
+			`SELECT id FROM items WHERE kind = 'movie' AND `+where+` ORDER BY title`, args...); err != nil {
+			return RedetectResult{}, fmt.Errorf("redetect: films: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RedetectResult{}, fmt.Errorf("redetect: %w", err)
+	}
+	return res, nil
+}
+
+// placeholders returns n comma-separated question marks.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// queryStrings runs a query returning one text column.
+func queryStrings(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// SegmentFilm is a film as credits detection sees it.
+type SegmentFilm struct {
+	ID          string
+	LibraryID   string
+	Title       string
+	Path        string
+	RuntimeSecs int
+	FileMtime   int64
+	// Analysed is true when the film's current file has been looked at
+	// for its credits, or they were set by hand.
+	Analysed bool
+}
+
+const segmentFilmCols = `i.id, i.library_id, i.title, i.path, i.runtime_secs, i.file_mtime,
+	a.item_id IS NOT NULL AND (a.locked = 1 OR a.file_mtime = i.file_mtime)`
+
+func scanSegmentFilm(row interface{ Scan(...any) error }) (SegmentFilm, error) {
+	var f SegmentFilm
+	err := row.Scan(&f.ID, &f.LibraryID, &f.Title, &f.Path, &f.RuntimeSecs, &f.FileMtime, &f.Analysed)
+	return f, err
+}
+
+// FilmsNeedingCredits lists a library's films whose current file has not
+// been looked at for end credits, in title order. As with episodes, files
+// not yet stamped by a scan are left out.
+func (s *Store) FilmsNeedingCredits(ctx context.Context, libraryID string) ([]SegmentFilm, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+segmentFilmCols+` FROM items i
+		 LEFT JOIN segment_analysis a ON a.item_id = i.id AND a.kind = 'credits'
+		 WHERE i.library_id = ? AND i.kind = 'movie' AND i.file_mtime != 0
+		   AND (a.item_id IS NULL OR (a.locked = 0 AND a.file_mtime != i.file_mtime))
+		 ORDER BY i.title, i.id`, libraryID)
+	if err != nil {
+		return nil, fmt.Errorf("films needing credits: %w", err)
+	}
+	defer rows.Close()
+	var out []SegmentFilm
+	for rows.Next() {
+		f, err := scanSegmentFilm(rows)
+		if err != nil {
+			return nil, fmt.Errorf("films needing credits: %w", err)
+		}
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("films needing credits: %w", err)
+	}
+	return out, nil
+}
+
+// FilmCreditsState returns one film as credits detection sees it.
+func (s *Store) FilmCreditsState(ctx context.Context, filmID string) (SegmentFilm, error) {
+	f, err := scanSegmentFilm(s.db.QueryRowContext(ctx,
+		`SELECT `+segmentFilmCols+` FROM items i
+		 LEFT JOIN segment_analysis a ON a.item_id = i.id AND a.kind = 'credits'
+		 WHERE i.id = ? AND i.kind = 'movie'`, filmID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SegmentFilm{}, ErrNotFound
+	}
+	if err != nil {
+		return SegmentFilm{}, fmt.Errorf("film credits state: %w", err)
+	}
+	return f, nil
 }
 
 // AdjacentSeasonEpisodes returns up to n episodes from the other seasons of

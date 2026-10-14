@@ -16,6 +16,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/homeassistant"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
@@ -375,6 +376,7 @@ func (s *server) playItem(c echo.Context) error {
 		// video stream bit-for-bit, so fall through to one instead of
 		// returning a direct-play URL that cannot play (mkv, most often).
 		if directPlayReason(item, caps) == "" {
+			s.registerPlayback(c, item, "direct", "original", "")
 			return c.JSON(http.StatusOK, direct)
 		}
 		if remuxSafe(item, vinfo) {
@@ -396,6 +398,10 @@ func (s *server) playItem(c echo.Context) error {
 		reason = "burning in image-based subtitles"
 	case quality == "" || quality == "auto":
 		if reason = directPlayReason(item, caps); reason == "" {
+			// Registered here, with the history row just opened, as the
+			// other paths are: left to the first heartbeat, the row was
+			// never closed and the play never counted.
+			s.registerPlayback(c, item, "direct", "original", "")
 			return c.JSON(http.StatusOK, direct)
 		}
 		// A container or audio-only mismatch is fixed by a remux, which
@@ -767,6 +773,7 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 	if id, ok := c.Get(playEventKey).(int64); ok {
 		p.EventID = id
 	}
+	p.DeviceID, _ = c.Get(ctxSessionID).(string)
 	// Context line: "Series · S01E02" for episodes, "Artist · Album" for tracks.
 	switch item.Kind {
 	case store.KindEpisode:
@@ -780,10 +787,11 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 			p.Subtitle = item.Artist + " · " + album.Title
 		}
 	}
-	s.playbacks.Start(p)
+	p = s.playbacks.Start(p)
 	if p.EventID != 0 { // a new play, not a heartbeat finding its entry gone
 		playbackLog.Info("playback started", "user", currentUser(c).Username, "title", playTitle(p),
 			"mode", p.Mode, "quality", p.Quality, "client", clientLabel(c), "ip", p.Client.IP)
+		s.firePlayback(homeassistant.PlaybackStarted, p)
 	}
 }
 
@@ -991,6 +999,7 @@ func (s *server) onPlaybackEnd(p playback.Playback) {
 	if err := s.store.FinishPlay(ctx, p.EventID, secs, completed, counts); err != nil {
 		playbackLog.Error("closing play history row failed", "event", p.EventID, "err", err)
 	}
+	s.firePlayback(homeassistant.PlaybackStopped, p)
 	s.events.Publish(events.Event{Type: "plays"})
 }
 

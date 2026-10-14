@@ -9,17 +9,16 @@
   // time — stays with App, which passes it in.
   import {
     User as UserIcon, MonitorPlay, Palette, Lock, MonitorSmartphone, Smartphone, KeyRound, Info,
-    ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy,
+    ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy, SlidersHorizontal,
   } from '@lucide/svelte'
   import {
-    AVATAR_COLOURS, QUALITIES, changePassword, createAPIKey, deleteAPIKey, listAPIKeys, nameDevice,
-    removeAvatar, revokeDevice, revokeOtherDevices, setAvatarColour, setPIN, updateMe,
-    type APIKey, type AvatarColour, type Device, type PlayQuality, type User,
+    AVATAR_COLOURS, changePassword, createAPIKey, deleteAPIKey, listAPIKeys, nameDevice,
+    removeAvatar, revokeDevice, revokeOtherDevices, forgetDevice, setAvatarColour, setPIN, updateMe,
+    type APIKey, type AvatarColour, type Device, type MyPrefs, type PrefEntry, type PrefOrigin, type User,
   } from './lib/api'
-  import { pref, setPref } from './lib/prefs'
+  import { onPrefs, prefState, resetPref, setPref } from './lib/prefs'
   import type { ThemeInfo } from './lib/theme'
-
-  type MusicQuality = 'original' | 'opus-128' | 'opus-64'
+  import { ha, loadHA } from './lib/homeassistant.svelte'
 
   let {
     me,
@@ -34,10 +33,6 @@
     onpickavatar,
     avatarBusy,
     avatarMsg,
-    autoplay,
-    onautoplay,
-    musicQuality,
-    onmusicquality,
   }: {
     me: User
     /** The open section's id, or '' for none (the list, on a phone). */
@@ -54,13 +49,15 @@
     onpickavatar: (file: File) => void
     avatarBusy: boolean
     avatarMsg: string
-    autoplay: boolean
-    onautoplay: (on: boolean) => void
-    musicQuality: MusicQuality
-    onmusicquality: (q: MusicQuality) => void
   } = $props()
 
-  const SECTIONS = [
+  // Preferences as the server resolved them, with the registry that
+  // describes them: the Playback and Appearance sections are drawn from it,
+  // so a preference the server adds appears here without a client change.
+  let prefs: MyPrefs | null = $state(prefState())
+  $effect(() => onPrefs((s) => (prefs = s)))
+
+  const BASE_SECTIONS = [
     { id: 'profile', label: 'Profile', icon: UserIcon },
     { id: 'playback', label: 'Playback', icon: MonitorPlay },
     { id: 'appearance', label: 'Appearance', icon: Palette },
@@ -69,9 +66,20 @@
     { id: 'keys', label: 'API keys', icon: KeyRound },
     { id: 'about', label: 'About', icon: Info },
   ]
+  // A section the registry names that this page does not know yet goes in
+  // before the account sections.
+  const SECTIONS = $derived.by(() => {
+    const known = new Set(BASE_SECTIONS.map((s) => s.id))
+    const extra = (prefs?.sections ?? [])
+      .filter((s) => !known.has(s.id))
+      .map((s) => ({ id: s.id, label: s.label, icon: SlidersHorizontal }))
+    const at = BASE_SECTIONS.findIndex((s) => s.id === 'security')
+    return [...BASE_SECTIONS.slice(0, at), ...extra, ...BASE_SECTIONS.slice(at)]
+  })
   // On a wide screen something is always open; on a phone '' is the list.
   const open = $derived(SECTIONS.some((s) => s.id === section) ? section : '')
   const shown = $derived(open || 'profile')
+  const extraSection = $derived(prefs?.sections.find((s) => s.id === shown && !BASE_SECTIONS.some((b) => b.id === s.id)))
   const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
   // ---- Profile ----
@@ -121,13 +129,19 @@
     'accent-2': 'Sky', 'chart-1': 'Colour one', 'chart-2': 'Colour two', 'chart-3': 'Colour three', ok: 'Green', err: 'Red',
   }
 
-  // ---- Playback ----
-  // Read when a title starts (quality, by App) or by the server when it
-  // picks tracks (languages, subtitles), so setting one is all there is.
-  let quality = $state(pref('quality', 'auto') as PlayQuality)
-  let audioLang = $state(pref('audio-lang', ''))
-  let subMode = $state(pref('sub-mode', 'off'))
-  let subLang = $state(pref('sub-lang', ''))
+  // ---- Preferences ----
+  // Read when a title starts (by App and the player) or by the server when
+  // it picks tracks, so setting one is all there is.
+  const inSection = (id: string) =>
+    (prefs?.registry ?? []).filter((p) => {
+      if (p.section !== id) return false
+      const hide = p.hideWhen
+      return !hide || prefs?.prefs[hide.key]?.value !== hide.value
+    })
+  const valueOf = (p: PrefEntry) => prefs?.prefs[p.key]?.value ?? p.default
+  const choiceLabel = (p: PrefEntry, v: string) =>
+    p.type === 'bool' ? (v === 'on' ? 'On' : 'Off') : (p.options?.find((o) => o.value === v)?.label ?? v)
+  const fromAdmin = (o?: PrefOrigin) => o?.source === 'server' || o?.source === 'group'
   function save(key: string, value: string) {
     try {
       setPref(key, value)
@@ -135,31 +149,6 @@
       /* private browsing: the server copy is what matters */
     }
   }
-  const QUALITY_HINTS: Record<PlayQuality, string> = {
-    auto: 'Plays the file as it is when this device can, and converts it only when it must.',
-    original: 'Always the untouched video. Some files will not play in some browsers.',
-    '1080p': 'Always converts, to save bandwidth or suit a slow connection.',
-    '720p': 'Always converts, to save bandwidth or suit a slow connection.',
-    '480p': 'Always converts, to save bandwidth or suit a slow connection.',
-  }
-  const SUB_MODES = [
-    { id: 'off', label: 'Off', hint: 'Switched on by hand in the player.' },
-    { id: 'forced', label: 'Signs and foreign dialogue', hint: 'Only the short tracks that translate signs and lines in another language.' },
-    { id: 'foreign', label: 'When the audio is in another language', hint: 'Full subtitles when a film is not in your language; otherwise only signs and foreign dialogue.' },
-    { id: 'always', label: 'Always', hint: 'Full subtitles whenever there are some in your language.' },
-  ]
-  const LANGUAGES = [
-    ['ar', 'Arabic'], ['zh', 'Chinese'], ['cs', 'Czech'], ['da', 'Danish'], ['nl', 'Dutch'], ['en', 'English'],
-    ['fi', 'Finnish'], ['fr', 'French'], ['de', 'German'], ['el', 'Greek'], ['he', 'Hebrew'], ['hi', 'Hindi'],
-    ['hu', 'Hungarian'], ['is', 'Icelandic'], ['id', 'Indonesian'], ['ga', 'Irish'], ['it', 'Italian'],
-    ['ja', 'Japanese'], ['ko', 'Korean'], ['ms', 'Malay'], ['no', 'Norwegian'], ['pl', 'Polish'],
-    ['pt', 'Portuguese'], ['ro', 'Romanian'], ['ru', 'Russian'], ['sk', 'Slovak'], ['es', 'Spanish'],
-    ['sv', 'Swedish'], ['th', 'Thai'], ['tr', 'Turkish'], ['uk', 'Ukrainian'], ['vi', 'Vietnamese'], ['cy', 'Welsh'],
-  ] as const
-  const MUSIC_QUALITIES: { id: MusicQuality; label: string }[] = [
-    { id: 'original', label: 'Original' }, { id: 'opus-128', label: 'High (Opus 128k)' }, { id: 'opus-64', label: 'Data saver (Opus 64k)' },
-  ]
-
   // ---- Sign-in and security ----
   let pwOpen = $state(false)
   let pwCurrent = $state(''), pwNew = $state(''), pwConfirm = $state(''), pwMsg = $state('')
@@ -241,7 +230,7 @@
   async function saveDeviceName(e: Event) {
     e.preventDefault()
     try {
-      await nameDevice(deviceName.trim())
+      await nameDevice({ name: deviceName.trim() })
       renaming = false
       deviceMsg = ''
       onreloaddevices()
@@ -249,11 +238,51 @@
       deviceMsg = errText(err)
     }
   }
+  // The room this device is in, for Home Assistant: the player shows that
+  // room's controls and the modes that play there.
+  const haAreas = $derived(
+    [...(ha.rooms?.allAreas ?? ha.rooms?.areas.filter((a) => a.id) ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
+  )
+  let areaBusy = $state(false)
+  let areaMsg = $state('')
+  async function saveArea(areaId: string) {
+    areaBusy = true
+    areaMsg = ''
+    try {
+      await nameDevice({ areaId })
+      if (ha.rooms) ha.rooms.currentAreaId = areaId
+      void loadHA()
+      onreloaddevices()
+    } catch (err) {
+      areaMsg = errText(err)
+    } finally {
+      areaBusy = false
+    }
+  }
+
   let gone: string[] = $state([]) // signed out here, hidden until the list reloads
   async function signOut(d: Device) {
     gone = [...gone, d.id]
     try {
       await revokeDevice(d.id)
+      onreloaddevices()
+    } catch (err) {
+      gone = gone.filter((id) => id !== d.id)
+      deviceMsg = errText(err)
+    }
+  }
+  // Forgetting a device removes it, with its name, room and settings, rather
+  // than only signing it out; asked twice, as it cannot be undone.
+  let forgetAsk = $state('')
+  async function forget(d: Device) {
+    if (forgetAsk !== d.id) {
+      forgetAsk = d.id
+      return
+    }
+    forgetAsk = ''
+    gone = [...gone, d.id]
+    try {
+      await forgetDevice(d.id)
       onreloaddevices()
     } catch (err) {
       gone = gone.filter((id) => id !== d.id)
@@ -391,84 +420,17 @@
 
     {:else if shown === 'playback'}
       <h2>Playback</h2>
-      <div class="card">
-        <div class="srow">
-          <label class="sl" for="s-quality">
-            <span class="st">Video quality</span>
-            <span class="sd">{QUALITY_HINTS[quality]} Changing it in the player changes it here too.</span>
-          </label>
-          <div class="sc">
-            <select id="s-quality" bind:value={quality} onchange={() => save('quality', quality)}>
-              {#each QUALITIES as q (q.id)}<option value={q.id}>{q.id === 'auto' ? 'Auto (recommended)' : q.label}</option>{/each}
-            </select>
-          </div>
-        </div>
-        <div class="srow">
-          <label class="sl" for="s-audio">
-            <span class="st">Audio language</span>
-            <span class="sd">Played when a file has it; otherwise the file's own choice.</span>
-          </label>
-          <div class="sc">
-            <select id="s-audio" bind:value={audioLang} onchange={() => save('audio-lang', audioLang)}>
-              <option value="">The file's default</option>
-              {#each LANGUAGES as [code, name] (code)}<option value={code}>{name}</option>{/each}
-            </select>
-          </div>
-        </div>
-        <div class="srow">
-          <label class="sl" for="s-subs">
-            <span class="st">Subtitles</span>
-            <span class="sd">{SUB_MODES.find((m) => m.id === subMode)?.hint}</span>
-          </label>
-          <div class="sc">
-            <select id="s-subs" bind:value={subMode} onchange={() => save('sub-mode', subMode)}>
-              {#each SUB_MODES as m (m.id)}<option value={m.id}>{m.label}</option>{/each}
-            </select>
-          </div>
-        </div>
-        {#if subMode !== 'off'}
-          <div class="srow">
-            <label class="sl" for="s-sublang">
-              <span class="st">Subtitle language</span>
-              <span class="sd">Picture-based subtitles, common on disc copies, are drawn into the video, which means converting it.</span>
-            </label>
-            <div class="sc">
-              <select id="s-sublang" bind:value={subLang} onchange={() => save('sub-lang', subLang)}>
-                <option value="">{audioLang ? 'Same as audio' : 'Any'}</option>
-                {#each LANGUAGES as [code, name] (code)}<option value={code}>{name}</option>{/each}
-              </select>
-            </div>
-          </div>
-        {/if}
-        <div class="srow tog">
-          <div class="sl">
-            <span class="st" id="s-autoplay">Play the next episode</span>
-            <span class="sd">Starts the next episode when one ends, after a short countdown you can stop.</span>
-          </div>
-          <div class="sc">
-            <button class="switch" role="switch" aria-checked={autoplay} aria-labelledby="s-autoplay" onclick={() => onautoplay(!autoplay)}><span></span></button>
-          </div>
-        </div>
-        <div class="srow">
-          <label class="sl" for="s-music">
-            <span class="st">Music quality</span>
-            <span class="sd">Data saver streams a smaller copy, for phones on mobile data. From the next track.</span>
-          </label>
-          <div class="sc">
-            <select id="s-music" value={musicQuality} onchange={(e) => onmusicquality((e.currentTarget as HTMLSelectElement).value as MusicQuality)}>
-              {#each MUSIC_QUALITIES as q (q.id)}<option value={q.id}>{q.label}</option>{/each}
-            </select>
-          </div>
-        </div>
-      </div>
+      {@render prefCard('playback')}
 
     {:else if shown === 'appearance'}
+      {@const themePref = prefs?.prefs.theme}
       <h2>Appearance</h2>
       <div class="card">
         <div class="srow col">
           <div class="sl">
             <span class="st">Theme</span>
             <span class="sd">Follows you to every device you sign in on.</span>
+            {#if fromAdmin(themePref)}<span class="sd">The default here is your administrator's choice.</span>{/if}
           </div>
           <div class="themes" role="radiogroup" aria-label="Theme">
             {#each themes as t (t.id)}
@@ -480,7 +442,14 @@
             {/each}
           </div>
         </div>
+        {#each inSection('appearance').filter((p) => p.key !== 'theme') as p (p.key)}
+          {@render prefRow(p)}
+        {/each}
       </div>
+
+    {:else if extraSection}
+      <h2>{extraSection.label}</h2>
+      {@render prefCard(extraSection.id)}
 
     {:else if shown === 'security'}
       <h2>Sign-in and security</h2>
@@ -531,7 +500,7 @@
 
     {:else if shown === 'devices'}
       <h2>Devices</h2>
-      <p class="lead">Every browser signed in as you. Sign one out if it is lost or not yours.</p>
+      <p class="lead">Every browser signed in as you. Sign one out if it is lost or not yours; a device keeps its name, room and settings until it is forgotten.</p>
       {#if thisDevice}
         <h3>This device</h3>
         <div class="card">
@@ -551,6 +520,31 @@
               </div>
               <button class="btn quiet" onclick={startRename}>{thisDevice.name ? 'Rename' : 'Name it'}</button>
             {/if}
+          </div>
+          {#if ha.rooms?.configured}
+            <div class="srow">
+              <div class="sl">
+                <label class="st" for="dev-area">This device is in</label>
+                <span class="sd">Its room in Home Assistant. The player shows that room's lights and modes.</span>
+              </div>
+              <div class="sc">
+                <select id="dev-area" value={ha.rooms.currentAreaId} disabled={areaBusy}
+                  onchange={(e) => saveArea((e.currentTarget as HTMLSelectElement).value)}>
+                  <option value="">No room</option>
+                  {#each haAreas as a (a.id)}<option value={a.id}>{a.name}</option>{/each}
+                </select>
+              </div>
+            </div>
+            {#if areaMsg}<p class="msg pad">{areaMsg}</p>{/if}
+          {/if}
+          <div class="srow">
+            <div class="sl">
+              <span class="st">Forget this device</span>
+              <span class="sd">Signing out keeps its name, room and settings for whoever signs in next. Forgetting removes them, and signs you out.</span>
+            </div>
+            <div class="sc">
+              <button class="btn quiet" onclick={() => forget(thisDevice)}>{forgetAsk === thisDevice.id ? 'Forget it?' : 'Forget'}</button>
+            </div>
           </div>
         </div>
       {/if}
@@ -647,6 +641,62 @@
   </div>
 </div>
 
+{#snippet prefCard(section: string)}
+  {#if prefs}
+    <div class="card">
+      {#each inSection(section) as p (p.key)}
+        {@render prefRow(p)}
+      {/each}
+    </div>
+  {:else}
+    <p class="lead">Loading your preferences…</p>
+  {/if}
+{/snippet}
+
+<!-- One preference, drawn from its registry entry: a switch, a list of
+     choices, a number or text. Locked ones stay visible but cannot be
+     changed; ones the viewer set say what Reset would go back to. -->
+{#snippet prefRow(p: PrefEntry)}
+  {@const r = prefs?.prefs[p.key]}
+  {@const value = valueOf(p)}
+  {@const hint = [p.options?.find((o) => o.value === value)?.description, p.description].filter(Boolean).join(' ')}
+  {@const id = `s-${p.key}`}
+  {@const locked = !!r?.locked}
+  <div class="srow" class:tog={p.type === 'bool'}>
+    <div class="sl">
+      <label class="st" id="{id}-l" for={id}>
+        {p.label}{#if p.scope === 'device'}<span class="tag">This device</span>{/if}
+      </label>
+      {#if hint}<span class="sd">{hint}</span>{/if}
+      {#if locked}
+        <span class="sd lock"><Lock size={13} /> Set by your administrator</span>
+      {:else if fromAdmin(r)}
+        <span class="sd">Your administrator's default.</span>
+      {:else if r?.default && r.default.value !== value}
+        <span class="sd">
+          <button class="reset" onclick={() => resetPref(p.key)}>Reset</button>
+          to {fromAdmin(r.default) ? "your administrator's default" : 'the default'}, {choiceLabel(p, r.default.value) || 'none'}
+        </span>
+      {/if}
+    </div>
+    <div class="sc">
+      {#if p.type === 'bool'}
+        <button {id} class="switch" role="switch" aria-checked={value === 'on'} aria-labelledby="{id}-l" disabled={locked}
+          onclick={() => save(p.key, value === 'on' ? 'off' : 'on')}><span></span></button>
+      {:else if p.type === 'enum'}
+        <select {id} {value} disabled={locked} onchange={(e) => save(p.key, (e.currentTarget as HTMLSelectElement).value)}>
+          {#each p.options ?? [] as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+        </select>
+      {:else if p.type === 'int'}
+        <input {id} type="number" {value} min={p.min} max={p.max} disabled={locked}
+          onchange={(e) => save(p.key, (e.currentTarget as HTMLInputElement).value)} />
+      {:else}
+        <input {id} {value} disabled={locked} onchange={(e) => save(p.key, (e.currentTarget as HTMLInputElement).value.trim())} />
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
 {#snippet deviceRow(d: Device)}
   <div class="dev">
     {#if isPhone(d)}<Smartphone size={20} />{:else}<MonitorSmartphone size={20} />{/if}
@@ -655,6 +705,7 @@
       <span class="sd">{[d.name ? d.client : '', where(d), d.online ? '' : `last used ${ago(d.lastSeenAt)}`].filter(Boolean).join(' · ')}</span>
     </div>
     <button class="btn quiet" onclick={() => signOut(d)}>Sign out</button>
+    <button class="btn quiet" onclick={() => forget(d)}>{forgetAsk === d.id ? 'Forget it?' : 'Forget'}</button>
   </div>
 {/snippet}
 
@@ -768,6 +819,13 @@
   .switch span { width: calc(1.5rem - 4px); height: calc(1.5rem - 4px); border-radius: 50%; background: var(--text); transition: transform 0.15s; }
   .switch[aria-checked='true'] { background: var(--accent); }
   .switch[aria-checked='true'] span { transform: translateX(1.1rem); }
+  .switch:disabled, select:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* ---- Preferences ---- */
+  label.st { cursor: default; }
+  .st .tag { margin-left: 0.5rem; vertical-align: 0.1em; }
+  .lock { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .reset { color: var(--accent-2); font-size: inherit; text-decoration: underline; text-underline-offset: 2px; }
 
   /* ---- Devices ---- */
   .dev { display: flex; align-items: center; gap: 0.9rem; padding: 0.8rem 1.1rem; color: var(--muted); }

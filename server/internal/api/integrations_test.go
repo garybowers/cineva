@@ -81,3 +81,49 @@ func TestIntegrationWebhookAuth(t *testing.T) {
 		})
 	}
 }
+
+// Names tell two instances of one kind apart, so no two may share one.
+func TestUniqueIntegrationName(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	hd, err := st.CreateArrConnection(ctx, store.ArrConnection{
+		Kind: "sonarr", Name: "Sonarr HD", URL: "http://sonarr:8989", APIKey: "k", CallbackURL: "http://cineva:4747",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: st}
+
+	for _, tc := range []struct {
+		name string
+		conn store.ArrConnection
+		want int // 0 for accepted
+	}{
+		{"a new name", store.ArrConnection{Kind: "sonarr", Name: "Sonarr 4K"}, 0},
+		{"taken by another", store.ArrConnection{Kind: "sonarr", Name: "Sonarr HD"}, http.StatusConflict},
+		{"taken, other case", store.ArrConnection{Kind: "radarr", Name: "sonarr hd"}, http.StatusConflict},
+		{"its own name, kept on edit", store.ArrConnection{ID: hd.ID, Kind: "sonarr", Name: "Sonarr HD"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := s.uniqueIntegrationName(ctx, tc.conn)
+			code := 0
+			if err != nil {
+				var he *echo.HTTPError
+				if !errors.As(err, &he) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				code = he.Code
+			}
+			if code != tc.want {
+				t.Fatalf("status = %d, want %d", code, tc.want)
+			}
+		})
+	}
+}

@@ -20,10 +20,12 @@ type LibraryAccess struct {
 }
 
 // UserGroup is a named set of this server's users ("Kids", "Grown-ups"),
-// for restricting libraries without listing every account.
+// for restricting libraries without listing every account. Priority orders
+// groups whose defaults conflict: the lowest number wins.
 type UserGroup struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
+	Priority  int      `json:"priority"`
 	MemberIDs []string `json:"memberIds"`
 	CreatedAt string   `json:"createdAt"`
 }
@@ -37,6 +39,7 @@ type AccessRepo interface {
 	CreateGroup(ctx context.Context, name string, memberIDs []string) (UserGroup, error)
 	UpdateGroup(ctx context.Context, id, name string, memberIDs []string) (UserGroup, error)
 	DeleteGroup(ctx context.Context, id string) error
+	SetGroupOrder(ctx context.Context, ids []string) error
 }
 
 var _ AccessRepo = (*Store)(nil)
@@ -148,16 +151,17 @@ func (s *Store) SetLibraryAccess(ctx context.Context, libraryID string, acc Libr
 	return tx.Commit()
 }
 
+// Groups lists every group in priority order.
 func (s *Store) Groups(ctx context.Context) ([]UserGroup, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, created_at FROM user_groups ORDER BY name COLLATE NOCASE`)
+		`SELECT id, name, priority, created_at FROM user_groups ORDER BY priority, name COLLATE NOCASE`)
 	if err != nil {
 		return nil, fmt.Errorf("groups: %w", err)
 	}
 	out := []UserGroup{}
 	for rows.Next() {
 		g := UserGroup{MemberIDs: []string{}}
-		if err := rows.Scan(&g.ID, &g.Name, &g.CreatedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Priority, &g.CreatedAt); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("groups: %w", err)
 		}
@@ -195,8 +199,8 @@ func (s *Store) groupMembers(ctx context.Context, groupID string) ([]string, err
 
 func (s *Store) group(ctx context.Context, id string) (UserGroup, error) {
 	g := UserGroup{}
-	err := s.db.QueryRowContext(ctx, `SELECT id, name, created_at FROM user_groups WHERE id = ?`, id).
-		Scan(&g.ID, &g.Name, &g.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, priority, created_at FROM user_groups WHERE id = ?`, id).
+		Scan(&g.ID, &g.Name, &g.Priority, &g.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserGroup{}, ErrNotFound
 	}
@@ -228,7 +232,10 @@ func (s *Store) saveGroup(ctx context.Context, id, name string, memberIDs []stri
 	defer tx.Rollback()
 	var res interface{ RowsAffected() (int64, error) }
 	if create {
-		res, err = tx.ExecContext(ctx, `INSERT INTO user_groups (id, name) VALUES (?, ?)`, id, name)
+		// A new group goes last: it should not quietly start overriding the
+		// defaults of groups the admin has already ordered.
+		res, err = tx.ExecContext(ctx, `INSERT INTO user_groups (id, name, priority)
+			VALUES (?, ?, (SELECT COALESCE(MAX(priority), -1) + 1 FROM user_groups))`, id, name)
 	} else {
 		res, err = tx.ExecContext(ctx, `UPDATE user_groups SET name = ? WHERE id = ?`, name, id)
 	}
@@ -266,3 +273,44 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// SetGroupOrder sets the groups' priority to the order given, first wins.
+// The list must name every group exactly once, so a stale admin page cannot
+// leave two groups sharing a place.
+func (s *Store) SetGroupOrder(ctx context.Context, ids []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("order groups: %w", err)
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_groups`).Scan(&n); err != nil {
+		return fmt.Errorf("order groups: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			return fmt.Errorf("%w: group %s is listed twice", ErrInvalidOrder, id)
+		}
+		seen[id] = true
+	}
+	if len(ids) != n {
+		return fmt.Errorf("%w: %d groups listed, %d exist", ErrInvalidOrder, len(ids), n)
+	}
+	for i, id := range ids {
+		res, err := tx.ExecContext(ctx, `UPDATE user_groups SET priority = ? WHERE id = ?`, i, id)
+		if err != nil {
+			return fmt.Errorf("order group %s: %w", id, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("%w: no group %s", ErrInvalidOrder, id)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("order groups: %w", err)
+	}
+	return nil
+}
+
+// ErrInvalidOrder is a group order that does not name every group once.
+var ErrInvalidOrder = errors.New("the order must list every group once")

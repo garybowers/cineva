@@ -71,6 +71,14 @@ func deviceLabel(sess store.Session) string {
 	return sess.Client
 }
 
+// deviceName is deviceLabel for a device nobody need be signed in on.
+func deviceName(d store.Device) string {
+	if d.Name != "" {
+		return d.Name
+	}
+	return d.Client
+}
+
 func (s *server) devicesFor(c echo.Context, owner store.User) ([]device, error) {
 	ctx := c.Request().Context()
 	sessions, err := s.store.UserSessions(ctx, owner.ID)
@@ -135,39 +143,57 @@ func currentSessionHash(c echo.Context) (string, error) {
 	return hash, nil
 }
 
-// PATCH /auth/sessions/current {name} — name this device.
+// PATCH /auth/sessions/current {name, areaId} — name this device, or put
+// it in a Home Assistant room. Fields left out are kept.
 func (s *server) nameDevice(c echo.Context) error {
 	hash, err := currentSessionHash(c)
 	if err != nil {
 		return err
 	}
 	var req struct {
-		Name string `json:"name"`
+		Name   *string `json:"name"`
+		AreaID *string `json:"areaId"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	name := strings.TrimSpace(req.Name)
-	if utf8.RuneCountInString(name) > 40 {
-		return echo.NewHTTPError(http.StatusBadRequest, "a device name is at most 40 characters")
+	ctx := c.Request().Context()
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if utf8.RuneCountInString(name) > 40 {
+			return echo.NewHTTPError(http.StatusBadRequest, "a device name is at most 40 characters")
+		}
+		if err := s.store.SetSessionName(ctx, hash, name); err != nil {
+			return err
+		}
 	}
-	if err := s.store.SetSessionName(c.Request().Context(), hash, name); err != nil {
-		return err
+	if req.AreaID != nil {
+		if err := s.validArea(*req.AreaID); err != nil {
+			return err
+		}
+		id, _ := c.Get(ctxSessionID).(string)
+		if err := s.store.SetDeviceArea(ctx, id, *req.AreaID); err != nil {
+			return err
+		}
+		s.events.Publish(events.Event{Type: "homeassistant", User: userID(c)})
 	}
 	s.events.Publish(events.Event{Type: "devices", User: userID(c)})
 	return c.NoContent(http.StatusNoContent)
 }
 
-// DELETE /auth/sessions/:id — sign one of the caller's other devices out.
+// DELETE /auth/sessions/:id — sign one of the caller's other devices out,
+// or with ?forget=true forget a device altogether (this one included).
 func (s *server) revokeDevice(c echo.Context) error {
-	if current, _ := c.Get(ctxSessionID).(string); c.Param("id") == current {
+	if current, _ := c.Get(ctxSessionID).(string); c.Param("id") == current && c.QueryParam("forget") != "true" {
 		return echo.NewHTTPError(http.StatusBadRequest, "use sign out for this device")
 	}
 	return s.revokeSession(c, currentUser(c), c.Param("id"))
 }
 
 // revokeSession signs a device out and closes its event stream, so it
-// finds out now rather than at its next request.
+// finds out now rather than at its next request. The device stays known,
+// with its name, room and preferences, unless ?forget=true, which removes
+// it: owner must be the one signed in on it.
 func (s *server) revokeSession(c echo.Context, owner store.User, id string) error {
 	ctx := c.Request().Context()
 	sess, err := s.store.UserSession(ctx, owner.ID, id)
@@ -176,12 +202,23 @@ func (s *server) revokeSession(c echo.Context, owner store.User, id string) erro
 	} else if err != nil {
 		return err
 	}
-	if err := s.store.DeleteUserSession(ctx, owner.ID, id); err != nil {
+	forget := c.QueryParam("forget") == "true"
+	if forget {
+		err = s.store.DeleteDevice(ctx, id)
+	} else {
+		err = s.store.DeleteUserSession(ctx, owner.ID, id)
+	}
+	if err != nil {
 		return err
 	}
 	s.events.Publish(events.Event{Type: "revoked", User: owner.ID, Session: id})
 	s.events.Publish(events.Event{Type: "devices", User: owner.ID})
-	s.audit(c, "session.revoke", "user", owner.ID, owner.Username, deviceLabel(sess))
+	action := "session.revoke"
+	if forget {
+		action = "device.forget"
+		s.events.Publish(events.Event{Type: "homeassistant"})
+	}
+	s.audit(c, action, "user", owner.ID, owner.Username, deviceLabel(sess))
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -361,4 +398,129 @@ func (s *server) revokeUserDevice(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusNotFound, "user not found")
 	}
 	return s.revokeSession(c, u, c.Param("sid"))
+}
+
+// ---- every device (admin) ----
+
+// adminDevice is a device as the admin's Devices page shows it.
+type adminDevice struct {
+	store.Device
+	// UserName is whoever is signed in on it now.
+	UserName string `json:"userName"`
+	Online   bool   `json:"online"`
+}
+
+// GET /devices (admin) — every screen, signed in on or not.
+func (s *server) listAllDevices(c echo.Context) error {
+	ctx := c.Request().Context()
+	devices, err := s.store.Devices(ctx)
+	if err != nil {
+		return err
+	}
+	users, err := s.store.Users(ctx)
+	if err != nil {
+		return err
+	}
+	names := map[string]string{}
+	for _, u := range users {
+		names[u.ID] = u.DisplayName
+		if names[u.ID] == "" {
+			names[u.ID] = u.Username
+		}
+	}
+	out := make([]adminDevice, 0, len(devices))
+	for _, d := range devices {
+		out = append(out, adminDevice{Device: d, UserName: names[d.UserID], Online: s.presence.online(d.ID)})
+	}
+	return c.JSON(http.StatusOK, out)
+}
+
+// PATCH /devices/:id (admin) {name, areaId, autoUserId} — fields left out
+// are kept. A device signs in by itself only as a user who is neither an
+// admin nor disabled: whoever sits in front of the TV gets that account.
+func (s *server) updateDevice(c echo.Context) error {
+	ctx := c.Request().Context()
+	d, err := s.store.Device(ctx, c.Param("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "device not found")
+	} else if err != nil {
+		return err
+	}
+	var req struct {
+		Name       *string `json:"name"`
+		AreaID     *string `json:"areaId"`
+		AutoUserID *string `json:"autoUserId"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if utf8.RuneCountInString(name) > 40 {
+			return echo.NewHTTPError(http.StatusBadRequest, "a device name is at most 40 characters")
+		}
+		if err := s.store.SetDeviceName(ctx, d.ID, name); err != nil {
+			return err
+		}
+	}
+	if req.AreaID != nil {
+		if err := s.validArea(*req.AreaID); err != nil {
+			return err
+		}
+		if err := s.store.SetDeviceArea(ctx, d.ID, *req.AreaID); err != nil {
+			return err
+		}
+		s.events.Publish(events.Event{Type: "homeassistant"})
+	}
+	if req.AutoUserID != nil {
+		detail := "shows the sign-in screen"
+		if id := *req.AutoUserID; id != "" {
+			u, err := s.store.UserByID(ctx, id)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "no such user")
+			}
+			if u.IsAdmin() {
+				return echo.NewHTTPError(http.StatusBadRequest,
+					"a device cannot sign in by itself as an admin: anyone in front of it would have the admin pages")
+			}
+			if u.Disabled {
+				return echo.NewHTTPError(http.StatusBadRequest, u.Username+" is disabled")
+			}
+			detail = "signs in as " + u.Username
+		}
+		if err := s.store.SetDeviceAutoUser(ctx, d.ID, *req.AutoUserID); err != nil {
+			return err
+		}
+		s.audit(c, "device.autouser", "device", d.ID, deviceName(d), detail)
+	}
+	if d.UserID != "" {
+		s.events.Publish(events.Event{Type: "devices", User: d.UserID})
+	}
+	updated, err := s.store.Device(ctx, d.ID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, updated)
+}
+
+// DELETE /devices/:id (admin) — forget a device: its name, room and
+// preferences go, and whoever is signed in on it is signed out.
+func (s *server) forgetDevice(c echo.Context) error {
+	ctx := c.Request().Context()
+	d, err := s.store.Device(ctx, c.Param("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "device not found")
+	} else if err != nil {
+		return err
+	}
+	if err := s.store.DeleteDevice(ctx, d.ID); err != nil {
+		return err
+	}
+	if d.UserID != "" {
+		s.events.Publish(events.Event{Type: "revoked", User: d.UserID, Session: d.ID})
+		s.events.Publish(events.Event{Type: "devices", User: d.UserID})
+	}
+	s.events.Publish(events.Event{Type: "homeassistant"})
+	s.audit(c, "device.forget", "device", d.ID, deviceName(d), "")
+	return c.NoContent(http.StatusNoContent)
 }

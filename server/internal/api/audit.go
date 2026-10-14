@@ -42,6 +42,8 @@ var auditMessages = map[string]string{
 	"request.delete":      "request withdrawn",
 	"request.search":      "searched for missing episodes",
 	"integration.options": "integration options changed",
+	"prefs.defaults":      "preference defaults changed",
+	"group.order":         "group priority changed",
 }
 
 // logAudit puts an audit entry on the console as well as in the trail: who

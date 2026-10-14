@@ -1,18 +1,20 @@
 <!--
-  An episode's intro and credits, for an administrator to correct: what
-  detection found (or did not), set by hand with m:ss times, said to be
-  absent, or handed back to detection — and the whole season sent back to
-  detection. A value set by hand is locked: re-detection leaves it alone
-  until it is handed back.
+  An episode's intro and credits, or a film's credits, for an administrator
+  or trusted editor to correct: what detection found (or did not), set by
+  hand with m:ss times, said to be absent, or handed back to detection — and
+  the item, or an episode's whole season, sent back to detection. A value
+  set by hand is locked: re-detection leaves it alone until it is handed
+  back, unless the person asks for it to be replaced.
 -->
 <script lang="ts">
   import { onMount } from 'svelte'
   import {
-    itemSegments, setItemSegment, clearItemSegment, redetectSeason,
+    itemSegments, setItemSegment, clearItemSegment,
     type Item, type ItemSegments, type SegmentKind, type SegmentState,
   } from './lib/api'
+  import { detect } from './lib/detection.svelte'
 
-  let { episode, onclose }: { episode: Item; onclose: () => void } = $props()
+  let { item, onclose }: { item: Item; onclose: () => void } = $props()
 
   const KINDS: { kind: SegmentKind; label: string; none: string }[] = [
     { kind: 'intro', label: 'Intro', none: 'No intro' },
@@ -30,7 +32,7 @@
 
   onMount(() => {
     dialog?.focus()
-    itemSegments(episode.id).then(take).catch((err) => (loadErr = errText(err)))
+    itemSegments(item.id).then(take).catch((err) => (loadErr = errText(err)))
   })
 
   const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -91,15 +93,18 @@
       msg = `The ${label.toLowerCase()} must end after it starts.`
       return
     }
-    run(() => setItemSegment(episode.id, kind, { startSecs: a, endSecs: b }), `${label} saved. Re-detection will leave it alone.`)
+    run(() => setItemSegment(item.id, kind, { startSecs: a, endSecs: b }), `${label} saved. Re-detection will leave it alone.`)
   }
 
-  async function redetect() {
+  /** Send this item — or, for an episode, its whole season — back to
+      detection. The season is the episode's parent; detect only needs its
+      id and kind. */
+  async function redetect(season: boolean) {
     busy = true
     msg = ''
     try {
-      await redetectSeason(episode.id)
-      msg = 'This season will be detected again, starting once nothing is playing. Times set by hand are kept.'
+      const target: Item = season && item.parentId ? { ...item, id: item.parentId, kind: 'season' } : item
+      msg = await detect(target, film ? ['credits'] : undefined)
     } catch (err) {
       msg = errText(err)
     } finally {
@@ -115,20 +120,23 @@
     }
   }
 
-  const code = $derived(`S${String(episode.seasonNum ?? 0).padStart(2, '0')}E${String(episode.episodeNum ?? 0).padStart(2, '0')}`)
+  const film = $derived(item.kind === 'movie')
+  const code = $derived(film ? '' : `S${String(item.seasonNum ?? 0).padStart(2, '0')}E${String(item.episodeNum ?? 0).padStart(2, '0')} · `)
+  // The kinds this item has: a film's opening is not worth skipping.
+  const kinds = $derived(KINDS.filter((k) => data?.segments.some((s) => s.kind === k.kind)))
 </script>
 
 <div class="seg-back" role="presentation" onclick={onclose}></div>
-<div class="seg" role="dialog" aria-modal="true" aria-label="Intro and credits" tabindex="-1" bind:this={dialog} onkeydown={onKeydown}>
-  <h2>Intro &amp; credits</h2>
-  <p class="sub">{code} · {episode.title}{#if data?.runtimeSecs} · {fmt(data.runtimeSecs)} long{/if}</p>
+<div class="seg" role="dialog" aria-modal="true" aria-label={film ? 'Credits' : 'Intro and credits'} tabindex="-1" bind:this={dialog} onkeydown={onKeydown}>
+  <h2>{film ? 'Credits' : 'Intro & credits'}</h2>
+  <p class="sub">{code}{item.title}{#if data?.runtimeSecs} · {fmt(data.runtimeSecs)} long{/if}</p>
 
   {#if loadErr}
     <p class="msg err">{loadErr}</p>
   {:else if !data}
     <p class="sub">Loading…</p>
   {:else}
-    {#each KINDS as k (k.kind)}
+    {#each kinds as k (k.kind)}
       {@const s = stateOf(k.kind)}
       <section class="kind">
         <header>
@@ -149,13 +157,13 @@
           <button type="button" class="btn primary" onclick={() => save(k.kind, k.label)} disabled={busy}>Save</button>
           <button
             type="button" class="btn"
-            onclick={() => run(() => setItemSegment(episode.id, k.kind, { none: true }), `Marked as having no ${k.label.toLowerCase()}.`)}
+            onclick={() => run(() => setItemSegment(item.id, k.kind, { none: true }), `Marked as having no ${k.label.toLowerCase()}.`)}
             disabled={busy || (s?.locked && !s.found)}>{k.none}</button>
           {#if s?.locked}
             <button
               type="button" class="btn"
-              title="Forget the times set by hand; detection looks at this episode again"
-              onclick={() => run(() => clearItemSegment(episode.id, k.kind), `${k.label} handed back to detection.`)}
+              title="Forget the times set by hand; detection looks at this {film ? 'film' : 'episode'} again"
+              onclick={() => run(() => clearItemSegment(item.id, k.kind), `${k.label} handed back to detection.`)}
               disabled={busy}>Back to detection</button>
           {/if}
         </div>
@@ -169,8 +177,14 @@
     {#if data?.detection}
       <button
         type="button" class="btn"
-        title="Detect every episode of this season again, keeping times set by hand"
-        onclick={redetect} disabled={busy}>Re-detect season</button>
+        title={film ? 'Read this film’s chapters for its credits again' : 'Detect this episode again, compared with the rest of its season'}
+        onclick={() => redetect(false)} disabled={busy}>Detect again</button>
+      {#if !film && item.parentId}
+        <button
+          type="button" class="btn"
+          title="Detect every episode of this season again"
+          onclick={() => redetect(true)} disabled={busy}>Detect season</button>
+      {/if}
     {/if}
     <span class="spacer"></span>
     <button type="button" class="btn" onclick={onclose}>Close</button>

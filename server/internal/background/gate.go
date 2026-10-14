@@ -166,6 +166,18 @@ func (g *Gate) ScheduleWait() string {
 // that changes: "manual", "schedule", "on-demand" or a Busy reason, and ""
 // when the gate opens.
 func (g *Gate) Wait(ctx context.Context, available func() bool, report func(reason string)) error {
+	return g.wait(ctx, available, report, true)
+}
+
+// WaitNow is Wait for work someone asked for by name — "Detect" on one
+// series — which goes ahead whatever the schedule says, as "Analyse now"
+// does, but still holds for a manual pause and gives way to playback and
+// scans.
+func (g *Gate) WaitNow(ctx context.Context, available func() bool, report func(reason string)) error {
+	return g.wait(ctx, available, report, false)
+}
+
+func (g *Gate) wait(ctx context.Context, available func() bool, report func(reason string), schedule bool) error {
 	poll := g.Poll
 	if poll <= 0 {
 		poll = time.Second
@@ -189,7 +201,7 @@ func (g *Gate) Wait(ctx context.Context, available func() bool, report func(reas
 		reason := ""
 		if g.Policy.Paused() {
 			reason = "manual"
-		} else if r := g.ScheduleWait(); r != "" {
+		} else if r := g.ScheduleWait(); schedule && r != "" {
 			reason = r
 		} else if g.Busy != nil {
 			if r := g.Busy(); r != "" {

@@ -23,11 +23,13 @@ import (
 	"github.com/garybowers/cineva/server/internal/auth"
 	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/events"
+	"github.com/garybowers/cineva/server/internal/homeassistant"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/playback"
+	"github.com/garybowers/cineva/server/internal/prefs"
 	"github.com/garybowers/cineva/server/internal/requests"
 	"github.com/garybowers/cineva/server/internal/segments"
 	"github.com/garybowers/cineva/server/internal/stats"
@@ -105,6 +107,9 @@ type server struct {
 	storage           *library.StorageMonitor
 	presence          *presence // which sessions have an event stream open
 	requests          *requests.Service
+	ha                *homeassistant.Service
+	haWho             principals // who users are, for Home Assistant access checks
+	prefs             *prefs.Service
 
 	// Library-wide metadata refreshes in flight, keyed by library id.
 	refreshMu sync.Mutex
@@ -131,6 +136,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		trickplayDir:      cfg.PreviewsDir,
 		background:        background.NewPolicy(),
 		refreshes:         map[string]*refreshJob{},
+		ha:                homeassistant.New(st),
+		prefs:             prefs.NewService(st),
 	}
 	if s.trickplayDir == "" {
 		s.trickplayDir = filepath.Join(cfg.TranscodeDir, "trickplay")
@@ -300,7 +307,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 			return r
 		}
 		if s.segments != nil {
-			if d := s.segments.Status(); d.Running && !d.Paused {
+			if s.segments.Status().Reading() {
 				return "detecting"
 			}
 		}
@@ -350,6 +357,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	// Closes each playback's history row, so the dashboard can tell a play
 	// that was watched from one that was abandoned after ten seconds.
 	s.playbacks.OnEnd = s.onPlaybackEnd
+	s.playbacks.OnPause = s.onPlaybackPause
+	s.startHomeAssistant(samplerCtx)
 	go s.playbacks.Run(samplerCtx)
 
 	e := echo.New()
@@ -511,6 +520,8 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.POST("/auth/pin/set", s.authSetPIN)
 	v1.GET("/auth/prefs", s.getPrefs)
 	v1.PUT("/auth/prefs", s.putPrefs)
+	v1.GET("/auth/me/prefs", s.getMyPrefs)
+	v1.PUT("/auth/me/prefs", s.putMyPrefs)
 	v1.GET("/auth/keys", s.listAPIKeys)
 	v1.POST("/auth/keys", s.createAPIKey)
 	v1.DELETE("/auth/keys/:id", s.deleteAPIKey)
@@ -524,6 +535,8 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.DELETE("/auth/sessions/:id", s.revokeDevice)
 	v1.GET("/auth/sessions/:id/queue", s.deviceQueue)
 	v1.POST("/auth/sessions/:id/play", s.playOnDevice)
+	v1.GET("/auth/sessions/:id/prefs", s.getDevicePrefs)
+	v1.PUT("/auth/sessions/:id/prefs", s.putDevicePrefs)
 	v1.GET("/libraries", s.listLibraries)
 	v1.GET("/libraries/:id", s.getLibrary)
 	v1.GET("/libraries/:id/items", s.libraryItems)
@@ -546,6 +559,15 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/items/:id/missing", s.itemMissing)
 	v1.POST("/items/:id/missing/search", s.searchMissing)
 	v1.GET("/events", s.eventStream)
+	// Home Assistant: rooms, controls, cameras and modes. Each handler
+	// checks the caller may see the entity or mode.
+	v1.GET("/homeassistant/rooms", s.haRooms)
+	v1.POST("/homeassistant/entities/:entityId/action", s.haEntityAction)
+	v1.GET("/homeassistant/cameras/:entityId/snapshot", s.haCameraSnapshot)
+	v1.GET("/homeassistant/cameras/:entityId/hls/:file", s.haCameraHLS)
+	v1.GET("/homeassistant/cameras/:entityId/hls/:dir/:file", s.haCameraHLS)
+	v1.GET("/homeassistant/modes", s.listHAModes)
+	v1.POST("/homeassistant/modes/:id/run", s.runHAMode)
 
 	// Playback (milestone 3)
 	v1.POST("/items/:id/play", s.playItem)
@@ -577,6 +599,19 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.PUT("/playlists/:id/items", s.setPlaylistItems)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
 	v1.GET("/play/:sid/:file", s.hlsFile)
+	// Anyone can report wrong intro or credits times on what they can see.
+	v1.POST("/items/:id/segments/reports", s.createSegmentReport)
+
+	// Intro and credits: administrators and trusted editors correct them
+	// and send titles back to detection; each handler checks the title is
+	// one the caller can see.
+	ed := v1.Group("", requireSegmentEditor)
+	ed.GET("/segments/status", s.segmentStatus)
+	ed.GET("/items/:id/segments", s.itemSegments)
+	ed.PUT("/items/:id/segments/:kind", s.putItemSegment)
+	ed.DELETE("/items/:id/segments/:kind", s.clearItemSegment)
+	ed.POST("/items/:id/segments/redetect", s.redetectSegments)
+	ed.POST("/segments/redetect", s.redetectSelection)
 
 	// Admin only.
 	adm := v1.Group("", requireAdmin)
@@ -587,14 +622,12 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.PUT("/libraries/:id/scan/queued", s.queueFullScan)
 	adm.DELETE("/libraries/:id/scan/queued", s.cancelQueuedFullScan)
 	adm.GET("/scans", s.listScans)
-	adm.GET("/segments/status", s.segmentStatus)
 	adm.POST("/segments/pause", s.pauseSegments)
 	adm.POST("/segments/resume", s.resumeSegments)
 	adm.POST("/segments/run", s.runSegments)
-	adm.GET("/items/:id/segments", s.itemSegments)
-	adm.PUT("/items/:id/segments/:kind", s.putItemSegment)
-	adm.DELETE("/items/:id/segments/:kind", s.clearItemSegment)
-	adm.POST("/items/:id/segments/redetect", s.redetectSegments)
+	adm.POST("/libraries/:id/segments/redetect", s.redetectLibrary)
+	adm.GET("/segments/reports", s.listSegmentReports)
+	adm.POST("/segments/reports/:id/resolve", s.resolveSegmentReport)
 	adm.GET("/previews/status", s.previewStatus)
 	adm.POST("/scans/:id/cancel", s.cancelScan)
 	adm.GET("/fs/dirs", s.listDirs)
@@ -604,6 +637,19 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.DELETE("/integrations/:id", s.deleteIntegration)
 	adm.GET("/integrations/:id/status", s.integrationStatus)
 	adm.PUT("/integrations/:id/options", s.setIntegrationOptions)
+	adm.GET("/devices", s.listAllDevices)
+	adm.PATCH("/devices/:id", s.updateDevice)
+	adm.DELETE("/devices/:id", s.forgetDevice)
+	adm.GET("/homeassistant", s.getHomeAssistant)
+	adm.PUT("/homeassistant", s.putHomeAssistant)
+	adm.DELETE("/homeassistant", s.deleteHomeAssistant)
+	adm.GET("/homeassistant/entities", s.listHAEntities)
+	adm.PUT("/homeassistant/entities/:entityId", s.putHAEntity)
+	adm.GET("/homeassistant/devices", s.listHADevices)
+	adm.PUT("/homeassistant/devices/:id/area", s.putHADeviceArea)
+	adm.POST("/homeassistant/modes", s.createHAMode)
+	adm.PATCH("/homeassistant/modes/:id", s.updateHAMode)
+	adm.DELETE("/homeassistant/modes/:id", s.deleteHAMode)
 	adm.POST("/requests/:id/approve", s.approveRequest)
 	adm.POST("/requests/:id/decline", s.declineRequest)
 	// Metadata management: inspect a match, search for the right title,
@@ -645,6 +691,11 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.POST("/groups", s.createGroup)
 	adm.PUT("/groups/:id", s.updateGroup)
 	adm.DELETE("/groups/:id", s.deleteGroup)
+	adm.PUT("/groups/order", s.setGroupOrder)
+	adm.GET("/groups/:id/prefs", s.getGroupPrefs)
+	adm.PUT("/groups/:id/prefs", s.putGroupPrefs)
+	adm.GET("/prefs/defaults", s.getPrefDefaults)
+	adm.PUT("/prefs/defaults", s.putPrefDefaults)
 	adm.GET("/libraries/:id/access", s.getLibraryAccess)
 	adm.PUT("/libraries/:id/access", s.setLibraryAccess)
 }

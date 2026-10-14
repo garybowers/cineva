@@ -11,7 +11,7 @@ import (
 )
 
 // adminEvents carry server-wide information only admins may see.
-var adminEvents = map[string]bool{"stats": true, "sessions": true, "logs": true, "users": true, "scan": true, "integrations": true}
+var adminEvents = map[string]bool{"stats": true, "sessions": true, "logs": true, "users": true, "scan": true, "integrations": true, "segmentReports": true}
 
 // eventStream is the /api/v1/events endpoint: a Server-Sent Events stream of
 // state changes (scan progress, library changes) so UIs update live instead
@@ -54,6 +54,9 @@ func (s *server) eventStream(c echo.Context) error {
 				continue
 			}
 			if (ev.User != "" && ev.User != me.ID) || (ev.Session != "" && ev.Session != sessionID) {
+				continue
+			}
+			if ev.Allow != nil && !admin && !ev.Allow(me.ID) {
 				continue
 			}
 			// A revoked device's stream ends here rather than staying open

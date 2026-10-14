@@ -19,6 +19,11 @@ type Event struct {
 	// routing, not payload, and are never sent.
 	User    string `json:"-"`
 	Session string `json:"-"`
+	// Allow, when set, narrows the event further to the users it returns
+	// true for (admins always get it): a Home Assistant entity's state
+	// goes only to those who may see that entity. Called once per stream
+	// per event, so it must be cheap.
+	Allow func(userID string) bool `json:"-"`
 }
 
 // Bus fans events out to subscribers. Slow subscribers never block a

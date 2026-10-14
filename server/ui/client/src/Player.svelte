@@ -5,14 +5,17 @@
     nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
     PLAYBACK_STOPPED, itemStorage, streamProblem,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
-    type SubtitleTrack, type Device,
+    type SubtitleTrack, type Device, type HAMode,
   } from './lib/api'
   import { onDismiss } from './lib/dismiss'
+  import SegmentReport from './SegmentReport.svelte'
+  import RoomPanel from './ha/RoomPanel.svelte'
+  import { controlsOf, currentRoom, ha, playedElsewhere } from './lib/homeassistant.svelte'
   import { pref } from './lib/prefs'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize, Expand, Shrink,
     Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge, Cast,
-    MonitorSmartphone,
+    MonitorSmartphone, Flag, Lamp,
   } from '@lucide/svelte'
 
   let {
@@ -302,14 +305,23 @@
     if (video.buffered.length > 0) bufferedEnd = video.buffered.end(video.buffered.length - 1)
     reportProgress()
     if (!duration) return
+    if (inIntro && !introSkipped && introMode() === 'auto') {
+      // Once: seeking back into the intro is a choice to watch it.
+      introSkipped = true
+      skipIntro()
+    }
     const left = duration - current
-    const creditsAt = credits ? credits.startSecs : duration - CREDITS_WINDOW
+    // Credits the viewer would rather watch play out, as if none had been
+    // detected; "next" moves on as they begin, with no countdown.
+    const cue = creditsMode() === 'end' ? undefined : credits
+    const creditsAt = cue ? cue.startSecs : duration - CREDITS_WINDOW
     if (next && !dismissed && current >= creditsAt) {
       showNext = true
-      const startsAt = credits ? Math.min(duration, credits.startSecs + CREDITS_COUNTDOWN) : duration
+      const countdown = creditsMode() === 'next' ? 0 : CREDITS_COUNTDOWN
+      const startsAt = cue ? Math.min(duration, cue.startSecs + countdown) : duration
       remaining = Math.max(0, Math.ceil(startsAt - current))
       // A file without detected credits rolls on from onEnded instead.
-      if (credits && remaining === 0 && left > 1 && !advanced && autoplayNext()) {
+      if (cue && remaining === 0 && left > 1 && !advanced && autoplayNext()) {
         advanced = true
         reportProgress(true)
         onnext(next)
@@ -355,10 +367,49 @@
   // a couple of seconds before its end, when skipping would save nothing.
   const intro = $derived(info.segments?.find((s) => s.kind === 'intro'))
   const inIntro = $derived(!!intro && current >= intro.startSecs && current < intro.endSecs - 2)
+  // The viewer's choices: skip-intro is auto, button or off; skip-credits is
+  // next, card or end (see onTimeUpdate).
+  const introMode = () => pref('skip-intro', 'button')
+  const creditsMode = () => pref('skip-credits', 'card')
+  let introSkipped = $state(false)
+  const offerSkip = $derived(inIntro && introMode() !== 'off' && (introMode() !== 'auto' || introSkipped))
   function skipIntro() {
     if (intro) seekTo(intro.endSecs)
   }
   const credits = $derived(info.segments?.find((s) => s.kind === 'credits'))
+
+  // ---- A film's credits ----
+  // Found from the film's chapter names, or set by hand. "Skip credits"
+  // finishes the film as reaching its end would; when a scene follows the
+  // credits, it skips to the scene instead. Reaching them marks the film
+  // watched, as the server does for an episode.
+  const inFilmCredits = $derived(
+    item.kind === 'movie' && !!credits && current >= credits.startSecs && current < credits.endSecs - 2,
+  )
+  function skipCredits() {
+    if (!credits || !video) return
+    if (duration && credits.endSecs < duration - 10) {
+      seekTo(credits.endSecs)
+      return
+    }
+    // At least the credits' start, so the server counts the film finished
+    // even when skipped in their first second.
+    const at = Math.ceil(Math.max(video.currentTime, credits.startSecs))
+    lastPosted = at
+    postProgress(item.id, at, true).catch(onProgressError)
+    video.pause()
+    onended()
+  }
+
+  // ---- Reporting wrong times ----
+  // Where playback was when "Report wrong intro or credits times" was
+  // chosen; null while the form is closed. Playback pauses meanwhile.
+  let reportAt: number | null = $state(null)
+  function openReport() {
+    openMenu = null
+    reportAt = video?.currentTime ?? current
+    video?.pause()
+  }
 
   function skip(secs: number) {
     seekTo(video.currentTime + secs)
@@ -446,7 +497,7 @@
     idle = false
     clearTimeout(idleTimer)
     idleTimer = setTimeout(() => {
-      if (!compact && video && !video.paused && openMenu === null && !overControls) idle = true
+      if (!compact && video && !video.paused && openMenu === null && !roomOpen && !overControls) idle = true
     }, 3000)
   }
   const holdControls = (on: boolean) => () => {
@@ -710,6 +761,52 @@
     return onDismiss('.menuwrap', () => (openMenu = null))
   })
 
+  // ---- The room this device is in, and modes (Home Assistant) ----
+  // A Room button opens this device's room's controls, and every mode this
+  // user may run, this room's first: there whenever either has something.
+  let roomOpen = $state(false)
+  const hasRoom = $derived.by(() => {
+    if (!ha.rooms?.configured) return false
+    const room = currentRoom()
+    return (!!room && controlsOf(room).length > 0) || ha.modes.length > 0
+  })
+
+  // A mode started here that plays a title plays what is on screen. Where
+  // its device is already playing it, the room is set around the film; a
+  // film left paused here plays once the room is ready. Where the mode
+  // sends it to another device, it leaves here as it does for Play on.
+  const followed: Record<string, HAMode> = {}
+  const playsTitle = (m: HAMode) => m.steps.some((st) => st.type === 'play')
+  function onModeStart(m: HAMode, runId: string) {
+    if (!playsTitle(m)) return
+    followed[runId] = m
+    // The other device resumes from the saved position, so save it now.
+    if (video && !stoppedByAdmin && !failure) {
+      lastPosted = Math.floor(video.currentTime)
+      void postProgress(item.id, lastPosted, video.paused).catch(() => {})
+    }
+  }
+  $effect(() => {
+    for (const r of Object.values(ha.runs)) {
+      if (!followed[r.runId] || r.status === 'running') continue
+      delete followed[r.runId]
+      if (r.status !== 'done') continue
+      if (playedElsewhere(r)) {
+        roomOpen = false
+        video?.pause()
+        if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {})
+        onclose()
+      } else if (!r.playedOn && video?.paused) {
+        video.play().catch(() => {})
+      }
+    }
+  })
+  function openRoom() {
+    openMenu = null
+    roomOpen = true
+    wake()
+  }
+
   // The info overlay is a panel over the picture, so it dismisses like the
   // menus rather than only via its own close button.
   $effect(() => {
@@ -934,8 +1031,17 @@
         </div>
       </div>
     {/if}
-    {#if inIntro && !compact}
+    {#if offerSkip && !compact}
       <button class="skipintro" onclick={skipIntro}>Skip intro</button>
+    {/if}
+    {#if inFilmCredits && !compact}
+      <button class="skipintro" onclick={skipCredits}>Skip credits</button>
+    {/if}
+    {#if reportAt !== null}
+      <SegmentReport {item} positionSecs={reportAt} durationSecs={duration} onclose={() => (reportAt = null)} />
+    {/if}
+    {#if roomOpen && hasRoom && !compact}
+      <RoomPanel itemId={item.id} onclose={() => { roomOpen = false; wake() }} onmodestart={onModeStart} />
     {/if}
     {#if showNext && next && !compact}
       <div class="upnext">
@@ -1140,9 +1246,20 @@
                   role="menuitemradio" aria-checked={q.id === quality}
                   onclick={() => changeQuality(q.id)}>{q.label}</button>
               {/each}
+              {#if item.kind === 'episode' || item.kind === 'movie'}
+                <div class="menu-head">Something wrong?</div>
+                <button class="menu-item report-row" role="menuitem" onclick={openReport}>
+                  <Flag size={14} /> Report wrong {item.kind === 'movie' ? 'credits' : 'intro or credits'} times
+                </button>
+              {/if}
             </div>
           {/if}
         </div>
+        {#if hasRoom}
+          <button class="ctl" class:on={roomOpen} onclick={openRoom}
+            title="Room and modes" aria-label="Room and modes"
+            aria-haspopup="dialog" aria-expanded={roomOpen}><Lamp size={16} /></button>
+        {/if}
         {#if onplayon}
           <div class="menuwrap">
             <button
@@ -1238,6 +1355,10 @@
      when there are none wraps, so the menu keeps a sensible width. */
   .menu.cast { width: max-content; min-width: 13rem; max-width: min(18rem, calc(100vw - 2rem)); }
   .dev-row { display: flex; align-items: center; gap: 0.5rem; }
+  /* The report row is longer than the quality rows; it wraps rather than
+     widening the menu past a phone's edge. */
+  .report-row { display: flex; align-items: center; gap: 0.5rem; white-space: normal; max-width: 15rem; }
+  .report-row::before { display: none; }
   .dev-row::before { display: none; }
   .dev-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .menu-note {

@@ -50,6 +50,9 @@ export interface User {
   libraryIds: string[]
   /** What happens to their requests; admins are always auto, whatever this says. */
   requestLevel: RequestLevel
+  /** A trusted editor: corrects intro and credits times and starts their
+      detection without being an admin. */
+  segmentEditor?: boolean
 }
 /** none: no request screens; approval: requests wait for an admin; auto: sent straight to Sonarr/Radarr. */
 export type RequestLevel = 'none' | 'approval' | 'auto'
@@ -76,6 +79,7 @@ export interface UserRequest {
   pin?: string // set, or '' to clear
   avatarColour?: AvatarColour | '' // '' back to the default
   requestLevel?: RequestLevel
+  segmentEditor?: boolean
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
 export const authStatus = () => req<{ setupRequired: boolean; user?: User }>('/auth/status')
@@ -102,6 +106,8 @@ export const revokeUserDevice = (id: string, sid: string) => req<void>(`/users/$
 export interface UserGroup {
   id: string
   name: string
+  /** Where groups' preference defaults conflict, the lowest number wins. */
+  priority: number
   memberIds: string[]
   createdAt: string
 }
@@ -118,6 +124,38 @@ export const createGroup = (name: string, memberIds: string[]) => req<UserGroup>
 export const updateGroup = (id: string, name: string, memberIds: string[]) =>
   req<UserGroup>(`/groups/${id}`, json('PUT', { name, memberIds }))
 export const deleteGroup = (id: string) => req<void>(`/groups/${id}`, { method: 'DELETE' })
+/** Every group, first wins where their defaults conflict. */
+export const setGroupOrder = (groupIds: string[]) => req<UserGroup[]>('/groups/order', json('PUT', { groupIds }))
+
+// Preference defaults: the server's and each group's, each optionally
+// locked so users cannot change it. The registry says what each key is.
+export interface PrefOption { value: string; label: string; description?: string }
+export interface PrefEntry {
+  key: string
+  type: 'bool' | 'enum' | 'int' | 'string' | 'list'
+  default: string
+  scope: 'person' | 'device'
+  lockable: boolean
+  section: string
+  label: string
+  description: string
+  options?: PrefOption[]
+  min?: number
+  max?: number
+}
+export interface PrefSetting { value: string; locked?: boolean }
+export interface PrefDefaults {
+  sections: { id: string; label: string }[]
+  registry: PrefEntry[]
+  server: Record<string, PrefSetting>
+  groups: { id: string; name: string; priority: number; defaults: Record<string, PrefSetting> }[]
+}
+/** A setting sets a key; null clears it. */
+export type PrefDefaultChanges = Record<string, PrefSetting | null>
+export const getPrefDefaults = () => req<PrefDefaults>('/prefs/defaults')
+export const putServerDefaults = (changes: PrefDefaultChanges) => req<PrefDefaults>('/prefs/defaults', json('PUT', changes))
+export const putGroupDefaults = (id: string, changes: PrefDefaultChanges) =>
+  req<Record<string, PrefSetting>>(`/groups/${id}/prefs`, json('PUT', changes))
 
 // Sonarr and Radarr. Cineva registers a webhook in each, so what they import
 // is scanned in within seconds rather than at the next scheduled rescan.
@@ -182,6 +220,163 @@ export const deleteIntegration = (id: string) =>
 export const integrationStatus = (id: string) => req<IntegrationStatus>(`/integrations/${id}/status`)
 export const setIntegrationOptions = (id: string, o: IntegrationOptions) =>
   req<Integration>(`/integrations/${id}/options`, json('PUT', o))
+
+// Home Assistant: one connection per server. Cineva sees only the entities
+// an admin exposes, each open to everyone or restricted like a library; a
+// device can be put in a room (an area); a mode is a short list of steps
+// people run. See docs/homeassistant.md.
+export interface HAConnection {
+  /** False when no instance is connected; the rest is then absent. */
+  configured: boolean
+  name?: string
+  url?: string
+  /** The websocket is open and authenticated. */
+  connected?: boolean
+  /** Home Assistant's version, from the last connect. */
+  version?: string
+  /** The token's user is an administrator in Home Assistant, which firing events needs. */
+  isAdmin?: boolean
+  playbackEvents?: boolean
+  /** Why it is not connected, when it is not. */
+  error?: string
+  /** Entities in the supported domains, and how many of them are exposed. */
+  entities?: number
+  exposed?: number
+  createdAt?: string
+  updatedAt?: string
+}
+export interface HAConnectionRequest {
+  name?: string
+  url?: string
+  /** A long-lived access token; blank on a change keeps the current one. */
+  token?: string
+  playbackEvents?: boolean
+}
+export type HADomain = 'light' | 'switch' | 'fan' | 'input_boolean' | 'cover' | 'media_player' | 'scene' | 'script' | 'camera'
+/** An entity's state, normalised; fields that do not apply to its domain are left out. */
+export interface HAEntity {
+  entityId: string
+  domain: HADomain
+  name: string
+  /** Its area, or its device's; "" for none. */
+  areaId: string
+  state: string
+  available: boolean
+  on?: boolean
+  dimmable?: boolean
+  brightnessPct?: number
+  /** 0 to 1. */
+  volume?: number
+  muted?: boolean
+  source?: string
+  sources?: string[]
+  mediaTitle?: string
+  /** A cover's position, 100 open. */
+  position?: number
+  /** A camera that can stream live. */
+  stream?: boolean
+}
+export interface HAEntityAdmin extends HAEntity {
+  exposed: boolean
+  access: LibraryAccess
+}
+export interface HAArea {
+  id: string
+  name: string
+  entities: HAEntity[]
+}
+export interface HARooms {
+  configured: boolean
+  connected: boolean
+  areas: HAArea[]
+  /** Every area in Home Assistant, for choosing a device's room. */
+  allAreas?: { id: string; name: string }[]
+  currentAreaId: string
+}
+/** A signed-in device, any user's, with the room it is in. */
+export interface HADevice {
+  id: string
+  userId: string
+  userName: string
+  /** Its name, or its browser and system when unnamed. */
+  name: string
+  online: boolean
+  /** "" for none. */
+  areaId: string
+}
+export interface HAModeStep {
+  type: 'action' | 'wait' | 'play'
+  /** action: one allowed service on one entity, with its fields. */
+  entityId?: string
+  service?: string
+  brightnessPct?: number
+  volume?: number
+  muted?: boolean
+  source?: string
+  /** wait: 1 to 30. */
+  seconds?: number
+  /** play: on this device, this title, or the one the mode is started from when itemId is empty. */
+  deviceId?: string
+  itemId?: string
+}
+export interface HAModeRequest {
+  name?: string
+  steps?: HAModeStep[]
+  access?: LibraryAccess
+}
+export interface HAMode {
+  id: string
+  name: string
+  steps: HAModeStep[]
+  /** It plays the title it is started from. */
+  needsTitle: boolean
+  /** The room its play step's device is in; "" for none. */
+  areaId?: string
+  access?: LibraryAccess
+  createdAt?: string
+  updatedAt?: string
+}
+export const getHomeAssistant = () => req<HAConnection>('/homeassistant')
+export const putHomeAssistant = (r: HAConnectionRequest) => req<HAConnection>('/homeassistant', json('PUT', r))
+export const deleteHomeAssistant = () => req<void>('/homeassistant', { method: 'DELETE' })
+export const listHAEntities = () => req<HAEntityAdmin[]>('/homeassistant/entities')
+/** A camera exposed without access is restricted to admins until someone is granted it. */
+export const putHAEntity = (entityId: string, body: { exposed: boolean; access?: LibraryAccess }) =>
+  req<HAEntityAdmin>(`/homeassistant/entities/${encodeURIComponent(entityId)}`, json('PUT', body))
+// Every device: a screen, which outlives the sessions signed in on it
+// (docs/devices.md).
+export interface AdminDevice {
+  id: string
+  /** Chosen name; '' when unnamed. */
+  name: string
+  /** Browser and system: "Chrome · Android". */
+  client: string
+  clientIp: string
+  /** Its Home Assistant room; '' for none. */
+  areaId: string
+  createdAt: string
+  lastSeenAt: string
+  /** Who is signed in on it now; '' for nobody. */
+  userId: string
+  userName: string
+  /** Who it signs in as when nobody is; '' for nobody. */
+  autoUserId: string
+  online: boolean
+}
+export const listAllDevices = () => req<AdminDevice[]>('/devices')
+export const updateDevice = (id: string, change: { name?: string; areaId?: string; autoUserId?: string }) =>
+  req<AdminDevice>(`/devices/${id}`, json('PATCH', change))
+export const forgetDevice = (id: string) => req<void>(`/devices/${id}`, { method: 'DELETE' })
+
+export const listHADevices = () => req<HADevice[]>('/homeassistant/devices')
+export const putHADeviceArea = (id: string, areaId: string) =>
+  req<void>(`/homeassistant/devices/${id}/area`, json('PUT', { areaId }))
+export const haRooms = () => req<HARooms>('/homeassistant/rooms')
+export const listHAModes = () => req<HAMode[]>('/homeassistant/modes')
+export const createHAMode = (r: HAModeRequest) => req<HAMode>('/homeassistant/modes', json('POST', r))
+/** Fields left out keep their values; steps, when sent, replace all of them. */
+export const updateHAMode = (id: string, r: HAModeRequest) => req<HAMode>(`/homeassistant/modes/${id}`, json('PATCH', r))
+export const deleteHAMode = (id: string) => req<void>(`/homeassistant/modes/${id}`, { method: 'DELETE' })
 
 // Requests for titles outside the library.
 export type RequestState = 'requested' | 'approved' | 'downloading' | 'available' | 'declined'
@@ -303,20 +498,27 @@ export interface IntroStatus {
   seasonsTotal: number
   episodesDone: number
   episodesTotal: number
+  /** Films looked at for end credits (from their chapter names). */
+  filmsDone?: number
+  filmsTotal?: number
   introsFound: number
   creditsFound: number
   unreadable: number
   /** Waiting: "manual" (paused here), or giving way to "playing" / "scanning". */
   paused?: boolean
   pauseReason?: 'manual' | 'playing' | 'scanning' | 'schedule' | 'on-demand'
-  current?: { series: string; season: number; kind: 'intro' | 'credits'; phase: 'reading' | 'comparing' | 'saving'; done: number; total: number }
+  /** series is a film's title when film is set. */
+  current?: { series: string; season: number; film?: boolean; kind: 'intro' | 'credits'; phase: 'reading' | 'comparing' | 'saving'; done: number; total: number }
   recent?: IntroResult[]
+  /** Seasons and films asked for by name, analysed first; the first is in hand when working. */
+  targets?: DetectionTarget[]
   last?: {
     libraryId: string
     finishedAt: string
     seconds: number
     seasons: number
     episodes: number
+    films?: number
     introsFound: number
     creditsFound: number
     unreadable: number
@@ -329,15 +531,64 @@ export interface IntroResult {
   series: string
   season: number
   episode: number
+  /** series is a film's title. */
+  film?: boolean
   found: boolean
   startSecs?: number
   endSecs?: number
+}
+export interface DetectionTarget {
+  itemId: string
+  kind: 'season' | 'film'
+  libraryId?: string
+  seriesId?: string
+  title: string
+  season?: number
+  working: boolean
 }
 export const segmentStatus = () => req<IntroStatus>('/segments/status')
 export const pauseSegments = () => req<IntroStatus>('/segments/pause', { method: 'POST' })
 export const resumeSegments = () => req<IntroStatus>('/segments/resume', { method: 'POST' })
 /** "Analyse now": run straight away, whatever the schedule, until the backlog is done. Starts seek-bar previews too. */
 export const runSegments = () => req<IntroStatus>('/segments/run', { method: 'POST' })
+
+/** What a re-detection covered: locked counts items whose hand-set times were kept. */
+export interface RedetectResult { items: number; reopened: number; locked: number }
+export interface RedetectOptions { kinds?: ('intro' | 'credits')[]; includeLocked?: boolean }
+const jsonPost = (body: unknown): RequestInit => ({
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+})
+/** Detect a whole film or TV library's intros and credits again, through its queue. */
+export const redetectLibrary = (id: string, opts: RedetectOptions = {}) =>
+  req<RedetectResult>(`/libraries/${id}/segments/redetect`, jsonPost(opts))
+/** Detect a selection again, ahead of every library's queue. */
+export const redetectSelection = (items: string[], opts: RedetectOptions = {}) =>
+  req<RedetectResult>('/segments/redetect', jsonPost({ ...opts, items }))
+
+/** A viewer saying an intro or credits skip is in the wrong place. */
+export interface SegmentReport {
+  id: string
+  itemId: string
+  userId: string
+  userName: string
+  kind: 'intro' | 'credits'
+  /** Where playback was when it was reported. */
+  positionSecs: number
+  note?: string
+  createdAt: string
+  resolvedAt?: string
+  itemKind: 'episode' | 'movie'
+  title: string
+  libraryId: string
+  seriesTitle?: string
+  seasonId?: string
+  seasonNum?: number
+  episodeNum?: number
+  /** Open reports on the same season (a film's, the film), this one included. */
+  seasonOpen: number
+}
+export const segmentReports = () => req<SegmentReport[]>('/segments/reports')
+export const resolveSegmentReport = (id: string) => req<void>(`/segments/reports/${id}/resolve`, { method: 'POST' })
 
 /** Background seek-bar preview building; also pushed over /events as "previews". */
 export interface PreviewStatus {
@@ -396,7 +647,14 @@ export interface Item {
   genres?: string[]
   /** Fields an operator has edited; automatic updates leave these alone. */
   lockedFields?: string[]
+  parentId?: string
+  seasonNum?: number
+  episodeNum?: number
 }
+
+/** Titles across every library: films and series first, then episodes (at most 20). */
+export const searchItems = (q: string) => req<Item[]>(`/search?q=${encodeURIComponent(q)}`)
+export const getItem = (id: string) => req<{ item: Item; children?: Item[] }>(`/items/${id}`)
 
 export interface MatchCandidate {
   tmdbId: number

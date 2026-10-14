@@ -245,6 +245,9 @@ export interface User {
   libraryIds: string[]
   /** What happens to this user's requests (admins are always auto). */
   requestLevel?: 'none' | 'approval' | 'auto'
+  /** A trusted editor: may correct intro and credits times and start
+      their detection without being an admin. */
+  segmentEditor?: boolean
 }
 export interface Profile {
   id: string
@@ -273,6 +276,8 @@ export interface Device {
   /** Has the app open now, so can be sent a queue. */
   online: boolean
   queue?: { count: number; index: number; current?: Item; seriesTitle?: string; updatedAt: string }
+  /** The Home Assistant area it is in (its room); "" for none. */
+  areaId?: string
 }
 /** A queue on its way between devices. */
 export interface HandoffQueue {
@@ -309,7 +314,11 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export const authStatus = () => get<{ setupRequired: boolean; loginMode: 'picker' | 'form'; user?: User }>('/auth/status')
+/** autoUser is who this device signs in as when nobody is signed in on it
+    (an admin's choice), for "Back to ..." on the profile picker. Asking
+    signs such a device in as them when nobody is. */
+export const authStatus = () =>
+  get<{ setupRequired: boolean; loginMode: 'picker' | 'form'; user?: User; autoUser?: { id: string; displayName: string } }>('/auth/status')
 export const login = (username: string, password: string) => post<User>('/auth/login', { username, password })
 export const setupAdmin = (username: string, password: string, displayName: string) =>
   post<User>('/auth/setup', { username, password, displayName })
@@ -338,9 +347,13 @@ export const setAvatarColour = (colour: AvatarColour | '') =>
   req<User>('/auth/avatar/colour', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ colour }) })
 
 export const listDevices = () => get<Device[]>('/auth/sessions')
-export const nameDevice = (name: string) =>
-  req<void>('/auth/sessions/current', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+/** Name this device, or put it in a Home Assistant room ("" for none).
+    Fields left out are kept, so send only what changes. */
+export const nameDevice = (change: { name?: string; areaId?: string }) =>
+  req<void>('/auth/sessions/current', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(change) })
 export const revokeDevice = (id: string) => req<void>(`/auth/sessions/${id}`, { method: 'DELETE' })
+/** Forget a device: its name, room and settings go, and it is signed out. */
+export const forgetDevice = (id: string) => req<void>(`/auth/sessions/${id}?forget=true`, { method: 'DELETE' })
 export const revokeOtherDevices = () => post<{ revoked: number }>('/auth/sessions/revoke-others')
 /** Records this device's queue so another can take it over. */
 export const saveDeviceQueue = (itemIds: string[], index: number) =>
@@ -357,11 +370,11 @@ const post = <T>(path: string, body?: unknown) =>
     body: body === undefined ? undefined : JSON.stringify(body),
   })
 
-// ---- Intro and credits, corrected by an administrator ----
+// ---- Intro and credits, corrected by an administrator or trusted editor ----
 export type SegmentKind = 'intro' | 'credits'
 export interface SegmentState {
   kind: SegmentKind
-  /** The episode has this segment; startSecs and endSecs are its bounds. */
+  /** The item has this segment; startSecs and endSecs are its bounds. */
   found: boolean
   startSecs?: number
   endSecs?: number
@@ -371,7 +384,7 @@ export interface SegmentState {
   locked: boolean
 }
 export interface ItemSegments {
-  /** Intro detection is on, so the season can be re-detected. */
+  /** Intro detection is on, so the item can be re-detected. A film has credits only. */
   detection: boolean
   runtimeSecs: number
   segments: SegmentState[]
@@ -383,8 +396,47 @@ export const setItemSegment = (id: string, kind: SegmentKind, body: { startSecs:
 /** Hand a hand-set segment back to detection. */
 export const clearItemSegment = (id: string, kind: SegmentKind) =>
   req<ItemSegments>(`/items/${id}/segments/${kind}`, { method: 'DELETE' })
-/** Detect a season's intros and credits again; id is the season or one of its episodes. */
-export const redetectSeason = (id: string) => post<{ reopened: number }>(`/items/${id}/segments/redetect`)
+/** What a re-detection covered. */
+export interface RedetectResult {
+  /** Episodes and films in scope. */
+  items: number
+  /** Analyses sent back to detection. */
+  reopened: number
+  /** Items whose hand-set times were kept; ask before replacing them. */
+  locked: number
+}
+export interface RedetectOptions {
+  kinds?: SegmentKind[]
+  includeLocked?: boolean
+}
+/** Detect an episode (alone), season, series or film again, ahead of the
+    library queue. */
+export const redetectItem = (id: string, opts: RedetectOptions = {}) =>
+  post<RedetectResult>(`/items/${id}/segments/redetect`, opts)
+
+/** A season or film waiting for detection, or being worked on. */
+export interface DetectionTarget {
+  itemId: string
+  kind: 'season' | 'film'
+  libraryId?: string
+  seriesId?: string
+  title: string
+  season?: number
+  working: boolean
+}
+/** As much of detection's status as the client shows: what it was asked
+    to do, and whether it is waiting. */
+export interface DetectionStatus {
+  enabled: boolean
+  paused?: boolean
+  pauseReason?: string
+  targets?: DetectionTarget[]
+}
+export const detectionStatus = () => get<DetectionStatus>('/segments/status')
+
+/** Tell the administrator an intro or credits skip is in the wrong place. */
+export const reportSegment = (id: string, body: { kind: SegmentKind; positionSecs: number; note?: string }) =>
+  post<unknown>(`/items/${id}/segments/reports`, body)
 
 export const getHealth = () => get<Health>('/health')
 export const listLibraries = () => get<Library[]>('/libraries')
@@ -805,3 +857,168 @@ export const addToPlaylist = (id: string, itemIds: string[]) => post<PlaylistDet
 /** The playlist's tracks, replaced with these in this order. */
 export const setPlaylistTracks = (id: string, itemIds: string[]) =>
   send<PlaylistDetail>('PUT', `/playlists/${id}/items`, { itemIds })
+
+// ---- Preferences ----
+// The server's registry says what each preference is; the resolved view
+// says what applies to this viewer on this device, and why.
+
+export type PrefSource = 'device' | 'user' | 'group' | 'server' | 'builtin'
+export interface PrefOption { value: string; label: string; description?: string }
+export interface PrefEntry {
+  key: string
+  type: 'bool' | 'enum' | 'int' | 'string' | 'list'
+  default: string
+  /** person: follows you everywhere; device: stays with this screen. */
+  scope: 'person' | 'device'
+  lockable: boolean
+  section: string
+  label: string
+  description: string
+  options?: PrefOption[]
+  min?: number
+  max?: number
+  /** Hidden while another preference has this value. */
+  hideWhen?: { key: string; value: string }
+}
+export interface PrefOrigin { value: string; source: PrefSource; groupId?: string; groupName?: string }
+export interface ResolvedPref extends PrefOrigin {
+  /** Set by an administrator; source and groupName say whose lock. */
+  locked: boolean
+  /** What applies without this viewer's own choices: what Reset goes back to. */
+  default?: PrefOrigin
+}
+export interface MyPrefs {
+  device?: string
+  sections: { id: string; label: string }[]
+  registry: PrefEntry[]
+  prefs: Record<string, ResolvedPref>
+}
+/** A value sets a key; null hands it back to the default. */
+export type PrefChanges = Record<string, string | null>
+
+export const getMyPrefs = () => get<MyPrefs>('/auth/me/prefs')
+export const putMyPrefs = (changes: PrefChanges) => send<MyPrefs>('PUT', '/auth/me/prefs', changes)
+/** Device preferences on this browser's own session. */
+export const putDevicePrefs = (changes: PrefChanges) => send<MyPrefs>('PUT', '/auth/sessions/current/prefs', changes)
+
+// ---- Home Assistant: the rooms, controls, cameras and modes this user may see ----
+// Browsers only ever talk to Cineva, which holds the Home Assistant
+// credential; camera pictures and live video are proxied through it too.
+
+export type HADomain =
+  'light' | 'switch' | 'fan' | 'input_boolean' | 'cover' | 'media_player' | 'scene' | 'script' | 'camera'
+
+/** An entity's state, normalised. Fields that do not apply to its domain are left out. */
+export interface HAEntity {
+  entityId: string
+  domain: HADomain
+  /** Its friendly name. */
+  name: string
+  /** Its area, or its device's; "" for none. */
+  areaId: string
+  /** Home Assistant's own state: "on", "off", "playing", "open", ... */
+  state: string
+  /** False when Home Assistant reports it unavailable or unknown. */
+  available: boolean
+  /** Lights, switches, fans, input booleans, media players. */
+  on?: boolean
+  /** A light that takes brightnessPct. */
+  dimmable?: boolean
+  brightnessPct?: number
+  /** A media player's volume, 0 to 1. */
+  volume?: number
+  muted?: boolean
+  /** A media player's input, and the inputs it offers. */
+  source?: string
+  sources?: string[]
+  /** What a media player says is playing. */
+  mediaTitle?: string
+  /** A cover's position, 100 open. */
+  position?: number
+  /** A camera that can stream live. */
+  stream?: boolean
+}
+
+export interface HAArea {
+  /** Home Assistant's area id; "" for entities with no area. */
+  id: string
+  name: string
+  /** Cameras are among them. */
+  entities: HAEntity[]
+}
+
+export interface HARooms {
+  configured: boolean
+  /** False while Home Assistant is unreachable; the last known states are still listed. */
+  connected: boolean
+  /** By name: areas holding at least one exposed entity this user may see. */
+  areas: HAArea[]
+  /** Every area in Home Assistant, for choosing this device's room. */
+  allAreas?: { id: string; name: string }[]
+  /** This device's room; "" for none. */
+  currentAreaId: string
+  /** This device, to tell whether a mode played here or sent the title elsewhere. */
+  currentDeviceId?: string
+}
+
+/** One allowed service on an entity, with the fields its domain takes. */
+export interface HAAction {
+  service: string
+  brightnessPct?: number
+  volume?: number
+  muted?: boolean
+  source?: string
+}
+
+export interface HAModeStep {
+  type: 'action' | 'wait' | 'play'
+  entityId?: string
+  service?: string
+  brightnessPct?: number
+  volume?: number
+  muted?: boolean
+  source?: string
+  seconds?: number
+  deviceId?: string
+  itemId?: string
+}
+
+/** A named list of steps an admin builds and users run: "Movie mode". */
+export interface HAMode {
+  id: string
+  name: string
+  steps: HAModeStep[]
+  /** It plays the title it is started from, so running it needs an itemId. */
+  needsTitle: boolean
+  /** The room its play step's device is in; "" when it plays nothing or the device has no room. */
+  areaId?: string
+}
+
+/** A mode run's progress, sent over the event stream to whoever started it. */
+export interface HAModeRun {
+  runId: string
+  modeId: string
+  modeName: string
+  status: 'running' | 'done' | 'failed'
+  step: number
+  steps: number
+  error?: string
+  /** The device the title was sent to, once the play step has run; empty when it was already playing it. */
+  playedOn?: string
+  playedOnName?: string
+}
+
+export const haRooms = () => get<HARooms>('/homeassistant/rooms')
+/** Accepted when it answers; the new state arrives as a "homeassistant" event. */
+export const haEntityAction = (entityId: string, action: HAAction) =>
+  post<void>(`/homeassistant/entities/${encodeURIComponent(entityId)}/action`, action)
+/** A camera's current picture. Add a query parameter to fetch a fresh one. */
+export const haSnapshotURL = (entityId: string) =>
+  `/api/v1/homeassistant/cameras/${encodeURIComponent(entityId)}/snapshot`
+/** A camera's live view, for hls.js; its relative paths lead to the rest. */
+export const haStreamURL = (entityId: string) =>
+  `/api/v1/homeassistant/cameras/${encodeURIComponent(entityId)}/hls/master_playlist.m3u8`
+export const listHAModes = () => get<HAMode[]>('/homeassistant/modes')
+/** Starts it in the background; mode-run events report each step. */
+export const runHAMode = (id: string, itemId?: string) =>
+  post<{ runId: string }>(`/homeassistant/modes/${encodeURIComponent(id)}/run`, itemId ? { itemId } : {})

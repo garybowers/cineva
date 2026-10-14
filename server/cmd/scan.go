@@ -24,6 +24,7 @@ func newManager(st *store.Store, artworkDir string) *library.Manager {
 			"fix", "set metadata.tmdb.api_key, CINEVA_METADATA_TMDB_API_KEY or --tmdb-key")
 	}
 	mgr := library.NewManager(st, video, artworkDir)
+	mgr.FilmCredits = viper.GetBool("libraries.intro_detection")
 	if viper.GetBool("metadata.musicbrainz.enabled") {
 		mgr.Music = metadata.NewMusicBrainz()
 	}

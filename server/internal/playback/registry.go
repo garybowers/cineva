@@ -31,6 +31,7 @@ type Playback struct {
 	Mode         string    `json:"mode"` // "direct" | "hls"
 	Quality      string    `json:"quality,omitempty"`
 	SessionID    string    `json:"sessionId,omitempty"` // HLS transcode session, when Mode is hls
+	DeviceID     string    `json:"deviceId,omitempty"`  // the browser session (device) playing it
 	Client       Client    `json:"client"`
 	PositionSecs int       `json:"positionSecs"`
 	DurationSecs int       `json:"durationSecs"`
@@ -56,6 +57,9 @@ type Registry struct {
 	// without warning — would otherwise leave its history row open for
 	// ever.
 	OnEnd func(Playback)
+	// OnPause is called when a heartbeat says a playback was paused or
+	// resumed; Paused carries which.
+	OnPause func(Playback)
 
 	mu   sync.Mutex
 	byID map[string]*Playback
@@ -104,10 +108,21 @@ func (r *Registry) Start(p Playback) Playback {
 func (r *Registry) Touch(userID, itemID string, positionSecs int, paused bool) bool {
 	r.mu.Lock()
 	p, ok := r.byID[key(userID, itemID)]
+	var flipped *Playback
 	if ok {
+		if p.Paused != paused {
+			flipped = p
+		}
 		p.PositionSecs, p.Paused, p.LastSeenAt = positionSecs, paused, time.Now().UTC()
+		if flipped != nil {
+			cp := *p
+			flipped = &cp
+		}
 	}
 	r.mu.Unlock()
+	if flipped != nil && r.OnPause != nil {
+		r.OnPause(*flipped)
+	}
 	if ok {
 		r.changed()
 	}

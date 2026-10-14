@@ -49,6 +49,12 @@ type Manager struct {
 	// setting; "" falls back to US inside CertificationFor.
 	CertRegion string
 
+	// FilmCredits, when set, records each scanned film's end credits from
+	// its chapter names (media.CreditsChapter), from the probe the scan
+	// already makes. libraries.intro_detection turns it off with the rest
+	// of detection.
+	FilmCredits bool
+
 	// Storage, when set, is consulted before a scan walks anything: a scan
 	// of a share that has stopped answering would otherwise hang on its
 	// first directory read.
@@ -588,12 +594,31 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, plan *scanP
 			}
 			m.saveGenres(ctx, saved.ID, item.Genres)
 			m.saveCredits(ctx, saved.ID, videoResult)
+			m.saveFilmCredits(ctx, saved.ID, item.FileMtime, probes[bi])
 			m.syncSubtitles(ctx, saved.ID, path)
 			m.syncAudioTracks(ctx, saved.ID, path)
 			created++
 		}
 	}
 	return len(files), created, nil
+}
+
+// saveFilmCredits records where a film's end credits start, read from its
+// chapter names, or that it has none to find: the chapters are already in
+// the probe, so this costs no read of the file. A file the probe could not
+// read is left for detection to try again; credits set by hand are kept
+// (SaveSegmentAnalysis leaves them alone).
+func (m *Manager) saveFilmCredits(ctx context.Context, itemID string, fileMtime int64, r probed) {
+	if !m.FilmCredits || r.Err != nil || fileMtime == 0 {
+		return
+	}
+	var seg *store.Segment
+	if start, end, ok := media.CreditsChapter(r.Info.Chapters, r.Info.RuntimeSecs); ok {
+		seg = &store.Segment{Kind: store.SegmentCredits, StartSecs: start, EndSecs: end}
+	}
+	if err := m.Store.SaveSegmentAnalysis(ctx, itemID, store.SegmentCredits, fileMtime, seg); err != nil {
+		logger.Warn("saving film credits failed", "path", r.Path, "err", err)
+	}
 }
 
 // saveCredits stores an item's cast and crew, downloading each headshot
