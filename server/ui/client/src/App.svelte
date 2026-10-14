@@ -3,12 +3,12 @@
   import {
     getHealth, listLibraries, libraryItems, libraryItemsSince, libraryGenres, type GenreCount,
     libraryCollections, collectionDetail, type CollectionInfo,
-    libraryRecommended, type RecRow, homeFeed, type HomeFeed,
+    libraryRecommended, libraryNewEpisodes, type RecRow, homeFeed, type HomeFeed,
     personDetail, type PersonProfile, type PersonCredit, type Person as PersonT, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents, setWatched,
     seriesNextUp, type NextUpInfo,
-    authStatus, login, setupAdmin, logout, changePassword, listAPIKeys, createAPIKey, deleteAPIKey, UNAUTHORISED, authProfiles, pinLogin, setPIN, type User as UserT, type APIKey, type Profile,
-    uploadAvatar, removeAvatar, setAvatarColour, AVATAR_COLOURS, type AvatarColour,
-    listDevices, nameDevice, revokeDevice, revokeOtherDevices, saveDeviceQueue, deviceQueue, playOnDevice, type Device,
+    authStatus, login, setupAdmin, logout, UNAUTHORISED, authProfiles, pinLogin, type User as UserT, type Profile,
+    uploadAvatar,
+    listDevices, saveDeviceQueue, deviceQueue, playOnDevice, type Device,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
     requestStatus, discoverSearch, discoverTitle, listRequests, createRequest, withdrawRequest, itemMissing, searchMissing,
     type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
@@ -27,12 +27,13 @@
   import { setMusicActions, addToPlaylist, plays as playsLabel, type ItemRef } from './music/actions.svelte'
   import AvatarCrop from './AvatarCrop.svelte'
   import SegmentEditor from './SegmentEditor.svelte'
+  import Settings from './Settings.svelte'
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
     RotateCcw, AudioLines, LogOut, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
-    Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone, Upload,
+    Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone,
     Inbox, Plus, Clock, CalendarClock, ListMusic,
   } from '@lucide/svelte'
 
@@ -186,21 +187,6 @@
       authBusy = false
     }
   }
-  // Own PIN (Settings)
-  let pinAuth = $state(''), pinNew = $state(''), pinMsg = $state('')
-  async function submitPIN2(e: Event, clear = false) {
-    e.preventDefault()
-    pinMsg = ''
-    try {
-      await setPIN(pinAuth, clear ? '' : pinNew)
-      pinMsg = clear ? 'PIN removed.' : 'PIN set.'
-      pinAuth = pinNew = ''
-      if (me) me = { ...me, hasPin: !clear }
-    } catch (err) {
-      pinMsg = err instanceof Error ? err.message : String(err)
-    }
-  }
-
   async function checkAuth() {
     try {
       const st = await authStatus()
@@ -241,47 +227,6 @@
     loadProfiles()
   }
 
-  // Change password + API keys (Settings page)
-  let pwCurrent = $state(''), pwNew = $state(''), pwMsg = $state('')
-  async function submitPassword(e: Event) {
-    e.preventDefault()
-    pwMsg = ''
-    try {
-      await changePassword(pwCurrent, pwNew)
-      pwCurrent = pwNew = ''
-      pwMsg = 'Password changed.'
-    } catch (err) {
-      pwMsg = err instanceof Error ? err.message : String(err)
-    }
-  }
-  let apiKeys: APIKey[] = $state([])
-  let newKeyName = $state('')
-  let revealedKey = $state('')
-  const loadKeys = () => listAPIKeys().then((k) => (apiKeys = k)).catch(() => {})
-  async function addKey(e: Event) {
-    e.preventDefault()
-    try {
-      const k = await createAPIKey(newKeyName || 'API key')
-      revealedKey = k.key
-      newKeyName = ''
-      apiKeys = [...apiKeys, k]
-    } catch (err) {
-      pwMsg = err instanceof Error ? err.message : String(err)
-    }
-  }
-
-  // Revoking drops the row immediately; a failure restores it and says why.
-  async function revokeKey(id: string) {
-    const before = apiKeys
-    apiKeys = apiKeys.filter((k) => k.id !== id)
-    try {
-      await deleteAPIKey(id)
-    } catch (err) {
-      apiKeys = before
-      pwMsg = err instanceof Error ? err.message : String(err)
-    }
-  }
-
   const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
   // ---- Picture ----
@@ -290,14 +235,6 @@
   let avatarBusy = $state(false)
   // The photo being framed before it goes up (AvatarCrop).
   let cropFile: File | null = $state(null)
-  function pickAvatar(e: Event) {
-    const input = e.currentTarget as HTMLInputElement
-    const file = input.files?.[0]
-    input.value = '' // choosing the same file again should still offer it
-    if (!file) return
-    avatarMsg = ''
-    cropFile = file
-  }
   async function sendAvatar(picture: Blob) {
     avatarBusy = true
     avatarMsg = ''
@@ -311,74 +248,19 @@
       avatarBusy = false
     }
   }
-  async function dropAvatar() {
-    try {
-      me = await removeAvatar()
-    } catch (err) {
-      avatarMsg = errText(err)
-    }
-  }
-  async function chooseColour(c: AvatarColour | '') {
-    try {
-      me = await setAvatarColour(c)
-    } catch (err) {
-      avatarMsg = errText(err)
-    }
-  }
-
   // ---- Devices ----
   // Every signed-in browser, this one included: named, signed out from
   // here, and the targets and sources of a handed-over queue.
   let devices: Device[] = $state([])
-  let deviceMsg = $state('')
-  let deviceName = $state('')
-  let renaming = false // the name field has focus: a refresh must not overwrite what is being typed
-  let confirmSignOutOthers = $state(false)
   const deviceTitle = (d: Device) => d.name || d.client || 'Unknown browser'
   const otherDevices = $derived(devices.filter((d) => !d.current))
   async function loadDevices() {
     try {
       devices = await listDevices()
-      if (!renaming) deviceName = devices.find((d) => d.current)?.name ?? ''
     } catch {
       /* the list stays as it was */
     }
   }
-  async function renameDevice(e: Event) {
-    e.preventDefault()
-    try {
-      await nameDevice(deviceName)
-      deviceMsg = deviceName ? `This device is now called ${deviceName}.` : 'Name cleared.'
-      loadDevices()
-    } catch (err) {
-      deviceMsg = errText(err)
-    }
-  }
-  async function signOutDevice(d: Device) {
-    const before = devices
-    devices = devices.filter((x) => x.id !== d.id)
-    try {
-      await revokeDevice(d.id)
-    } catch (err) {
-      devices = before
-      deviceMsg = errText(err)
-    }
-  }
-  async function signOutOthers() {
-    if (!confirmSignOutOthers) {
-      confirmSignOutOthers = true
-      return
-    }
-    confirmSignOutOthers = false
-    try {
-      const { revoked } = await revokeOtherDevices()
-      deviceMsg = revoked === 1 ? 'Signed out 1 other device.' : `Signed out ${revoked} other devices.`
-      loadDevices()
-    } catch (err) {
-      deviceMsg = errText(err)
-    }
-  }
-
   let tab: Tab = $state('home')
   let health: Health | null = $state(null)
   let offline = $state(false)
@@ -418,7 +300,7 @@
     if (listening && music) return '/listening'
     if (tab === 'home') return '/'
     if (tab === 'queue') return '/queue'
-    if (tab === 'settings') return '/settings'
+    if (tab === 'settings') return '/settings' + (settingsSection ? '/' + settingsSection : '')
     if (tab === 'requests') return '/requests'
     if (tab === 'playlists') return '/playlists' + (playlistId ? '/' + playlistId : '')
     if (tab === 'discover' && discoverKey) return `/discover/${discoverKey.type}/${discoverKey.id}`
@@ -442,8 +324,16 @@
     if (p !== location.pathname) history.pushState({}, '', p)
   }
 
+  // The open Settings section (/settings/devices); '' for the list.
+  let settingsSection = $state('')
+  function openSettings(id: string) {
+    settingsSection = id
+    syncURL()
+  }
+
   function setTab(t: Tab) {
     tab = t
+    if (t === 'settings') settingsSection = ''
     listening = false
     syncURL()
   }
@@ -458,6 +348,7 @@
       }
       if (parts[0] === 'settings') {
         tab = 'settings'
+        settingsSection = parts[1] ?? ''
         return
       }
       if (parts[0] === 'queue') {
@@ -598,9 +489,6 @@
   // Music streaming quality: original file, or a server-side Opus transcode
   // for slow connections. Takes effect from the next track.
   type MusicQuality = 'original' | 'opus-128' | 'opus-64'
-  const musicQualities: { id: MusicQuality; label: string }[] = [
-    { id: 'original', label: 'Original' }, { id: 'opus-128', label: 'High (Opus 128k)' }, { id: 'opus-64', label: 'Data saver (Opus 64k)' },
-  ]
   let musicQuality: MusicQuality = $state(pref('music-quality', 'original') as MusicQuality)
   function setMusicQuality(q: MusicQuality) {
     musicQuality = q
@@ -1244,6 +1132,26 @@
   // ---- Recommended ----
   const resumeHere = $derived(resume.filter((r) => r.libraryId === currentLib?.id))
 
+  // New episodes on a TV library's Recommended tab: what aired lately,
+  // decided server-side. Refetched with the resume list, as home is, so a
+  // tick appears once an episode is watched.
+  let newEps: ResumeItem[] = $state([])
+  $effect(() => {
+    void resume
+    const lib = currentLib
+    if (!lib || lib.mediaType !== 'tv') {
+      newEps = []
+      return
+    }
+    if (tab !== 'libraries' || libTab !== 'recommended' || detail) return
+    libraryNewEpisodes(lib.id)
+      .then((r) => { if (currentLib?.id === lib.id) newEps = r })
+      .catch(() => (newEps = []))
+  })
+
+  /** "S6 · E5", as an episode card or a series' newest arrival reads. */
+  const epLabel = (season?: number, episode?: number) => `S${season ?? 0} · E${episode ?? 0}`
+
   // ---- Music view: artist rail + album shelves ----
   let musicAll: Item[] = $state([])
   let selArtist = $state('ALL') // artist item id | 'ALL' | 'COMP'
@@ -1842,13 +1750,18 @@
   }
 
   // The stream index of an image subtitle being painted into the picture,
-  // carried across restarts so a quality change does not drop it.
+  // carried across restarts so a quality change does not drop it. 0 leaves
+  // the subtitle to the user's preferences; -1 is the viewer having chosen
+  // none, which the server then respects rather than reapplying them.
   let burnSub = $state(0)
+  // A text subtitle to show once a restart that dropped a burned one is up.
+  let showAfterBurn = ''
 
-  /** Restart playback with a bitmap subtitle burned in. */
-  function burnSubtitle(streamIndex: number) {
+  /** Restart playback with a bitmap subtitle burned in, or (-1) without one. */
+  function burnSubtitle(streamIndex: number, thenShow = '') {
     burnSub = streamIndex
-    if (playing) startPlay(playing.item, playing.quality, false, undefined, true)
+    showAfterBurn = thenShow
+    if (playing) startPlay(playing.item, playing.quality, false, playing.info.audioTrack, true)
   }
 
   // ---- Notices ----
@@ -1883,6 +1796,10 @@
     const slow = setTimeout(() => notify('info', `Starting ${item.title}…`, 30000), 600)
     try {
       const info = await playItem(item.id, quality, fromStart, audioTrack, burnSub || undefined)
+      if (showAfterBurn) {
+        info.subtitle = showAfterBurn
+        showAfterBurn = ''
+      }
       clearTimeout(slow)
       if (notice?.kind === 'info') notice = null
       music = null // video and music are mutually exclusive
@@ -2316,7 +2233,6 @@
     poll()
     loadRequestStatus()
     applyRoute(location.pathname)
-    if (tab === 'settings') loadKeys()
     const onPop = () => applyRoute(location.pathname)
     window.addEventListener('popstate', onPop)
     // Live updates over SSE; the slow poll below is only the fallback for
@@ -2558,6 +2474,23 @@
   {/if}
 {/snippet}
 
+<!-- A new episode: the series' poster and title lead, since the episode's
+     own still is landscape and its title alone does not say which show. -->
+{#snippet newEpisodeCell(r: ResumeItem, open: () => void)}
+  <button class="cell" onclick={open}>
+    <span class="posterwrap">
+      {@render poster(r.seriesPoster ? { ...r, poster: r.seriesPoster } : r)}
+      {#if r.watched}<span class="seen" title="Watched"><Check size={13} /></span>{/if}
+      {#if progressPct(r) > 0}
+        <span class="resume" title="{progressPct(r)}% watched"><span style="width: {progressPct(r)}%"></span></span>
+      {/if}
+    </span>
+    <span class="cell-title">{r.seriesTitle || r.title}</span>
+    <span class="cell-sub">{r.title}</span>
+    <span class="cell-sub">{epLabel(r.seasonNum, r.episodeNum)}</span>
+  </button>
+{/snippet}
+
 <!-- Asking for something a series is missing: a request for users whose
      requests need approval, a search in Sonarr for admins and users whose
      requests go straight through, or the state of a request already made. -->
@@ -2609,7 +2542,9 @@
     </span>
     <span class="cell-title">{item.title}</span>
     <span class="cell-sub">
-      {#if item.kind === 'album'}{item.artist}{#if item.year} · {item.year}{/if}{:else if item.year}{item.year}{/if}
+      <!-- A series that gained an episode lately says which, so a returning
+           show reads as new rather than as the year it began. -->
+      {#if item.kind === 'album'}{item.artist}{#if item.year} · {item.year}{/if}{:else if item.latestEpisode}{epLabel(item.latestEpisode.seasonNum, item.latestEpisode.episodeNum)}{:else if item.year}{item.year}{/if}
     </span>
   </button>
 {/snippet}
@@ -2764,7 +2699,7 @@
           <div class="um-name">{me.displayName}</div>
           <div class="um-sub">{me.username} · {me.role}</div>
           {#if me.role === 'admin'}<a class="um-item" href="/admin/">Admin</a>{/if}
-          <button class="um-item" onclick={() => { showUserMenu = false; setTab('settings'); loadKeys() }}><KeyRound size={14} /> Account settings</button>
+          <button class="um-item" onclick={() => { showUserMenu = false; setTab('settings') }}><KeyRound size={14} /> Account settings</button>
           <button class="um-item" onclick={signOut}><LogOut size={14} /> Sign out</button>
         </div>
       {/if}
@@ -3319,6 +3254,14 @@
               <span class="cell-title">{r.seriesTitle || r.title}</span>
               <span class="cell-sub">S{String(r.seasonNum).padStart(2, '0')}E{String(r.episodeNum).padStart(2, '0')} · {r.title}</span>
             </button>
+          {/each}
+        </div>
+      {/if}
+      {#if home && home.newEpisodes.length > 0}
+        {@render shelfHead('New episodes', '')}
+        <div class="shelf-row">
+          {#each home.newEpisodes as r (r.id)}
+            {@render newEpisodeCell(r, () => showItem(r))}
           {/each}
         </div>
       {/if}
@@ -3940,6 +3883,16 @@
                 </div>
               </section>
             {/if}
+            {#if newEps.length > 0}
+              <section>
+                <h2>New episodes</h2>
+                <div class="grid">
+                  {#each newEps as r (r.id)}
+                    {@render newEpisodeCell(r, () => openItem(r.id, false, r))}
+                  {/each}
+                </div>
+              </section>
+            {/if}
             {#each recRows as row (row.kind + row.title)}
               <section>
                 <h2>
@@ -4137,155 +4090,26 @@
         {/if}
       {/if}
     {:else}
-      <h1>Settings</h1>
-      <section class="card">
-        <div class="row">
-          <span>Theme</span>
-          <div class="theme-picker">
-            {#each themes as t (t.id)}
-              <button class="chip" class:sel={theme === t.id} onclick={() => setTheme(t.id)}>{t.name}</button>
-            {/each}
-          </div>
-        </div>
-        <div class="row">
-          <span>Server</span>
-          <span class="muted">{offline ? 'unreachable' : `${health?.service} ${health?.version}`}</span>
-        </div>
-        <div class="row col">
-          <span>Picture <span class="muted small">— on the profile picker and in the top bar</span></span>
-          {#if me}
-            <div class="facerow">
-              {@render face(me, 'tile-avatar')}
-              <div class="faceside">
-                <div class="inline">
-                  <label class="chip upload" class:busy={avatarBusy}>
-                    <Upload size={14} /> {avatarBusy ? 'Uploading…' : me.avatar ? 'Change photo' : 'Upload a photo'}
-                    <input type="file" accept="image/jpeg,image/png,image/gif,image/webp" onchange={pickAvatar} disabled={avatarBusy} />
-                  </label>
-                  {#if me.avatar}<button class="chip" onclick={dropAvatar}>Remove photo</button>{/if}
-                </div>
-                {#if !me.avatar}
-                  <div class="swatches" role="radiogroup" aria-label="Colour behind your initial">
-                    <button class="swatch" class:sel={!me.avatarColour} role="radio" aria-checked={!me.avatarColour} aria-label="Default" title="Default" onclick={() => chooseColour('')}></button>
-                    {#each AVATAR_COLOURS as c (c)}
-                      <button class="swatch" class:sel={me.avatarColour === c} role="radio" aria-checked={me.avatarColour === c} aria-label={c} title={c} style:--face="var(--{c})" onclick={() => chooseColour(c)}></button>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </div>
-          {/if}
-          {#if avatarMsg}<span class="muted small">{avatarMsg}</span>{/if}
-
-        </div>
-        <div class="row col">
-          <span>Password</span>
-          <form class="inline" onsubmit={submitPassword}>
-            <input type="password" placeholder="Current password" bind:value={pwCurrent} autocomplete="current-password" required />
-            <input type="password" placeholder="New password (8+ characters)" bind:value={pwNew} autocomplete="new-password" minlength="8" required />
-            <button class="chip" type="submit">Change</button>
-          </form>
-          {#if pwMsg}<span class="muted small">{pwMsg}</span>{/if}
-        </div>
-        <div class="row col">
-          <span>Quick sign-in PIN <span class="muted small">— {me?.hasPin ? 'set: tap your name on the sign-in screen and enter it' : 'not set: 4–6 digits for the profile picker'}</span></span>
-          <form class="inline" onsubmit={submitPIN2}>
-            <input type="password" placeholder={me?.hasPassword ? 'Current password' : 'Current PIN'} bind:value={pinAuth} autocomplete="current-password" required />
-            <input type="password" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" placeholder="New PIN (4–6 digits)" bind:value={pinNew} required />
-            <button class="chip" type="submit">{me?.hasPin ? 'Change PIN' : 'Set PIN'}</button>
-            {#if me?.hasPin && me?.hasPassword}<button class="chip" type="button" onclick={(e) => submitPIN2(e, true)}>Remove PIN</button>{/if}
-          </form>
-          {#if pinMsg}<span class="muted small">{pinMsg}</span>{/if}
-        </div>
-        <div class="row col">
-          <span>API keys <span class="muted small">— for apps and scripts; send as <code>Authorization: Bearer</code> · <a href="/api/docs/" target="_blank" rel="noopener">API reference</a></span></span>
-          {#if revealedKey}
-            <div class="keyreveal">
-              <span>New key — copy it now, it will not be shown again:</span>
-              <code>{revealedKey}</code>
-              <button class="chip" onclick={() => (revealedKey = '')}>Done</button>
-            </div>
-          {/if}
-          {#each apiKeys as k (k.id)}
-            <div class="keyrow">
-              <span>{k.name}</span>
-              <span class="muted small">created {k.createdAt.slice(0, 10)}{k.lastUsedAt ? ` · last used ${k.lastUsedAt.slice(0, 16)}` : ' · never used'}</span>
-              <button class="chip" onclick={() => revokeKey(k.id)}>Revoke</button>
-            </div>
-          {/each}
-          <form class="inline" onsubmit={addKey}>
-            <input placeholder="Key name (e.g. Phone)" bind:value={newKeyName} />
-            <button class="chip" type="submit">Create key</button>
-          </form>
-        </div>
-        <div class="row col">
-          <span>Signed-in devices <span class="muted small">— sign one out if it is lost or not yours</span></span>
-          <form class="inline" onsubmit={renameDevice}>
-            <input
-              placeholder="Name this device (e.g. Living-room TV)"
-              maxlength="40"
-              bind:value={deviceName}
-              onfocus={() => (renaming = true)}
-              onblur={() => (renaming = false)}
-            />
-            <button class="chip" type="submit">Save name</button>
-          </form>
-          {#each devices as d (d.id)}
-            <div class="devrow">
-              <MonitorSmartphone size={18} />
-              <div class="devtext">
-                <span class="devname">
-                  {deviceTitle(d)}
-                  {#if d.current}<span class="tag">this device</span>{:else if d.online}<span class="tag on">open now</span>{/if}
-                </span>
-                <span class="muted small">
-                  {[d.name ? d.client : '', d.clientIp, `signed in ${d.createdAt.slice(0, 10)}`, `last active ${d.lastSeenAt.slice(0, 16)}`].filter(Boolean).join(' · ')}
-                </span>
-              </div>
-              {#if !d.current}<button class="chip" onclick={() => signOutDevice(d)}>Sign out</button>{/if}
-            </div>
-          {/each}
-          {#if otherDevices.length > 0}
-            <div class="inline">
-              <button class="chip" class:danger={confirmSignOutOthers} onclick={signOutOthers} onblur={() => (confirmSignOutOthers = false)}>
-                {confirmSignOutOthers ? `Sign out ${otherDevices.length} ${otherDevices.length === 1 ? 'device' : 'devices'}?` : 'Sign out all other devices'}
-              </button>
-            </div>
-          {/if}
-          {#if deviceMsg}<span class="muted small">{deviceMsg}</span>{/if}
-        </div>
-        <div class="row">
-          <span>Music streaming quality</span>
-          <div class="theme-picker">
-            {#each musicQualities as q (q.id)}
-              <button class="chip" class:sel={musicQuality === q.id} onclick={() => setMusicQuality(q.id)}>{q.label}</button>
-            {/each}
-          </div>
-        </div>
-        <div class="row">
-          <span>Next-episode autoplay</span>
-          <div class="theme-picker">
-            <button class="chip" class:sel={autoplay} onclick={() => setAutoplay(true)}>On</button>
-            <button class="chip" class:sel={!autoplay} onclick={() => setAutoplay(false)}>Off</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- Required by TMDB's terms wherever their data is used. -->
-      <section class="card">
-        <div class="row">
-          <span>
-            Metadata
-            <span class="muted small">
-              — film and programme details, artwork and cast come from
-              <a href="https://www.themoviedb.org/" target="_blank" rel="noreferrer noopener">TMDB</a>.
-            </span>
-          </span>
-        </div>
-        <p class="muted small attrib">
-          This product uses the TMDB API but is not endorsed or certified by TMDB.
-        </p>
-      </section>
+      {#if me}
+        <Settings
+          {me}
+          section={settingsSection}
+          onsection={openSettings}
+          onme={(u) => (me = u)}
+          {themes}
+          {theme}
+          onsettheme={setTheme}
+          {devices}
+          onreloaddevices={loadDevices}
+          onpickavatar={(f) => { avatarMsg = ''; cropFile = f }}
+          {avatarBusy}
+          {avatarMsg}
+          {autoplay}
+          onautoplay={setAutoplay}
+          {musicQuality}
+          onmusicquality={setMusicQuality}
+        />
+      {/if}
     {/if}
   </main>
   <AddToPlaylist />
@@ -4351,22 +4175,6 @@
   .avatar { overflow: hidden; padding: 0; }
   .avatar .initial.tinted { background: var(--face); color: var(--bg); width: 100%; height: 100%; display: grid; place-items: center; }
   .avatar img.initial { width: 100%; height: 100%; }
-  .facerow { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
-  .faceside { display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; }
-  .upload { position: relative; display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; }
-  .upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-  .upload.busy { opacity: 0.6; cursor: progress; }
-  .swatches { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-  .swatch {
-    width: 1.9rem; height: 1.9rem; border-radius: 50%;
-    background: var(--face, linear-gradient(135deg, var(--accent), var(--accent-2)));
-    border: 2px solid transparent; outline: 1px solid var(--border);
-  }
-  .swatch.sel { border-color: var(--bg); outline: 2px solid var(--text); }
-  .devrow { display: flex; align-items: center; gap: 0.75rem; padding: 0.35rem 0; color: var(--muted); }
-  .devtext { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-  .devname { color: var(--text); font-weight: 500; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
-  .devtext .small { overflow-wrap: anywhere; }
   .tag { font-size: 0.7rem; padding: 0.05rem 0.45rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-weight: 400; }
   .tag.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
   .chip.danger { color: var(--err); border-color: var(--err); }
@@ -4399,12 +4207,6 @@
   .um-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.6rem; border-radius: 6px; color: var(--text); text-align: left; text-decoration: none; font-size: 0.9rem; }
   .um-item:hover { background: var(--bg); }
   .row.col { flex-direction: column; align-items: stretch; gap: 0.5rem; }
-  .inline { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-  .inline input { flex: 1; min-width: 10rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.45rem 0.6rem; font: inherit; }
-  .keyrow { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
-  .keyrow span:first-child { font-weight: 500; }
-  .keyreveal { display: flex; flex-direction: column; gap: 0.4rem; background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 8px; padding: 0.6rem 0.8rem; }
-  .keyreveal code { user-select: all; word-break: break-all; color: var(--accent-2); }
 
   /* ---- Persistent top bar: logo, universal search, profile ---- */
   /* --surface-radius rounds the big floating surfaces alike: the sidebar
@@ -6073,7 +5875,6 @@
     border-bottom: 1px solid var(--border);
   }
   .row:last-child { border-bottom: none; }
-  .theme-picker { display: flex; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
   .chip {
     padding: 0.3rem 0.75rem;
     border-radius: 999px;

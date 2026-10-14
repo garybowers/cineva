@@ -112,6 +112,7 @@ type UserRepo interface {
 	Users(ctx context.Context) ([]User, error)
 	CountUsers(ctx context.Context) (int, error)
 	UpdateUser(ctx context.Context, id, displayName, role string, disabled bool) error
+	SetDisplayName(ctx context.Context, id, displayName string) error
 	SetAvatar(ctx context.Context, id, path string) error
 	SetAvatarColour(ctx context.Context, id, colour string) error
 	SetRequestLevel(ctx context.Context, id, level string) error
@@ -250,6 +251,21 @@ func (s *Store) UpdateUser(ctx context.Context, id, displayName, role string, di
 		return fmt.Errorf("update user: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetDisplayName changes only the name shown for a user, which is what a
+// user may change about themselves; role and access stay with the admin.
+func (s *Store) SetDisplayName(ctx context.Context, id, displayName string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET display_name = ? WHERE id = ?`, displayName, id)
+	if err != nil {
+		return fmt.Errorf("set display name: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("set display name: %w", err)
+	} else if n == 0 {
 		return ErrNotFound
 	}
 	return nil

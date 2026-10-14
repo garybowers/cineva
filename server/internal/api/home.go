@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -31,8 +32,12 @@ type homeResponse struct {
 	// NextUp is the next unstarted episode of each series the viewer has
 	// been watching, once they have finished the one before — an episode
 	// they are part-way through is in ContinueWatching instead.
-	NextUp  []store.ResumeItem `json:"nextUp"`
-	Shelves []homeShelf        `json:"shelves"`
+	NextUp []store.ResumeItem `json:"nextUp"`
+	// NewEpisodes is the episodes that aired lately across every TV library
+	// the viewer may see, newest first: one row, like Next Up, since a new
+	// episode is news whichever library it landed in.
+	NewEpisodes []store.ResumeItem `json:"newEpisodes"`
+	Shelves     []homeShelf        `json:"shelves"`
 }
 
 // GET /home — everything the home screen shows, in one request, limited to
@@ -80,6 +85,11 @@ func (s *server) home(c echo.Context) error {
 			Item: up.Item, SeriesID: sr.ID, SeriesTitle: sr.Title,
 			SeriesPoster: sr.Poster, SeriesBackdrop: sr.Backdrop,
 		})
+	}
+
+	// The same window and cap as a TV library's own row (libraryNewEpisodes).
+	if resp.NewEpisodes, err = s.store.NewEpisodes(ctx, uid, visibleLibraryIDs(me), time.Now(), homeRowSize); err != nil {
+		return err
 	}
 
 	libs, err := s.store.Libraries(ctx)

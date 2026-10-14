@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -359,6 +360,30 @@ func (s *server) libraryRecommended(c echo.Context) error {
 		rows[i].Items = s.withPlayState(c, c.Param("id"), rows[i].Items)
 	}
 	return c.JSON(http.StatusOK, rows)
+}
+
+// GET /libraries/:id/new-episodes — a TV library's New episodes row: the
+// episodes that aired lately, newest first (Plex calls it Recently Released
+// Episodes).
+//
+// Its own endpoint rather than a recommended row because its cards are
+// episodes from many shows, each needing its series' title and poster, and
+// a recommended row's items are plain items. Server-side, like the rest, so
+// every client agrees on what counts as new (store.NewEpisodeDays).
+func (s *server) libraryNewEpisodes(c echo.Context) error {
+	ctx := c.Request().Context()
+	lib, err := s.store.Library(ctx, c.Param("id"))
+	if err != nil || !canSeeLibrary(currentUser(c), lib.ID) {
+		return echo.NewHTTPError(http.StatusNotFound, "library not found")
+	}
+	if lib.MediaType != store.MediaTV {
+		return echo.NewHTTPError(http.StatusBadRequest, "not a TV library")
+	}
+	eps, err := s.store.NewEpisodes(ctx, userID(c), []string{lib.ID}, time.Now(), homeRowSize)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, eps)
 }
 
 // GET /libraries/:id/collections — the collections this library holds more

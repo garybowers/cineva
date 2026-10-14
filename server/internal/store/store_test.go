@@ -750,16 +750,17 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		"Kind": true, "ParentID": true, "Path": true,
 	}
 	elsewhere := map[string]bool{
-		"LockedFields": true, // its own CSV column, checked below
-		"Genres":       true, // its own table, see ReplaceGenres
-		"Watched":      true, // per-user play state, not an item column
-		"PositionSecs": true,
-		"WatchedAt":    true,
-		"PlayCount":    true, // per-user play counts, see play_counts
-		"LastPlayedAt": true,
-		"VersionOf":    true, // set by version grouping, not the caller
-		"FileMtime":    true, // write-only; read back through FileStamps, below
-		"SidecarStamp": true, // likewise
+		"LockedFields":  true, // its own CSV column, checked below
+		"Genres":        true, // its own table, see ReplaceGenres
+		"LatestEpisode": true, // derived from a series' episodes, see RecentlyAdded
+		"Watched":       true, // per-user play state, not an item column
+		"PositionSecs":  true,
+		"WatchedAt":     true,
+		"PlayCount":     true, // per-user play counts, see play_counts
+		"LastPlayedAt":  true,
+		"VersionOf":     true, // set by version grouping, not the caller
+		"FileMtime":     true, // write-only; read back through FileStamps, below
+		"SidecarStamp":  true, // likewise
 	}
 	wv, gv := reflect.ValueOf(want), reflect.ValueOf(got)
 	typ := wv.Type()

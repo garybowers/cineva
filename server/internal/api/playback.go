@@ -48,7 +48,9 @@ type capabilities struct {
 	FromStart bool `json:"fromStart"`
 	// BurnSubtitle is the stream index of an image-based subtitle (PGS,
 	// VobSub) to paint into the picture. Forces a re-encode, since nothing
-	// can be drawn on a copied stream.
+	// can be drawn on a copied stream. 0 leaves the choice to the user's
+	// subtitle preference; -1 says the viewer has chosen, so none is
+	// burned in and the preference is not applied.
 	BurnSubtitle int `json:"burnSubtitle"`
 }
 
@@ -175,6 +177,12 @@ type playInfo struct {
 	// picker; AudioTrack is the stream index actually being played.
 	Audio      []store.AudioTrack `json:"audio"`
 	AudioTrack int                `json:"audioTrack"`
+	// Subtitle is the id of the subtitle the user's preferences switched
+	// on, for the player to show; BurnedSubtitle the stream index being
+	// painted into the picture, when that track is an image one or the
+	// viewer picked one. Both empty when no subtitle is on.
+	Subtitle       string `json:"subtitle,omitempty"`
+	BurnedSubtitle int    `json:"burnedSubtitle,omitempty"`
 	// What the viewer is actually being sent, for the player's info panel.
 	Source Source `json:"source"`
 }
@@ -302,8 +310,14 @@ func (s *server) playItem(c echo.Context) error {
 	if err != nil {
 		playbackLog.Warn("loading segments failed", "title", item.Title, "err", err)
 	}
-	// The requested track, defaulting to the file's own default.
-	chosen := defaultAudioTrack(audio)
+	// The requested track, else the user's language, else the file's own
+	// default. A preference that cannot be read is not worth failing a
+	// playback over: the file's defaults apply.
+	prefs, err := s.store.Prefs(c.Request().Context(), userID(c))
+	if err != nil {
+		playbackLog.Warn("loading track preferences failed", "err", err)
+	}
+	chosen := chooseAudio(audio, prefs[prefAudioLang])
 	if body.AudioTrack != nil {
 		for _, a := range audio {
 			if a.StreamIndex == *body.AudioTrack {
@@ -311,6 +325,28 @@ func (s *server) playItem(c echo.Context) error {
 			}
 		}
 	}
+	// The subtitle: what the viewer picked, else what the preferences
+	// switch on. An image track has to be burned in, which only a re-encode
+	// can do — never on "original", which promises the untouched video.
+	burn, subtitle := body.BurnSubtitle, ""
+	if burn == 0 {
+		audioLang := ""
+		for _, a := range audio {
+			if a.StreamIndex == chosen {
+				audioLang = a.Language
+			}
+		}
+		if st, ok := chooseSubtitle(tracks, audioLang, prefs); ok {
+			switch {
+			case st.TextCodec():
+				subtitle = st.ID
+			case quality != "original":
+				subtitle, burn = st.ID, st.StreamIndex
+			}
+		}
+	}
+	burn = max(burn, 0)
+
 	src := Source{
 		Container: item.Container, VideoCodec: item.VideoCodec,
 		Width: item.Width, Height: item.Height,
@@ -320,7 +356,7 @@ func (s *server) playItem(c echo.Context) error {
 	direct := playInfo{
 		Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
 		DurationSecs: item.RuntimeSecs, PositionSecs: resume,
-		Subtitles: subs, Audio: audio, AudioTrack: chosen,
+		Subtitles: subs, Audio: audio, AudioTrack: chosen, Subtitle: subtitle,
 		Chapters: vinfo.Chapters, Segments: segs,
 		Source: func() Source {
 			d := src
@@ -352,7 +388,7 @@ func (s *server) playItem(c echo.Context) error {
 		// autoVideoQuality caps at 1080p, so a 4K source is downscaled.
 		sessionQuality = autoVideoQuality(item)
 		reason = item.VideoCodec + " cannot be remuxed to fMP4 — re-encoding"
-	case body.BurnSubtitle > 0:
+	case burn > 0:
 		// Burning in a bitmap subtitle means drawing on the picture, which
 		// only the re-encode path can do. Said plainly in the reason, so a
 		// viewer who picks one understands why the quality changed.
@@ -398,7 +434,7 @@ func (s *server) playItem(c echo.Context) error {
 		// than accumulating rounding error across a long film.
 		FrameRateNum: vinfo.FrameRateNum,
 		FrameRateDen: vinfo.FrameRateDen,
-		BurnSubtitle: body.BurnSubtitle,
+		BurnSubtitle: burn,
 	})
 	if err != nil {
 		return err
@@ -416,6 +452,7 @@ func (s *server) playItem(c echo.Context) error {
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
 		Reason: reason, Subtitles: subs, Audio: audio, AudioTrack: chosen,
+		Subtitle: subtitle, BurnedSubtitle: burn,
 		Chapters: vinfo.Chapters, Segments: segs,
 		Source: src,
 	})

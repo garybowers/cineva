@@ -45,7 +45,7 @@
     onquality: (q: PlayQuality) => void
     onaudiotrack: (streamIndex: number) => void
     /** Restart playback with an image subtitle painted in. */
-    onburnsubtitle: (streamIndex: number) => void
+    onburnsubtitle: (streamIndex: number, thenShow?: string) => void
     onexpand: () => void
     ontime?: (secs: number) => void
     /** The user's other devices that have the app open: where "Play on…"
@@ -74,7 +74,6 @@
   let prev: Item | null = $state(null)
   let showNext = $state(false)
   let remaining = $state(0)
-  let subtitle = $state('off')
   let showInfo = $state(false)
   // The track in play. The server resolves the file's default, so this
   // starts from what it actually chose rather than guessing.
@@ -102,6 +101,13 @@
   const burnSubs = info.subtitles?.filter((t) => t.burnIn) ?? []
   const subLabel = (t: SubtitleTrack) =>
     t.title || t.language?.toUpperCase() || t.codec
+  // What the server switched on from the viewer's preferences, or what was
+  // picked before a restart: a text track shown from the start, or an image
+  // one already painted in.
+  // svelte-ignore state_referenced_locally
+  const burned = info.burnedSubtitle ?? 0
+  // svelte-ignore state_referenced_locally
+  let subtitle = $state(textSubs.some((t) => t.id === info.subtitle) ? info.subtitle! : 'off')
 
   function readVolume(): number {
     try {
@@ -146,7 +152,7 @@
         bitrateKbps = Math.round((item.sizeBytes * 8) / item.runtimeSecs / 1000)
       }
     }
-    for (const track of video.textTracks) track.mode = 'hidden' // off until picked
+    for (const track of video.textTracks) track.mode = track.id === subtitle ? 'showing' : 'hidden'
     video.volume = volume
     video.play().catch(() => {})
     if (!compact) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -520,6 +526,14 @@
   }
 
   function selectSubtitle(id: string) {
+    if (burned) {
+      // The burned track is part of the picture: taking it away means
+      // restarting without it, then showing the text track if one was picked.
+      openMenu = null
+      reportProgress(true)
+      onburnsubtitle(-1, id === 'off' ? '' : id)
+      return
+    }
     subtitle = id
     for (const track of video.textTracks) {
       track.mode = track.id === subtitle ? 'showing' : 'hidden'
@@ -1039,7 +1053,7 @@
         {#if textSubs.length > 0 || burnSubs.length > 0}
           <div class="menuwrap">
             <button
-              class="ctl" class:on={openMenu === 'cc' || subtitle !== 'off'}
+              class="ctl" class:on={openMenu === 'cc' || subtitle !== 'off' || burned > 0}
               onclick={() => toggleMenu('cc')}
               title="Subtitles" aria-label="Subtitles"
               aria-haspopup="menu" aria-expanded={openMenu === 'cc'}><Captions size={16} /></button>
@@ -1047,8 +1061,8 @@
               <div class="menu" role="menu">
                 <div class="menu-head">Subtitles</div>
                 <button
-                  class="menu-item" class:sel={subtitle === 'off'}
-                  role="menuitemradio" aria-checked={subtitle === 'off'}
+                  class="menu-item" class:sel={subtitle === 'off' && !burned}
+                  role="menuitemradio" aria-checked={subtitle === 'off' && !burned}
                   onclick={() => selectSubtitle('off')}>Off</button>
                 {#each textSubs as t (t.id)}
                   <button
@@ -1060,10 +1074,10 @@
                   <div class="menu-head">Burned in</div>
                   {#each burnSubs as t (t.id)}
                     <button
-                      class="menu-item"
-                      role="menuitem"
+                      class="menu-item" class:sel={burned === t.streamIndex}
+                      role="menuitemradio" aria-checked={burned === t.streamIndex}
                       title="Painted into the picture — restarts playback"
-                      onclick={() => selectBurnIn(t)}>{subLabel(t)}</button>
+                      onclick={() => (burned === t.streamIndex ? (openMenu = null) : selectBurnIn(t))}>{subLabel(t)}</button>
                   {/each}
                 {/if}
               </div>

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/labstack/echo/v4"
 
@@ -476,6 +477,38 @@ func (s *server) authLogout(c echo.Context) error {
 // GET /auth/me
 func (s *server) authMe(c echo.Context) error {
 	return c.JSON(http.StatusOK, currentUser(c))
+}
+
+// maxDisplayName bounds the name on the profile picker and top bar.
+const maxDisplayName = 40
+
+// PATCH /auth/me {displayName} — rename yourself. The username, which signs
+// in, is not changed: only the name other people see.
+func (s *server) updateMe(c echo.Context) error {
+	var req struct {
+		DisplayName string `json:"displayName"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	name := strings.TrimSpace(req.DisplayName)
+	if name == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "a name cannot be empty")
+	}
+	if utf8.RuneCountInString(name) > maxDisplayName {
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("a name can be at most %d characters", maxDisplayName))
+	}
+	u := currentUser(c)
+	if err := s.store.SetDisplayName(c.Request().Context(), u.ID, name); err != nil {
+		return err
+	}
+	s.audit(c, "user.renamed", "user", u.ID, name, u.DisplayName)
+	s.events.Publish(events.Event{Type: "users"})
+	fresh, err := s.store.UserByID(c.Request().Context(), u.ID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, fresh)
 }
 
 // POST /auth/password {current, new} — change own password; other

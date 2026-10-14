@@ -107,6 +107,12 @@ type Item struct {
 	// Genres is filled by the handlers that need it, not by every item
 	// query — the grid lists thousands of rows and does not use them.
 	Genres []string `json:"genres,omitempty"`
+	// LatestEpisode is set on a series in a recently added row when an
+	// episode of it arrived within NewEpisodeDays: the newest one, so the
+	// tile can say "S6 · E5" rather than the year the show began. Like
+	// Genres it is filled by the query that needs it, not by every item
+	// query.
+	LatestEpisode *EpisodeBrief `json:"latestEpisode,omitempty"`
 
 	// Watched and PositionSecs are the viewer's own state, not the item's.
 	// Like Genres they are filled in by the handlers that serve a signed-in

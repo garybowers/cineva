@@ -235,6 +235,26 @@ paths:
       tags: [Account]
       responses:
         "200": { description: User, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+    patch:
+      summary: Change your own display name
+      description: >
+        The name shown on the profile picker and in the top bar. The
+        username, which signs in, does not change; role and library access
+        stay with an admin.
+      operationId: updateMe
+      tags: [Account]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string, minLength: 1, maxLength: 40, description: Trimmed; at most 40 characters }
+      responses:
+        "200": { description: The user as changed, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "400": { description: Empty or too long }
   /auth/password:
     post:
       summary: Change own password (other sessions are signed out)
@@ -259,7 +279,11 @@ paths:
       description: >
         Theme, quality, autoplay and the like, kept on the server so every
         device you sign in on agrees. Keys and values are strings the client
-        defines; the server does not interpret them.
+        defines. The server reads three when playback starts:
+        `audio-lang` (ISO 639-1 code of the preferred audio language),
+        `sub-mode` (`off`, `forced` for signs and foreign dialogue only,
+        `foreign` for a full subtitle when the audio is in another language,
+        or `always`) and `sub-lang` (ISO 639-1; defaults to `audio-lang`).
       operationId: getPrefs
       tags: [Account]
       responses:
@@ -1685,8 +1709,9 @@ paths:
       description: >
         Built server-side so every client shows the same rows. Recently added
         leads, ranked as on the home screen — series by their newest episode
-        for TV — and is left out for media types without that listing. The
-        rest are recommendations for the viewer: because you watched, highly
+        for TV, each series carrying latestEpisode when one arrived in the
+        last six weeks — and is left out for media types without that
+        listing. The rest are recommendations for the viewer: because you watched, highly
         rated and unseen, genre rows and unwatched. Every item carries the
         viewer's own watch state.
       operationId: libraryRecommended
@@ -1710,6 +1735,35 @@ paths:
                     items:
                       type: array
                       items: { $ref: "#/components/schemas/Item" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/new-episodes:
+    get:
+      summary: A TV library's New episodes row
+      description: >
+        Episodes in the library that aired in the last six weeks, newest
+        broadcast first and, of a day's broadcasts, the latest to arrive;
+        at most 20. Episodes with no air date are left out, and a back
+        catalogue fetched today is not new: it is the broadcast that counts.
+        A file that was on disk more than a week before its air date is
+        taken for a mismatch and left out too.
+        Each carries its series (title and artwork, since an episode title
+        alone does not say which show it is) and the viewer's own watch
+        state. The home screen has the same row across every TV library the
+        viewer may see.
+      operationId: libraryNewEpisodes
+      tags: [Libraries]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Episodes, newest first; empty when nothing aired lately
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ResumeItem" }
+        "400": { description: Not a TV library }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /libraries/{id}/listening:
@@ -2449,6 +2503,20 @@ paths:
                 fromStart:
                   type: boolean
                   description: Ignore the stored resume position and play from 00:00
+                audioTrack:
+                  type: integer
+                  description: >
+                    Stream index of the audio to play. Absent: the user's
+                    preferred language (preference `audio-lang`), else the
+                    file's default.
+                burnSubtitle:
+                  type: integer
+                  description: >
+                    Stream index of an image subtitle (PGS, VobSub) to paint
+                    into the picture, which forces a re-encode. 0 or absent
+                    leaves the subtitle to the user's preferences
+                    (`sub-mode`, `sub-lang`); -1 means the viewer has chosen
+                    and the preferences are not applied.
       responses:
         "200":
           description: How to play the item, including the resume position
@@ -2709,7 +2777,9 @@ paths:
         Limited to the libraries the viewer may see. Continue Watching holds
         one entry per series (its most recently played episode); Next Up is
         the next unstarted episode of each recently watched series that has
-        nothing part-watched; shelves are each library's recently added row
+        nothing part-watched; New Episodes is what aired in the last six
+        weeks across the TV libraries, as /libraries/{id}/new-episodes lists
+        it for one; shelves are each library's recently added row
         (series ordered by their newest episode for TV) followed by the first
         two recommendation rows of each film and TV library.
       operationId: home
@@ -2721,12 +2791,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [continueWatching, nextUp, shelves]
+                required: [continueWatching, nextUp, newEpisodes, shelves]
                 properties:
                   continueWatching:
                     type: array
                     items: { $ref: "#/components/schemas/ResumeItem" }
                   nextUp:
+                    type: array
+                    items: { $ref: "#/components/schemas/ResumeItem" }
+                  newEpisodes:
                     type: array
                     items: { $ref: "#/components/schemas/ResumeItem" }
                   shelves:
@@ -3358,6 +3431,21 @@ components:
           type: array
           items: { type: string }
           description: Filled by the endpoints that need it, not by every item query.
+        latestEpisode:
+          type: object
+          description: >
+            On a series in a recently added row, when an episode of it
+            arrived in the last six weeks: the newest to arrive, so a client
+            can label the series with what is new ("S6 · E5") rather than
+            the year it began. Absent otherwise.
+          required: [id, title, seasonNum, episodeNum, addedAt]
+          properties:
+            id: { type: string, format: uuid }
+            title: { type: string }
+            seasonNum: { type: integer }
+            episodeNum: { type: integer }
+            addedAt: { type: string, description: When the file arrived }
+            airDate: { type: string, description: 'Broadcast date, "2026-10-08"' }
         watched:
           type: boolean
           description: >
@@ -3469,8 +3557,21 @@ components:
         audioTrack:
           type: integer
           description: >
-            Stream index actually being played — the file's default unless
-            the request asked for another. -1 when the file has no audio.
+            Stream index actually being played: the one requested, else the
+            first in the user's preferred language, else the file's default.
+            -1 when the file has no audio.
+        subtitle:
+          type: string
+          description: >
+            Id of the subtitle the user's preferences switched on, for the
+            player to show from the start. A text track is overlaid by the
+            player; an image track is already burned in (see
+            burnedSubtitle). Absent when none is on.
+        burnedSubtitle:
+          type: integer
+          description: >
+            Stream index of the image subtitle painted into the picture,
+            chosen by the viewer or by their preferences. Absent when none.
         segments:
           type: array
           description: >

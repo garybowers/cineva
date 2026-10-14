@@ -9,6 +9,7 @@
   --muted: #8a93a3;
   --accent: #7c5cff;
   --accent-2: #4dc3ff;
+  --on-accent: #ffffff; /* text and icons on an --accent fill */
   --ok: #3ecf8e;
   --err: #ff6b6b;
   /* Chart series (categorical, fixed order; validated for CVD against --panel) */

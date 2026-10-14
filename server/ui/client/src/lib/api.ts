@@ -64,6 +64,9 @@ export interface Item {
   seasonCount?: number
   episodeCount?: number
   genres?: string[]
+  /** On a series in a recently added row, when an episode of it arrived in
+   *  the last six weeks: the newest one, to label the tile with what is new. */
+  latestEpisode?: EpisodeBrief
   videoCodec?: string
   audioCodec?: string
   width?: number
@@ -126,6 +129,10 @@ export interface PlayInfo {
   subtitles: SubtitleTrack[]
   audio: AudioTrack[]
   audioTrack: number
+  /** The subtitle the user's preferences switched on, to show from the start. */
+  subtitle?: string
+  /** Stream index of the image subtitle burned into the picture, if any. */
+  burnedSubtitle?: number
   /** The file's own chapter marks, in order. Absent for files with none. */
   chapters?: Chapter[]
   /** Parts the player can offer to skip, such as a detected intro. */
@@ -181,6 +188,16 @@ function detectCaps() {
 }
 const caps = detectCaps()
 
+/** Enough of an episode to label something else with it. */
+export interface EpisodeBrief {
+  id: string
+  title: string
+  seasonNum: number
+  episodeNum: number
+  addedAt: string
+  airDate?: string
+}
+
 export interface ResumeItem extends Item {
   positionSecs: number
   /** An episode's series, since its own title does not say which show. Its
@@ -205,6 +222,8 @@ export interface HomeFeed {
   continueWatching: ResumeItem[]
   /** The next unstarted episode of each series being watched. */
   nextUp: ResumeItem[]
+  /** Episodes that aired lately across the TV libraries, newest first. */
+  newEpisodes: ResumeItem[]
   shelves: HomeShelf[]
 }
 export const homeFeed = () => get<HomeFeed>('/home')
@@ -297,6 +316,11 @@ export const setupAdmin = (username: string, password: string, displayName: stri
 export const logout = () => post<void>('/auth/logout')
 export const authProfiles = () => get<Profile[]>('/auth/profiles')
 export const pinLogin = (userId: string, pin: string) => post<User>('/auth/pin', { userId, pin })
+export const updateMe = (displayName: string) => req<User>('/auth/me', {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ displayName }),
+})
 export const setPIN = (password: string, pin: string) => post<void>('/auth/pin/set', { password, pin })
 export const changePassword = (current: string, next: string) => post<void>('/auth/password', { current, new: next })
 export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
@@ -406,6 +430,8 @@ export interface RecRow {
   items: Item[]
 }
 export const libraryRecommended = (id: string) => get<RecRow[]>(`/libraries/${id}/recommended`)
+/** A TV library's New episodes row: what aired lately, newest first. */
+export const libraryNewEpisodes = (id: string) => get<ResumeItem[]>(`/libraries/${id}/new-episodes`)
 
 /** The genres this library actually holds, most common first. */
 export const libraryGenres = (id: string) => req<GenreCount[]>(`/libraries/${id}/genres`)
