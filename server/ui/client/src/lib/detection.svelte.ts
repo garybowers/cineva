@@ -3,6 +3,7 @@
 // it is getting on. The status arrives over the event stream ("segments");
 // the app hands each one to setDetection.
 
+import { tv } from './tv.svelte'
 import {
   detectionStatus, redetectItem,
   type DetectionStatus, type DetectionTarget, type Item, type SegmentKind, type User,
@@ -20,7 +21,10 @@ export function loadDetection() {
 }
 
 /** Whether a user may correct intro and credits times and start detection. */
-export const canEditSegments = (u: User | null | undefined) => !!u && (u.role === 'admin' || !!u.segmentEditor)
+// Never on a TV: editing and detection are administration, which belongs
+// on a computer or phone (see docs/tv.md).
+export const canEditSegments = (u: User | null | undefined) =>
+  !tv.on && !!u && (u.role === 'admin' || !!u.segmentEditor)
 
 /** The targeted detection under this item — the season or film itself, a
     season of this series, or an episode's season — if any is waiting or

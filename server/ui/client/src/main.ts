@@ -2,9 +2,14 @@ import { mount } from 'svelte'
 import '@fontsource-variable/inter'
 import './app.css'
 import { applyTheme, currentTheme } from './lib/theme'
+import { applyInterface, installSpatial } from './lib/tv.svelte'
 import App from './App.svelte'
 
 applyTheme(currentTheme())
+// TV mode, from this device's preference (its local copy, so it is right
+// before sign-in) or from what browser this is.
+applyInterface()
+installSpatial()
 
 const app = mount(App, { target: document.getElementById('app')! })
 

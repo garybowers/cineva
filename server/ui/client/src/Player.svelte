@@ -12,6 +12,7 @@
   import RoomPanel from './ha/RoomPanel.svelte'
   import { controlsOf, currentRoom, ha, playedElsewhere } from './lib/homeassistant.svelte'
   import { pref } from './lib/prefs'
+  import { ownKeys, tv } from './lib/tv.svelte'
   import {
     Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, X, Maximize, Expand, Shrink,
     Maximize2, SkipBack, SkipForward, Info, Captions, Languages, Settings, List, Gauge, Cast,
@@ -512,9 +513,86 @@
     togglePlay()
   }
 
+  // ---- A TV remote ----
+  // With the controls out of the way: OK and play/pause play and pause, left
+  // and right skip ten seconds (rewind and fast-forward thirty), up or down
+  // bring the controls back with the focus on play, and Back leaves. With
+  // the focus on a control, the arrows move between controls and Back puts
+  // them away. Menus and the room panel handle their own keys.
+  const BACK_KEYS = new Set(['Escape', 'Backspace', 'GoBack', 'BrowserBack'])
+  const onControl = () => {
+    const el = document.activeElement as HTMLElement | null
+    return !!el && el !== box && !!box?.contains(el) && el.matches('button, input, select, a, [tabindex]:not([tabindex="-1"])')
+  }
+  function tvKey(e: KeyboardEvent): boolean {
+    if (openMenu !== null || roomOpen) return false
+    switch (e.key) {
+      case 'MediaPlayPause':
+      case 'MediaPlay':
+      case 'MediaPause':
+        togglePlay()
+        wake()
+        return true
+      case 'MediaFastForward':
+        skip(30)
+        wake()
+        return true
+      case 'MediaRewind':
+        skip(-30)
+        wake()
+        return true
+    }
+    if (onControl()) {
+      if (BACK_KEYS.has(e.key)) {
+        ;(document.activeElement as HTMLElement).blur()
+        idle = !paused
+        return true
+      }
+      return false // the arrows move between the controls
+    }
+    switch (e.key) {
+      case 'ArrowLeft':
+        skip(-10)
+        wake()
+        return true
+      case 'ArrowRight':
+        skip(10)
+        wake()
+        return true
+      case 'Enter':
+      case ' ':
+        togglePlay()
+        wake()
+        return true
+      case 'ArrowUp':
+      case 'ArrowDown':
+        wake()
+        box?.querySelector<HTMLElement>('.controls .playpause')?.focus()
+        return true
+    }
+    if (BACK_KEYS.has(e.key)) {
+      onclose()
+      return true
+    }
+    return false
+  }
+  // While the full player shows on a TV it has the remote, and fills the
+  // screen.
+  $effect(() => {
+    if (!tv.on || compact) return
+    windowed = true
+    ownKeys(tvKey)
+    return () => {
+      ownKeys(null)
+      windowed = false
+    }
+  })
+
   function onKeydown(e: KeyboardEvent) {
     const target = e.target as HTMLElement
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return
+    // On a TV the remote's keys are tvKey's, and the arrows move focus.
+    if (tv.on && !compact && (e.key.startsWith('Arrow') || BACK_KEYS.has(e.key))) return
     if (e.shiftKey && (e.key === 'N' || e.key === 'P')) {
       const ep = e.key === 'N' ? next : prev
       if (ep) { e.preventDefault(); onnext(ep) }

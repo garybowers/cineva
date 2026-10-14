@@ -14,6 +14,7 @@
     type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
   } from './lib/api'
   import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+  import { tv } from './lib/tv.svelte'
   import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
   import { onDismiss } from './lib/dismiss'
   import { loadQueue, saveQueue } from './lib/queue'
@@ -36,7 +37,7 @@
   import {
     House, Library as LibraryIcon, Settings as SettingsIcon, User, Clapperboard, Tv,
     Music as MusicIcon, Headphones, Podcast, BookOpen, Play, Shuffle, Download,
-    RotateCcw, AudioLines, LogOut, Users, KeyRound, Search, Eye, EyeOff, X, Check,
+    RotateCcw, AudioLines, LogOut, Users, Delete, KeyRound, Search, Eye, EyeOff, X, Check,
     ListVideo, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Ellipsis, TriangleAlert,
     Pin, PinOff, PanelLeftOpen, ZoomIn, ZoomOut, Cast, MonitorSmartphone,
     Inbox, Plus, Clock, CalendarClock, ListMusic, ScanSearch, Lamp,
@@ -156,7 +157,15 @@
     authPass = ''
     authUser = p.username
     authErr = ''
-    setTimeout(() => (document.querySelector('.pinpad input') as HTMLInputElement | null)?.focus(), 30)
+    // On a TV the number pad takes the focus, so the remote can enter the
+    // PIN without the television's own keyboard covering the screen.
+    setTimeout(() => (document.querySelector(tv.on ? '.digits button' : '.pinpad input') as HTMLElement | null)?.focus(), 30)
+  }
+  // A digit from the on-screen pad; it signs in once the PIN is complete
+  // only when OK is pressed, as typing does.
+  function padDigit(d: string) {
+    if (d === 'del') pin = pin.slice(0, -1)
+    else if (pin.length < 6) pin += d
   }
   // A picked profile without a PIN signs in with its password.
   async function submitPickedPassword(e: Event) {
@@ -1156,6 +1165,14 @@
   })
   // The banner: what was last in progress, or else the next episode due.
   const hero = $derived(home?.continueWatching[0] ?? home?.nextUp[0] ?? null)
+  // What a title is, for the TV banner's preview of the focused one.
+  const kindLabel = (k: string) =>
+    ({ movie: 'Film', series: 'Series', season: 'Season', episode: 'Episode', album: 'Album', artist: 'Artist', track: 'Track' } as Record<string, string>)[k] ?? ''
+  // The preview belongs to Home; elsewhere the banner is not shown.
+  $effect(() => {
+    void tab
+    tv.focused = null
+  })
 
   function scrollShelf(e: Event, dir: number) {
     const row = (e.currentTarget as HTMLElement).closest('.shelf-head')?.nextElementSibling as HTMLElement | null
@@ -2471,7 +2488,7 @@
       <p>Titles appear here as they are found.</p>
     </div>
   {:else if me?.role === 'admin'}
-    <div class="empty">Nothing here yet — run a scan from the <a href="/admin/">admin UI</a>.</div>
+    <div class="empty">Nothing here yet — run a scan from {@render adminLink()}.</div>
   {:else}
     <div class="empty">Nothing here yet. Ask an administrator to scan this library.</div>
   {/if}
@@ -2543,7 +2560,7 @@
 <!-- A new episode: the series' poster and title lead, since the episode's
      own still is landscape and its title alone does not say which show. -->
 {#snippet newEpisodeCell(r: ResumeItem, open: () => void)}
-  <button class="cell" onclick={open}>
+  <button class="cell" data-nav-id={r.id} onclick={open} onfocus={() => { if (tv.on) tv.focused = r }}>
     <span class="posterwrap">
       {@render poster(r.seriesPoster ? { ...r, poster: r.seriesPoster } : r)}
       {#if r.watched}<span class="seen" title="Watched"><Check size={13} /></span>{/if}
@@ -2579,8 +2596,14 @@
 <!-- open defaults to opening the item in place, inside its library; the
      home screen passes showItem instead, which switches to the library
      first. -->
+<!-- The admin pages: a link on a computer or phone; on a TV, where they
+     are not offered, just where to find them. -->
+{#snippet adminLink(href = '/admin/')}
+  {#if tv.on}the admin pages on a computer or phone{:else}<a {href}>the admin UI</a>{/if}
+{/snippet}
+
 {#snippet cell(item: Item, open: () => void = () => openItem(item.id, false, item))}
-  <button class="cell" onclick={open}>
+  <button class="cell" data-nav-id={item.id} onclick={open} onfocus={() => { if (tv.on) tv.focused = item }}>
     <span class="posterwrap">
       {@render poster(item)}
       {#if item.kind === 'movie' || item.kind === 'episode'}
@@ -2591,7 +2614,7 @@
           class="seentoggle"
           class:on={item.watched}
           role="button"
-          tabindex="0"
+          tabindex={tv.on ? -1 : 0}
           aria-label={item.watched ? `Mark ${item.title} unwatched` : `Mark ${item.title} watched`}
           title={item.watched ? 'Watched — click to unmark' : 'Mark watched'}
           onclick={(e) => toggleWatchedOn(item, e)}
@@ -2639,7 +2662,17 @@
         <h1>{picked.displayName}</h1>
         {#if picked.hasPin}
           <p>Enter your PIN</p>
-          <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" bind:value={pin} required aria-label="PIN" />
+          <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" bind:value={pin} required aria-label="PIN"
+            readonly={tv.on} tabindex={tv.on ? -1 : 0} />
+          {#if tv.on}
+            <div class="digits" role="group" aria-label="PIN digits">
+              {#each ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'del', '0'] as d (d)}
+                <button type="button" class:del={d === 'del'} onclick={() => padDigit(d)} aria-label={d === 'del' ? 'Delete a digit' : d}>
+                  {#if d === 'del'}<Delete size={20} />{:else}{d}{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
         {:else}
           <p>Enter your password</p>
           <input type="password" class="pw" autocomplete="current-password" bind:value={authPass} required aria-label="Password" />
@@ -2767,7 +2800,7 @@
         <div class="usermenu" role="menu">
           <div class="um-name">{me.displayName}</div>
           <div class="um-sub">{me.username} · {me.role}</div>
-          {#if me.role === 'admin'}<a class="um-item" href="/admin/">Admin</a>{/if}
+          {#if me.role === 'admin' && !tv.on}<a class="um-item" href="/admin/">Admin</a>{/if}
           <button class="um-item" onclick={() => { showUserMenu = false; setTab('settings') }}><KeyRound size={14} /> Account settings</button>
           <!-- On a device that signs in by itself, signing out just opens the
                profile picker, so say what it is for. -->
@@ -2783,6 +2816,7 @@
 
   <div class="body" class:sidepinned={sidePinned}>
   <aside
+    data-nav-group
     class="side"
     class:pinned={sidePinned}
     class:open={sideOpen}
@@ -3025,7 +3059,7 @@
     {:else if tab === 'requests'}
       <h1>Requests</h1>
       {#if me?.role === 'admin'}
-        <p class="muted small reqnote">Everyone's requests. Approve or decline those waiting on the <a href="/admin/requests">Requests page of the admin</a>.</p>
+        <p class="muted small reqnote">Everyone's requests. Approve or decline those waiting on the Requests page of {@render adminLink('/admin/requests')}.</p>
       {/if}
       {#if requestsErr}<div class="empty">{requestsErr}</div>{/if}
       {#if myRequests.length === 0 && !requestsErr}
@@ -3053,7 +3087,7 @@
               </div>
               <div class="reqside">
                 <span class="reqstate" data-state={r.status}>{requestLabel[r.status]}</span>
-                {#if r.status === 'requested' && (r.userId === me?.id || me?.role === 'admin')}
+                {#if r.status === 'requested' && (r.userId === me?.id || (me?.role === 'admin' && !tv.on))}
                   <button class="linkish small" onclick={() => withdraw(r)}>Withdraw</button>
                 {/if}
               </div>
@@ -3294,20 +3328,26 @@
       </section>
     {:else if tab === 'home'}
       <h1 class="visually-hidden">Home</h1>
-      {#if hero}
-        {@const bg = hero.seriesBackdrop || hero.backdrop || hero.seriesPoster || hero.poster}
-        {@const left = hero.positionSecs > 0 && hero.runtimeSecs ? Math.max(1, Math.round((hero.runtimeSecs - hero.positionSecs) / 60)) : 0}
-        <section class="hero">
+      <!-- On a TV the banner shows whatever title the focus is on, as a
+           preview; its buttons belong to the featured title only, since OK
+           on a poster opens that title anyway. -->
+      {@const shown = (tv.on && tv.focused ? tv.focused : hero) as typeof hero}
+      {#if shown}
+        {@const previewing = shown !== hero}
+        {@const bg = shown.seriesBackdrop || shown.backdrop || shown.seriesPoster || shown.poster}
+        {@const left = !previewing && shown.positionSecs > 0 && shown.runtimeSecs ? Math.max(1, Math.round((shown.runtimeSecs - shown.positionSecs) / 60)) : 0}
+        <section class="hero" class:previewing>
           {#if bg}<img class="hero-bg" src={bg} alt="" />{/if}
           <div class="hero-body">
-            <div class="hero-kicker">{left ? 'Continue watching' : 'Next up'}</div>
-            <h2 class="hero-title">{hero.seriesTitle || hero.title}</h2>
-            {#if hero.kind === 'episode'}
-              <div class="hero-sub">S{String(hero.seasonNum).padStart(2, '0')}E{String(hero.episodeNum).padStart(2, '0')} · {hero.title}</div>
-            {:else if hero.year}
-              <div class="hero-sub">{hero.year}</div>
+            <div class="hero-kicker">{previewing ? kindLabel(shown.kind) : left ? 'Continue watching' : 'Next up'}</div>
+            <h2 class="hero-title">{shown.seriesTitle || shown.title}</h2>
+            {#if shown.kind === 'episode'}
+              <div class="hero-sub">S{String(shown.seasonNum).padStart(2, '0')}E{String(shown.episodeNum).padStart(2, '0')} · {shown.title}</div>
+            {:else if shown.year}
+              <div class="hero-sub">{shown.year}</div>
             {/if}
-            {#if hero.overview}<p class="hero-overview">{hero.overview}</p>{/if}
+            {#if shown.overview}<p class="hero-overview">{shown.overview}</p>{/if}
+            {#if hero && !previewing}
             <div class="actions">
               <button class="play" disabled={starting === hero.id} onclick={() => hero && startPlay(hero)}>
                 <Play size={15} /> {starting === hero.id ? 'Starting…' : left ? 'Resume' : 'Play'}
@@ -3315,13 +3355,14 @@
               {#if left}<span class="hero-left">{left} min left</span>{/if}
               <button class="dl" onclick={() => hero && showItem(hero)}>More info</button>
             </div>
+            {/if}
           </div>
         </section>
       {/if}
 
       {#if home && home.continueWatching.length > 0}
         {@render shelfHead('Continue Watching', '')}
-        <div class="shelf-row">
+        <div class="shelf-row" data-nav-group>
           {#each home.continueWatching as r (r.id)}
             <button class="cell" onclick={() => startPlay(r)}>{@render resumeBody(r)}</button>
           {/each}
@@ -3329,7 +3370,7 @@
       {/if}
       {#if home && home.nextUp.length > 0}
         {@render shelfHead('Next Up', '')}
-        <div class="shelf-row">
+        <div class="shelf-row" data-nav-group>
           {#each home.nextUp as r (r.id)}
             <button class="cell" onclick={() => startPlay(r)}>
               {@render poster(r.seriesPoster ? { ...r, poster: r.seriesPoster } : r)}
@@ -3341,7 +3382,7 @@
       {/if}
       {#if home && home.newEpisodes.length > 0}
         {@render shelfHead('New episodes', '')}
-        <div class="shelf-row">
+        <div class="shelf-row" data-nav-group>
           {#each home.newEpisodes as r (r.id)}
             {@render newEpisodeCell(r, () => showItem(r))}
           {/each}
@@ -3350,7 +3391,7 @@
       {#if home}
         {#each home.shelves as sh (sh.libraryId + sh.kind + sh.title)}
           {@render shelfHead(sh.title, sh.libraryName)}
-          <div class="shelf-row">
+          <div class="shelf-row" data-nav-group>
             {#each sh.items as item (item.id)}
               {@render cell(item, () => showItem(item))}
             {/each}
@@ -3364,7 +3405,7 @@
       <section>
         <h2>Libraries</h2>
         {#if libraries.length === 0}
-          <div class="empty">No libraries yet — create one in the <a href="/admin/">admin UI</a>.</div>
+          <div class="empty">No libraries yet — create one in {@render adminLink()}.</div>
         {:else}
           <div class="librow">
             {#each libraries as lib (lib.id)}
@@ -4173,7 +4214,7 @@
         {#if libraries.length === 0}
           <div class="empty tall">
             <p><strong>No libraries yet.</strong></p>
-            <p>Libraries are created in the <a href="/admin/">admin UI</a> — one media type each.</p>
+            <p>Libraries are created in {@render adminLink()} — one media type each.</p>
           </div>
         {:else}
           <div class="librow">
@@ -4288,6 +4329,15 @@
   .pinpad { align-items: center; text-align: center; }
   .pinpad input { text-align: center; font-size: 1.6rem; letter-spacing: 0.6rem; width: 12rem; }
   .pinpad input.pw { font-size: 1rem; letter-spacing: normal; width: 16rem; }
+  /* The remote's number pad, on a TV. */
+  .digits { display: grid; grid-template-columns: repeat(3, 3.6rem); gap: 0.6rem; justify-content: center; }
+  .digits button {
+    height: 3.6rem; border-radius: 12px; font-size: 1.4rem; font-weight: 600;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    display: grid; place-items: center;
+  }
+  .digits button:focus { background: var(--accent); color: var(--on-accent); }
+  .digits .del { color: var(--muted); }
   .userwrap { position: relative; }
   .avatar .initial { font-weight: 600; font-size: 0.85rem; }
   .usermenu {
@@ -6005,4 +6055,42 @@
   @media (min-width: 768px) {
     main { padding-bottom: 1.25rem; }
   }
+
+  /* ---- TV mode (docs/tv.md) ----
+     The same screens, sized for across the room and worked with a remote.
+     Everything is in rem, so the root size scales the whole interface:
+     16px on a 1280-wide screen, 24px at 1080p. */
+  :global(html.tv) { font-size: clamp(16px, 1.25vw, 40px); }
+  /* Icons are drawn at fixed pixel sizes; they grow with the text. */
+  :global(html.tv svg.lucide-icon) { zoom: var(--tv-scale, 1); }
+  /* Focus is the only cursor there is: it has to be unmissable, and
+     whatever has it is kept clear of the screen's edges and the banner. */
+  :global(html.tv :focus) { outline: 0.18rem solid var(--accent-2); outline-offset: 0.18rem; scroll-margin: 12vh 3rem; }
+  :global(html.tv) .cell:focus { outline: none; }
+  :global(html.tv) .poster { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+  :global(html.tv) .cell:focus .poster {
+    transform: scale(1.07);
+    border-color: var(--accent-2);
+    box-shadow: 0 0 0 0.18rem var(--accent-2), 0 1rem 2rem rgb(0 0 0 / 0.45);
+  }
+  :global(html.tv) .cell:focus .cell-title { color: var(--accent-2); }
+  /* Room for a focused poster to grow without being clipped. */
+  :global(html.tv) .shelf-row { padding: 0.8rem 0.6rem; scroll-snap-type: none; }
+  /* What a remote cannot use: scroll arrows (focus scrolls the rows), the
+     poster-size slider, and the hover-only watched tick. */
+  :global(html.tv) .shelf-nav,
+  :global(html.tv) .pzoom,
+  :global(html.tv) .seentoggle { display: none; }
+  /* Home: the banner stays while the rows move under it, showing the
+     focused title. */
+  :global(html.tv) .hero {
+    position: sticky;
+    top: var(--topbar-h);
+    z-index: 3;
+    min-height: 42vh;
+    margin-bottom: 0.5rem;
+    background: var(--bg);
+  }
+  :global(html.tv) .hero.previewing .hero-overview { -webkit-line-clamp: 3; line-clamp: 3; }
+  :global(html.tv) .shelf-row .cell { scroll-margin-top: calc(var(--topbar-h) + 46vh); }
 </style>

@@ -208,6 +208,16 @@ var registry = []Pref{
 		Section: "appearance", Label: "Theme",
 		Description: "Follows you to every device you sign in on.",
 	},
+	{
+		Key: "interface", Type: TypeEnum, Default: "auto", Scope: ScopeDevice, Lockable: false,
+		Section: "appearance", Label: "Interface",
+		Description: "How this screen shows Cineva. It stays with the screen whoever signs in on it.",
+		Options: []Option{
+			{Value: "auto", Label: "Automatic", Description: "TV on a television's own browser (Fire TV, Android TV, LG, Samsung), desktop everywhere else."},
+			{Value: "desktop", Label: "Desktop", Description: "For a mouse, keyboard or touch."},
+			{Value: "tv", Label: "TV", Description: "Large, and worked with a remote's arrows, OK and Back."},
+		},
+	},
 }
 
 var byKey = func() map[string]*Pref {

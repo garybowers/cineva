@@ -20,6 +20,7 @@
     type MyNotifications, type NotifyDestination, type NotifyKind,
   } from './lib/api'
   import { onPrefs, prefState, resetPref, setPref } from './lib/prefs'
+  import { tv } from './lib/tv.svelte'
   import type { ThemeInfo } from './lib/theme'
   import { ha, loadHA } from './lib/homeassistant.svelte'
   import Sheet from './Sheet.svelte'
@@ -486,7 +487,8 @@
           </button>
         </li>
       {/each}
-      {#if me.role === 'admin'}
+      <!-- Administration is for a computer or phone, never a TV. -->
+      {#if me.role === 'admin' && !tv.on}
         <li class="sep">
           <a class="snav-item" href="/admin/">
             <ShieldCheck size={17} />
