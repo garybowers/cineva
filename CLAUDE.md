@@ -192,4 +192,4 @@ backlog entries; it cannot be called done with undocumented gaps.
 
 ## Open questions (resolve before building the relevant milestone)
 
-- Live TV / DVR — explicitly out of scope for now, revisit after v1
+- Live TV / DVR — wanted (tuners, programme guides, recording; see the BACKLOG.md section), but not designed: write `server/docs/livetv.md` and settle it before building, after v1

@@ -345,6 +345,27 @@ Groundwork that is cheap before federation and expensive after it ("Preparing no
 - [ ] Users carry their home server's identity (this server's key + user id).
 - [ ] A federation protocol version constant and capabilities list.
 
+## Live TV and DVR (not designed yet)
+Watching and recording broadcast TV, the way people use an HDHomeRun with
+Plex's DVR today: Cineva relays the tuner's channels to every screen and
+records shows on a schedule. Needs a design note (`server/docs/livetv.md`)
+before building; it would be its own library type, with recordings landing
+as ordinary items in it.
+
+First, HDHomeRun live TV and recording:
+- [ ] **HDHomeRun tuners**: found on the network (UDP discovery, or an address entered by hand), read through their HTTP API (`discover.json`, `lineup.json`, a stream URL per channel), and tuners shared between live viewing and recordings, with the busy-tuner case handled ("all tuners in use; recording X on tuner 2").
+- [ ] **Channel line-up**: imported from the tuner, with channels hidden, renumbered, favourited and given logos; the same channel from two tuners merged.
+- [ ] **Programme guide**: XMLTV (a file or a URL, refreshed on a schedule) and Schedules Direct first, the guide broadcast over the air (DVB EIT, ATSC PSIP) as a fallback; guide channels matched to tuner channels; a guide grid in the web client that works at phone width and with a remote in TV mode.
+- [ ] **Live viewing**: the tuner's MPEG-TS (MPEG-2 or H.264, often interlaced 1080i) through the existing HLS transcoder with deinterlacing and hardware acceleration; pause and rewind from a time-shift buffer; channel up and down and a mini guide in the player; "Continue here" and "Play on…" working for live channels too.
+- [ ] **Scheduled recording**: one-off recordings from the guide, and series rules ("every new episode of X", by title, channel and time, new episodes only using the guide's first-shown flag), padding before and after, priorities and conflict handling when tuners run out, and a list of what is coming up.
+- [ ] **Recordings**: the stream written to disk as broadcast and remuxed afterwards (so a recording never depends on transcoding keeping up), matched to TMDB like any episode or film so they sit with the rest of the library, with retention rules (keep the last N, delete once watched, keep until space is needed).
+- [ ] **Access**: who may watch live TV and who may schedule recordings, set like library access; notifications when a recording fails or a series rule finds nothing.
+
+Later:
+- [ ] Tuner cards inside the server through the Linux DVB API (DVB-T/T2, DVB-S/S2, DVB-C, ATSC), and other network tuners.
+- [ ] Commercial detection and skipping, as intro skipping works today; optional transcoding of recordings to save space.
+- [ ] Federation: probably recordings shared across a nebula like any library, live tuners not.
+
 ## Operational
 
 - [x] `make build` echoed its own recipe, which put the TMDB key in the terminal, in scrollback and in any CI log that ever ran it. The key-bearing recipes are silenced with `@`. The key that was exposed this way should be rotated at themoviedb.org — silencing the recipe stops it happening again but does nothing about a key already seen.

@@ -7,9 +7,55 @@ the fly when a device cannot play a file as it is. It is one program: the web
 client and the admin UI are built in, and there is nothing else to install.
 
 It is written in Go for Linux, and is under active development. Video and
-music are in daily use; audiobooks, podcasts and books are on the way.
+music are in daily use; audiobooks, podcasts and books are on the way. The
+video work is done by FFmpeg itself, built into the binary through
+[ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo) — see
+[Thanks](#thanks).
 
 ![Cineva's home screen](docs/screenshots/home.webp)
+
+## Why another media server?
+
+Because Plex, for years the obvious choice, has stopped putting the people
+who run it first. Your server, your disks and your files, and yet:
+
+- **Watching your own films away from home now costs money.** Since April
+  2025 Plex no longer offers remote playback of personal media as a free
+  feature: you, or whoever runs the server, need a Plex Pass, or a separate
+  Remote Watch Pass. The same change put the Plex Pass up to $6.99 a month,
+  $69.99 a year or $249.99 for life
+  ([MacRumors](https://www.macrumors.com/2025/03/19/plex-price-increase)).
+- **Using your own graphics card is a paid extra.** Hardware-accelerated
+  streaming, which lets a modest server transcode for several screens, is a
+  premium feature that needs an active Plex Pass
+  ([Plex support](https://support.plex.tv/articles/115002178853-using-hardware-accelerated-streaming/)).
+- **Your account lives on their servers, and so does the risk.** Signing in
+  goes through plex.tv even when the server is in the next room, so when
+  Plex or your internet connection is down, apps can refuse to play files on
+  your own network
+  ([Plex forums](https://forums.plex.tv/t/plex-by-default-is-useless-even-as-a-local-server-when-internet-down/930093)).
+  And in September 2025, as in 2022, Plex asked users to reset their
+  passwords after a breach exposed email addresses, usernames, hashed
+  passwords and authentication data
+  ([TechCrunch](https://techcrunch.com/2025/09/09/plex-urges-users-to-change-passwords-after-data-breach/)).
+- **What you watch has been treated as theirs to share.** Plex's "Week in
+  Review" emails told people what their friends had been watching, an
+  opt-out feature that caught many by surprise
+  ([404 Media](https://www.404media.co/plex-users-fear-discover-together-week-in-review-feature-will-leak-porn-habits-to-their-friends-and-family/)).
+- **Your library is no longer the point of the app.** The 2025 redesign
+  dropped features people used, such as Watch Together, and left many
+  feeling their own media now comes second to Plex's ad-supported films and
+  live channels ([HotHardware](https://hothardware.com/news/plex-punts-a-popular-feature),
+  [Plex forums](https://forums.plex.tv/t/new-ui-is-an-awful-experience/931048)).
+
+Cineva goes the other way. It runs entirely on your own machine and needs
+an account with nobody: users, passwords and watch history stay in its
+database, on your disk, and it plays your files on your network whether or
+not the internet is up. Nothing is behind a paywall. There is no telemetry:
+the only things it fetches from the internet are artwork and details for
+your titles. There are no ads or bundled channels, and what you watch is
+never shared with anyone unless you send it somewhere yourself. It is free
+software under the AGPL, so it stays that way.
 
 ## What it does
 
@@ -23,9 +69,13 @@ music are in daily use; audiobooks, podcasts and books are on the way.
   TMDB; music from embedded tags, MusicBrainz and the Cover Art Archive.
   Search ignores case and accents: "amelie" finds *Amélie*.
 - **Playback** — direct play when the browser can handle the file, otherwise
-  HLS transcoding with seeking; hardware transcoding through VA-API (AMD and
-  Intel) where available. Text subtitles are served as WebVTT, and the seek
-  bar shows preview pictures.
+  HLS transcoding with seeking. Text subtitles are served as WebVTT, and the
+  seek bar shows preview pictures.
+- **Hardware transcoding, free** — the GPU decodes and encodes, so a small
+  machine can transcode 4K for several screens at once: AMD and
+  Intel through VA-API, NVIDIA through NVENC, and Intel Quick Sync. Cineva
+  finds what the machine has when it starts and uses it, falling back to
+  the processor where there is none. Nothing to buy or unlock.
 - **Series** — next-up tracking, intro and credits detection from the audio
   episodes share (with "Skip intro", and times that can be corrected by
   hand), and an up-next card that autoplays the next episode.
@@ -84,6 +134,117 @@ music are in daily use; audiobooks, podcasts and books are on the way.
 
 The Home Assistant pictures are of a demonstration instance, not a real
 house.
+
+## Roadmap
+
+Where Cineva is, and where it is going. There are no dates: things ship
+when they work properly. Finer-grained plans and known gaps are in
+[BACKLOG.md](BACKLOG.md).
+
+**Working today**
+
+- Films and TV: scanning, TMDB metadata, direct play and transcoding with
+  hardware acceleration, subtitles, intro and credits detection, next-up and
+  autoplay.
+- Music: albums and artists, gapless playback, ratings, manual and smart
+  playlists.
+- The web client on phones, desktops and televisions (TV mode), installable
+  as an app; the admin UI.
+- Accounts, profiles, groups and per-library access; per-person
+  preferences with household defaults; devices, "Continue here" and "Play
+  on…".
+- Home Assistant rooms, cameras and modes; Sonarr, Radarr and Lidarr;
+  requests; notifications; importing from Plex and Jellyfin.
+
+**Next**
+
+- **Audiobooks** — M4B with chapters, multi-file books, playback speed and
+  exact resume.
+- **Podcasts** — subscribe by RSS feed; new episodes downloaded and old ones
+  cleared by a retention rule.
+- **Books and comics** — EPUB with a built-in reader that remembers your
+  place, PDF, CBZ and CBR with a page reader, and an OPDS catalogue for
+  reader apps such as KOReader.
+- **More of it your way** — per-series and per-film settings (languages,
+  subtitles, intro skipping), home screens arranged per device, saved views,
+  control over recommendations, spoiler protection, seasonal rows, and an
+  age-rating limit for children's profiles
+  ([design](server/docs/personalisation.md)).
+- **Requests** — telling people when what they asked for has arrived, and a
+  calendar of upcoming episodes.
+- **Hardware transcoding** — NVIDIA and Intel Quick Sync work, but have had
+  far less testing than AMD through VA-API; HDR tone mapping on the GPU.
+
+**Later**
+
+- **Federation** — several households' servers (ours, the parents', a
+  friend's) joined into one Cineva: open any of them and see everyone's
+  libraries together, signed in as yourself, with watch history that follows
+  you. Works even when no server can accept incoming connections
+  ([design](server/docs/federation.md)).
+- **Native apps** — phone, tablet and laptop apps with true offline
+  downloads for travelling, syncing what you watched when you are back
+  online. A Fire TV app wrapping TV mode comes with them.
+- **Not yet decided** — photo libraries, sign-in through an identity provider
+  (OIDC), a relay for watching away from home without opening ports, and
+  PostgreSQL for very large libraries.
+- **Live TV and recording** — watch an HDHomeRun's channels on any screen
+  and record on a schedule: a programme guide (XMLTV, Schedules Direct),
+  series recordings of new episodes, pause and rewind live TV. Tuner cards
+  in the server after that. On the backlog, not yet designed.
+
+## Free and open software
+
+Cineva is free software, and is built to stay that way.
+
+- **The licence protects you.** Cineva is under the GNU Affero General Public
+  Licence, version 3 or later. You may use it, study it, change it and share
+  it; and anyone who runs a changed version as a service for other people
+  must offer them its source too, so improvements cannot be locked away on
+  someone's server.
+- **Contributions can never become proprietary.** Contributors keep the
+  copyright in their work. The [Contributor Licence Agreement](CLA.md) lets
+  the project be relicensed only under a licence approved by the Open Source
+  Initiative or the Free Software Foundation — never a closed one.
+- **Made from free software, all the way down.** Go, FFmpeg (a GPLv3 build,
+  with x264 and x265), [ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo),
+  SQLite, Svelte. Every dependency is checked before it is added: MIT, BSD,
+  Apache, LGPL, GPLv3 and AGPLv3 are welcome; anything GPLv2-only, or with
+  non-commercial or field-of-use restrictions, is not.
+- **Yours, not a platform.** No account with us or anyone else, no
+  telemetry, no DRM, no store and no ads. Your library and everyone's watch
+  history sit in one SQLite file on your own disk.
+- **Open to other software.** Everything the web client does goes through a
+  documented REST API ([OpenAPI 3.1](server/docs/openapi.yaml)), so anyone
+  can write a client or a script against it, and OPDS will open the book
+  libraries to reader apps.
+
+## How AI is used
+
+Cineva is written with the help of AI coding assistants, mainly
+[Claude Code](https://claude.com/product/claude-code). It is said here
+plainly because you should know how the software you run is made, and what
+keeps it sound.
+
+- **A person is in charge.** The maintainer decides what Cineva does and how
+  it should look and behave, sends back what is not right, and uses it every
+  day on real servers, televisions and phones. The assistant does not decide
+  what gets built or what ships.
+- **The rules are written down.** [CLAUDE.md](CLAUDE.md) sets out the
+  requirements, architecture, conventions and licence rules that every
+  change must follow — the same document human contributors read.
+- **Everything is checked the same way.** Changes come with tests (the
+  database is tested against real SQLite files, and the API against its
+  published specification), and every push is built, linted and tested on
+  amd64 and arm64 in CI, whoever or whatever wrote the change.
+- **No AI in the product.** Cineva has no AI features and talks to no AI
+  service. Intro and credits detection compares the audio that episodes
+  share; recommendations are plain rules over your own library and history.
+  Nothing you watch is sent anywhere, to train a model or otherwise.
+- **Contributions.** Changes written with an assistant are welcome, on the
+  same terms as any other: you are responsible for what you submit, must
+  understand it and have tested it, and sign it off under the
+  [CLA](CLA.md).
 
 ## Requirements
 
@@ -296,9 +457,12 @@ make build   # writes bin/cineva
 into your builds, put `TMDB_KEY = <key>` in `local.mk` at the top of the
 repository — it is ignored by git.
 
-The FFmpeg library is built from source, with a patch adding the Linux VA-API
-hardware decoders, rather than downloaded; [CLAUDE.md](CLAUDE.md) explains
-why, and describes the code's layout and conventions.
+The FFmpeg library is built from source with
+[ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo)'s own
+build, plus a small patch adding the Linux VA-API hardware decoders, rather
+than downloaded; [CLAUDE.md](CLAUDE.md) explains why, and describes the
+code's layout and conventions. The patch is kept as one change so it can be
+offered upstream.
 
 ### Releases
 
@@ -339,6 +503,27 @@ other than GitHub's arm64 runners.
 Bug reports, ideas and pull requests are welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up, what a change needs, and
 how it is reviewed.
+
+## Thanks
+
+Cineva stands on [FFmpeg](https://ffmpeg.org), and it reaches FFmpeg
+through **[ffmpeg-statigo](https://github.com/linuxmatters/ffmpeg-statigo)**,
+from [Martin Wimpress](https://github.com/flexiondotorg) and the
+[Linux Matters](https://linuxmatters.sh) podcast. It is not a wrapper around
+the `ffmpeg` command but Go bindings to the real FFmpeg libraries, built
+statically into the program, with hardware acceleration and generated
+bindings covering most of FFmpeg's API. It is why Cineva can be a single
+binary with nothing to install beside it: no system FFmpeg to hunt down, no
+version mismatches, the same codecs everywhere. Every probe, transcode,
+subtitle extraction and seek-bar preview here goes through it. Thank you,
+Martin, and thank you to Chandler Newman, whose
+[ffmpeg-go](https://github.com/csnewman/ffmpeg-go) it grew from. If you
+build anything in Go that touches audio or video, start there — and give
+[Linux Matters](https://linuxmatters.sh) a listen.
+
+Metadata comes from [TMDB](https://www.themoviedb.org),
+[MusicBrainz](https://musicbrainz.org) and the
+[Cover Art Archive](https://coverartarchive.org).
 
 ## Licence
 
