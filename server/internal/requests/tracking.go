@@ -58,6 +58,7 @@ func (s *Service) CheckAvailable(ctx context.Context) error {
 			return err
 		}
 		reqLog.Info("request available", "title", r.Title)
+		s.notify("request.available", r)
 		changed = true
 	}
 	if changed {

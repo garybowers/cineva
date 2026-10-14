@@ -1022,3 +1022,66 @@ export const listHAModes = () => get<HAMode[]>('/homeassistant/modes')
 /** Starts it in the background; mode-run events report each step. */
 export const runHAMode = (id: string, itemId?: string) =>
   post<{ runId: string }>(`/homeassistant/modes/${encodeURIComponent(id)}/run`, itemId ? { itemId } : {})
+
+// ---- Notifications: the caller's own destinations ----
+// Personal events (your requests, new episodes of what you watch) go only
+// to destinations you set up yourself. The kinds say which settings each
+// needs, so the form is drawn from them.
+
+export interface NotifyField {
+  name: string
+  label: string
+  secret?: boolean
+  required?: boolean
+  hint?: string
+}
+export interface NotifyKind {
+  id: string
+  label: string
+  personal: boolean
+  fields: NotifyField[]
+}
+export interface NotifyEvent {
+  id: string
+  label: string
+  scope: 'household' | 'personal'
+}
+export interface NotifyDestination {
+  id: string
+  ownerId?: string
+  kind: string
+  name: string
+  /** The kind's settings; secrets masked to their last four characters ("••••abcd"). */
+  config: Record<string, string>
+  events: string[]
+  libraryIds: string[]
+  enabled: boolean
+  lastSentAt?: string
+  lastError?: string
+  lastErrorAt?: string
+  createdAt?: string
+  updatedAt?: string
+}
+/** On create kind, name and config are needed; kind cannot change. A secret
+    left blank on an update keeps its saved value. */
+export interface NotifyDestinationRequest {
+  kind?: string
+  name?: string
+  config?: Record<string, string>
+  events?: string[]
+  enabled?: boolean
+}
+export interface MyNotifications {
+  destinations: NotifyDestination[]
+  events: NotifyEvent[]
+  kinds: NotifyKind[]
+}
+
+export const myNotifications = () => get<MyNotifications>('/auth/me/notifications')
+export const createMyDestination = (d: NotifyDestinationRequest) => post<NotifyDestination>('/auth/me/notifications', d)
+export const updateMyDestination = (id: string, change: NotifyDestinationRequest) =>
+  send<NotifyDestination>('PATCH', `/auth/me/notifications/${encodeURIComponent(id)}`, change)
+export const deleteMyDestination = (id: string) =>
+  req<void>(`/auth/me/notifications/${encodeURIComponent(id)}`, { method: 'DELETE' })
+/** Sends a test message now; throws with the reason when it was not delivered. */
+export const testMyDestination = (id: string) => post<void>(`/auth/me/notifications/${encodeURIComponent(id)}/test`)

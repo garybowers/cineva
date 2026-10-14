@@ -31,8 +31,12 @@
   import AccessPicker from './AccessPicker.svelte'
   import SmartHome from './SmartHome.svelte'
   import Devices from './Devices.svelte'
+  import Notifications from './Notifications.svelte'
+  import ImportWizard from './ImportWizard.svelte'
+  import type { ImportRun } from './lib/api'
+  import { Import as ImportIcon } from '@lucide/svelte'
   import {
-    Plus, Tv, Film, House, ChevronRight, RefreshCw, SlidersHorizontal, Pencil, Unplug, TriangleAlert, X,
+    Plus, Tv, Film, Music, House, ChevronRight, RefreshCw, SlidersHorizontal, Pencil, Unplug, TriangleAlert, X,
   } from '@lucide/svelte'
   import Defaults from './Defaults.svelte'
   import { applyTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
@@ -70,7 +74,7 @@
     else newPaths = final
   }
 
-  type Page = 'dashboard' | 'libraries' | 'users' | 'devices' | 'defaults' | 'requests' | 'activity' | 'logs' | 'integrations' | 'smarthome' | 'settings'
+  type Page = 'dashboard' | 'libraries' | 'users' | 'devices' | 'defaults' | 'requests' | 'activity' | 'logs' | 'integrations' | 'notifications' | 'smarthome' | 'settings'
   const pages: { id: Page; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'libraries', label: 'Libraries' },
@@ -81,6 +85,7 @@
     { id: 'activity', label: 'Activity' },
     { id: 'logs', label: 'Logs' },
     { id: 'integrations', label: 'Integrations' },
+    { id: 'notifications', label: 'Notifications' },
     { id: 'smarthome', label: 'Smart home' },
     { id: 'settings', label: 'Settings' },
   ]
@@ -228,6 +233,9 @@
 
   // ---- Users page ----
   let users: User[] = $state([])
+  // Import from Plex or Jellyfin: the dialogue, and the latest run from the event stream.
+  let importOpen = $state(false)
+  let importRun: ImportRun | null = $state(null)
   const loadUsers = () => listUsers().then((u) => (users = u)).catch(() => {})
   let editing: (UserRequest & { id?: string; clearPin?: boolean; hasPin?: boolean }) | null = $state(null) // null = closed; no id = new
   let userErr = $state('')
@@ -363,7 +371,14 @@
       label: 'Radarr', icon: Film, url: 'http://radarr.lan:7878',
       blurb: 'Films. Films it imports are scanned in within seconds, and requests for films are sent to it.',
     },
+    lidarr: {
+      label: 'Lidarr', icon: Music, url: 'http://lidarr.lan:8686',
+      blurb: 'Music. Albums it imports are scanned into the music libraries within seconds.',
+    },
   }
+  // Requests go to Sonarr and Radarr; Lidarr only brings imports in, so it
+  // has paths to map but no profile or folder to choose.
+  const takesRequests = (k: IntegrationKind) => k !== 'lidarr'
   const kindLabel = (k: IntegrationKind) => integrationKinds[k].label
   let integrations: Integration[] = $state([])
   // The Add dialogue's first step, choosing the kind; editingInt is the
@@ -1660,6 +1675,7 @@
         stats: onSample,
         logs: () => { if (!logsLoading) loadLogs() },
         users: () => { loadUsers(); loadGroups() },
+        import: (data) => (importRun = data as ImportRun | null),
         requests: loadRequests,
         integrations: loadIntegrations,
         // States that changed carry entities and only matter to the Smart
@@ -1718,7 +1734,7 @@
       const rest = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
       const parts = rest.split('/').filter(Boolean).map(decodeURIComponent)
       const [first, second] = parts
-      const pages: Page[] = ['dashboard', 'libraries', 'users', 'devices', 'defaults', 'requests', 'activity', 'logs', 'integrations', 'smarthome', 'settings']
+      const pages: Page[] = ['dashboard', 'libraries', 'users', 'devices', 'defaults', 'requests', 'activity', 'logs', 'integrations', 'notifications', 'smarthome', 'settings']
       const target = pages.includes(first as Page) ? (first as Page) : 'dashboard'
       page = target
       if (target === 'libraries' && second) {
@@ -2380,8 +2396,14 @@
     {:else if page === 'users'}
       <div class="titlerow">
         <h1>Users</h1>
-        <button class="primary" onclick={newUser}>+ Add user</button>
+        <div class="titleacts">
+          <button class="lib-btn ibtn" onclick={() => (importOpen = true)}><ImportIcon size={15} /> Import from Plex or Jellyfin</button>
+          <button class="primary" onclick={newUser}>+ Add user</button>
+        </div>
       </div>
+      {#if importOpen}
+        <ImportWizard {users} live={importRun} onclose={() => (importOpen = false)} />
+      {/if}
       {#if editing}
         <form class="panel form wide" onsubmit={saveUser}>
           {#if !editing.id}
@@ -2646,7 +2668,7 @@
       {/if}
       {#if intNote}<div class="error slim">{intNote}</div>{/if}
       {#if integrations.length === 0 && !ha?.configured}
-        <div class="empty slim">Nothing connected yet. Add Sonarr for series, Radarr for films, and Home Assistant for the rooms you watch in.</div>
+        <div class="empty slim">Nothing connected yet. Add Sonarr for series, Radarr for films, Lidarr for music, and Home Assistant for the rooms you watch in.</div>
       {/if}
       <div class="intgrid">
         {#each integrations as i (i.id)}
@@ -2684,11 +2706,13 @@
                   None received yet
                 {/if}
               </dd>
-              <dt>Requests</dt>
-              <dd>
-                {st?.qualityProfiles.find((q) => q.id === i.qualityProfileId)?.name ?? (i.qualityProfileId ? `Profile ${i.qualityProfileId}` : 'First quality profile')}
-                · {i.rootFolder || 'first root folder'}
-              </dd>
+              {#if takesRequests(i.kind)}
+                <dt>Requests</dt>
+                <dd>
+                  {st?.qualityProfiles.find((q) => q.id === i.qualityProfileId)?.name ?? (i.qualityProfileId ? `Profile ${i.qualityProfileId}` : 'First quality profile')}
+                  · {i.rootFolder || 'first root folder'}
+                </dd>
+              {/if}
               {#if i.pathMaps.length > 0}
                 <dt>Paths</dt>
                 <dd>{i.pathMaps.map((m) => `${m.from} → ${m.to}`).join(', ')}</dd>
@@ -2700,7 +2724,7 @@
               <button class="lib-btn ibtn" onclick={() => testIntegration(i)} disabled={intStatus[i.id] === 'checking'}>
                 <RefreshCw size={15} class={intStatus[i.id] === 'checking' ? 'spin' : ''} /> Test
               </button>
-              <button class="lib-btn ibtn" onclick={() => editOptions(i)}><SlidersHorizontal size={15} /> Requests &amp; paths</button>
+              <button class="lib-btn ibtn" onclick={() => editOptions(i)}><SlidersHorizontal size={15} /> {takesRequests(i.kind) ? 'Requests & paths' : 'Paths'}</button>
               <button class="lib-btn ibtn" onclick={() => editIntegration(i)}><Pencil size={15} /> Edit</button>
               <button class="lib-btn ibtn danger push" onclick={() => (disconnecting = i)}><Unplug size={15} /> Disconnect</button>
             </div>
@@ -2797,8 +2821,9 @@
       {#if optsFor && optsConn}
         {@const st = checked(optsConn.id)}
         {@const label = kindLabel(optsConn.kind)}
-        <Modal title="Requests and paths · {optsConn.name}" onclose={() => (optsFor = null)}>
+        <Modal title="{takesRequests(optsConn.kind) ? 'Requests and paths' : 'Paths'} · {optsConn.name}" onclose={() => (optsFor = null)}>
           <form id="opts-form" class="form modalform" onsubmit={saveOptions}>
+            {#if takesRequests(optsConn.kind)}
             {#if intStatus[optsConn.id] === 'checking'}<p class="hint">Asking {optsConn.name} for its profiles and folders…</p>{/if}
             <label>Quality profile for requests
               <select bind:value={optsFor.qualityProfileId}>
@@ -2812,6 +2837,7 @@
                 {#each st?.rootFolders ?? [] as f (f.id)}<option value={f.path}>{f.path} · {freeSpace(f.freeSpace)}</option>{/each}
               </select>
             </label>
+            {/if}
             <div class="facefield">
               <span>Path mapping</span>
               <p class="hint">For when {label} sees the media at other paths than Cineva does, as it does in a container.</p>
@@ -2893,6 +2919,8 @@
           {/snippet}
         </Modal>
       {/if}
+    {:else if page === 'notifications'}
+      <Notifications {libraries} />
     {:else if page === 'devices'}
       <Devices bind:this={devicesPage} {users} homeAssistant={!!ha?.configured} />
     {:else if page === 'smarthome'}
@@ -3382,6 +3410,7 @@
   .bar { margin-bottom: 1rem; }
   .titlerow { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   .titlerow h1 { margin-bottom: 1rem; }
+  .titleacts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; margin-bottom: 1rem; }
   .refresh { border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.8rem; color: var(--text); margin-bottom: 1rem; }
   .refresh:hover { border-color: var(--accent); }
   .refresh:disabled { opacity: 0.5; }

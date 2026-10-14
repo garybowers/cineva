@@ -47,6 +47,21 @@ type scanPlan struct {
 	// (every item, on the first scan after migration 0032), written once
 	// the walk is done rather than treated as a change.
 	adopt map[string]int64
+	// added is what this scan created that the library did not have
+	// before (films, episodes, albums), for "new in the library" messages.
+	added []store.Item
+}
+
+// noteNew records a saved item as new to the library when no item had its
+// path before. Nothing is new on a library's first scan, when everything
+// would be: announcing a whole library as it is set up is noise.
+func (p *scanPlan) noteNew(path string, saved store.Item) {
+	if len(p.stamps) == 0 {
+		return
+	}
+	if _, ok := p.stamps[path]; !ok {
+		p.added = append(p.added, saved)
+	}
 }
 
 // fileStat is what the change test reads from disk for one video.

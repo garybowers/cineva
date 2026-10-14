@@ -24,10 +24,12 @@ import (
 	"github.com/garybowers/cineva/server/internal/background"
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/homeassistant"
+	"github.com/garybowers/cineva/server/internal/importer"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
+	"github.com/garybowers/cineva/server/internal/notify"
 	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/prefs"
 	"github.com/garybowers/cineva/server/internal/requests"
@@ -108,6 +110,8 @@ type server struct {
 	presence          *presence // which sessions have an event stream open
 	requests          *requests.Service
 	ha                *homeassistant.Service
+	notify            *notify.Service
+	importer          *importer.Runner
 	haWho             principals // who users are, for Home Assistant access checks
 	prefs             *prefs.Service
 
@@ -137,6 +141,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		background:        background.NewPolicy(),
 		refreshes:         map[string]*refreshJob{},
 		ha:                homeassistant.New(st),
+		notify:            notify.New(st),
+		importer:          &importer.Runner{Store: st},
 		prefs:             prefs.NewService(st),
 	}
 	if s.trickplayDir == "" {
@@ -235,6 +241,7 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s.storage = library.NewStorageMonitor(st)
 	s.storage.OnChange = func(lib store.Library, st library.StorageStatus) {
 		s.events.Publish(events.Event{Type: "libraries"})
+		s.notifyStorage(lib, st)
 		// Detection and previews skipped this library while it was down;
 		// catch up.
 		if st.Available {
@@ -359,6 +366,8 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	s.playbacks.OnEnd = s.onPlaybackEnd
 	s.playbacks.OnPause = s.onPlaybackPause
 	s.startHomeAssistant(samplerCtx)
+	s.startNotifications(samplerCtx)
+	s.startImporter()
 	go s.playbacks.Run(samplerCtx)
 
 	e := echo.New()
@@ -561,6 +570,12 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/events", s.eventStream)
 	// Home Assistant: rooms, controls, cameras and modes. Each handler
 	// checks the caller may see the entity or mode.
+	// The caller's own notification destinations.
+	v1.GET("/auth/me/notifications", s.getMyNotifications)
+	v1.POST("/auth/me/notifications", s.createMyDestination)
+	v1.PATCH("/auth/me/notifications/:id", s.updateMyDestination)
+	v1.DELETE("/auth/me/notifications/:id", s.deleteMyDestination)
+	v1.POST("/auth/me/notifications/:id/test", s.testMyDestination)
 	v1.GET("/homeassistant/rooms", s.haRooms)
 	v1.POST("/homeassistant/entities/:entityId/action", s.haEntityAction)
 	v1.GET("/homeassistant/cameras/:entityId/snapshot", s.haCameraSnapshot)
@@ -637,6 +652,15 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	adm.DELETE("/integrations/:id", s.deleteIntegration)
 	adm.GET("/integrations/:id/status", s.integrationStatus)
 	adm.PUT("/integrations/:id/options", s.setIntegrationOptions)
+	adm.POST("/import/check", s.importCheck)
+	adm.POST("/import/runs", s.startImport)
+	adm.GET("/import/runs/current", s.currentImport)
+	adm.GET("/notifications", s.getNotifications)
+	adm.PUT("/notifications/settings", s.putNotifySettings)
+	adm.POST("/notifications/destinations", s.createHouseholdDestination)
+	adm.PATCH("/notifications/destinations/:id", s.updateHouseholdDestination)
+	adm.DELETE("/notifications/destinations/:id", s.deleteHouseholdDestination)
+	adm.POST("/notifications/destinations/:id/test", s.testHouseholdDestination)
 	adm.GET("/devices", s.listAllDevices)
 	adm.PATCH("/devices/:id", s.updateDevice)
 	adm.DELETE("/devices/:id", s.forgetDevice)

@@ -26,6 +26,8 @@ type Event struct {
 	TvdbID int
 	// Episodes are the episodes a Sonarr event names.
 	Episodes []store.EpisodeRef
+	// Albums are the albums a Lidarr event names; Title is then the artist.
+	Albums []string
 }
 
 // Grab is a release sent to the download client: the title is downloading.
@@ -36,6 +38,12 @@ func (e Event) Grab() bool { return e.Type == "Grab" }
 func (e Event) Describe() string {
 	if e.Title == "" {
 		return ""
+	}
+	if len(e.Albums) > 0 {
+		if len(e.Albums) == 1 {
+			return e.Title + " · " + e.Albums[0]
+		}
+		return fmt.Sprintf("%s · %d albums", e.Title, len(e.Albums))
 	}
 	if len(e.Episodes) == 0 {
 		if e.Year > 0 {
@@ -65,7 +73,8 @@ func (e Event) ChangesFiles() bool {
 	switch e.Type {
 	case "Download", "ImportComplete", "Rename",
 		"SeriesDelete", "EpisodeFileDelete",
-		"MovieDelete", "MovieFileDelete":
+		"MovieDelete", "MovieFileDelete",
+		"Retag", "ArtistDelete", "AlbumDelete": // Lidarr's
 		return true
 	}
 	return false
@@ -76,12 +85,13 @@ type pathed struct {
 	FolderPath string `json:"folderPath"`
 	ID         int    `json:"id"`
 	Title      string `json:"title"`
+	Name       string `json:"name"` // a Lidarr artist's
 	Year       int    `json:"year"`
 	TmdbID     int    `json:"tmdbId"`
 	TvdbID     int    `json:"tvdbId"`
 }
 
-// ParseEvent reads a Sonarr or Radarr webhook body.
+// ParseEvent reads a Sonarr, Radarr or Lidarr webhook body.
 func ParseEvent(body []byte) (Event, error) {
 	var raw struct {
 		EventType    string   `json:"eventType"`
@@ -90,6 +100,9 @@ func ParseEvent(body []byte) (Event, error) {
 		EpisodeFile  *pathed  `json:"episodeFile"`
 		EpisodeFiles []pathed `json:"episodeFiles"`
 		MovieFile    *pathed  `json:"movieFile"`
+		Artist       *pathed  `json:"artist"`
+		Albums       []pathed `json:"albums"`
+		TrackFiles   []pathed `json:"trackFiles"`
 		Episodes     []struct {
 			SeasonNumber  int `json:"seasonNumber"`
 			EpisodeNumber int `json:"episodeNumber"`
@@ -113,6 +126,18 @@ func ParseEvent(body []byte) (Event, error) {
 	add(raw.MovieFile)
 	for i := range raw.EpisodeFiles {
 		add(&raw.EpisodeFiles[i])
+	}
+	for i := range raw.TrackFiles {
+		add(&raw.TrackFiles[i])
+	}
+	if a := raw.Artist; a != nil {
+		add(a)
+		ev.Title, ev.ArrID = a.Name, a.ID
+		for _, al := range raw.Albums {
+			if al.Title != "" {
+				ev.Albums = append(ev.Albums, al.Title)
+			}
+		}
 	}
 	add(raw.Series)
 	add(raw.Movie)

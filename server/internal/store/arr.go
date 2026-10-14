@@ -13,7 +13,7 @@ import (
 // ArrConnection is a connected Sonarr or Radarr instance.
 type ArrConnection struct {
 	ID   string `json:"id"`
-	Kind string `json:"kind"` // "sonarr" | "radarr"
+	Kind string `json:"kind"` // "sonarr" | "radarr" | "lidarr"
 	Name string `json:"name"`
 	URL  string `json:"url"`
 	// APIKey is the instance's key. Never sent to clients.
@@ -111,8 +111,8 @@ func (s *Store) ArrConnection(ctx context.Context, id string) (ArrConnection, er
 }
 
 func (s *Store) CreateArrConnection(ctx context.Context, c ArrConnection) (ArrConnection, error) {
-	if c.Kind != "sonarr" && c.Kind != "radarr" {
-		return ArrConnection{}, fmt.Errorf("unknown kind %q: want sonarr or radarr", c.Kind)
+	if c.Kind != "sonarr" && c.Kind != "radarr" && c.Kind != "lidarr" {
+		return ArrConnection{}, fmt.Errorf("unknown kind %q: want sonarr, radarr or lidarr", c.Kind)
 	}
 	c.ID = uuid.NewString()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO arr_connections

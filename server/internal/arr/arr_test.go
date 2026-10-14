@@ -20,8 +20,16 @@ type fakeArr struct {
 	saved   map[int]map[string]any
 	nextID  int
 	refuses string // a validation failure to answer saves with
+	version string // "v1" for Lidarr; v3 otherwise
 
 	library
+}
+
+func (f *fakeArr) api(path string) string {
+	if f.version == "" {
+		return "/api/v3" + path
+	}
+	return "/api/" + f.version + path
 }
 
 func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -32,9 +40,9 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
-	case r.URL.Path == "/api/v3/system/status":
+	case r.URL.Path == f.api("/system/status"):
 		json.NewEncoder(w).Encode(map[string]any{"appName": f.app, "version": "4.0.15"})
-	case r.URL.Path == "/api/v3/notification/schema":
+	case r.URL.Path == f.api("/notification/schema"):
 		json.NewEncoder(w).Encode([]map[string]any{
 			{"implementation": "Slack", "fields": []any{}},
 			{
@@ -44,6 +52,7 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"onRename": false, "supportsOnRename": true,
 				"onHealthIssue": false, "supportsOnHealthIssue": true,
 				"onMovieDelete": false, "supportsOnMovieDelete": false,
+				"onReleaseImport": false, "supportsOnReleaseImport": true,
 				"fields": []any{
 					map[string]any{"name": "url", "value": ""},
 					map[string]any{"name": "method", "value": 2},
@@ -53,8 +62,8 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 		})
-	case r.Method == http.MethodPost && r.URL.Path == "/api/v3/notification",
-		r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/v3/notification/"):
+	case r.Method == http.MethodPost && r.URL.Path == f.api("/notification"),
+		r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, f.api("/notification/")):
 		if f.refuses != "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode([]map[string]any{{"propertyName": "Url", "errorMessage": f.refuses}})
@@ -71,7 +80,7 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		def["id"] = id
 		f.saved[id] = def
 		json.NewEncoder(w).Encode(def)
-	case strings.HasPrefix(r.URL.Path, "/api/v3/notification/"):
+	case strings.HasPrefix(r.URL.Path, f.api("/notification/")):
 		id := idFrom(r.URL.Path)
 		def, ok := f.saved[id]
 		if !ok {
@@ -92,7 +101,8 @@ func (f *fakeArr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func idFrom(path string) int {
 	var id int
-	for _, ch := range strings.TrimPrefix(path, "/api/v3/notification/") {
+	_, tail, _ := strings.Cut(path, "/notification/")
+	for _, ch := range tail {
 		id = id*10 + int(ch-'0')
 	}
 	return id
@@ -152,6 +162,28 @@ func TestRegisterWebhook(t *testing.T) {
 	}
 }
 
+// Lidarr speaks v1 of the same API, and its import trigger is subscribed.
+func TestLidarr(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeArr{app: "Lidarr", version: "v1", saved: map[int]map[string]any{}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	c := New("lidarr", srv.URL, "key")
+	if _, err := c.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := c.RegisterWebhook(ctx, 0, Webhook{Name: "Cineva", URL: "http://cineva/hook", Username: "cineva", Password: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.saved[id]["onReleaseImport"] != true {
+		t.Fatalf("Lidarr's import trigger not subscribed: %v", fake.saved[id])
+	}
+	if _, err := New("sonarr", srv.URL, "key").Status(ctx); err == nil {
+		t.Fatal("a Lidarr answered as Sonarr")
+	}
+}
+
 func TestClientErrors(t *testing.T) {
 	ctx := context.Background()
 	fake := &fakeArr{app: "Radarr", saved: map[int]map[string]any{}, refuses: "Unable to send test message"}
@@ -190,6 +222,10 @@ func TestParseEvent(t *testing.T) {
 		{"radarr download", `{"eventType":"Download","movie":{"folderPath":"/movies/Film (2020)"},"movieFile":{"path":"/movies/Film (2020)/f.mkv"}}`,
 			true, []string{"/movies/Film (2020)/f.mkv", "/movies/Film (2020)"}},
 		{"grab", `{"eventType":"Grab","series":{"path":"/tv/Show"}}`, false, []string{"/tv/Show"}},
+		{"lidarr import", `{"eventType":"Download","artist":{"id":7,"name":"Elbow","path":"/music/Elbow"},"albums":[{"title":"Seldom Seen Kid"}],"trackFiles":[{"path":"/music/Elbow/Seldom Seen Kid/01.flac"}]}`,
+			true, []string{"/music/Elbow/Seldom Seen Kid/01.flac", "/music/Elbow"}},
+		{"lidarr retag", `{"eventType":"Retag","artist":{"name":"Elbow","path":"/music/Elbow"}}`, true, []string{"/music/Elbow"}},
+		{"lidarr album delete", `{"eventType":"AlbumDelete","artist":{"name":"Elbow","path":"/music/Elbow"}}`, true, []string{"/music/Elbow"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ev, err := ParseEvent([]byte(tc.body))
@@ -204,6 +240,10 @@ func TestParseEvent(t *testing.T) {
 	if _, err := ParseEvent([]byte("not json")); err == nil {
 		t.Fatal("parsed a body that is not JSON")
 	}
+	ev, _ := ParseEvent([]byte(`{"eventType":"Download","artist":{"name":"Elbow","path":"/music/Elbow"},"albums":[{"title":"Seldom Seen Kid"}]}`))
+	if got := ev.Describe(); got != "Elbow · Seldom Seen Kid" {
+		t.Fatalf("lidarr describe = %q", got)
+	}
 }
 
 func TestLibraries(t *testing.T) {
@@ -212,6 +252,7 @@ func TestLibraries(t *testing.T) {
 		{ID: "kids", MediaType: store.MediaTV, Source: "local", Paths: []string{"/mnt/media/Kids TV"}},
 		{ID: "remote", MediaType: store.MediaTV, Source: "federated", Paths: []string{"/mnt/media/TV"}},
 		{ID: "films", MediaType: store.MediaMovies, Source: "local", Paths: []string{"/mnt/media/Movies"}},
+		{ID: "music", MediaType: store.MediaMusic, Source: "local", Paths: []string{"/mnt/media/Music"}},
 	}
 	for _, tc := range []struct {
 		name  string
@@ -223,6 +264,7 @@ func TestLibraries(t *testing.T) {
 		{"prefix is not containment", "sonarr", []string{"/mnt/media/TV2/Show"}, "tv,kids"},
 		{"container paths fall back to the type", "sonarr", []string{"/tv/Show"}, "tv,kids"},
 		{"radarr", "radarr", []string{"/movies/Film"}, "films"},
+		{"lidarr", "lidarr", []string{"/mnt/media/Music/Elbow/01.flac"}, "music"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var ids []string

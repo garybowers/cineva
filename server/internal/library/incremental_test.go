@@ -276,3 +276,59 @@ func remove(rel string) func(*testing.T, string) {
 		}
 	}
 }
+
+// A scan reports the titles it added, for notifications: nothing on a
+// library's first scan, only the new episode on a later one, and nothing
+// on a full rescan of what was already there.
+func TestScanReportsNewTitles(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Show", "Season 1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Show.S01E01.mkv")
+	st := newLibTestStore(t)
+	ctx := context.Background()
+	lib, err := st.CreateLibrary(ctx, "TV", store.MediaTV, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(st, stubVideo{tv: metadata.VideoResult{TmdbID: 1, Title: "Show", Status: "Ended"}}, "")
+	m.Probe = func(string) (media.Info, error) { return media.Info{RuntimeSecs: 1800}, nil }
+	var added []store.Item
+	var scans int
+	m.OnScanFinished = func(_ store.Library, sc store.Scan, a []store.Item) {
+		scans++
+		added = a
+		if sc.Status != "completed" {
+			t.Errorf("scan %s: %s", sc.Status, sc.Error)
+		}
+	}
+	scan := func(full bool) []store.Item {
+		t.Helper()
+		if _, err := m.RunScanSync(ctx, lib, full); err != nil {
+			t.Fatal(err)
+		}
+		return added
+	}
+	if got := scan(false); len(got) != 0 {
+		t.Fatalf("first scan announced %d titles", len(got))
+	}
+	write("Show.S01E02.mkv")
+	got := scan(false)
+	if len(got) != 1 || got[0].Kind != store.KindEpisode || got[0].EpisodeNum != 2 {
+		t.Fatalf("second scan added %+v, want episode 2 alone", got)
+	}
+	if got := scan(true); len(got) != 0 {
+		t.Fatalf("a full rescan announced %d titles", len(got))
+	}
+	if scans != 3 {
+		t.Fatalf("OnScanFinished called %d times, want 3", scans)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -50,8 +51,8 @@ func (s *server) createIntegration(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid body")
 	}
-	if req.Kind != "sonarr" && req.Kind != "radarr" {
-		return echo.NewHTTPError(http.StatusBadRequest, "kind must be sonarr or radarr")
+	if !slices.Contains(arr.Kinds, req.Kind) {
+		return echo.NewHTTPError(http.StatusBadRequest, "kind must be sonarr, radarr or lidarr")
 	}
 	conn := store.ArrConnection{Kind: req.Kind}
 	if err := applyArrRequest(c, &conn, req); err != nil {

@@ -91,19 +91,19 @@ type AddOptions struct {
 
 func (c *Client) QualityProfiles(ctx context.Context) ([]QualityProfile, error) {
 	out := []QualityProfile{}
-	err := c.do(ctx, http.MethodGet, "/api/v3/qualityprofile", nil, &out)
+	err := c.do(ctx, http.MethodGet, c.api("/qualityprofile"), nil, &out)
 	return out, err
 }
 
 func (c *Client) RootFolders(ctx context.Context) ([]RootFolder, error) {
 	out := []RootFolder{}
-	err := c.do(ctx, http.MethodGet, "/api/v3/rootfolder", nil, &out)
+	err := c.do(ctx, http.MethodGet, c.api("/rootfolder"), nil, &out)
 	return out, err
 }
 
 func (c *Client) Health(ctx context.Context) ([]HealthCheck, error) {
 	out := []HealthCheck{}
-	err := c.do(ctx, http.MethodGet, "/api/v3/health", nil, &out)
+	err := c.do(ctx, http.MethodGet, c.api("/health"), nil, &out)
 	return out, err
 }
 
@@ -113,7 +113,7 @@ func (c *Client) Queue(ctx context.Context) ([]QueueItem, error) {
 	var page struct {
 		Records []QueueItem `json:"records"`
 	}
-	err := c.do(ctx, http.MethodGet, "/api/v3/queue?page=1&pageSize=250", nil, &page)
+	err := c.do(ctx, http.MethodGet, c.api("/queue?page=1&pageSize=250"), nil, &page)
 	if page.Records == nil {
 		page.Records = []QueueItem{}
 	}
@@ -121,7 +121,7 @@ func (c *Client) Queue(ctx context.Context) ([]QueueItem, error) {
 }
 
 func (c *Client) command(ctx context.Context, body map[string]any) error {
-	return c.do(ctx, http.MethodPost, "/api/v3/command", body, nil)
+	return c.do(ctx, http.MethodPost, c.api("/command"), body, nil)
 }
 
 // Defaults fills in a profile and root folder an admin has not chosen with

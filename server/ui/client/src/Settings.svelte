@@ -10,15 +10,19 @@
   import {
     User as UserIcon, MonitorPlay, Palette, Lock, MonitorSmartphone, Smartphone, KeyRound, Info,
     ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy, SlidersHorizontal,
+    Bell, Plus,
   } from '@lucide/svelte'
   import {
     AVATAR_COLOURS, changePassword, createAPIKey, deleteAPIKey, listAPIKeys, nameDevice,
     removeAvatar, revokeDevice, revokeOtherDevices, forgetDevice, setAvatarColour, setPIN, updateMe,
+    myNotifications, createMyDestination, updateMyDestination, deleteMyDestination, testMyDestination,
     type APIKey, type AvatarColour, type Device, type MyPrefs, type PrefEntry, type PrefOrigin, type User,
+    type MyNotifications, type NotifyDestination, type NotifyKind,
   } from './lib/api'
   import { onPrefs, prefState, resetPref, setPref } from './lib/prefs'
   import type { ThemeInfo } from './lib/theme'
   import { ha, loadHA } from './lib/homeassistant.svelte'
+  import Sheet from './Sheet.svelte'
 
   let {
     me,
@@ -61,6 +65,7 @@
     { id: 'profile', label: 'Profile', icon: UserIcon },
     { id: 'playback', label: 'Playback', icon: MonitorPlay },
     { id: 'appearance', label: 'Appearance', icon: Palette },
+    { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'security', label: 'Sign-in and security', icon: Lock },
     { id: 'devices', label: 'Devices', icon: MonitorSmartphone },
     { id: 'keys', label: 'API keys', icon: KeyRound },
@@ -345,6 +350,126 @@
       keyMsg = errText(err)
     }
   }
+
+  // ---- Notifications ----
+  // The caller's own destinations, for events about them alone. The kinds
+  // the server offers carry their settings, so the form is drawn from them.
+  let notif = $state<MyNotifications | null>(null)
+  let notifMsg = $state('')
+  async function loadNotif() {
+    try {
+      notif = await myNotifications()
+    } catch (err) {
+      notifMsg = errText(err)
+    }
+  }
+  $effect(() => {
+    if (shown === 'notifications') void loadNotif()
+  })
+  const kindOf = (id: string) => notif?.kinds.find((k) => k.id === id)
+  function eventsSummary(d: NotifyDestination): string {
+    const all = notif?.events ?? []
+    const chosen = all.filter((e) => d.events.includes(e.id))
+    if (chosen.length === 0) return 'No events chosen'
+    if (chosen.length === all.length) return 'Every event'
+    return chosen.map((e) => e.label).join(', ')
+  }
+  // A test's answer, shown beside its buttons until the next test.
+  let testing = $state('')
+  let tested: Record<string, { ok: boolean; text: string }> = $state({})
+  async function testDest(d: NotifyDestination) {
+    testing = d.id
+    delete tested[d.id]
+    try {
+      await testMyDestination(d.id)
+      tested[d.id] = { ok: true, text: 'Delivered' }
+    } catch (err) {
+      tested[d.id] = { ok: false, text: errText(err) }
+    } finally {
+      testing = ''
+      void loadNotif() // the destination now records the attempt
+    }
+  }
+  async function toggleDest(d: NotifyDestination) {
+    notifMsg = ''
+    try {
+      const saved = await updateMyDestination(d.id, { enabled: !d.enabled })
+      if (notif) notif.destinations = notif.destinations.map((x) => (x.id === saved.id ? saved : x))
+    } catch (err) {
+      notifMsg = errText(err)
+    }
+  }
+  // Deleting is asked twice, as Forget is for a device.
+  let deleteAsk = $state('')
+  async function deleteDest(d: NotifyDestination) {
+    if (deleteAsk !== d.id) {
+      deleteAsk = d.id
+      return
+    }
+    deleteAsk = ''
+    notifMsg = ''
+    try {
+      await deleteMyDestination(d.id)
+      if (notif) notif.destinations = notif.destinations.filter((x) => x.id !== d.id)
+    } catch (err) {
+      notifMsg = errText(err)
+    }
+  }
+
+  // The add/edit form. editing is null when closed, '' when adding, else
+  // the destination's id. A secret field starts blank: left blank, the
+  // saved value is kept, and its mask shows as the placeholder.
+  let editing: string | null = $state(null)
+  let draft = $state({ kind: '', name: '', values: {} as Record<string, string>, events: [] as string[], enabled: true })
+  let formMsg = $state('')
+  let formBusy = $state(false)
+  const editingDest = $derived(editing ? notif?.destinations.find((d) => d.id === editing) : undefined)
+  const draftKind = $derived(kindOf(draft.kind))
+  function openAdd() {
+    const kinds = notif?.kinds ?? []
+    draft = { kind: kinds.length === 1 ? kinds[0].id : '', name: '', values: {}, events: (notif?.events ?? []).map((e) => e.id), enabled: true }
+    formMsg = ''
+    editing = ''
+  }
+  function openEdit(d: NotifyDestination) {
+    const values: Record<string, string> = {}
+    for (const f of kindOf(d.kind)?.fields ?? []) values[f.name] = f.secret ? '' : (d.config[f.name] ?? '')
+    draft = { kind: d.kind, name: d.name, values, events: [...d.events], enabled: d.enabled }
+    formMsg = ''
+    editing = d.id
+  }
+  function chooseKind(k: NotifyKind) {
+    if (draft.kind === k.id) return
+    draft.kind = k.id
+    draft.values = {}
+  }
+  function toggleEvent(id: string, on: boolean) {
+    draft.events = on ? [...draft.events, id] : draft.events.filter((e) => e !== id)
+  }
+  async function saveDest(e: Event) {
+    e.preventDefault()
+    if (!draftKind) {
+      formMsg = 'Choose where to send them first.'
+      return
+    }
+    formBusy = true
+    formMsg = ''
+    const config: Record<string, string> = {}
+    for (const f of draftKind.fields) config[f.name] = (draft.values[f.name] ?? '').trim()
+    // In the catalogue's order, whatever order they were ticked in.
+    const events = (notif?.events ?? []).map((x) => x.id).filter((id) => draft.events.includes(id))
+    try {
+      const body = { name: draft.name.trim(), config, events, enabled: draft.enabled }
+      if (editing) await updateMyDestination(editing, body)
+      else await createMyDestination({ kind: draft.kind, ...body })
+      editing = null
+      await loadNotif()
+    } catch (err) {
+      formMsg = errText(err)
+    } finally {
+      formBusy = false
+    }
+  }
 </script>
 
 <div class="settings" class:has-open={open !== ''}>
@@ -446,6 +571,124 @@
           {@render prefRow(p)}
         {/each}
       </div>
+
+    {:else if shown === 'notifications'}
+      <h2>Notifications</h2>
+      <p class="lead">
+        Be told when your requests are approved, declined or ready to watch, and when new episodes of series you are
+        watching arrive. These go only to destinations you set up here, never to a shared channel.
+      </p>
+      {#if !notif}
+        <p class="lead">{notifMsg || 'Loading your notifications…'}</p>
+      {:else}
+        {#if notif.destinations.length > 0}
+          <div class="card">
+            {#each notif.destinations as d (d.id)}
+              {@const k = kindOf(d.kind)}
+              {@const t = tested[d.id]}
+              <div class="dest">
+                <div class="dest-head">
+                  <div class="dev-text">
+                    <span class="dev-name" id="nd-{d.id}">{d.name}<span class="tag">{k?.label ?? d.kind}</span></span>
+                    <span class="sd">{eventsSummary(d)}</span>
+                    {#if !k}
+                      <span class="sd">No longer offered here. Delete it, or ask an admin.</span>
+                    {:else if d.lastError}
+                      <span class="sd bad">Not delivered{d.lastErrorAt ? ` ${ago(d.lastErrorAt)}` : ''}: {d.lastError}</span>
+                    {:else if d.lastSentAt}
+                      <span class="sd">Last delivered {ago(d.lastSentAt)}</span>
+                    {:else}
+                      <span class="sd">Nothing sent yet</span>
+                    {/if}
+                  </div>
+                  <button class="switch" role="switch" aria-checked={d.enabled} aria-labelledby="nd-{d.id}"
+                    title={d.enabled ? 'On' : 'Off'} onclick={() => toggleDest(d)}><span></span></button>
+                </div>
+                <div class="btns">
+                  <button class="btn" onclick={() => testDest(d)} disabled={testing === d.id}>{testing === d.id ? 'Sending…' : 'Test'}</button>
+                  {#if k}<button class="btn quiet" onclick={() => openEdit(d)}>Edit</button>{/if}
+                  <button class="btn quiet" class:danger={deleteAsk === d.id} onclick={() => deleteDest(d)}
+                    onblur={() => { if (deleteAsk === d.id) deleteAsk = '' }}>{deleteAsk === d.id ? 'Delete it?' : 'Delete'}</button>
+                  {#if t}<span class="sd test" class:good={t.ok} class:bad={!t.ok} role="status">{t.text}</span>{/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+        {#if notif.kinds.length === 0}
+          <div class="card"><p class="sd pad first">An admin has not made any kinds of destination available yet.</p></div>
+        {:else}
+          <div class="btns" class:after={notif.destinations.length > 0}>
+            <button class="btn" onclick={openAdd}><Plus size={15} /> Add a destination</button>
+          </div>
+        {/if}
+        {#if notifMsg}<p class="msg">{notifMsg}</p>{/if}
+      {/if}
+
+      {#if editing !== null}
+        <Sheet title={editing ? `Edit ${editingDest?.name ?? 'destination'}` : 'Add a destination'} onclose={() => (editing = null)}>
+          <form class="nform" onsubmit={saveDest}>
+            {#if editing}
+              <div class="field">
+                <span class="st">Sent by</span>
+                <span class="sd">{draftKind?.label ?? draft.kind}</span>
+              </div>
+            {:else}
+              <div class="field">
+                <span class="st" id="nf-kind">Send them by</span>
+                <div class="themes" role="radiogroup" aria-labelledby="nf-kind">
+                  {#each notif?.kinds ?? [] as k (k.id)}
+                    <button type="button" class="theme" class:sel={draft.kind === k.id} role="radio" aria-checked={draft.kind === k.id} onclick={() => chooseKind(k)}>
+                      <span>{k.label}</span>
+                      {#if draft.kind === k.id}<Check size={15} class="tick" />{/if}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if draftKind}
+              <label class="field">
+                <span class="st">Name</span>
+                <input maxlength="60" placeholder="For example, My phone" bind:value={draft.name} required />
+              </label>
+              {#each draftKind.fields as f (f.name)}
+                {@const masked = editing ? (editingDest?.config[f.name] ?? '') : ''}
+                <label class="field">
+                  <span class="st">{f.label}{#if !f.required}<span class="opt">optional</span>{/if}</span>
+                  <input bind:value={draft.values[f.name]} autocomplete="off" spellcheck="false"
+                    placeholder={f.secret && masked ? masked : ''}
+                    required={f.required && !(f.secret && masked)} />
+                  {#if f.secret && masked}<span class="sd">Leave blank to keep the saved one.</span>{/if}
+                  {#if f.hint}<span class="sd">{f.hint}</span>{/if}
+                  {#if draftKind.id === 'telegram' && f.name === 'chatId'}
+                    <span class="sd">To find yours, send the bot a message, then ask an admin to look it up, or ask @userinfobot.</span>
+                  {/if}
+                </label>
+              {/each}
+              <fieldset class="field">
+                <legend class="st">Tell me when</legend>
+                {#each notif?.events ?? [] as ev (ev.id)}
+                  <label class="check">
+                    <input type="checkbox" checked={draft.events.includes(ev.id)}
+                      onchange={(e) => toggleEvent(ev.id, (e.currentTarget as HTMLInputElement).checked)} />
+                    <span>{ev.label}</span>
+                  </label>
+                {/each}
+              </fieldset>
+              <div class="field row">
+                <span class="st" id="nf-on">Enabled</span>
+                <button type="button" class="switch" role="switch" aria-checked={draft.enabled} aria-labelledby="nf-on"
+                  onclick={() => (draft.enabled = !draft.enabled)}><span></span></button>
+              </div>
+            {/if}
+            {#if formMsg}<p class="msg bad">{formMsg}</p>{/if}
+            <div class="btns">
+              <button class="btn primary" type="submit" disabled={formBusy || !draftKind}>{formBusy ? 'Saving…' : editing ? 'Save' : 'Add'}</button>
+              <button class="btn quiet" type="button" onclick={() => (editing = null)}>Cancel</button>
+            </div>
+          </form>
+        </Sheet>
+      {/if}
 
     {:else if extraSection}
       <h2>{extraSection.label}</h2>
@@ -842,6 +1085,26 @@
   .reveal { padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.7rem; margin-bottom: 1rem; border-color: var(--accent); }
   .reveal code { word-break: break-all; background: var(--bg); padding: 0.6rem 0.7rem; border-radius: 8px; border: 1px solid var(--border); }
   .reveal > * + * { border-top: none; }
+
+  /* ---- Notifications ---- */
+  .dest { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.85rem 1.1rem; }
+  .dest-head { display: flex; align-items: flex-start; gap: 0.9rem; }
+  .dest-head .switch { flex: none; margin-top: 0.1rem; }
+  .dest .dev-text { overflow-wrap: anywhere; }
+  .sd.bad, .msg.bad { color: var(--err); }
+  .sd.good { color: var(--ok); }
+  .test { flex-basis: 100%; overflow-wrap: anywhere; }
+  .pad.first { padding-top: 0.9rem; }
+  .nform { display: flex; flex-direction: column; gap: 1rem; }
+  .field { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+  .field.row { flex-direction: row; align-items: center; justify-content: space-between; }
+  .field input { width: 100%; min-width: 0; }
+  .nform .theme span { min-width: 0; overflow-wrap: anywhere; }
+  .opt { margin-left: 0.45rem; font-size: 0.78rem; color: var(--muted); }
+  fieldset.field { border: none; padding: 0; margin: 0; gap: 0.45rem; }
+  fieldset.field legend { padding: 0; margin-bottom: 0.35rem; }
+  .check { display: flex; align-items: center; gap: 0.6rem; font-size: 0.9rem; color: var(--text); cursor: pointer; }
+  .check input { width: 1.05rem; height: 1.05rem; padding: 0; margin: 0; flex: none; accent-color: var(--accent); }
 
   .back { display: none; }
 

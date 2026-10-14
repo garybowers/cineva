@@ -191,6 +191,7 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 				return len(files), created, err
 			}
 			plan.keep[saved.ID] = true
+			plan.noteNew(albumDir, saved)
 			albumID, albumIDs[albumDir] = saved.ID, saved.ID
 			created++
 		}

@@ -54,6 +54,10 @@ type Service struct {
 	// downloading, while any request is waiting to start. Zero is five
 	// minutes.
 	PollEvery time.Duration
+	// Notify, when set, hears of each change worth telling someone about
+	// (see docs/notifications.md): "request.waiting", "request.failed",
+	// "request.approved", "request.declined" and "request.available".
+	Notify func(event string, r store.MediaRequest)
 
 	missingMu sync.Mutex
 	missing   map[int]missingEntry // by series TMDB id
@@ -240,6 +244,7 @@ func (s *Service) Create(ctx context.Context, u store.User, in NewRequest) (stor
 	}
 	defer s.changed()
 	if level != store.RequestAuto {
+		s.notify("request.waiting", saved)
 		return saved, true, nil
 	}
 	sent, err := s.send(ctx, saved, Override{}, u.ID)
@@ -273,7 +278,21 @@ func (s *Service) send(ctx context.Context, r store.MediaRequest, ov Override, b
 	if err != nil {
 		return r, err
 	}
+	switch {
+	case sendErr != nil:
+		s.notify("request.failed", saved)
+	case by != saved.UserID:
+		// Approved by an admin. One sent straight away on its owner's own
+		// say-so needs no news: they have just asked.
+		s.notify("request.approved", saved)
+	}
 	return saved, sendErr
+}
+
+func (s *Service) notify(event string, r store.MediaRequest) {
+	if s.Notify != nil {
+		s.Notify(event, r)
+	}
 }
 
 func (s *Service) deliver(ctx context.Context, r *store.MediaRequest, ov Override) error {
@@ -353,6 +372,7 @@ func (s *Service) Decline(ctx context.Context, admin store.User, id, note string
 	if err != nil {
 		return store.MediaRequest{}, err
 	}
+	s.notify("request.declined", saved)
 	s.changed()
 	return saved, nil
 }

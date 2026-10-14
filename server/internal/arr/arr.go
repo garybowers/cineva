@@ -1,10 +1,11 @@
-// Package arr talks to Sonarr and Radarr: enough of their v3 API to check a
-// connection and register a webhook in it, the shape of the events that
-// webhook delivers, and the calls a request needs — adding or monitoring a
-// film or series and searching for it.
+// Package arr talks to Sonarr, Radarr and Lidarr: enough of their API to
+// check a connection and register a webhook in it, the shape of the events
+// that webhook delivers, and the calls a request needs — adding or
+// monitoring a film or series and searching for it.
 //
-// Both apps share one API surface for this — system status and the
-// notification ("Connect") providers — so one client serves either.
+// The apps share one API surface for this — system status, health and the
+// notification ("Connect") providers — so one client serves all three.
+// Sonarr and Radarr speak v3 of it, Lidarr v1.
 package arr
 
 import (
@@ -21,7 +22,7 @@ import (
 
 // Client is one Sonarr or Radarr instance.
 type Client struct {
-	Kind   string // "sonarr" | "radarr"
+	Kind   string // "sonarr" | "radarr" | "lidarr"
 	URL    string // base URL, e.g. http://sonarr.lan:8989
 	APIKey string
 	HTTP   *http.Client
@@ -38,12 +39,27 @@ func New(kind, url, apiKey string) *Client {
 	}
 }
 
-// Label is the app's name for messages: "Sonarr" or "Radarr".
+// Kinds are the apps Cineva connects to.
+var Kinds = []string{"sonarr", "radarr", "lidarr"}
+
+// Label is the app's name for messages: "Sonarr", "Radarr" or "Lidarr".
 func (c *Client) Label() string {
-	if c.Kind == "radarr" {
+	switch c.Kind {
+	case "radarr":
 		return "Radarr"
+	case "lidarr":
+		return "Lidarr"
 	}
 	return "Sonarr"
+}
+
+// api is the path of one of the app's endpoints: Lidarr's API is v1, the
+// others' v3, with the same shapes where Cineva uses them.
+func (c *Client) api(path string) string {
+	if c.Kind == "lidarr" {
+		return "/api/v1" + path
+	}
+	return "/api/v3" + path
 }
 
 // Status is the part of /system/status worth keeping.
@@ -57,7 +73,7 @@ type Status struct {
 // accept a webhook whose events Cineva then reads as the wrong media type.
 func (c *Client) Status(ctx context.Context) (Status, error) {
 	var st Status
-	if err := c.do(ctx, http.MethodGet, "/api/v3/system/status", nil, &st); err != nil {
+	if err := c.do(ctx, http.MethodGet, c.api("/system/status"), nil, &st); err != nil {
 		return Status{}, err
 	}
 	if st.AppName != "" && !strings.EqualFold(st.AppName, c.Label()) {
@@ -89,6 +105,11 @@ var triggers = map[string]bool{
 	"onMovieDelete":                 true,
 	"onMovieFileDelete":             true,
 	"onMovieFileDeleteForUpgrade":   true,
+	// Lidarr's.
+	"onReleaseImport": true,
+	"onArtistDelete":  true,
+	"onAlbumDelete":   true,
+	"onTrackRetag":    true,
 }
 
 // RegisterWebhook creates Cineva's webhook in the app, or updates the one
@@ -98,7 +119,7 @@ var triggers = map[string]bool{
 func (c *Client) RegisterWebhook(ctx context.Context, id int, hook Webhook) (int, error) {
 	var def map[string]any
 	if id > 0 {
-		err := c.do(ctx, http.MethodGet, fmt.Sprintf("/api/v3/notification/%d", id), nil, &def)
+		err := c.do(ctx, http.MethodGet, c.api(fmt.Sprintf("/notification/%d", id)), nil, &def)
 		var se *StatusError
 		if errors.As(err, &se) && se.Code == http.StatusNotFound {
 			id, def = 0, nil
@@ -110,7 +131,7 @@ func (c *Client) RegisterWebhook(ctx context.Context, id int, hook Webhook) (int
 		// Start from the app's own template rather than a hand-written body,
 		// so fields and triggers this version has (or lacks) come out right.
 		var schema []map[string]any
-		if err := c.do(ctx, http.MethodGet, "/api/v3/notification/schema", nil, &schema); err != nil {
+		if err := c.do(ctx, http.MethodGet, c.api("/notification/schema"), nil, &schema); err != nil {
 			return 0, err
 		}
 		for _, s := range schema {
@@ -130,9 +151,9 @@ func (c *Client) RegisterWebhook(ctx context.Context, id int, hook Webhook) (int
 	}
 	var err error
 	if id > 0 {
-		err = c.do(ctx, http.MethodPut, fmt.Sprintf("/api/v3/notification/%d", id), def, &saved)
+		err = c.do(ctx, http.MethodPut, c.api(fmt.Sprintf("/notification/%d", id)), def, &saved)
 	} else {
-		err = c.do(ctx, http.MethodPost, "/api/v3/notification", def, &saved)
+		err = c.do(ctx, http.MethodPost, c.api("/notification"), def, &saved)
 	}
 	if err != nil {
 		return 0, err
@@ -180,7 +201,7 @@ func (c *Client) DeleteWebhook(ctx context.Context, id int) error {
 	if id <= 0 {
 		return nil
 	}
-	err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/api/v3/notification/%d", id), nil, nil)
+	err := c.do(ctx, http.MethodDelete, c.api(fmt.Sprintf("/notification/%d", id)), nil, nil)
 	var se *StatusError
 	if errors.As(err, &se) && se.Code == http.StatusNotFound {
 		return nil

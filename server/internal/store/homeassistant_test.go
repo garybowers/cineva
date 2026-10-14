@@ -117,3 +117,40 @@ func TestHomeAssistantStore(t *testing.T) {
 		t.Fatal("disconnecting dropped the exposure")
 	}
 }
+
+// Who is watching a series: anyone who watched or part-watched one of its
+// episodes recently, and nobody else.
+func TestSeriesWatchers(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	lib, err := s.CreateLibrary(ctx, "TV", MediaTV, []string{"/tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(it Item) Item {
+		t.Helper()
+		saved, err := s.UpsertItem(ctx, it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	show := save(Item{LibraryID: lib.ID, Kind: KindSeries, Title: "Slow Horses", Path: "/tv/Slow Horses"})
+	season := save(Item{LibraryID: lib.ID, Kind: KindSeason, ParentID: show.ID, Title: "Season 1", SeasonNum: 1, Path: "/tv/Slow Horses/Season 1"})
+	ep := save(Item{LibraryID: lib.ID, Kind: KindEpisode, ParentID: season.ID, Title: "Failure's Contagious", SeasonNum: 1, EpisodeNum: 1,
+		Path: "/tv/Slow Horses/Season 1/e1.mkv", RuntimeSecs: 3000})
+	watcher, _ := s.CreateUser(ctx, "dad", "", "h", RoleUser)
+	if _, err := s.CreateUser(ctx, "kid", "", "h", RoleUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetProgress(ctx, watcher.ID, ep.ID, 600, ep.RuntimeSecs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SeriesWatchers(ctx, show.ID, 180)
+	if err != nil || len(got) != 1 || got[0] != watcher.ID {
+		t.Fatalf("watchers = %v, %v; want only dad", got, err)
+	}
+	if got, _ := s.SeriesWatchers(ctx, season.ID, 180); len(got) != 0 {
+		t.Fatalf("a season id matched watchers: %v", got)
+	}
+}

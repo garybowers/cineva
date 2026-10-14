@@ -159,7 +159,7 @@ export const putGroupDefaults = (id: string, changes: PrefDefaultChanges) =>
 
 // Sonarr and Radarr. Cineva registers a webhook in each, so what they import
 // is scanned in within seconds rather than at the next scheduled rescan.
-export type IntegrationKind = 'sonarr' | 'radarr'
+export type IntegrationKind = 'sonarr' | 'radarr' | 'lidarr'
 export interface Integration {
   id: string
   kind: IntegrationKind
@@ -890,3 +890,149 @@ export const updateItem = (id: string, edit: ItemEdit) =>
   })
 /** Hand the item back to the provider; values stay until the next refresh. */
 export const clearItemLocks = (id: string) => req<void>(`/items/${id}/locks`, { method: 'DELETE' })
+
+// ---- Notifications (docs/notifications.md) -----------------------------
+// Household destinations the admin sets up: ntfy, Gotify, Discord,
+// Telegram or a webhook, each with the events it receives. Secrets come
+// back masked ("••••abcd"); sending one blank or still masked keeps it.
+export type NotifyKindId = 'ntfy' | 'gotify' | 'discord' | 'telegram' | 'webhook'
+export interface NotifyDestination {
+  id: string
+  /** '' for a household destination. */
+  ownerId?: string
+  kind: NotifyKindId
+  name: string
+  /** The kind's settings; secrets masked to their last four characters. */
+  config: Record<string, string>
+  events: string[]
+  /** The libraries "new in the library" may name; [] for those open to everyone. */
+  libraryIds: string[]
+  enabled: boolean
+  /** SQLite UTC times; '' when it has not happened. */
+  lastSentAt?: string
+  lastError?: string
+  lastErrorAt?: string
+  createdAt?: string
+  updatedAt?: string
+}
+/** On create kind, name and config are required; kind cannot change. */
+export interface NotifyDestinationRequest {
+  kind?: NotifyKindId
+  name?: string
+  config?: Record<string, string>
+  events?: string[]
+  libraryIds?: string[]
+  enabled?: boolean
+}
+export interface NotifyEvent {
+  id: string
+  label: string
+  scope: 'household' | 'personal'
+}
+export interface NotifyField {
+  name: string
+  label: string
+  secret?: boolean
+  required?: boolean
+  hint?: string
+}
+export interface NotifyKind {
+  id: NotifyKindId
+  label: string
+  /** Users may set one up for themselves. */
+  personal: boolean
+  fields: NotifyField[]
+}
+export interface NotifySettings {
+  /** Cineva's address for links in messages; '' for none. */
+  publicUrl: string
+  /** The ntfy server users may send to; '' to offer them no ntfy. */
+  ntfyServer: string
+}
+export interface NotificationsOverview {
+  destinations: NotifyDestination[]
+  events: NotifyEvent[]
+  kinds: NotifyKind[]
+  settings: NotifySettings
+}
+export const getNotifications = () => req<NotificationsOverview>('/notifications')
+export const putNotifySettings = (s: NotifySettings) => req<NotifySettings>('/notifications/settings', json('PUT', s))
+export const createNotifyDestination = (r: NotifyDestinationRequest) =>
+  req<NotifyDestination>('/notifications/destinations', json('POST', r))
+/** Fields left out are kept. */
+export const updateNotifyDestination = (id: string, r: NotifyDestinationRequest) =>
+  req<NotifyDestination>(`/notifications/destinations/${id}`, json('PATCH', r))
+export const deleteNotifyDestination = (id: string) => req<void>(`/notifications/destinations/${id}`, { method: 'DELETE' })
+/** Resolves once delivered; rejects with the reason it was not. */
+export const testNotifyDestination = (id: string) => req<void>(`/notifications/destinations/${id}/test`, { method: 'POST' })
+
+// ---- Import from Plex and Jellyfin (docs/import.md) --------------------
+// The token is sent with each call and never stored by the server.
+export type ImportKind = 'plex' | 'jellyfin'
+export interface ImportSource {
+  kind: ImportKind
+  url: string
+  token: string
+}
+export interface ImportCheck {
+  kind: ImportKind
+  name: string
+  version: string
+  users: { id: string; name: string; admin: boolean }[]
+  /** Limits of this source worth saying before an import. */
+  caveats?: string[]
+}
+/** What a source user becomes: an existing user, a new one, or (neither) skipped. */
+export interface ImportMapping {
+  sourceId: string
+  sourceName: string
+  userId?: string
+  create?: boolean
+}
+export interface ImportOptions {
+  watchState: boolean
+  playlists: boolean
+}
+export interface ImportRequest extends ImportSource {
+  users: ImportMapping[]
+  options: ImportOptions
+  dryRun: boolean
+}
+export interface ImportUserResult {
+  source: string
+  user: string
+  watched: number
+  inProgress: number
+  /** States written; fewer than matched where Cineva had newer ones; 0 on a dry run. */
+  written: number
+  unmatched: number
+  /** Up to 100 of them. */
+  unmatchedTitles?: string[]
+  /** Matched, but in libraries the Cineva user cannot see; left alone. */
+  notVisible: number
+  playlists: number
+  tracks: number
+  /** The account made for this user; the password is shown here once. */
+  created?: { username: string; password: string }
+  error?: string
+}
+export interface ImportRun {
+  id: string
+  kind: ImportKind
+  /** The source server's name. */
+  source: string
+  dryRun: boolean
+  status: 'running' | 'done' | 'failed'
+  step: string
+  done: number
+  total: number
+  error?: string
+  startedAt?: string
+  finishedAt?: string
+  users: ImportUserResult[]
+}
+export const checkImportSource = (s: ImportSource) => req<ImportCheck>('/import/check', json('POST', s))
+/** Runs in the background; progress arrives as "import" events. 409 while another runs. */
+export const startImport = (r: ImportRequest) => req<ImportRun>('/import/runs', json('POST', r))
+/** The running or last run; null when none has run since the server started. */
+export const currentImport = () => req<ImportRun>('/import/runs/current').catch(() => null)

@@ -36,7 +36,11 @@ tags:
   - name: Users
     description: "Accounts and groups (admin)"
   - name: Integrations
-    description: "Sonarr and Radarr"
+    description: "Sonarr, Radarr and Lidarr"
+  - name: Import
+    description: "Bringing watch state, users and music playlists from Plex or Jellyfin (admin)"
+  - name: Notifications
+    description: "Household and personal notification destinations: ntfy, Gotify, Discord, Telegram, webhooks"
   - name: Home Assistant
     description: "Rooms, controls, cameras and modes, through the household's Home Assistant"
   - name: Requests
@@ -2464,7 +2468,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
   /integrations:
     get:
-      summary: List connected Sonarr and Radarr instances (admin)
+      summary: List connected Sonarr, Radarr and Lidarr instances (admin)
       description: >
         Cineva registers a webhook in each, so what they import is scanned in
         within seconds rather than at the next scheduled rescan. API keys are
@@ -2478,7 +2482,7 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/Integration" } }
     post:
-      summary: Connect a Sonarr or Radarr instance and register Cineva's webhook in it (admin)
+      summary: Connect a Sonarr, Radarr or Lidarr instance and register Cineva's webhook in it (admin)
       description: >
         Checks the URL and API key against the instance's system status (and
         that it is the kind named), then creates a webhook connection there
@@ -2600,7 +2604,7 @@ paths:
 
   /integrations/{id}/webhook:
     post:
-      summary: Receive a Sonarr or Radarr webhook event
+      summary: Receive a Sonarr, Radarr or Lidarr webhook event
       description: >
         Called by the instance, not by users: public, authenticated with HTTP
         basic auth as user "cineva" and the connection's secret, which Cineva
@@ -2626,7 +2630,7 @@ paths:
           application/json:
             schema:
               type: object
-              description: Sonarr or Radarr's webhook payload; only the fields below are read.
+              description: Sonarr, Radarr or Lidarr's webhook payload; only the fields below are read.
               properties:
                 eventType: { type: string }
                 series: { type: object, properties: { id: { type: integer }, title: { type: string }, tvdbId: { type: integer }, path: { type: string } } }
@@ -2928,6 +2932,235 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Home Assistant is unreachable, or the play step's device does not have Cineva open }
+  /notifications:
+    get:
+      summary: Household notification destinations, what they can receive, and the settings (admin)
+      description: Secrets in destinations' settings are masked to their last four characters.
+      operationId: getNotifications
+      tags: [Notifications]
+      responses:
+        "200":
+          description: Destinations and catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destinations: { type: array, items: { $ref: "#/components/schemas/NotifyDestination" } }
+                  events: { type: array, items: { $ref: "#/components/schemas/NotifyEvent" } }
+                  kinds: { type: array, items: { $ref: "#/components/schemas/NotifyKind" } }
+                  settings: { $ref: "#/components/schemas/NotifySettings" }
+  /notifications/settings:
+    put:
+      summary: Set the public address for links and the ntfy server users may use (admin)
+      operationId: putNotifySettings
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotifySettings" }
+      responses:
+        "200": { description: Saved, content: { application/json: { schema: { $ref: "#/components/schemas/NotifySettings" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /notifications/destinations:
+    post:
+      summary: Add a household destination (admin)
+      description: Any kind; its events are the household ones.
+      operationId: createHouseholdDestination
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotifyDestinationRequest" }
+      responses:
+        "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/NotifyDestination" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /notifications/destinations/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Change a household destination (admin)
+      description: Fields left out are kept; a secret sent blank or masked keeps its value.
+      operationId: updateHouseholdDestination
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotifyDestinationRequest" }
+      responses:
+        "200": { description: Saved, content: { application/json: { schema: { $ref: "#/components/schemas/NotifyDestination" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Remove a household destination (admin)
+      operationId: deleteHouseholdDestination
+      tags: [Notifications]
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /notifications/destinations/{id}/test:
+    post:
+      summary: Send a test message to a household destination now (admin)
+      operationId: testHouseholdDestination
+      tags: [Notifications]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Delivered }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { description: Not delivered; the message says why, content: { application/json: { schema: { type: object, properties: { message: { type: string } } } } } }
+  /auth/me/notifications:
+    get:
+      summary: Your own notification destinations, and the kinds and events you may use
+      description: >
+        Personal destinations reach only fixed services (Discord, Telegram)
+        or the ntfy server an admin chose, which is why ntfy is missing
+        until one has; ntfy's server field is not offered, being fixed.
+      operationId: getMyNotifications
+      tags: [Notifications]
+      responses:
+        "200":
+          description: Destinations and catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destinations: { type: array, items: { $ref: "#/components/schemas/NotifyDestination" } }
+                  events: { type: array, items: { $ref: "#/components/schemas/NotifyEvent" } }
+                  kinds: { type: array, items: { $ref: "#/components/schemas/NotifyKind" } }
+    post:
+      summary: Add one of your own destinations
+      operationId: createMyDestination
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotifyDestinationRequest" }
+      responses:
+        "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/NotifyDestination" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /auth/me/notifications/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Change one of your own destinations
+      operationId: updateMyDestination
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotifyDestinationRequest" }
+      responses:
+        "200": { description: Saved, content: { application/json: { schema: { $ref: "#/components/schemas/NotifyDestination" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Remove one of your own destinations
+      operationId: deleteMyDestination
+      tags: [Notifications]
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /auth/me/notifications/{id}/test:
+    post:
+      summary: Send a test message to one of your own destinations now
+      operationId: testMyDestination
+      tags: [Notifications]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Delivered }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { description: Not delivered; the message says why, content: { application/json: { schema: { type: object, properties: { message: { type: string } } } } } }
+  /import/check:
+    post:
+      summary: Connect to a Plex or Jellyfin server and list its users (admin)
+      description: >
+        The token is used for this request only and never stored. Jellyfin
+        takes an API key from its dashboard; Plex the server owner's
+        X-Plex-Token. See docs/import.md.
+      operationId: importCheck
+      tags: [Import]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportSource" }
+      responses:
+        "200":
+          description: The source
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  kind: { type: string, enum: [plex, jellyfin] }
+                  name: { type: string }
+                  version: { type: string }
+                  users:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        admin: { type: boolean }
+                  caveats: { type: array, items: { type: string }, description: Limits of this source worth saying before an import }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { description: The source could not be reached or refused the token, content: { application/json: { schema: { type: object, properties: { message: { type: string } } } } } }
+  /import/runs:
+    post:
+      summary: Start a dry run or an import from Plex or Jellyfin (admin)
+      description: >
+        Runs in the background; progress arrives as "import" events and
+        from GET /import/runs/current. Imported watch state is written only
+        where Cineva has none, or an older one, for that user and title.
+        One import runs at a time (409 otherwise).
+      operationId: startImport
+      tags: [Import]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/ImportSource" }
+                - type: object
+                  properties:
+                    users:
+                      type: array
+                      description: What each source user becomes; one with neither userId nor create is skipped
+                      items:
+                        type: object
+                        properties:
+                          sourceId: { type: string }
+                          sourceName: { type: string }
+                          userId: { type: string, description: An existing Cineva user }
+                          create: { type: boolean, description: Make a Cineva account for them, with a temporary password in the result }
+                    options:
+                      type: object
+                      properties:
+                        watchState: { type: boolean }
+                        playlists: { type: boolean, description: Music playlists, and Jellyfin's favourite tracks as "Favourites" }
+                    dryRun: { type: boolean, description: Report what would come across without writing anything }
+      responses:
+        "202": { description: Started, content: { application/json: { schema: { $ref: "#/components/schemas/ImportRun" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: An import is already running }
+  /import/runs/current:
+    get:
+      summary: The running or last import (admin)
+      operationId: currentImport
+      tags: [Import]
+      responses:
+        "200": { description: The run, content: { application/json: { schema: { $ref: "#/components/schemas/ImportRun" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
   /fs/dirs:
     get:
       summary: List subdirectories of a server path (admin folder picker)
@@ -3647,7 +3880,7 @@ components:
       required: [id, kind, name, url, callbackUrl, notificationId, version]
       properties:
         id: { type: string }
-        kind: { type: string, enum: [sonarr, radarr] }
+        kind: { type: string, enum: [sonarr, radarr, lidarr] }
         name: { type: string }
         url: { type: string, description: The instance's base URL }
         callbackUrl: { type: string, description: Cineva's address as the instance reaches it }
@@ -3859,8 +4092,8 @@ components:
       type: object
       description: On create, kind, url and apiKey are required. On update, kind is ignored and blank fields keep their values.
       properties:
-        kind: { type: string, enum: [sonarr, radarr] }
-        name: { type: string, description: 'Unique among integrations, ignoring case; defaults to "Sonarr" or "Radarr"' }
+        kind: { type: string, enum: [sonarr, radarr, lidarr] }
+        name: { type: string, description: 'Unique among integrations, ignoring case; defaults to "Sonarr", "Radarr" or "Lidarr"' }
         url: { type: string }
         apiKey: { type: string, writeOnly: true }
         callbackUrl: { type: string }
@@ -4169,6 +4402,103 @@ components:
         access: { $ref: "#/components/schemas/LibraryAccess" }
         createdAt: { type: string }
         updatedAt: { type: string }
+    NotifyDestination:
+      type: object
+      required: [id, kind, name, config, events, libraryIds, enabled]
+      properties:
+        id: { type: string }
+        ownerId: { type: string, description: '"" for a household destination' }
+        kind: { type: string, enum: [ntfy, gotify, discord, telegram, webhook] }
+        name: { type: string }
+        config: { type: object, additionalProperties: { type: string }, description: The kind's settings; secrets masked to their last four characters }
+        events: { type: array, items: { type: string } }
+        libraryIds: { type: array, items: { type: string }, description: 'Household only: the libraries "new in the library" may name; [] for those open to everyone' }
+        enabled: { type: boolean }
+        lastSentAt: { type: string }
+        lastError: { type: string }
+        lastErrorAt: { type: string }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    NotifyDestinationRequest:
+      type: object
+      description: On create kind, name and config are required. kind cannot change.
+      properties:
+        kind: { type: string, enum: [ntfy, gotify, discord, telegram, webhook] }
+        name: { type: string }
+        config: { type: object, additionalProperties: { type: string } }
+        events: { type: array, items: { type: string } }
+        libraryIds: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+    NotifyEvent:
+      type: object
+      properties:
+        id: { type: string, example: request.available }
+        label: { type: string }
+        scope: { type: string, enum: [household, personal] }
+    NotifyKind:
+      type: object
+      properties:
+        id: { type: string }
+        label: { type: string }
+        personal: { type: boolean, description: Users may set one up for themselves }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              label: { type: string }
+              secret: { type: boolean }
+              required: { type: boolean }
+              hint: { type: string }
+    NotifySettings:
+      type: object
+      properties:
+        publicUrl: { type: string, description: 'Cineva''s address for links in messages; "" for none' }
+        ntfyServer: { type: string, description: 'The ntfy server users may send to; "" to offer them no ntfy' }
+    ImportSource:
+      type: object
+      required: [kind, url, token]
+      properties:
+        kind: { type: string, enum: [plex, jellyfin] }
+        url: { type: string, example: "http://jellyfin.lan:8096" }
+        token: { type: string, writeOnly: true }
+    ImportRun:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        source: { type: string, description: The source server's name }
+        dryRun: { type: boolean }
+        status: { type: string, enum: [running, done, failed] }
+        step: { type: string }
+        done: { type: integer }
+        total: { type: integer }
+        error: { type: string }
+        startedAt: { type: string }
+        finishedAt: { type: string }
+        users:
+          type: array
+          items:
+            type: object
+            properties:
+              source: { type: string }
+              user: { type: string }
+              watched: { type: integer }
+              inProgress: { type: integer }
+              written: { type: integer, description: States written; fewer than matched where Cineva had newer ones; 0 on a dry run }
+              unmatched: { type: integer }
+              unmatchedTitles: { type: array, items: { type: string }, description: Up to 100 of them }
+              notVisible: { type: integer, description: Matched, but in libraries the Cineva user cannot see; left alone }
+              playlists: { type: integer }
+              tracks: { type: integer }
+              created:
+                type: object
+                description: The account made for this user; the password is shown here once
+                properties:
+                  username: { type: string }
+                  password: { type: string }
+              error: { type: string }
     LibraryAccess:
       type: object
       required: [restricted, userIds, groupIds]
@@ -4747,7 +5077,7 @@ components:
             properties:
               message: { type: string }
     UpstreamFailed:
-      description: Sonarr or Radarr could not be reached, refused the API key, or refused the webhook (its own message is passed on)
+      description: Sonarr, Radarr or Lidarr could not be reached, refused the API key, or refused the webhook (its own message is passed on)
       content:
         application/json:
           schema:

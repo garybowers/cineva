@@ -63,6 +63,10 @@ type Manager struct {
 	// OnScanDone, when set, is called after a scan completes successfully —
 	// how the server starts work that depends on what a scan found.
 	OnScanDone func(lib store.Library)
+	// OnScanFinished, when set, is called after every scan, failed ones
+	// included, with its result and the titles it added (see noteNew):
+	// how notifications hear of new titles and failed scans.
+	OnScanFinished func(lib store.Library, scan store.Scan, added []store.Item)
 
 	// Playing, when set, reports whether anything is being played. A
 	// rescan requested by a webhook waits for it to stop, up to
@@ -443,6 +447,13 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	done.Status, done.Error = status, errMsg
 	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
 	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
+	if m.OnScanFinished != nil && errMsg != "cancelled" {
+		var added []store.Item
+		if plan != nil && status == "completed" {
+			added = plan.added
+		}
+		m.OnScanFinished(lib, done, added)
+	}
 	// The throttle means the last upserts (and any prune) came after the
 	// final report, so close with an unconditional refetch hint. Scanning is
 	// false here: this fires once the scan is over, and a client left
@@ -597,6 +608,7 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, plan *scanP
 			m.saveFilmCredits(ctx, saved.ID, item.FileMtime, probes[bi])
 			m.syncSubtitles(ctx, saved.ID, path)
 			m.syncAudioTracks(ctx, saved.ID, path)
+			plan.noteNew(path, saved)
 			created++
 		}
 	}
@@ -802,6 +814,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 		}
 		m.syncSubtitles(ctx, saved.ID, path)
 		m.syncAudioTracks(ctx, saved.ID, path)
+		plan.noteNew(path, saved)
 		created++
 	}
 

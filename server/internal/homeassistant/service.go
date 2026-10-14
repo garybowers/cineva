@@ -77,6 +77,9 @@ type Service struct {
 	// called without the service's lock held.
 	OnStates func([]Entity)
 	OnChange func()
+	// OnConnection, when set, hears that a working connection was lost
+	// (up false, with the reason) and, after that, that it came back.
+	OnConnection func(up bool, detail string)
 
 	mu         sync.RWMutex
 	cfg        *store.HAConnection
@@ -95,6 +98,9 @@ type Service struct {
 	root      context.Context
 	runCancel context.CancelFunc
 	runDone   chan struct{}
+	// lostTold is that OnConnection was told the connection was lost, so
+	// the next connect is news.
+	lostTold bool
 }
 
 func New(st Store) *Service {
@@ -171,6 +177,12 @@ func (s *Service) run(ctx context.Context, cfg store.HAConnection, done chan str
 		s.mu.Unlock()
 		if wasUp {
 			logger.Warn("home assistant connection lost", "url", cfg.URL, "err", err)
+			s.mu.Lock()
+			s.lostTold = true
+			s.mu.Unlock()
+			if s.OnConnection != nil {
+				s.OnConnection(false, err.Error())
+			}
 		} else {
 			logger.Debug("home assistant connect failed", "url", cfg.URL, "err", err)
 		}
@@ -240,7 +252,12 @@ func (s *Service) session(ctx context.Context, cfg store.HAConnection) error {
 	}
 	s.mu.Lock()
 	s.c, s.connected, s.lastErr, s.isAdmin = c, true, "", admin
+	back := s.lostTold
+	s.lostTold = false
 	s.mu.Unlock()
+	if back && s.OnConnection != nil {
+		s.OnConnection(true, "")
+	}
 	logger.Info("connected to home assistant", "url", cfg.URL, "version", c.version, "entities", len(states))
 	if c.version != "" && c.version != cfg.Version {
 		if err := s.store.SetHAVersion(ctx, c.version); err != nil {

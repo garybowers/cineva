@@ -9,8 +9,11 @@ import (
 
 // MediaType is the library type an app's events belong to.
 func MediaType(kind string) store.MediaType {
-	if kind == "radarr" {
+	switch kind {
+	case "radarr":
 		return store.MediaMovies
+	case "lidarr":
+		return store.MediaMusic
 	}
 	return store.MediaTV
 }
