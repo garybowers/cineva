@@ -888,6 +888,8 @@ func (s *server) firePlayback(event string, p playback.Playback) {
 }
 
 func (s *server) onPlaybackPause(p playback.Playback) {
+	// Devices list what each plays and whether it is paused.
+	s.events.Publish(events.Event{Type: "devices", User: p.UserID})
 	if p.Paused {
 		s.firePlayback(homeassistant.PlaybackPaused, p)
 	} else {

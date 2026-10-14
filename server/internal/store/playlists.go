@@ -70,6 +70,7 @@ var smartFields = map[string][]string{
 	"added":      {"inLast", "notInLast"},
 	"plays":      {"is", "gt", "lt"},
 	"lastPlayed": {"inLast", "notInLast"},
+	"rating":     {"is", "atLeast", "atMost"},
 }
 
 // smartSorts maps each sort to its ORDER BY. "random" reshuffles on every
@@ -84,6 +85,7 @@ var smartSorts = map[string]string{
 	"plays":       "COALESCE(pc.plays, 0) DESC, pc.last_played_at DESC",
 	"lastPlayed":  "COALESCE(pc.last_played_at, '') DESC",
 	"leastRecent": "COALESCE(pc.last_played_at, '') ASC, random()",
+	"rating":      "COALESCE(rt.stars, 0) DESC, random()",
 }
 
 // Normalise fills the defaults and checks every rule, so what is stored is
@@ -124,6 +126,8 @@ func (r *SmartRules) Normalise() error {
 		if smartNumeric(rule.Field) {
 			if n, err := strconv.Atoi(r.Rules[i].Value); err != nil || n < 0 {
 				return fmt.Errorf("%w: rule %d: %s needs a whole number", ErrInvalidPlaylist, i+1, rule.Field)
+			} else if rule.Field == "rating" && n > 5 {
+				return fmt.Errorf("%w: rule %d: a rating is 0 to 5 stars", ErrInvalidPlaylist, i+1)
 			}
 		} else if r.Rules[i].Value == "" {
 			return fmt.Errorf("%w: rule %d: %s needs a value", ErrInvalidPlaylist, i+1, rule.Field)
@@ -134,14 +138,14 @@ func (r *SmartRules) Normalise() error {
 
 func smartNumeric(field string) bool {
 	switch field {
-	case "year", "added", "plays", "lastPlayed":
+	case "year", "added", "plays", "lastPlayed", "rating":
 		return true
 	}
 	return false
 }
 
-// condition is one rule as SQL over tracks t, their albums a and the
-// viewer's play counts pc. Rules are checked by Normalise first.
+// condition is one rule as SQL over tracks t, their albums a, the viewer's
+// play counts pc and their ratings rt. Rules are checked by Normalise first.
 func (r SmartRule) condition() (string, []any) {
 	n, _ := strconv.Atoi(r.Value)
 	days := fmt.Sprintf("-%d days", n)
@@ -152,14 +156,14 @@ func (r SmartRule) condition() (string, []any) {
 		return `(t.artist <> ? COLLATE NOCASE AND a.artist <> ? COLLATE NOCASE)`, []any{r.Value, r.Value}
 	case "artist.contains":
 		p := likeContains(r.Value)
-		return `(` + foldedCol("t.artist", r.Value) + ` LIKE ? ESCAPE '\' OR ` +
-			foldedCol("a.artist", r.Value) + ` LIKE ? ESCAPE '\')`, []any{p, p}
+		return `(` + foldedCol("t.artist") + ` LIKE ? ESCAPE '\' OR ` +
+			foldedCol("a.artist") + ` LIKE ? ESCAPE '\')`, []any{p, p}
 	case "album.is":
 		return `a.title = ? COLLATE NOCASE`, []any{r.Value}
 	case "album.contains":
-		return foldedCol("a.title", r.Value) + ` LIKE ? ESCAPE '\'`, []any{likeContains(r.Value)}
+		return foldedCol("a.title") + ` LIKE ? ESCAPE '\'`, []any{likeContains(r.Value)}
 	case "title.contains":
-		return foldedCol("t.title", r.Value) + ` LIKE ? ESCAPE '\'`, []any{likeContains(r.Value)}
+		return foldedCol("t.title") + ` LIKE ? ESCAPE '\'`, []any{likeContains(r.Value)}
 	case "genre.is":
 		return `EXISTS (SELECT 1 FROM item_genres g WHERE g.item_id IN (t.id, a.id) AND g.genre = ? COLLATE NOCASE)`, []any{r.Value}
 	case "genre.isNot":
@@ -187,17 +191,46 @@ func (r SmartRule) condition() (string, []any) {
 	case "lastPlayed.notInLast":
 		// Never played is not played in the last N days too.
 		return `(pc.last_played_at IS NULL OR pc.last_played_at < datetime('now', ?))`, []any{days}
+	case "rating.is":
+		// 0 is "not rated".
+		return `COALESCE(rt.stars, 0) = ?`, []any{n}
+	case "rating.atLeast":
+		return `COALESCE(rt.stars, 0) >= ?`, []any{n}
+	case "rating.atMost":
+		// Rated, and no more than n: "at most 2 stars" is the ones the
+		// viewer marked down, not everything they never got round to.
+		return `rt.stars <= ?`, []any{n}
 	}
 	return "0", nil
 }
 
 // trackQuery is the shared SELECT for playlist tracks: track columns, then
-// the viewer's play count and last play.
+// the viewer's play count, last play and rating. It takes the viewer's id
+// twice, for the play counts and the ratings.
 func trackQuery() string {
-	return `SELECT ` + itemColumns("t") + `, COALESCE(pc.plays, 0), COALESCE(pc.last_played_at, '')
+	return `SELECT ` + itemColumns("t") + `, COALESCE(pc.plays, 0), COALESCE(pc.last_played_at, ''), COALESCE(rt.stars, 0)
 		FROM items t
 		JOIN items a ON a.id = t.parent_id
-		LEFT JOIN play_counts pc ON pc.item_id = t.id AND pc.user_id = ?`
+		LEFT JOIN play_counts pc ON pc.item_id = t.id AND pc.user_id = ?
+		LEFT JOIN ratings rt ON rt.item_id = t.id AND rt.user_id = ?`
+}
+
+// queryTracks runs a trackQuery.
+func (s *Store) queryTracks(ctx context.Context, query string, args ...any) ([]Item, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query tracks: %w", err)
+	}
+	defer rows.Close()
+	items := []Item{}
+	for rows.Next() {
+		var it Item
+		if err := rows.Scan(append(itemScanTargets(&it), &it.PlayCount, &it.LastPlayedAt, &it.UserRating)...); err != nil {
+			return nil, fmt.Errorf("scan track: %w", err)
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
 }
 
 // libraryScope limits a query to libraries (column col); nil means no limit
@@ -223,7 +256,7 @@ func (s *Store) EvaluateSmart(ctx context.Context, userID string, rules SmartRul
 		return nil, err
 	}
 	scope, args := libraryScope("t.library_id", libraryIDs)
-	args = append([]any{userID}, args...)
+	args = append([]any{userID, userID}, args...)
 	where := "t.kind = 'track' AND " + scope
 	if len(rules.Rules) > 0 {
 		joiner := " AND "
@@ -239,7 +272,7 @@ func (s *Store) EvaluateSmart(ctx context.Context, userID string, rules SmartRul
 		where += " AND (" + strings.Join(conds, joiner) + ")"
 	}
 	args = append(args, rules.Limit)
-	return s.queryItemsPlayed(ctx,
+	return s.queryTracks(ctx,
 		trackQuery()+` WHERE `+where+` ORDER BY `+smartSorts[rules.Sort]+` LIMIT ?`, args...)
 }
 
@@ -362,8 +395,8 @@ func (s *Store) PlaylistWithTracks(ctx context.Context, userID, id string, libra
 		tracks, err = s.EvaluateSmart(ctx, userID, *p.Smart, libraryIDs)
 	} else {
 		scope, args := libraryScope("t.library_id", libraryIDs)
-		args = append([]any{userID, id}, args...)
-		tracks, err = s.queryItemsPlayed(ctx,
+		args = append([]any{userID, userID, id}, args...)
+		tracks, err = s.queryTracks(ctx,
 			strings.Replace(trackQuery(), "FROM items t",
 				"FROM playlist_items pi JOIN items t ON t.id = pi.item_id", 1)+
 				` WHERE pi.playlist_id = ? AND `+scope+` ORDER BY pi.position`, args...)

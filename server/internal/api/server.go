@@ -544,6 +544,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.DELETE("/auth/sessions/:id", s.revokeDevice)
 	v1.GET("/auth/sessions/:id/queue", s.deviceQueue)
 	v1.POST("/auth/sessions/:id/play", s.playOnDevice)
+	v1.POST("/auth/sessions/:id/takeover", s.takeOverDevice)
 	v1.GET("/auth/sessions/:id/prefs", s.getDevicePrefs)
 	v1.PUT("/auth/sessions/:id/prefs", s.putDevicePrefs)
 	v1.GET("/libraries", s.listLibraries)
@@ -590,6 +591,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/items/:id/download", s.downloadItem)
 	v1.POST("/items/:id/progress", s.postProgress)
 	v1.PUT("/items/:id/watched", s.putWatched)
+	v1.PUT("/items/:id/rating", s.putRating)
 	v1.DELETE("/items/:id/playback", s.stopPlayback)
 	v1.POST("/items/:id/playback/stop", s.stopPlayback) // sendBeacon-friendly alias
 	v1.GET("/items/:id/next", s.nextUp)

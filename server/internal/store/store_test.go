@@ -758,6 +758,7 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		"WatchedAt":     true,
 		"PlayCount":     true, // per-user play counts, see play_counts
 		"LastPlayedAt":  true,
+		"UserRating":    true, // per-user ratings, see the ratings table
 		"VersionOf":     true, // set by version grouping, not the caller
 		"FileMtime":     true, // write-only; read back through FileStamps, below
 		"SidecarStamp":  true, // likewise

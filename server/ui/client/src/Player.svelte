@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte'
   import Hls from 'hls.js'
   import {
-    nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES,
+    nextUp, prevEpisode, postProgress, stopPlayback, beaconStop, stopSession, QUALITIES, TAKEN_OVER,
     PLAYBACK_STOPPED, itemStorage, streamProblem,
     type Item, type PlayInfo, type PlayQuality, type AudioTrack, type PlaySource, type Chapter,
     type SubtitleTrack, type Device, type HAMode,
@@ -104,7 +104,7 @@
   // choosing one restarts playback as a re-encode.
   const burnSubs = info.subtitles?.filter((t) => t.burnIn) ?? []
   const subLabel = (t: SubtitleTrack) =>
-    t.title || t.language?.toUpperCase() || t.codec
+    t.title || t.languageName || t.language?.toUpperCase() || t.codec
   // What the server switched on from the viewer's preferences, or what was
   // picked before a restart: a text track shown from the start, or an image
   // one already painted in.
@@ -265,11 +265,21 @@
   const onHide = () => beaconStop(item.id)
   window.addEventListener('pagehide', onHide)
 
+  // Another device is continuing this title: pause, and report where it
+  // stopped so that device starts from there.
+  function onTakenOver(e: Event) {
+    if ((e as CustomEvent<{ itemId: string }>).detail.itemId !== item.id || !video) return
+    video.pause()
+    reportProgress(true)
+  }
+  window.addEventListener(TAKEN_OVER, onTakenOver)
+
   onDestroy(() => {
     destroyed = true
     clearInterval(heartbeat)
     clearInterval(stallWatch)
     window.removeEventListener('pagehide', onHide)
+    window.removeEventListener(TAKEN_OVER, onTakenOver)
     reportProgress(true) // reads currentTime, so it runs before the teardown
     hls?.destroy()
     // hls.destroy() only covers the HLS path. A direct-play <video> keeps its
@@ -543,6 +553,13 @@
         return true
     }
     if (onControl()) {
+      // The timeline, focused, steps 10 seconds a press rather than its
+      // native half second.
+      if ((document.activeElement as HTMLElement).matches('.seek') && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        skip(e.key === 'ArrowLeft' ? -10 : 10)
+        wake()
+        return true
+      }
       if (BACK_KEYS.has(e.key)) {
         ;(document.activeElement as HTMLElement).blur()
         idle = !paused
@@ -897,7 +914,8 @@
   function audioLabel(a: AudioTrack): string {
     const parts: string[] = []
     if (a.title) parts.push(a.title)
-    else if (a.language) parts.push(languageName(a.language))
+    // Named by the server, which knows every ISO 639 code.
+    else if (a.language) parts.push(a.languageName || a.language.toUpperCase())
     else parts.push(`Track ${a.streamIndex}`)
     if (a.channels) parts.push(channelLabel(a.channels))
     if (a.codec) parts.push(a.codec.toUpperCase())
@@ -906,17 +924,6 @@
 
   const channelLabel = (n: number) =>
     n === 1 ? 'Mono' : n === 2 ? 'Stereo' : n === 6 ? '5.1' : n === 8 ? '7.1' : `${n}ch`
-
-  // Three-letter ISO codes are what media files carry; show the few that
-  // come up often in full and fall back to the code itself.
-  const LANGUAGES: Record<string, string> = {
-    eng: 'English', fre: 'French', fra: 'French', ger: 'German', deu: 'German',
-    spa: 'Spanish', ita: 'Italian', por: 'Portuguese', dut: 'Dutch', nld: 'Dutch',
-    jpn: 'Japanese', kor: 'Korean', chi: 'Chinese', zho: 'Chinese', rus: 'Russian',
-    pol: 'Polish', swe: 'Swedish', nor: 'Norwegian', dan: 'Danish', fin: 'Finnish',
-    hin: 'Hindi', ara: 'Arabic', tur: 'Turkish', tha: 'Thai', vie: 'Vietnamese',
-  }
-  const languageName = (code: string) => LANGUAGES[code.toLowerCase()] ?? code.toUpperCase()
 
   const hdrLabel = (src: PlaySource) =>
     src.dvProfile ? `Dolby Vision (profile ${src.dvProfile})` : src.hdrFormat === 'pq' ? 'HDR10' : 'HLG'
@@ -1012,7 +1019,7 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<section class="nowplaying" class:idle class:compact class:windowed={windowed || fullscreen} bind:this={box} onmousemove={wake} onpointerdown={wake}>
+<section class="nowplaying" class:idle class:compact class:windowed={windowed || fullscreen} data-nav-scope={tv.on && !compact ? '' : undefined} bind:this={box} onmousemove={wake} onpointerdown={wake}>
   {#if compact}
     <div class="mini-progress"><div style="width: {pct(current)}%"></div></div>
   {/if}
@@ -1886,5 +1893,17 @@
     padding: 0.4rem 0.9rem;
     border: 1px solid rgba(255, 255, 255, 0.25);
     border-radius: 8px;
+  }
+  /* TV mode: the focused control fills with the accent and grows a
+     little, rather than wearing the page's focus ring. */
+  /* The television has its own volume, and a slider would keep left and
+     right from ever leaving it; Mute stays. */
+  :global(html.tv) .nowplaying .vol { display: none; }
+  :global(html.tv) .nowplaying:not(.compact) .ctl { transition: background-color 0.15s ease, color 0.15s ease, transform 0.15s ease; }
+  :global(html.tv) .nowplaying:not(.compact) .ctl:focus {
+    outline: none;
+    background: var(--accent);
+    color: var(--on-accent);
+    transform: scale(1.12);
   }
 </style>

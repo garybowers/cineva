@@ -152,6 +152,101 @@ func TestMusicCoverChange(t *testing.T) {
 	}
 }
 
+// An album whose tracks sit in disc folders takes its cover from the album
+// folder when it has one, else from the disc folders, first disc first
+// (by number, not by name), and within a folder by the usual cover names.
+// A cover replaced in a disc folder is picked up by an incremental scan.
+func TestMusicDiscFolderCover(t *testing.T) {
+	tests := []struct {
+		name   string
+		covers map[string]string // path under the album folder -> contents
+		want   string
+	}{
+		{"album folder only", map[string]string{"cover.jpg": "album"}, "album"},
+		{"album folder before disc", map[string]string{"folder.jpg": "album", "CD1/cover.jpg": "disc 1"}, "album"},
+		{"first disc", map[string]string{"CD2/cover.jpg": "disc 2", "CD1/cover.jpg": "disc 1"}, "disc 1"},
+		{"first disc before better name", map[string]string{"Disc 2/cover.jpg": "disc 2", "Disc 1/front.png": "disc 1"}, "disc 1"},
+		{"by number, not name", map[string]string{"CD10/cover.jpg": "disc 10", "CD2/cover.jpg": "disc 2"}, "disc 2"},
+		{"best name within a disc", map[string]string{"Disk1/front.jpg": "front", "Disk1/Cover.JPG": "cover"}, "cover"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			albumDir := filepath.Join(root, "Artist", "2001 - Album")
+			write := func(rel, data string) {
+				t.Helper()
+				p := filepath.Join(albumDir, rel)
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("CD1/01 - One.flac", "x")
+			write("CD2/01 - Two.flac", "x")
+			for rel, data := range tc.covers {
+				write(rel, data)
+			}
+
+			st := newLibTestStore(t)
+			ctx := context.Background()
+			lib, err := st.CreateLibrary(ctx, "Music", store.MediaMusic, []string{root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			artDir := t.TempDir()
+			m := NewManager(st, nil, artDir)
+			probes := 0
+			m.ProbeAudio = func(string) (media.AudioInfo, error) {
+				probes++
+				return media.AudioInfo{RuntimeSecs: 180}, nil
+			}
+			m.CoverArt = func(string) []byte { return nil }
+			cover := func() string {
+				t.Helper()
+				probes = 0
+				if res, err := m.RunScanSync(ctx, lib, false); err != nil || res.Status != "completed" {
+					t.Fatalf("scan: %v %+v", err, res)
+				}
+				items, err := st.ItemsByLibrary(ctx, lib.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, it := range items {
+					if it.Kind == store.KindAlbum {
+						name, _, _ := strings.Cut(strings.TrimPrefix(it.Poster, "/artwork/"), "?")
+						data, err := os.ReadFile(filepath.Join(artDir, name))
+						if err != nil {
+							t.Fatalf("album poster %q: %v", it.Poster, err)
+						}
+						return string(data)
+					}
+				}
+				t.Fatal("no album")
+				return ""
+			}
+
+			if got := cover(); got != tc.want {
+				t.Fatalf("cover = %q, want %q", got, tc.want)
+			}
+			// Replace whichever file won; the next scan rereads only the cover.
+			for rel, data := range tc.covers {
+				if data == tc.want {
+					write(rel, "replaced "+data)
+					later := time.Now().Add(time.Minute)
+					if err := os.Chtimes(filepath.Join(albumDir, rel), later, later); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if got := cover(); got != "replaced "+tc.want || probes != 0 {
+				t.Fatalf("after replacing: cover = %q with %d probes, want %q with none", got, probes, "replaced "+tc.want)
+			}
+		})
+	}
+}
+
 func TestSplitGenres(t *testing.T) {
 	tests := []struct {
 		tag  string

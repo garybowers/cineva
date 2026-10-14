@@ -9,6 +9,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/garybowers/cineva/server/internal/lang"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/store"
@@ -18,9 +19,11 @@ import (
 type subtitleInfo struct {
 	ID       string `json:"id"`
 	Language string `json:"language,omitempty"`
-	Title    string `json:"title,omitempty"`
-	Codec    string `json:"codec"`
-	Forced   bool   `json:"forced,omitempty"`
+	// LanguageName is Language in English, for a client to show.
+	LanguageName string `json:"languageName,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Codec        string `json:"codec"`
+	Forced       bool   `json:"forced,omitempty"`
 	// URL is set only for text tracks (extractable to WebVTT).
 	URL string `json:"url,omitempty"`
 	// BurnIn marks a track that can only be shown by painting it into the
@@ -37,7 +40,7 @@ func subtitleInfos(tracks []store.SubtitleTrack) []subtitleInfo {
 	out := make([]subtitleInfo, 0, len(tracks))
 	for _, t := range tracks {
 		info := subtitleInfo{
-			ID: t.ID, Language: t.Language, Title: t.Title,
+			ID: t.ID, Language: t.Language, LanguageName: lang.NameOf(t.Language), Title: t.Title,
 			Codec: t.Codec, Forced: t.Forced,
 		}
 		if t.TextCodec() {

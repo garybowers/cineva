@@ -7,7 +7,7 @@ export interface FieldSpec {
   label: string
   ops: SmartOp[]
   /** Whole numbers (and what they count), or free text. */
-  unit?: 'days' | 'plays' | 'year'
+  unit?: 'days' | 'plays' | 'year' | 'stars'
 }
 
 export const fields: Record<SmartField, FieldSpec> = {
@@ -20,6 +20,7 @@ export const fields: Record<SmartField, FieldSpec> = {
   added: { label: 'Added', ops: ['inLast', 'notInLast'], unit: 'days' },
   plays: { label: 'Plays', ops: ['is', 'gt', 'lt'], unit: 'plays' },
   lastPlayed: { label: 'Last played', ops: ['inLast', 'notInLast'], unit: 'days' },
+  rating: { label: 'Rating', ops: ['atLeast', 'atMost', 'is'], unit: 'stars' },
 }
 
 /** An operator's wording in the editor, which depends on the field. */
@@ -33,6 +34,8 @@ export function opLabel(field: SmartField, op: SmartOp): string {
     case 'lt': return unit === 'year' ? 'before' : 'fewer than'
     case 'inLast': return 'in the last'
     case 'notInLast': return 'not in the last'
+    case 'atLeast': return 'at least'
+    case 'atMost': return 'at most'
   }
 }
 
@@ -41,6 +44,7 @@ export const sorts: { id: SmartSort; label: string }[] = [
   { id: 'plays', label: 'Most played' },
   { id: 'lastPlayed', label: 'Recently played' },
   { id: 'leastRecent', label: 'Longest unplayed' },
+  { id: 'rating', label: 'Highest rated' },
   { id: 'added', label: 'Recently added' },
   { id: 'year', label: 'Newest first' },
   { id: 'artist', label: 'Artist' },
@@ -62,6 +66,11 @@ export function describeRule(r: SmartRule): string {
       return r.op === 'inLast' ? `Added in the last ${days}` : `Added more than ${days} ago`
     case 'year':
       return `From ${r.op === 'is' ? '' : opLabel('year', r.op) + ' '}${r.value}`
+    case 'rating': {
+      const st = n === 1 ? '1 star' : `${n} stars`
+      if (r.op === 'is') return n === 0 ? 'Not rated' : `Rated ${st}`
+      return `Rated ${opLabel('rating', r.op)} ${st}`
+    }
     default:
       return `${fields[r.field].label} ${opLabel(r.field, r.op)} ${r.value}`
   }

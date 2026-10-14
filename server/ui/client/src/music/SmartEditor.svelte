@@ -41,7 +41,7 @@
     const r = rules.rules[i]
     r.field = f
     if (!fields[f].ops.includes(r.op)) r.op = fields[f].ops[0]
-    r.value = fields[f].unit === 'days' ? '30' : fields[f].unit === 'plays' ? '0' : ''
+    r.value = fields[f].unit === 'days' ? '30' : fields[f].unit === 'plays' ? '0' : fields[f].unit === 'stars' ? '4' : ''
   }
   function addRule() {
     rules.rules.push({ field: 'artist', op: 'is', value: '' })
@@ -98,7 +98,13 @@
           <select bind:value={r.op} aria-label="Condition">
             {#each fields[r.field].ops as op (op)}<option value={op}>{opLabel(r.field, op)}</option>{/each}
           </select>
-          {#if fields[r.field].unit}
+          {#if fields[r.field].unit === 'stars'}
+            <!-- 0, "not rated", only reads sensibly after "is". -->
+            <select bind:value={r.value} aria-label="Stars">
+              {#if r.op === 'is'}<option value="0">not rated</option>{/if}
+              {#each ['1', '2', '3', '4', '5'] as n (n)}<option value={n}>{n} {n === '1' ? 'star' : 'stars'}</option>{/each}
+            </select>
+          {:else if fields[r.field].unit}
             <input class="num" type="number" min="0" inputmode="numeric" bind:value={r.value} aria-label="Value" required />
             {#if fields[r.field].unit === 'days'}<span class="unit">days</span>{:else if fields[r.field].unit === 'plays'}<span class="unit">times</span>{/if}
           {:else}

@@ -11,6 +11,7 @@
   import { describe, blankRules } from './smart'
   import Mosaic from './Mosaic.svelte'
   import TrackMenu from './TrackMenu.svelte'
+  import Stars from './Stars.svelte'
   import SmartEditor from './SmartEditor.svelte'
 
   let { playlistId, onopen }: { playlistId: string | null; onopen: (id: string | null) => void } = $props()
@@ -189,6 +190,7 @@
       <ol class="tracks" class:manual>
         {#each open.tracks as t, i (`${t.id}-${i}`)}
           <li
+            class="trackstars"
             class:over={dragOver === i && dragFrom !== i}
             class:dragging={dragFrom === i}
             draggable={manual}
@@ -206,6 +208,7 @@
               <span class="tplays" title={t.lastPlayedAt ? `Last played ${playedWhen(t.lastPlayedAt)}` : 'Not played yet'}>{t.playCount ? plays(t.playCount) : ''}</span>
               <span class="ttime">{trackTime(t.runtimeSecs)}</span>
             </button>
+            <Stars track={t} />
             {#if manual}
               <span class="moves">
                 <button title="Move up" aria-label="Move {t.title} up" disabled={i === 0} onclick={() => move(i, -1)}><ArrowUp size={15} /></button>

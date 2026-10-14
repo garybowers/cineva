@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/labstack/echo/v4"
@@ -51,6 +52,34 @@ type device struct {
 	Current bool          `json:"current"`
 	Online  bool          `json:"online"`
 	Queue   *queueSummary `json:"queue,omitempty"`
+	Playing *nowPlaying   `json:"playing,omitempty"`
+}
+
+// nowPlaying is what a device is playing, as its last heartbeat put it, for
+// another device to offer "Continue here".
+type nowPlaying struct {
+	Item         store.Item `json:"item"`
+	SeriesTitle  string     `json:"seriesTitle,omitempty"`
+	PositionSecs int        `json:"positionSecs"`
+	DurationSecs int        `json:"durationSecs"`
+	Paused       bool       `json:"paused"`
+	// ReportedAt is when the position was reported, so a client can move
+	// it on while the title plays.
+	ReportedAt time.Time `json:"reportedAt"`
+}
+
+// playingOn is what a user's device is playing, or nil.
+func (s *server) playingOn(c echo.Context, owner store.User, deviceID string) *nowPlaying {
+	p, ok := s.playbacks.OnDevice(owner.ID, deviceID)
+	if !ok {
+		return nil
+	}
+	it, err := s.store.Item(c.Request().Context(), p.ItemID)
+	if err != nil || !canSeeLibrary(owner, it.LibraryID) {
+		return nil
+	}
+	return &nowPlaying{Item: it, SeriesTitle: s.seriesTitleOf(c, it), PositionSecs: p.PositionSecs,
+		DurationSecs: p.DurationSecs, Paused: p.Paused, ReportedAt: p.LastSeenAt}
 }
 
 // queueSummary says enough about a device's queue to choose it: how long it
@@ -101,6 +130,7 @@ func (s *server) devicesFor(c echo.Context, owner store.User) ([]device, error) 
 			}
 			d.Queue = sum
 		}
+		d.Playing = s.playingOn(c, owner, sess.ID)
 		out = append(out, d)
 	}
 	return out, nil
@@ -327,6 +357,103 @@ func (s *server) deviceQueue(c echo.Context) error {
 		return err
 	}
 	return c.JSON(http.StatusOK, out)
+}
+
+// takeover is what POST /auth/sessions/:id/takeover answers: what to play
+// here, from where the other device left it.
+type takeover struct {
+	handoffQueue
+	// PositionSecs is where the other device had got to in the first item.
+	// A film or episode resumes there from its saved state anyway; music
+	// keeps no resume state, so the client starts the track here.
+	PositionSecs int    `json:"positionSecs"`
+	From         string `json:"from"`
+}
+
+// How long a takeover waits for the other device to pause and say where it
+// stopped, before going with its last heartbeat (up to 15 seconds behind).
+const takeoverWait = 3 * time.Second
+
+// POST /auth/sessions/:id/takeover — continue here what another of the
+// caller's devices is playing. That device is told to pause (a "takeover"
+// event naming this one) and report where it got to; the answer is the
+// queue to play from there: the other device's queue when it is on it, else
+// the title and, for a track, the rest of its album.
+func (s *server) takeOverDevice(c echo.Context) error {
+	ctx := c.Request().Context()
+	me := currentUser(c)
+	source, err := s.store.UserSession(ctx, me.ID, c.Param("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "session not found")
+	} else if err != nil {
+		return err
+	}
+	here, _ := c.Get(ctxSessionID).(string)
+	if source.ID == here {
+		return echo.NewHTTPError(http.StatusBadRequest, "that is this device")
+	}
+	p, ok := s.playbacks.OnDevice(me.ID, source.ID)
+	if !ok {
+		return echo.NewHTTPError(http.StatusConflict, "nothing is playing on "+deviceLabel(source))
+	}
+	to := "another device"
+	if sess, err := s.store.UserSession(ctx, me.ID, here); err == nil {
+		to = deviceLabel(sess)
+	}
+	if s.presence.online(source.ID) {
+		asked := time.Now().UTC()
+		s.events.Publish(events.Event{Type: "takeover", User: me.ID, Session: source.ID,
+			Data: map[string]string{"to": to, "itemId": p.ItemID}})
+		// Its pause comes back as a heartbeat; until then the last one is
+		// the best there is.
+		deadline := time.NewTimer(takeoverWait)
+		defer deadline.Stop()
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+	wait:
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline.C:
+				break wait
+			case <-tick.C:
+				now, ok := s.playbacks.Get(me.ID, p.ItemID)
+				if !ok {
+					break wait // it stopped instead
+				}
+				p = now
+				if now.Paused && now.LastSeenAt.After(asked) {
+					break wait
+				}
+			}
+		}
+	}
+	item, err := s.store.Item(ctx, p.ItemID)
+	if err != nil || !canSeeLibrary(me, item.LibraryID) {
+		return echo.NewHTTPError(http.StatusNotFound, "what "+deviceLabel(source)+" is playing cannot be played here")
+	}
+	q := store.SessionQueue{ItemIDs: []string{item.ID}}
+	if sq, err := source.ParsedQueue(); err == nil && sq.Index >= 0 && sq.Index < len(sq.ItemIDs) && sq.ItemIDs[sq.Index] == item.ID {
+		q = sq
+	} else if item.Kind == store.KindTrack && item.ParentID != "" {
+		if tracks, err := s.store.ItemsByParent(ctx, item.ParentID); err == nil {
+			q.ItemIDs = q.ItemIDs[:0]
+			for _, t := range tracks {
+				if t.Kind == store.KindTrack {
+					q.ItemIDs = append(q.ItemIDs, t.ID)
+				}
+				if t.ID == item.ID {
+					q.Index = len(q.ItemIDs) - 1
+				}
+			}
+		}
+	}
+	resolved, err := s.resolveQueue(c, q)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, takeover{handoffQueue: resolved, PositionSecs: p.PositionSecs, From: deviceLabel(source)})
 }
 
 // handoff is the "handoff" event's payload: a queue sent to a device.

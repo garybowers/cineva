@@ -6,8 +6,10 @@ import (
 	"testing"
 )
 
-// Two spellings that differ only by case match each other under LIKE once
-// both are folded, in any script; ones that differ otherwise do not.
+// Two spellings that differ only by case or accents match each other under
+// LIKE once both are folded, in any script and whichever side holds the
+// accents; ones that differ otherwise do not. Checked through foldedCol, as
+// the queries use it, so the ASCII shortcut is exercised too.
 func TestFold(t *testing.T) {
 	st := newTestStore(t)
 	tests := []struct {
@@ -19,29 +21,55 @@ func TestFold(t *testing.T) {
 		{"Amélie", "Ame\u0301lie", true}, // decomposed accent, as a Mac writes it
 		{"Σταθης", "ΣΤΑΘΗΣ", true},
 		{"ὀδυσσεύς", "ὈΔΥΣΣΕΎΣ", true},
-		{"σ", "ς", true}, // final sigma folds with the others
+		{"ὀδυσσεύς", "οδυσσευς", true}, // Greek breathings and accents too
+		{"σ", "ς", true},               // final sigma folds with the others
 		{"Ångström", "ångström", true},
+		{"Ångström", "Angstrom", true},
 		{"ПРИВЕТ", "привет", true},
+		{"Ёлка", "елка", true},
 		{"kelvin", "\u212aELVIN", true}, // the Kelvin sign is a K
 		{"plain ascii", "PLAIN ASCII", true},
-		{"Amelie", "Amélie", false}, // case, not accents
-		{"Ωmega", "ωMEGa", true},
-		{"Straße", "STRASSE", false}, // simple folding: ß is one letter, not two
+		{"Amelie", "Amélie", true},
+		{"amélie", "Amelie", true},
+		{"Bjork", "Björk", true},
+		{"Motorhead", "Motörhead", true},
+		{"Sigur Ros", "Sigur Rós", true},
+		{"Pokemon", "Pokémon", true},
+		{"Tiesto", "Tiësto", true},
+		{"Viet Nam", "Việt Nam", true}, // stacked marks
+		{"Straße", "STRASSE", true},    // ß is spelled out
+		{"strasse", "Straße", true},
+		{"Søren", "Soren", true},
+		{"Ærø", "aero", true},
+		{"Œuvre", "oeuvre", true},
+		{"Łódź", "Lodz", true},
+		{"Đorđe", "Dorde", true},
+		{"Kırık", "Kirik", true}, // Turkish dotless i
+		{"İstanbul", "istanbul", true},
+		{"\ufb01lm", "film", true}, // the fi ligature
+		{"ＡＢＣ", "abc", true},       // full-width letters
+		{"Amelie", "Amalie", false},
+		{"Bjork", "Bjorn", false},
+		{"が", "か", false}, // a kana voicing mark is part of the letter
 	}
 	for _, tc := range tests {
-		var same bool
-		if err := st.db.QueryRow(`SELECT unifold(?) LIKE ?`, tc.a, Fold(tc.b)).Scan(&same); err != nil {
-			t.Fatal(err)
-		}
-		if same != tc.same {
-			t.Errorf("%q LIKE %q after folding is %v, want %v (%q, %q)", tc.a, tc.b, same, tc.same, Fold(tc.a), Fold(tc.b))
+		for _, pair := range [][2]string{{tc.a, tc.b}, {tc.b, tc.a}} {
+			col, query := pair[0], pair[1]
+			var same bool
+			if err := st.db.QueryRow(`SELECT `+foldedCol("?1")+` LIKE ?2`, col, Fold(query)).Scan(&same); err != nil {
+				t.Fatal(err)
+			}
+			if same != tc.same {
+				t.Errorf("%q LIKE %q after folding is %v, want %v (%q, %q)", col, query, same, tc.same, Fold(col), Fold(query))
+			}
 		}
 	}
 }
 
-// The Manage filter matches regardless of case in any script, not only in
-// ASCII as SQLite's LIKE does, and still treats % and _ literally.
-func TestManageItemsUnicodeCase(t *testing.T) {
+// The Manage filter matches regardless of case and accents in any script,
+// not only ASCII case as SQLite's LIKE does, and still treats % and _
+// literally.
+func TestManageItemsUnicodeFold(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	lib, err := st.CreateLibrary(ctx, "Films", MediaMovies, []string{"/m"})
@@ -53,6 +81,7 @@ func TestManageItemsUnicodeCase(t *testing.T) {
 		{Title: "Ο Θίασος", Path: "/m/o-thiasos.mkv"},
 		{Title: "Ivan's Childhood", Path: "/m/Иваново детство/film.mkv"},
 		{Title: "Brazil", Path: "/m/brazil_100%.mkv"},
+		{Title: "Motorhead Live", Path: "/m/motorhead.mkv"},
 	} {
 		it.LibraryID, it.Kind = lib.ID, KindMovie
 		if _, err := st.UpsertItem(ctx, it); err != nil {
@@ -67,7 +96,10 @@ func TestManageItemsUnicodeCase(t *testing.T) {
 		{"amélie", []string{"Amélie"}},
 		{"ΘΊΑΣΟΣ", []string{"Ο Θίασος"}},
 		{"ИВАНОВО", []string{"Ivan's Childhood"}}, // matched on the path
-		{"Amelie", []string{}},                    // case-insensitive, not accent-insensitive
+		{"Amelie", []string{"Amélie"}},            // an ASCII query, an accented title
+		{"amelie (2001)", []string{"Amélie"}},     // and path
+		{"MOTÖRHEAD", []string{"Motorhead Live"}}, // an accented query, an ASCII title
+		{"Amalie", []string{}},
 		{"0%", []string{"Brazil"}},
 		{"l_1", []string{"Brazil"}},
 		{"%", []string{"Brazil"}},
@@ -96,9 +128,10 @@ func TestManageItemsUnicodeCase(t *testing.T) {
 	}
 }
 
-// Search folds case across Unicode too — titles, artists and people — and
-// keeps a title that starts with the query ahead of one that contains it.
-func TestSearchItemsUnicodeCase(t *testing.T) {
+// Search folds case and accents across Unicode too — titles, artists and
+// people — and keeps a title that starts with the query ahead of one that
+// contains it.
+func TestSearchItemsUnicodeFold(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	films, err := st.CreateLibrary(ctx, "Films", MediaMovies, []string{"/m"})
@@ -123,6 +156,8 @@ func TestSearchItemsUnicodeCase(t *testing.T) {
 	add(Item{LibraryID: music.ID, Kind: KindAlbum, Title: "Homogenic", Artist: "Björk", Path: "/a/Björk/Homogenic"})
 	add(Item{LibraryID: films.ID, Kind: KindMovie, Title: "100% Wolf", Path: "/m/wolf.mkv"})
 	add(Item{LibraryID: films.ID, Kind: KindMovie, Title: "1000 Ways", Path: "/m/ways.mkv"})
+	add(Item{LibraryID: films.ID, Kind: KindMovie, Title: "Amelie and the Ghost", Path: "/m/ghost.mkv"})
+	add(Item{LibraryID: music.ID, Kind: KindAlbum, Title: "Ace of Spades", Artist: "Motorhead", Path: "/a/Motorhead/Ace of Spades"})
 	if err := st.ReplaceCredits(ctx, stalker.ID,
 		nil, []Person{{TmdbID: 8452, Name: "Андрей Тарковский", Role: "Director"}}); err != nil {
 		t.Fatal(err)
@@ -132,8 +167,12 @@ func TestSearchItemsUnicodeCase(t *testing.T) {
 		query string
 		want  []string
 	}{
-		{"AMÉLIE", []string{"Amélie", "Le Fabuleux Destin d'Amélie Poulain"}},
+		{"AMÉLIE", []string{"Amelie and the Ghost", "Amélie", "Le Fabuleux Destin d'Amélie Poulain"}},
+		{"amelie", []string{"Amelie and the Ghost", "Amélie", "Le Fabuleux Destin d'Amélie Poulain"}},
 		{"BJÖRK", []string{"Homogenic"}},
+		{"bjork", []string{"Homogenic"}},
+		{"Motörhead", []string{"Ace of Spades"}},
+		{"tarkovsky", []string{}}, // folding is not transliteration
 		{"ТАРКОВСКИЙ", []string{"Stalker"}},
 		{"100%", []string{"100% Wolf"}},
 	}

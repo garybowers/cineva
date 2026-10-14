@@ -33,3 +33,14 @@ button {
   border: none;
   cursor: pointer;
 }
+
+/* A track row's stars (music/Stars.svelte): shown once the track is rated,
+   otherwise only while the row is pointed at or has the focus, so a long
+   list is not a wall of empty stars. A phone has nothing to point with, and
+   rates from the track's menu instead. */
+.trackstars .stars.unrated { visibility: hidden; }
+.trackstars:hover .stars.unrated,
+.trackstars:focus-within .stars.unrated { visibility: visible; }
+@media (hover: none) {
+  .trackstars .stars.unrated { display: none; }
+}

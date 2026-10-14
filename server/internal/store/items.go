@@ -129,6 +129,10 @@ type Item struct {
 	// Viewer state like Watched, filled in by the handlers that use it.
 	PlayCount    int    `json:"playCount,omitempty"`
 	LastPlayedAt string `json:"lastPlayedAt,omitempty"`
+	// UserRating is the viewer's star rating, 1 to 5; 0 (absent) when they
+	// have not rated it (see migration 0043). Viewer state like Watched;
+	// Rating above is the provider's score.
+	UserRating int `json:"userRating,omitempty"`
 }
 
 type ItemRepo interface {
@@ -447,11 +451,11 @@ func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]Item, e
 			year = y
 		}
 	}
-	// Case-insensitive across Unicode (see unifold), with the query's own %
-	// and _ matched literally. People are matched once, in the subquery,
-	// rather than once per item.
+	// Insensitive to case and accents across Unicode (see Fold), with the
+	// query's own % and _ matched literally. People are matched once, in
+	// the subquery, rather than once per item.
 	contains, prefix := likeContains(q), likePrefix(q)
-	title, artist, name := foldedCol("i.title", q), foldedCol("i.artist", q), foldedCol("p.name", q)
+	title, artist, name := foldedCol("i.title"), foldedCol("i.artist"), foldedCol("p.name")
 	return s.queryItems(ctx,
 		`SELECT `+itemCols+` FROM items i
 		 WHERE i.kind IN ('movie', 'series', 'episode', 'artist', 'album', 'track')

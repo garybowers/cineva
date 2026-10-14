@@ -66,6 +66,7 @@ func (s *server) getArtist(c echo.Context) error {
 	if page.TopTracks, err = s.store.ArtistTopTracks(ctx, userID(c), artist, artistTopTracks); err != nil {
 		return err
 	}
+	page.TopTracks = s.withRatings(c, page.TopTracks)
 	if page.Stats, err = s.store.ArtistStats(ctx, userID(c), artist.ID); err != nil {
 		return err
 	}
@@ -113,6 +114,7 @@ func (s *server) libraryListening(c echo.Context) error {
 	if out.MostPlayed, err = s.store.MostPlayedTracks(ctx, uid, lib.ID, listeningRowSize); err != nil {
 		return err
 	}
+	out.MostPlayed = s.withRatings(c, out.MostPlayed)
 	if out.MostPlayedAlbums, err = s.store.MostPlayedAlbums(ctx, uid, lib.ID, listeningRowSize); err != nil {
 		return err
 	}

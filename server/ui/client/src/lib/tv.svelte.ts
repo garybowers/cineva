@@ -55,9 +55,11 @@ export function ownKeys(fn: ((e: KeyboardEvent) => boolean) | null) {
   owner = fn
 }
 
-/** Where focus may go: the topmost open dialogue, else the page. */
+/** Where focus may go: the topmost open dialogue, else the page. The full
+    player counts as one (data-nav-scope): the page it covers is still laid
+    out underneath, and the arrows must not wander off onto it. */
 function scope(): ParentNode {
-  const dialogs = [...document.querySelectorAll<HTMLElement>('[role="dialog"], [aria-modal="true"], dialog[open]')]
+  const dialogs = [...document.querySelectorAll<HTMLElement>('[role="dialog"], [aria-modal="true"], dialog[open], [data-nav-scope]')]
     .filter(visible)
   return dialogs.at(-1) ?? document
 }

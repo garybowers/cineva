@@ -38,8 +38,10 @@ Changing it switches at once.
   else on the page's main action (Play), opened at the top of the page,
   else the first poster in view. Entering the rail lands on the page it is
   on.
-- **Focus** is the only cursor: a thick ring, and a focused poster lifts.
-  Whatever has focus scrolls into view clear of the screen's edges.
+- **Focus** is the only cursor: a focused poster lifts, a focused tab, rail
+  entry or player control fills with the accent (as a television's own
+  menus do), and anything else wears a thick ring. Whatever has focus
+  scrolls into view clear of the screen's edges.
 - **Home** keeps its banner on screen while the rows scroll under it, and
   the banner previews whichever title has focus.
 - **Pointer-only controls go**: row scroll arrows (focus scrolls rows),
@@ -48,7 +50,10 @@ Changing it switches at once.
   hidden, OK and play/pause play and pause, left and right skip 10 seconds
   (rewind and fast-forward 30), up or down bring the controls back with the
   focus on play, and Back leaves; with a control focused the arrows move
-  between controls and Back hides them.
+  between controls (and, on the timeline, skip 10 seconds) and Back hides
+  them. Focus stays inside the player, never wandering onto the page
+  under it. There is no volume slider: the television has its own, and
+  Mute stays.
 - **Signing in** with a PIN shows an on-screen number pad instead of the
   television's keyboard.
 

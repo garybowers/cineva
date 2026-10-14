@@ -67,7 +67,11 @@ func (s *server) writeMyPrefs(c echo.Context, device string) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(http.StatusOK, myPrefs{Device: device, Sections: prefs.Sections, Registry: prefs.Registry(), Prefs: r})
+	reg, err := s.prefs.Registry(c.Request().Context(), prefs.ResolvedKeep(r))
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, myPrefs{Device: device, Sections: prefs.Sections, Registry: reg, Prefs: r})
 }
 
 // GET /auth/me/prefs?device= — every preference as it applies to you on
@@ -176,7 +180,11 @@ func (s *server) allPrefDefaults(c echo.Context) (prefDefaults, error) {
 	if err != nil {
 		return prefDefaults{}, err
 	}
-	return prefDefaults{Sections: prefs.Sections, Registry: prefs.Registry(), Defaults: d}, nil
+	reg, err := s.prefs.Registry(c.Request().Context(), prefs.DefaultsKeep(d))
+	if err != nil {
+		return prefDefaults{}, err
+	}
+	return prefDefaults{Sections: prefs.Sections, Registry: reg, Defaults: d}, nil
 }
 
 // GET /prefs/defaults — the registry, the server's defaults, and every

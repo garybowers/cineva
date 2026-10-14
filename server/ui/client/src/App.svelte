@@ -8,7 +8,7 @@
     seriesNextUp, type NextUpInfo,
     authStatus, login, setupAdmin, logout, UNAUTHORISED, authProfiles, pinLogin, type User as UserT, type Profile,
     uploadAvatar,
-    listDevices, saveDeviceQueue, deviceQueue, playOnDevice, type Device,
+    listDevices, saveDeviceQueue, deviceQueue, playOnDevice, takeOverDevice, TAKEN_OVER, type Device,
     type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
     requestStatus, discoverSearch, discoverTitle, listRequests, createRequest, withdrawRequest, itemMissing, searchMissing,
     type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
@@ -25,7 +25,8 @@
   import PlaylistsView from './music/PlaylistsView.svelte'
   import AddToPlaylist from './music/AddToPlaylist.svelte'
   import TrackMenu from './music/TrackMenu.svelte'
-  import { setMusicActions, addToPlaylist, plays as playsLabel, type ItemRef } from './music/actions.svelte'
+  import Stars from './music/Stars.svelte'
+  import { setMusicActions, addToPlaylist, plays as playsLabel, ratedElsewhere, type ItemRef } from './music/actions.svelte'
   import AvatarCrop from './AvatarCrop.svelte'
   import SegmentEditor from './SegmentEditor.svelte'
   import DetectMenu from './DetectMenu.svelte'
@@ -535,7 +536,9 @@
   let trail: Item[] = $state([]) // breadcrumb ancestors of the current detail
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
-  let music: { queue: Item[]; startIndex: number; shuffle: boolean; gen: number } | null = $state(null)
+  // offset: seconds into the first track, when continuing from another
+  // device.
+  let music: { queue: Item[]; startIndex: number; shuffle: boolean; offset?: number; gen: number } | null = $state(null)
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
 
@@ -638,9 +641,9 @@
   }
 
   // Video and music playback are mutually exclusive.
-  function startMusic(tracks: Item[], startIndex: number, shuffleAll = false) {
+  function startMusic(tracks: Item[], startIndex: number, shuffleAll = false, offset = 0) {
     playing = null
-    music = { queue: tracks, startIndex, shuffle: shuffleAll, gen: ++playGen }
+    music = { queue: tracks, startIndex, shuffle: shuffleAll, offset, gen: ++playGen }
   }
 
   // ---- Listening session: full-page album view over the playing queue ----
@@ -1657,9 +1660,10 @@
     if (!devMenu) return
     return onDismiss('.devwrap', () => (devMenu = null))
   })
-  // The device lists are only needed where they are shown.
+  // Always wanted: the strip offering to continue what another device
+  // plays (below) reads them on every page.
   $effect(() => {
-    if (me && (tab === 'settings' || tab === 'queue')) loadDevices()
+    if (me) loadDevices()
   })
   const takeable = $derived(otherDevices.filter((d) => d.queue?.current))
 
@@ -1693,6 +1697,7 @@
   }
   async function takeQueueFrom(d: Device) {
     devMenu = null
+    if (d.playing && d.online) return continueHere(d)
     try {
       const q = await deviceQueue(d.id)
       if (q.items.length === 0) {
@@ -1704,6 +1709,53 @@
       notify('error', errText(err))
     }
   }
+  // ---- Continue here what another device plays ----
+  // While another of the user's devices is playing and this one is not, a
+  // strip above the bottom of the screen offers to carry on here; that
+  // device pauses (see the takeover event). A paused one is not offered,
+  // so a tab left paused somewhere does not nag for ever; the Queue page's
+  // "Continue from…" still reaches it.
+  let devicesSoon: ReturnType<typeof setTimeout> | undefined
+  const elsewhere = $derived(otherDevices.find((d) => d.online && d.playing && !d.playing.paused) ?? null)
+  let clockNow = $state(Date.now())
+  $effect(() => {
+    if (!elsewhere) return
+    const t = setInterval(() => (clockNow = Date.now()), 1000)
+    return () => clearInterval(t)
+  })
+  // Where it has got to, moved on from its last heartbeat.
+  function elsewhereAt(d: Device): number {
+    const p = d.playing
+    if (!p) return 0
+    const since = p.paused ? 0 : Math.max(0, (clockNow - Date.parse(p.reportedAt)) / 1000)
+    return Math.min(p.durationSecs || Infinity, p.positionSecs + since)
+  }
+  const clock = (secs: number) => {
+    const s = Math.floor(secs)
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = String(s % 60).padStart(2, '0')
+    return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`
+  }
+  let continuing = $state(false)
+  async function continueHere(d: Device) {
+    if (continuing) return
+    continuing = true
+    try {
+      const t = await takeOverDevice(d.id)
+      const cur = t.items[t.index]
+      if (!cur) {
+        notify('info', `Nothing ${deviceTitle(d)} is playing can be played here.`)
+        return
+      }
+      if (cur.kind === 'track') startMusic(t.items, t.index, false, t.positionSecs)
+      else playList(t.items, t.index)
+    } catch (err) {
+      notify('error', errText(err))
+    } finally {
+      continuing = false
+      loadDevices()
+    }
+  }
+
   // Another device sent its queue here.
   function receiveHandoff(data: unknown) {
     const h = data as { from?: string; items?: Item[]; index?: number } | null
@@ -1972,18 +2024,6 @@
     if (detail.item.kind === 'movie') {
       itemSubtitles(detail.item.id).then((s) => (detailSubs = s)).catch(() => {})
     }
-    // Where to carry on in this series. Decided by the server so the web
-    // client and the native apps cannot disagree about where someone is up
-    // to (see CLAUDE.md).
-    upNextHere = null
-    if (detail.item.kind === 'series' || detail.item.kind === 'season') {
-      const forID = detail.item.id
-      seriesNextUp(forID)
-        .then((u) => {
-          if (detail?.item.id === forID) upNextHere = u
-        })
-        .catch(() => {})
-    }
     if (selectEp) focusEpisode(selectEp.id)
     syncURL()
   }
@@ -1993,6 +2033,24 @@
   let selEpId: string | null = $state(null)
   // Where to carry on in the series or season being viewed.
   let upNextHere: NextUpInfo | null = $state(null)
+  // Where to carry on in this series. Decided by the server so the web
+  // client and the native apps cannot disagree about where someone is up
+  // to (see CLAUDE.md). Follows the page shown however it was reached: a
+  // link, its address, Back or a breadcrumb.
+  const nextUpFor = $derived.by(() => {
+    const it = detail?.item
+    return it?.kind === 'series' || it?.kind === 'season' ? it.id : ''
+  })
+  $effect(() => {
+    const forID = nextUpFor
+    upNextHere = null
+    if (!forID) return
+    seriesNextUp(forID)
+      .then((u) => {
+        if (detail?.item.id === forID) upNextHere = u
+      })
+      .catch(() => {})
+  })
   // The row whose ⋯ menu is open, and the row showing its whole overview.
   let epMenu: string | null = $state(null)
   // The episode or film whose intro and credits an administrator or
@@ -2300,6 +2358,11 @@
     // anything a dropped event missed.
     const closeEvents = subscribeEvents(
       {
+        // A track rated on another of this viewer's screens.
+        rating: (data) => {
+          const d = data as { itemId?: string; stars?: number } | null
+          if (d?.itemId) ratedElsewhere(d.itemId, d.stars ?? 0)
+        },
         libraries: () => {
           listLibraries().then((l) => (libraries = l)).catch(() => {})
           continueWatching().then((r) => (resume = r)).catch(() => {})
@@ -2316,9 +2379,17 @@
         // This user's devices changed: one signed in or out, opened or
         // closed the app, or saved a queue.
         devices: () => {
-          if (tab === 'settings' || tab === 'queue') loadDevices()
+          clearTimeout(devicesSoon)
+          devicesSoon = setTimeout(loadDevices, 250)
         },
         handoff: receiveHandoff,
+        // Another of this user's devices is continuing what this one plays.
+        takeover: (data) => {
+          const t = data as { to?: string; itemId?: string } | null
+          if (!t?.itemId) return
+          window.dispatchEvent(new CustomEvent(TAKEN_OVER, { detail: { itemId: t.itemId } }))
+          notify('info', `Continued on ${t.to ?? 'another device'}.`)
+        },
         // Preferences changed on another device, or an admin changed a
         // default or a lock.
         prefs: adoptPrefs,
@@ -2900,7 +2971,7 @@
       <button class="notice-x" aria-label="Dismiss" onclick={() => (notice = null)}><X size={14} /></button>
     </div>
   {/if}
-  <main class:withbar={(playing && playerCompact) || !!music}>
+  <main class:withbar={(playing && playerCompact) || !!music || (!!elsewhere && !playing)}>
     {#if tab === 'libraries' && currentLib && !listening}
       <nav class="crumbs" aria-label="Breadcrumb">
         <button class="crumb" onclick={toLibraries}>Libraries</button>
@@ -2939,6 +3010,7 @@
           queue={music.queue}
           startIndex={music.startIndex}
           startShuffle={music.shuffle}
+          startOffset={music.offset}
           onclose={() => { music = null; musicNow = null; if (listening) closeListening() }}
           onlocate={openAlbumOf}
           onexpand={openListening}
@@ -3028,7 +3100,7 @@
           <ul class="session-tracks">
             {#each albumTracks as t (t.id)}
               {@const qi = music.queue.findIndex((q) => q.id === t.id)}
-              <li>
+              <li class="trackstars">
                 <button class="strack" class:current={t.id === musicNow.track.id} onclick={() => mpRef?.jumpTo(qi)}>
                   <span class="tno">{t.trackNum || ''}</span>
                   <span class="tname">{t.title}</span>
@@ -3037,6 +3109,8 @@
                     <span class="strack-progress"><span style="width: {Math.min(100, (musicPos / t.runtimeSecs) * 100)}%"></span></span>
                   {/if}
                 </button>
+                <Stars track={t} />
+                <TrackMenu track={t} album={false} />
               </li>
             {/each}
           </ul>
@@ -3716,7 +3790,7 @@
           {:else}
             <ul class="children">
               {#each detail.children as child, ci (child.id)}
-                <li class:hl={child.id === hlTrackId} class:trackrow={child.kind === 'track'}>
+                <li class:hl={child.id === hlTrackId} class:trackrow={child.kind === 'track'} class:trackstars={child.kind === 'track'}>
                   {#if child.kind === 'track'}
                     <button onclick={() => detail && startMusic(detail.children, ci)}>
                       <span>
@@ -3729,6 +3803,7 @@
                         <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
                       </span>
                     </button>
+                    <Stars track={child} />
                     <TrackMenu track={child} album={false} />
                   {:else}
                     <button onclick={() => openItem(child.id, true, child)}>
@@ -3925,12 +4000,14 @@
                         </div>
                         <ul class="tlist">
                           {#each tracks as t, ti (t.id)}
-                            <li>
+                            <li class="trackstars">
                               <button onclick={() => startMusic(tracks, ti)}>
                                 <span class="tno">{t.trackNum || ti + 1}</span>
                                 <span class="tname">{t.title}{#if t.artist && t.artist !== album.artist}<span class="muted"> — {t.artist}</span>{/if}</span>
                                 <span class="muted ttm">{trackTime(t.runtimeSecs)}</span>
                               </button>
+                              <Stars track={t} size={13} />
+                              <TrackMenu track={t} album={false} />
                             </li>
                           {/each}
                         </ul>
@@ -4249,6 +4326,24 @@
   <AddToPlaylist />
 
   {@render personPanel()}
+
+  {#if elsewhere?.playing && !playing && !music}
+    {@const np = elsewhere.playing}
+    {@const at = elsewhereAt(elsewhere)}
+    <div class="elsewhere" role="region" aria-label="Playing on {deviceTitle(elsewhere)}">
+      {#if np.durationSecs}<div class="ew-progress"><div style="width: {Math.min(100, (at / np.durationSecs) * 100)}%"></div></div>{/if}
+      {@render thumb(np.item)}
+      <div class="ew-body">
+        <span class="ew-title">
+          {#if np.seriesTitle}{np.seriesTitle} · {/if}{#if np.item.kind === 'episode'}S{String(np.item.seasonNum).padStart(2, '0')}E{String(np.item.episodeNum).padStart(2, '0')} · {/if}{np.item.title}
+        </span>
+        <span class="ew-where"><MonitorSmartphone size={13} /> Playing on {deviceTitle(elsewhere)} · {clock(at)}</span>
+      </div>
+      <button class="ew-go" disabled={continuing} onclick={() => elsewhere && continueHere(elsewhere)}>
+        <Play size={15} /> {continuing ? 'Pausing it…' : 'Continue here'}
+      </button>
+    </div>
+  {/if}
 
   <nav class="tabbar">
     {#each navTabs as t (t.id)}
@@ -4644,6 +4739,41 @@
   .side-pin { margin-left: auto; }
   .side-pin[aria-pressed='true'] { color: var(--accent-2); }
   main.withbar { padding-bottom: 6.5rem; }
+  /* "Playing on Living-room TV · Continue here": where the music bar sits,
+     which it never shares the screen with. */
+  .elsewhere {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 45;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 4.2rem;
+    padding: 0.55rem 0.9rem;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    --thumb-h: 2.9rem;
+  }
+  .ew-progress { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--border); }
+  .ew-progress div { height: 100%; background: var(--accent); transition: width 1s linear; }
+  .ew-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+  .ew-title { font-weight: 600; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ew-where { display: flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: var(--accent-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .ew-where :global(svg) { flex: none; }
+  .ew-go {
+    flex: none;
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.55rem 1rem;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--on-accent);
+    font-weight: 600;
+    font-size: 0.88rem;
+  }
+  .ew-go:disabled { opacity: 0.7; }
+  @media (max-width: 767px) {
+    .elsewhere { bottom: 3.35rem; gap: 0.6rem; }
+  }
   .side-item {
     position: relative;
     display: flex;
@@ -5235,6 +5365,8 @@
   .session-album { font-size: 1.5rem; margin: 0 0 0.3rem; line-height: 1.2; }
   .small { font-size: 0.8rem; }
   .session-tracks { list-style: none; flex: 1; min-width: 0; max-width: 36rem; padding-top: 0.5rem; }
+  .session-tracks li { display: flex; align-items: center; gap: 0.25rem; }
+  .session-tracks .strack { flex: 1; min-width: 0; }
   .strack {
     position: relative;
     display: flex;
@@ -5453,7 +5585,8 @@
     flex-wrap: wrap;
   }
   .tlist { list-style: none; columns: 2; column-gap: 2rem; }
-  .tlist li { break-inside: avoid; }
+  .tlist li { break-inside: avoid; display: flex; align-items: center; gap: 0.15rem; }
+  .tlist li > button { flex: 1; min-width: 0; }
   .tlist button {
     display: flex;
     align-items: baseline;
@@ -6066,6 +6199,26 @@
   /* Focus is the only cursor there is: it has to be unmissable, and
      whatever has it is kept clear of the screen's edges and the banner. */
   :global(html.tv :focus) { outline: 0.18rem solid var(--accent-2); outline-offset: 0.18rem; scroll-margin: 12vh 3rem; }
+  /* Tabs and menus light up instead of wearing a ring, as a television's
+     own menus do: the focused one fills with the accent, the current one
+     keeps a quieter tint. (A ring would also lose its top and bottom to a
+     tab bar that scrolls sideways.) */
+  :global(html.tv) .subtabs { gap: 0.5rem; padding: 0.55rem 0; }
+  :global(html.tv) .subtab {
+    padding: 0.45rem 1.15rem;
+    border-bottom: 0;
+    border-radius: 999px;
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+  :global(html.tv) .subtab.on { color: var(--text); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  :global(html.tv) .side-item { transition: background-color 0.15s ease, color 0.15s ease; }
+  :global(html.tv) .subtab:focus,
+  :global(html.tv) .side-item:focus,
+  :global(html.tv) .azl:focus {
+    outline: none;
+    background: var(--accent);
+    color: var(--on-accent);
+  }
   :global(html.tv) .cell:focus { outline: none; }
   :global(html.tv) .poster { transition: transform 0.15s ease, box-shadow 0.15s ease; }
   :global(html.tv) .cell:focus .poster {

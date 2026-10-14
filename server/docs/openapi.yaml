@@ -584,6 +584,38 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: The device is not connected }
+  /auth/sessions/{id}/takeover:
+    post:
+      summary: Continue here what another of your devices is playing
+      description: >
+        That device receives a "takeover" event (see /events), pauses and
+        reports where it got to; the server waits a few seconds at most for
+        it, then answers with what to play here: that device's queue when it
+        is on it, else the title and, for a track, the rest of its album.
+        A film or episode resumes from the saved position as usual;
+        positionSecs is where to start a track, which keeps no resume state.
+        Once this device plays the title, the paused one's heartbeats no
+        longer move the saved position, until it plays again itself.
+      operationId: takeOverDevice
+      tags: [Devices]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: What to play here
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/HandoffQueue"
+                  - type: object
+                    required: [positionSecs, from]
+                    properties:
+                      positionSecs: { type: integer, description: Where the other device got to in the current item }
+                      from: { type: string, description: The other device's name }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Nothing is playing on that device }
   /auth/sessions/{id}/prefs:
     get:
       summary: One of your devices' own preferences
@@ -1779,7 +1811,10 @@ paths:
         concerned), and, sent only to the user concerned,
         "devices" (no data — refetch /auth/sessions), "handoff" (to one
         device: {from, items, index} — a queue sent by POST
-        /auth/sessions/{id}/play; start playing it) and "revoked" (to one
+        /auth/sessions/{id}/play; start playing it), "takeover" (to one
+        device: {to, itemId} — another device is continuing what this one
+        plays; pause, report the position, and stop reporting until played
+        again) and "revoked" (to one
         device, which is signed out; the stream closes after it),
         "homeassistant" (data: {entities: [HAEntity]} — states that changed,
         each sent only to users who may see that entity; or no data —
@@ -1788,7 +1823,8 @@ paths:
         (to the user who started it: {runId, modeId, modeName, status:
         running|done|failed, step, steps, error, playedOn, playedOnName} —
         playedOn is the device the title was sent to, empty when that
-        device was already playing it). Events are advisory; clients refetch what
+        device was already playing it), and "rating" (to the user who rated:
+        {itemId, stars}, 0 when cleared). Events are advisory; clients refetch what
         they display on receipt, and a dropped event costs staleness until
         the next one, not correctness.
       operationId: eventStream
@@ -3526,6 +3562,32 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /items/{id}/rating:
+    put:
+      summary: Rate an item, 1 to 5 stars, or clear the rating
+      description: >
+        The requesting user's own rating, like a resume position: other
+        users never see it. 0 clears it. The user's other devices are told
+        by a "rating" event on /events. Smart playlists can select and sort
+        by it.
+      operationId: setRating
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stars]
+              properties:
+                stars: { type: integer, minimum: 0, maximum: 5 }
+      responses:
+        "204": { description: Rated }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /items/{id}/progress:
     post:
       summary: Report playback position (crossing ~90% marks the item watched)
@@ -4132,6 +4194,19 @@ components:
             current: { $ref: "#/components/schemas/Item" }
             seriesTitle: { type: string, description: The current item's series, for an episode }
             updatedAt: { type: string }
+        playing:
+          type: object
+          description: >
+            What it is playing now, as its last heartbeat said (absent when
+            nothing): for another device to offer to continue it there.
+          required: [item, positionSecs, durationSecs, paused, reportedAt]
+          properties:
+            item: { $ref: "#/components/schemas/Item" }
+            seriesTitle: { type: string, description: The item's series, for an episode }
+            positionSecs: { type: integer }
+            durationSecs: { type: integer }
+            paused: { type: boolean }
+            reportedAt: { type: string, format: date-time, description: When the position was reported; it moves on from there while playing }
     AdminDevice:
       type: object
       required: [id, name, client, areaId, userId, autoUserId, online]
@@ -4199,7 +4274,14 @@ components:
         section: { type: string, description: The Settings section it appears in }
         label: { type: string }
         description: { type: string }
-        options: { type: array, items: { $ref: "#/components/schemas/PrefOption" } }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/PrefOption" }
+          description: >-
+            For the language preferences (audio-lang, sub-lang), the first choice and then the languages
+            the libraries hold (audio tracks' and subtitles' respectively), named in English and sorted by
+            name, plus any language the values shown alongside still hold. Their values are language
+            codes, ISO 639-1 where the language has one.
         min: { type: integer }
         max: { type: integer }
         hideWhen:
@@ -4632,6 +4714,14 @@ components:
         id: { type: string, description: "Folder name; stylesheet at /themes/{id}/theme.css" }
         name: { type: string }
         appearance: { type: string, enum: [dark, light] }
+        tokens:
+          type: object
+          additionalProperties: { type: string }
+          description: >-
+            The theme's design tokens from its theme.css, by name without the leading dashes
+            (bg, panel, border, text, muted, accent, accent-2, on-accent, ok, err, chart-1..3), so a
+            client can draw a preview of the theme without switching to it.
+          example: { bg: "#0e1116", panel: "#161b23", text: "#e8ebf0", accent: "#7c5cff" }
 
     Library:
       type: object
@@ -4745,6 +4835,14 @@ components:
             listing, an album's tracks in item detail, the listening rows,
             artist pages and playlists.
         lastPlayedAt: { type: string, description: When the requesting user's last counted play was, as for playCount }
+        userRating:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: >
+            The requesting user's star rating, absent when they have not
+            rated it. Filled in where playCount is. Not to be confused with
+            rating, the metadata provider's score.
 
     ArtistPage:
       type: object
@@ -4772,7 +4870,8 @@ components:
         lt), format (is; container or codec, e.g. flac), added (inLast,
         notInLast; days), plays (is, gt, lt; the user's own), lastPlayed
         (inLast, notInLast; days, and never played counts as not in the
-        last N days).
+        last N days), rating (is, atLeast, atMost; the user's own stars, 0 to
+        5, where is 0 means not rated and atMost matches only rated tracks).
       properties:
         match: { type: string, enum: [all, any], default: all }
         rules:
@@ -4781,14 +4880,14 @@ components:
             type: object
             required: [field, op, value]
             properties:
-              field: { type: string, enum: [artist, album, title, genre, year, format, added, plays, lastPlayed] }
-              op: { type: string, enum: [is, isNot, contains, gt, lt, inLast, notInLast] }
-              value: { type: string, description: Text, or a whole number as text for year, added, plays and lastPlayed }
+              field: { type: string, enum: [artist, album, title, genre, year, format, added, plays, lastPlayed, rating] }
+              op: { type: string, enum: [is, isNot, contains, gt, lt, inLast, notInLast, atLeast, atMost] }
+              value: { type: string, description: Text, or a whole number as text for year, added, plays, lastPlayed and rating }
         sort:
           type: string
-          enum: [random, title, artist, album, year, added, plays, lastPlayed, leastRecent]
+          enum: [random, title, artist, album, year, added, plays, lastPlayed, leastRecent, rating]
           default: random
-          description: random reshuffles on every read; leastRecent puts the longest unplayed first
+          description: random reshuffles on every read; leastRecent puts the longest unplayed first; rating the user's highest rated first
         limit: { type: integer, minimum: 1, maximum: 1000, default: 100 }
     Playlist:
       type: object
@@ -4965,6 +5064,7 @@ components:
         streamIndex: { type: integer }
         codec: { type: string }
         language: { type: string, description: ISO 639-2 code as the file carries it }
+        languageName: { type: string, description: "The language in English (French for fre or fra); absent when the tag names no language the server knows" }
         title: { type: string }
         channels: { type: integer, description: 2 = stereo, 6 = 5.1, 8 = 7.1 }
         bitRate: { type: integer }
@@ -4994,7 +5094,8 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
-        language: { type: string }
+        language: { type: string, description: The language tag as the file carries it }
+        languageName: { type: string, description: "The language in English (German for ger or deu); absent when the tag names no language the server knows" }
         title: { type: string }
         codec: { type: string, description: subrip/ass/mov_text/vtt (text) or hdmv_pgs_subtitle/dvd_subtitle (image) }
         forced: { type: boolean }

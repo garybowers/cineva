@@ -7,6 +7,9 @@ export interface ThemeInfo {
   id: string
   name: string
   appearance: 'dark' | 'light'
+  /** The theme's design tokens by name without the dashes ("bg",
+   *  "on-accent"), for drawing a preview without switching to it. */
+  tokens?: Record<string, string>
 }
 
 export const DEFAULT_THEME = 'midnight'

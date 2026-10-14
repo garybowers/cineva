@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+
+	"github.com/garybowers/cineva/server/internal/lang"
 )
 
 // Type is how a preference's string is read.
@@ -87,6 +89,10 @@ type Pref struct {
 	Min         *int       `json:"min,omitempty"`
 	Max         *int       `json:"max,omitempty"`
 	HideWhen    *Condition `json:"hideWhen,omitempty"`
+
+	// langs marks a language preference, whose Options beyond the first
+	// are the languages the libraries hold.
+	langs langSource
 }
 
 // Section is a Settings section, in the order a client shows them.
@@ -104,30 +110,24 @@ var Sections = []Section{
 
 // Track preferences, read by the server when playback starts.
 const (
-	AudioLang = "audio-lang" // ISO 639-1; "" = the file's default
+	AudioLang = "audio-lang" // a lang.Code, ISO 639-1 where there is one; "" = the file's default
 	SubMode   = "sub-mode"   // off | forced | foreign | always
-	SubLang   = "sub-lang"   // ISO 639-1; "" = the audio preference, else any
+	SubLang   = "sub-lang"   // a lang.Code; "" = the audio preference, else any
 )
 
-// languages offered for audio and subtitles, by ISO 639-1 code. Adding one
-// is one line here; every client picks it up from the registry.
-var languages = []Option{
-	{Value: "ar", Label: "Arabic"}, {Value: "zh", Label: "Chinese"}, {Value: "cs", Label: "Czech"},
-	{Value: "da", Label: "Danish"}, {Value: "nl", Label: "Dutch"}, {Value: "en", Label: "English"},
-	{Value: "fi", Label: "Finnish"}, {Value: "fr", Label: "French"}, {Value: "de", Label: "German"},
-	{Value: "el", Label: "Greek"}, {Value: "he", Label: "Hebrew"}, {Value: "hi", Label: "Hindi"},
-	{Value: "hu", Label: "Hungarian"}, {Value: "is", Label: "Icelandic"}, {Value: "id", Label: "Indonesian"},
-	{Value: "ga", Label: "Irish"}, {Value: "it", Label: "Italian"}, {Value: "ja", Label: "Japanese"},
-	{Value: "ko", Label: "Korean"}, {Value: "ms", Label: "Malay"}, {Value: "no", Label: "Norwegian"},
-	{Value: "pl", Label: "Polish"}, {Value: "pt", Label: "Portuguese"}, {Value: "ro", Label: "Romanian"},
-	{Value: "ru", Label: "Russian"}, {Value: "sk", Label: "Slovak"}, {Value: "es", Label: "Spanish"},
-	{Value: "sv", Label: "Swedish"}, {Value: "th", Label: "Thai"}, {Value: "tr", Label: "Turkish"},
-	{Value: "uk", Label: "Ukrainian"}, {Value: "vi", Label: "Vietnamese"}, {Value: "cy", Label: "Welsh"},
-}
+// Language preferences offer the languages the libraries hold, not a fixed
+// list: their Options are filled in when the registry is served (see
+// Service.Registry), from the audio tracks for the audio preference and the
+// subtitle tracks for the subtitle one. A stored value need only name a
+// language the server knows (internal/lang), so a choice outlives the last
+// file in that language.
+type langSource int
 
-func withFirst(first Option, rest []Option) []Option {
-	return append([]Option{first}, rest...)
-}
+const (
+	notLanguages langSource = iota
+	audioLanguages
+	subtitleLanguages
+)
 
 const convertHint = "Always converts, to save bandwidth or suit a slow connection."
 
@@ -151,7 +151,8 @@ var registry = []Pref{
 		Key: AudioLang, Type: TypeEnum, Default: "", Scope: ScopePerson, Lockable: true,
 		Section: "playback", Label: "Audio language",
 		Description: "Played when a file has it; otherwise the file's own choice.",
-		Options:     withFirst(Option{Value: "", Label: "The file's default"}, languages),
+		Options:     []Option{{Value: "", Label: "The file's default"}},
+		langs:       audioLanguages,
 	},
 	{
 		Key: SubMode, Type: TypeEnum, Default: "off", Scope: ScopePerson, Lockable: true,
@@ -167,8 +168,9 @@ var registry = []Pref{
 		Key: SubLang, Type: TypeEnum, Default: "", Scope: ScopePerson, Lockable: true,
 		Section: "playback", Label: "Subtitle language",
 		Description: "Picture-based subtitles, common on disc copies, are drawn into the video, which means converting it.",
-		Options:     withFirst(Option{Value: "", Label: "Same as the audio language"}, languages),
+		Options:     []Option{{Value: "", Label: "Same as the audio language"}},
 		HideWhen:    &Condition{Key: SubMode, Value: "off"},
+		langs:       subtitleLanguages,
 	},
 	{
 		Key: "autoplay", Type: TypeBool, Default: On, Scope: ScopePerson, Lockable: true,
@@ -228,8 +230,10 @@ var byKey = func() map[string]*Pref {
 	return m
 }()
 
-// Registry is every registered preference, in Settings order. The slice is
-// a copy; the entries are shared and must not be changed.
+// Registry is every registered preference, in Settings order, with the
+// language preferences offering only their first choice (Service.Registry
+// adds the languages). The slice is a copy; the entries are shared and must
+// not be changed.
 func Registry() []Pref { return slices.Clone(registry) }
 
 // Lookup returns a registered preference, or nil for a key the registry
@@ -247,6 +251,12 @@ func (p *Pref) Validate(v string) error {
 			return fmt.Errorf("%s: must be %q or %q", p.Key, On, Off)
 		}
 	case TypeEnum:
+		if p.langs != notLanguages && v != "" {
+			if _, ok := lang.Name(v); !ok {
+				return fmt.Errorf("%s: %q is not a language code the server knows", p.Key, v)
+			}
+			return nil
+		}
 		if !slices.ContainsFunc(p.Options, func(o Option) bool { return o.Value == v }) {
 			return fmt.Errorf("%s: %q is not one of its choices", p.Key, v)
 		}

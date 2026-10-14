@@ -7,6 +7,7 @@
   import { music, trackTime, plays, playedWhen } from './actions.svelte'
   import Mosaic from './Mosaic.svelte'
   import TrackMenu from './TrackMenu.svelte'
+  import Stars from './Stars.svelte'
 
   let { libraryId, onplaylists }: { libraryId: string; onplaylists: () => void } = $props()
 
@@ -81,7 +82,7 @@
     <h3>Most played</h3>
     <ol class="tracks">
       {#each top as t, i (t.id)}
-        <li>
+        <li class="trackstars">
           <button class="trow" onclick={() => music().play(top, i)}>
             <span class="rank">{i + 1}</span>
             {#if t.poster}<img src={t.poster} alt="" loading="lazy" />{:else}<span class="thumb"><MusicIcon size={14} /></span>{/if}
@@ -89,6 +90,7 @@
             <span class="tplays">{plays(t.playCount)}</span>
             <span class="ttime">{trackTime(t.runtimeSecs)}</span>
           </button>
+          <Stars track={t} />
           <TrackMenu track={t} />
         </li>
       {/each}

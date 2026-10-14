@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+
+	"github.com/garybowers/cineva/server/internal/lang"
 )
 
 // AudioTrack is one embedded audio stream of an item.
@@ -14,10 +16,14 @@ type AudioTrack struct {
 	StreamIndex int    `json:"streamIndex"`
 	Codec       string `json:"codec"`
 	Language    string `json:"language,omitempty"`
-	Title       string `json:"title,omitempty"`
-	Channels    int    `json:"channels,omitempty"`
-	BitRate     int64  `json:"bitRate,omitempty"`
-	Default     bool   `json:"default,omitempty"`
+	// LanguageName is Language in English ("French" for "fre"), for a
+	// client to show; empty when the tag names no language the server
+	// knows. Not stored: it is filled in when the tracks are read.
+	LanguageName string `json:"languageName,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Channels     int    `json:"channels,omitempty"`
+	BitRate      int64  `json:"bitRate,omitempty"`
+	Default      bool   `json:"default,omitempty"`
 }
 
 type AudioTrackRepo interface {
@@ -69,6 +75,7 @@ func (s *Store) AudioTracksForItem(ctx context.Context, itemID string) ([]AudioT
 			return nil, fmt.Errorf("scan audio track: %w", err)
 		}
 		t.Default = def == 1
+		t.LanguageName = lang.NameOf(t.Language)
 		out = append(out, t)
 	}
 	return out, rows.Err()

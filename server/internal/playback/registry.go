@@ -167,6 +167,65 @@ func (r *Registry) StopSession(sessionID string) {
 	}
 }
 
+// Get returns the playback of an item by a user, if there is one.
+func (r *Registry) Get(userID, itemID string) (Playback, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.byID[key(userID, itemID)]
+	if !ok {
+		return Playback{}, false
+	}
+	return *p, true
+}
+
+// OnDevice returns what a device (a browser session) is playing, if
+// anything: the playback it most recently reported on.
+func (r *Registry) OnDevice(userID, deviceID string) (Playback, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var best *Playback
+	for _, p := range r.byID {
+		if p.UserID == userID && p.DeviceID == deviceID && (best == nil || p.LastSeenAt.After(best.LastSeenAt)) {
+			best = p
+		}
+	}
+	if best == nil {
+		return Playback{}, false
+	}
+	return *best, true
+}
+
+// Claim makes a playback the given device's, as when a device that handed
+// a title over starts playing it again. Reports whether that changed it.
+func (r *Registry) Claim(userID, itemID, deviceID string) bool {
+	if deviceID == "" {
+		return false
+	}
+	r.mu.Lock()
+	p, ok := r.byID[key(userID, itemID)]
+	changed := ok && p.DeviceID != deviceID
+	if changed {
+		p.DeviceID = deviceID
+	}
+	r.mu.Unlock()
+	if changed {
+		r.changed()
+	}
+	return changed
+}
+
+// HeldElsewhere reports whether a user's playback of an item is now another
+// device's, still playing: what a device that handed the title over (and
+// sits paused on it) must not overwrite. A device that resumes playing
+// takes it back.
+func (r *Registry) HeldElsewhere(userID, itemID, deviceID string) bool {
+	if deviceID == "" {
+		return false
+	}
+	p, ok := r.Get(userID, itemID)
+	return ok && p.DeviceID != "" && p.DeviceID != deviceID && !p.Paused
+}
+
 // List returns active playbacks, most recently started first.
 func (r *Registry) List() []Playback {
 	r.mu.Lock()

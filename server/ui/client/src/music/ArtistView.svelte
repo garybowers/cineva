@@ -7,6 +7,7 @@
   import { artistPage, itemDetail, type ArtistPage, type Item } from '../lib/api'
   import { music, addToPlaylist, trackTime, totalTime, plays } from './actions.svelte'
   import TrackMenu from './TrackMenu.svelte'
+  import Stars from './Stars.svelte'
 
   let { artist }: { artist: Item } = $props()
 
@@ -147,7 +148,7 @@
       <ol class="tracks">
         {#each page.topTracks as t, i (t.id)}
           {@const al = albumOf(t)}
-          <li>
+          <li class="trackstars">
             <button class="trow" onclick={() => page && music().play(page.topTracks, i)}>
               <span class="rank">{i + 1}</span>
               {#if t.poster}<img src={t.poster} alt="" loading="lazy" />{:else}<span class="thumb ph"><MusicIcon size={14} /></span>{/if}
@@ -158,6 +159,7 @@
               <span class="tplays" title="Your plays">{t.playCount ? plays(t.playCount) : ''}</span>
               <span class="ttime">{trackTime(t.runtimeSecs)}</span>
             </button>
+            <Stars track={t} />
             <TrackMenu track={t} artist={false} />
           </li>
         {/each}

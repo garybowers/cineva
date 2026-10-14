@@ -17,6 +17,7 @@ import (
 
 	"github.com/garybowers/cineva/server/internal/events"
 	"github.com/garybowers/cineva/server/internal/homeassistant"
+	"github.com/garybowers/cineva/server/internal/lang"
 	"github.com/garybowers/cineva/server/internal/library"
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
@@ -788,6 +789,8 @@ func (s *server) registerPlayback(c echo.Context, item store.Item, mode, quality
 		}
 	}
 	p = s.playbacks.Start(p)
+	// The user's other devices offer to continue what this one plays.
+	s.events.Publish(events.Event{Type: "devices", User: p.UserID})
 	if p.EventID != 0 { // a new play, not a heartbeat finding its entry gone
 		playbackLog.Info("playback started", "user", currentUser(c).Username, "title", playTitle(p),
 			"mode", p.Mode, "quality", p.Quality, "client", clientLabel(c), "ip", p.Client.IP)
@@ -828,6 +831,10 @@ func (s *server) listSessions(c echo.Context) error {
 // DELETE /items/:id/playback — the client has stopped; drop the activity
 // entry straight away (and any transcode behind it).
 func (s *server) stopPlayback(c echo.Context) error {
+	// Not this device's to stop once another has taken the title over.
+	if device, _ := c.Get(ctxSessionID).(string); s.playbacks.HeldElsewhere(userID(c), c.Param("id"), device) {
+		return c.NoContent(http.StatusNoContent)
+	}
 	if sid, ok := s.playbacks.Stop(userID(c), c.Param("id")); ok && sid != "" {
 		s.sessions.Stop(sid)
 	}
@@ -886,11 +893,22 @@ func (s *server) postProgress(c echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusConflict, "playback was stopped by an administrator")
 	}
+	// A device that handed this title to another of the user's devices and
+	// sits paused on it says nothing that counts: its paused position would
+	// otherwise overwrite the one playing on, and its heartbeat take the
+	// playback back. Pressing play on it again does take it back.
+	device, _ := c.Get(ctxSessionID).(string)
+	if req.Paused && s.playbacks.HeldElsewhere(userID(c), item.ID, device) {
+		return c.JSON(http.StatusOK, store.PlayState{ItemID: item.ID, PositionSecs: req.PositionSecs})
+	}
 	// Heartbeat for the activity registry. A client whose entry was reaped
 	// (or that predates a restart) is re-registered so it shows up again.
 	if !s.playbacks.Touch(userID(c), item.ID, req.PositionSecs, req.Paused) {
 		s.registerPlayback(c, item, "direct", "", "")
 		s.playbacks.Touch(userID(c), item.ID, req.PositionSecs, req.Paused)
+	}
+	if !req.Paused && s.playbacks.Claim(userID(c), item.ID, device) {
+		s.events.Publish(events.Event{Type: "devices", User: userID(c)})
 	}
 	// Music positions are not resume state: tracks are short and would
 	// otherwise litter Continue Watching.
@@ -956,7 +974,7 @@ func (s *server) backfillAudioTracks(c echo.Context, item store.Item) []store.Au
 	tracks := make([]store.AudioTrack, 0, len(streams))
 	for _, a := range streams {
 		tracks = append(tracks, store.AudioTrack{
-			StreamIndex: a.Index, Codec: a.Codec, Language: a.Language,
+			StreamIndex: a.Index, Codec: a.Codec, Language: a.Language, LanguageName: lang.NameOf(a.Language),
 			Title: a.Title, Channels: a.Channels, BitRate: a.BitRate, Default: a.Default,
 		})
 	}
@@ -978,6 +996,7 @@ const playEventKey = "cineva.playEventID"
 // was open rather than playhead movement: someone who skips about has still
 // spent that long watching, which is what the dashboard is reporting.
 func (s *server) onPlaybackEnd(p playback.Playback) {
+	s.events.Publish(events.Event{Type: "devices", User: p.UserID})
 	if p.EventID == 0 {
 		return // no row was opened for this playback
 	}

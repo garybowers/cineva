@@ -82,6 +82,9 @@ export interface Item {
   /** The viewer's counted plays (an album's: its tracks' summed) and the last one. */
   playCount?: number
   lastPlayedAt?: string
+  /** The viewer's own stars, 1 to 5; absent when not rated. (rating above
+      is the provider's score.) */
+  userRating?: number
 }
 
 export interface ItemDetail {
@@ -97,6 +100,8 @@ export interface ItemDetail {
 export interface SubtitleTrack {
   id: string
   language?: string
+  /** The language in English ("German" for "ger"), when the server knows it. */
+  languageName?: string
   title?: string
   codec: string
   forced?: boolean
@@ -276,6 +281,8 @@ export interface Device {
   /** Has the app open now, so can be sent a queue. */
   online: boolean
   queue?: { count: number; index: number; current?: Item; seriesTitle?: string; updatedAt: string }
+  /** What it is playing now, as its last heartbeat said. */
+  playing?: { item: Item; seriesTitle?: string; positionSecs: number; durationSecs: number; paused: boolean; reportedAt: string }
   /** The Home Assistant area it is in (its room); "" for none. */
   areaId?: string
 }
@@ -361,6 +368,14 @@ export const saveDeviceQueue = (itemIds: string[], index: number) =>
 export const deviceQueue = (id: string) => get<HandoffQueue>(`/auth/sessions/${id}/queue`)
 export const playOnDevice = (id: string, itemIds: string[], index: number) =>
   post<void>(`/auth/sessions/${id}/play`, { itemIds, index })
+/** Continue here what another device plays: it pauses, and this is what
+    to play from where it stopped (positionSecs for a track, which keeps no
+    resume state). */
+export const takeOverDevice = (id: string) =>
+  post<HandoffQueue & { positionSecs: number; from: string }>(`/auth/sessions/${id}/takeover`, {})
+/** Said to the players when another device takes over what this one plays:
+    the one playing itemId pauses and reports where it stopped. */
+export const TAKEN_OVER = 'cineva:taken-over'
 
 const get = <T>(path: string) => req<T>(path)
 const post = <T>(path: string, body?: unknown) =>
@@ -519,6 +534,8 @@ export interface AudioTrack {
   streamIndex: number
   codec: string
   language?: string
+  /** The language in English ("French" for "fre"), when the server knows it. */
+  languageName?: string
   title?: string
   channels?: number
   bitRate?: number
@@ -823,9 +840,9 @@ export interface Listening {
 }
 export const libraryListening = (id: string) => get<Listening>(`/libraries/${id}/listening`)
 
-export type SmartField = 'artist' | 'album' | 'title' | 'genre' | 'year' | 'format' | 'added' | 'plays' | 'lastPlayed'
-export type SmartOp = 'is' | 'isNot' | 'contains' | 'gt' | 'lt' | 'inLast' | 'notInLast'
-export type SmartSort = 'random' | 'title' | 'artist' | 'album' | 'year' | 'added' | 'plays' | 'lastPlayed' | 'leastRecent'
+export type SmartField = 'artist' | 'album' | 'title' | 'genre' | 'year' | 'format' | 'added' | 'plays' | 'lastPlayed' | 'rating'
+export type SmartOp = 'is' | 'isNot' | 'contains' | 'gt' | 'lt' | 'inLast' | 'notInLast' | 'atLeast' | 'atMost'
+export type SmartSort = 'random' | 'title' | 'artist' | 'album' | 'year' | 'added' | 'plays' | 'lastPlayed' | 'leastRecent' | 'rating'
 export interface SmartRule { field: SmartField; op: SmartOp; value: string }
 export interface SmartRules { match: 'all' | 'any'; rules: SmartRule[]; sort: SmartSort; limit: number }
 
@@ -845,6 +862,9 @@ export interface PlaylistDetail { playlist: Playlist; tracks: Item[] }
 
 const send = <T>(method: string, path: string, body: unknown) =>
   req<T>(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+
+/** Rate an item 1 to 5 stars; 0 clears the rating. */
+export const setRating = (id: string, stars: number) => send<void>('PUT', `/items/${id}/rating`, { stars })
 
 export const listPlaylists = () => get<Playlist[]>('/playlists')
 export const createPlaylist = (name: string, smart?: SmartRules) => post<Playlist>('/playlists', { name, smart })

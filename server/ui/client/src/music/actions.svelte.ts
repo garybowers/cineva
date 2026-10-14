@@ -8,7 +8,7 @@
  * same half-dozen callbacks through every layer.
  */
 
-import type { Item } from '../lib/api'
+import { setRating, type Item } from '../lib/api'
 
 export interface MusicActions {
   /** Start these tracks from index and open the listening view. */
@@ -47,6 +47,37 @@ export const picker = $state({ ids: [] as string[], label: '' })
 export function addToPlaylist(ids: string[], label: string): void {
   picker.ids = ids
   picker.label = label
+}
+
+/**
+ * The viewer's star ratings changed since the lists on screen were fetched,
+ * by item id (0 for cleared): a track rated on the album page shows the
+ * same stars in the player and on a playlist without refetching either.
+ */
+const rated = $state<Record<string, number>>({})
+
+/** A track's stars, 0 when not rated. */
+export function stars(track: Item): number {
+  return rated[track.id] ?? track.userRating ?? 0
+}
+
+/** A rating from elsewhere: another of the viewer's screens. */
+export function ratedElsewhere(itemId: string, n: number): void {
+  rated[itemId] = n
+}
+
+/** Rate a track; the same stars again clear it. Shown at once, put back if
+    the server refuses. */
+export async function rate(track: Item, n: number): Promise<void> {
+  const before = stars(track)
+  const next = n === before ? 0 : n
+  rated[track.id] = next
+  try {
+    await setRating(track.id, next)
+  } catch (err) {
+    rated[track.id] = before
+    music().notify('error', err instanceof Error ? err.message : String(err))
+  }
 }
 
 /** "3:07" for a track. */

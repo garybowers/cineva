@@ -147,6 +147,14 @@
   const valueOf = (p: PrefEntry) => prefs?.prefs[p.key]?.value ?? p.default
   const choiceLabel = (p: PrefEntry, v: string) =>
     p.type === 'bool' ? (v === 'on' ? 'On' : 'Off') : (p.options?.find((o) => o.value === v)?.label ?? v)
+  // A theme's preview colours, as custom properties on its card: only the
+  // tokens the mini screen draws with, each from that theme's own set.
+  const previewTokens = ['bg', 'panel', 'border', 'text', 'muted', 'accent', 'accent-2']
+  const previewStyle = (t: ThemeInfo) =>
+    previewTokens
+      .filter((k) => t.tokens?.[k])
+      .map((k) => `--p-${k}: ${t.tokens![k]}`)
+      .join('; ')
   const fromAdmin = (o?: PrefOrigin) => o?.source === 'server' || o?.source === 'group'
   function save(key: string, value: string) {
     try {
@@ -559,12 +567,24 @@
             <span class="sd">Follows you to every device you sign in on.</span>
             {#if fromAdmin(themePref)}<span class="sd">The default here is your administrator's choice.</span>{/if}
           </div>
-          <div class="themes" role="radiogroup" aria-label="Theme">
+          <div class="tgrid" role="radiogroup" aria-label="Theme">
             {#each themes as t (t.id)}
-              <button class="theme" class:sel={theme === t.id} role="radio" aria-checked={theme === t.id} onclick={() => onsettheme(t.id)}>
-                {#if t.appearance === 'light'}<Sun size={18} />{:else}<Moon size={18} />{/if}
-                <span>{t.name}</span>
-                {#if theme === t.id}<Check size={15} class="tick" />{/if}
+              <button class="tcard" class:sel={theme === t.id} role="radio" aria-checked={theme === t.id} onclick={() => onsettheme(t.id)}>
+                <!-- A small screen of the app in this theme's own colours. -->
+                <span class="mini" style={previewStyle(t)} aria-hidden="true">
+                  <span class="mini-bar"><span class="mini-logo"></span><span class="mini-line short"></span></span>
+                  <span class="mini-body">
+                    <span class="mini-line title"></span>
+                    <span class="mini-line"></span>
+                    <span class="mini-posters"><span></span><span></span><span></span><span></span><span></span></span>
+                    <span class="mini-btn"></span>
+                  </span>
+                </span>
+                <span class="tname">
+                  {#if t.appearance === 'light'}<Sun size={15} />{:else}<Moon size={15} />{/if}
+                  <span>{t.name}</span>
+                  {#if theme === t.id}<Check size={15} class="tick" />{/if}
+                </span>
               </button>
             {/each}
           </div>
@@ -1046,7 +1066,49 @@
   }
   .swatch.sel { outline-color: var(--text); }
 
-  /* ---- Appearance ---- */
+  /* ---- Appearance ----
+     Each theme card is a small screen drawn in that theme's own tokens,
+     handed over as --p-* custom properties (previewStyle); the page's own
+     tokens stand in for any a theme does not define. At least two to a row,
+     even at phone width. */
+  .tgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(10rem, calc(50% - 0.4rem)), 1fr)); gap: 0.8rem; }
+  .tcard {
+    display: flex; flex-direction: column; gap: 0.55rem; padding: 0.5rem 0.5rem 0.6rem; min-width: 0;
+    border-radius: 12px; border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .tcard:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .tcard.sel { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
+  .tname { display: flex; align-items: center; gap: 0.45rem; padding: 0 0.2rem; font-size: 0.9rem; }
+  .tname span { flex: 1; min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tcard :global(.tick) { color: var(--accent); flex: none; }
+  /* Sized from the card's width, so it keeps its shape at any size. */
+  .mini {
+    display: flex; flex-direction: column; overflow: hidden;
+    border-radius: 7px; border: 1px solid var(--p-border, var(--border)); background: var(--p-bg, var(--bg));
+  }
+  .mini-bar {
+    display: flex; align-items: center; gap: 5%; padding: 4% 7%;
+    background: var(--p-panel, var(--panel)); border-bottom: 1px solid var(--p-border, var(--border));
+  }
+  .mini-logo { flex: none; width: 7%; aspect-ratio: 1; border-radius: 50%; background: var(--p-accent, var(--accent)); }
+  .mini-body { display: flex; flex-direction: column; align-items: flex-start; padding: 6% 7% 7%; }
+  .mini-body > * + * { margin-top: 5%; }
+  .mini-line { height: 0.2rem; width: 55%; border-radius: 999px; background: var(--p-muted, var(--muted)); }
+  .mini-line.title { width: 40%; height: 0.3rem; background: var(--p-text, var(--text)); }
+  .mini-line.short { width: 30%; }
+  .mini-posters { align-self: stretch; display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.2rem; }
+  .mini-posters span {
+    aspect-ratio: 2 / 3; border-radius: 3px; border: 1px solid var(--p-border, var(--border));
+    background: linear-gradient(160deg, color-mix(in srgb, var(--p-accent-2, var(--accent-2)) 40%, var(--p-panel, var(--panel))), var(--p-panel, var(--panel)));
+  }
+  .mini-btn { width: 28%; aspect-ratio: 4 / 1; border-radius: 999px; background: var(--p-accent, var(--accent)); }
+  /* TV mode: the focused card keeps the ring every focus wears there and
+     grows a little, as a focused poster does; the row's padding leaves it
+     room, so neither is clipped. */
+  :global(html.tv) .tcard:focus { outline: 0.18rem solid var(--accent-2); outline-offset: 0.18rem; transform: scale(1.04); }
+  :global(html.tv) .tcard:focus .tname { color: var(--accent-2); }
+  /* Plain choice cards, as for a notification's kind. */
   .themes { display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); gap: 0.6rem; }
   .theme {
     display: flex; align-items: center; gap: 0.55rem; padding: 0.75rem 0.9rem;
@@ -1129,4 +1191,8 @@
     .sc.inline input { flex: 1; width: auto; }
     .pic, .srow.tog { flex-direction: row; align-items: center; }
   }
+  /* TV mode: the focused section fills with the accent, like the rail's
+     (App.svelte). */
+  :global(html.tv) .snav-item { transition: background-color 0.15s ease, color 0.15s ease; }
+  :global(html.tv) .snav-item:focus { outline: none; background: var(--accent); color: var(--on-accent); }
 </style>

@@ -1,10 +1,13 @@
 <script lang="ts">
-  // The ⋯ menu on a track row: queue it, put it on a playlist, or go to its
-  // album or artist. The same menu wherever a track is listed.
+  // The ⋯ menu on a track row: rate it, queue it, put it on a playlist, or
+  // go to its album or artist. The same menu wherever a track is listed.
+  // The stars are here as well as in the row because a phone has no
+  // pointer to reveal the row's.
   import { Ellipsis, ListPlus, ListMusic, Disc3, MicVocal, Trash2, ArrowUp, ArrowDown } from '@lucide/svelte'
   import { onDismiss } from '../lib/dismiss'
   import { itemDetail, type Item } from '../lib/api'
   import { music, addToPlaylist } from './actions.svelte'
+  import Stars from './Stars.svelte'
 
   let {
     track,
@@ -57,6 +60,7 @@
   </button>
   {#if open}
     <div class="tm-pop" role="menu">
+      <div class="tm-rate"><span>Rating</span><Stars {track} size={17} /></div>
       <button class="tm-item" role="menuitem" onclick={() => act(() => music().queue([track]))}><ListPlus size={15} /> Add to queue</button>
       <button class="tm-item" role="menuitem" onclick={() => act(() => addToPlaylist([track.id], track.title))}><ListMusic size={15} /> Add to playlist…</button>
       {#if onmove}
@@ -97,5 +101,11 @@
     text-align: left; font-size: 0.88rem; color: var(--text); white-space: nowrap;
   }
   .tm-item:hover { background: var(--bg); }
+  .tm-rate {
+    display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+    padding: 0.3rem 0.35rem 0.4rem 0.6rem; margin-bottom: 0.2rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.88rem; color: var(--muted);
+  }
   .tm-item.danger { color: var(--err); }
 </style>

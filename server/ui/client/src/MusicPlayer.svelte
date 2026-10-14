@@ -4,9 +4,10 @@
   // play gapless (a plain <audio> leaves an audible gap between files).
   // A silent <audio> element holds the browser's media session so lock
   // screens and hardware keys work while Web Audio does the actual playing.
+  import Stars from './music/Stars.svelte'
   import { onDestroy, onMount } from 'svelte'
   import { pref } from './lib/prefs'
-  import { playItem, postProgress, stopPlayback, beaconStop, type Item } from './lib/api'
+  import { playItem, postProgress, stopPlayback, beaconStop, TAKEN_OVER, type Item } from './lib/api'
   import {
     Shuffle, SkipBack, SkipForward, Play, Pause, Repeat, Repeat1,
     X, Music as MusicIcon, Disc3,
@@ -16,6 +17,7 @@
     queue,
     startIndex = 0,
     startShuffle = false,
+    startOffset = 0,
     onclose,
     onlocate,
     onexpand,
@@ -25,6 +27,8 @@
     queue: Item[]
     startIndex?: number
     startShuffle?: boolean
+    /** Seconds into the first track: continuing from another device. */
+    startOffset?: number
     onclose: () => void
     onlocate: (track: Item) => void
     onexpand?: () => void
@@ -384,10 +388,24 @@
     holder.volume = 0.01 // inaudible; some browsers drop the session at 0
     installMediaHandlers()
     paused = false
-    play(shuffle && queue.length > 1 ? Math.floor(Math.random() * queue.length) : startIndex)
+    play(shuffle && queue.length > 1 ? Math.floor(Math.random() * queue.length) : startIndex, startOffset)
   })
 
   const onHide = () => { if (track) beaconStop(track.id) }
+
+  // Another device is continuing this track: pause, and say where.
+  function onTakenOver(e: Event) {
+    const id = (e as CustomEvent<{ itemId: string }>).detail.itemId
+    if (!track || track.id !== id) return
+    if (ctx && !paused) {
+      paused = true
+      ctx.suspend()
+      updateMediaSession()
+    }
+    if (ctx) postProgress(track.id, Math.floor(position()), true).catch(() => {})
+  }
+  window.addEventListener(TAKEN_OVER, onTakenOver)
+  onDestroy(() => window.removeEventListener(TAKEN_OVER, onTakenOver))
   window.addEventListener('pagehide', onHide)
 
   onDestroy(() => {
@@ -430,6 +448,7 @@
       <button class="mb-title" onclick={() => onlocate(track)} title="Go to album">{track.title}</button>
       <span class="mb-artist">{track.artist}{loading ? ' · loading…' : ''}</span>
     </div>
+    <span class="mb-stars"><Stars {track} size={15} /></span>
 
     <div class="transport">
       <button class="ctl" class:on={shuffle} onclick={toggleShuffle} title="Shuffle"><Shuffle size={16} /></button>
@@ -490,6 +509,7 @@
     .musicbar { bottom: 3.35rem; }
     .seekarea { display: none; } /* progress strip carries position on phones */
     .vol { display: none; }
+    .mb-stars { display: none; } /* rated from the listening view's track menu */
   }
   .mb-progress {
     position: absolute;
@@ -528,6 +548,8 @@
   }
   .mb-title:hover { color: var(--accent-2); }
   .mb-artist { font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .mb-stars { flex: none; }
 
   .transport { display: flex; align-items: center; gap: 0.1rem; flex: none; }
   .ctl {

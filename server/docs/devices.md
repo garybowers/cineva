@@ -92,6 +92,33 @@ they sign out the TV goes back to Family.
 - **Pruning**: a device with no session that has not been used for 90 days
   (`store.DeviceUnusedDays`) is forgotten by the scheduled housekeeping.
 
+## Continue here
+
+What one of a user's devices plays, another can carry on. Each device in
+`/auth/sessions` says what it is `playing` (title, position as of its last
+heartbeat, paused), from the activity registry, and the client shows a
+strip above the bottom of the screen ("Playing on Living-room TV ·
+Continue here") on every other device of theirs that is playing nothing
+itself. A paused device is not offered there, so a tab left paused does not
+nag for ever; the Queue page's "Continue from..." reaches it.
+
+Continuing (`POST /auth/sessions/{id}/takeover`):
+
+1. The server sends the playing device a `takeover` event. It pauses and
+   reports where it stopped.
+2. The server waits for that report, up to three seconds, else goes with
+   the last heartbeat (up to 15 seconds behind).
+3. It answers with what to play: the device's queue when it is on it, else
+   the title and, for a track, the rest of its album. A film or episode
+   resumes from its saved position as ever; a track starts at
+   `positionSecs`, since music keeps no resume state.
+
+The activity registry knows one playback per user and title, so once the
+new device plays it, a paused device still showing it must not speak for
+it: its paused heartbeats and its stop are ignored while another device is
+playing the title (`Registry.HeldElsewhere`). Pressing play on it again
+takes the title back.
+
 ## Storage
 
 - `devices (id, secret_hash, name, client, client_ip, ha_area,

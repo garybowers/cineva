@@ -40,8 +40,9 @@ var trackFileRe = regexp.MustCompile(`^(\d{1,3})\s*-\s*(.+)$`)
 // layout (Artist/Year - Album/NN - Title.ext) as fallback.
 func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPlan, report reportFunc) (int, int, error) {
 	var files []string
-	// The cover images the walk passes, by folder: what albumArtwork reads,
-	// and what an album's sidecar fingerprint is taken over.
+	// The cover images the walk passes, by album folder (a disc folder's
+	// filed under its album): what albumArtwork reads, and what an album's
+	// sidecar fingerprint is taken over.
 	covers := map[string][]fs.DirEntry{}
 	for _, root := range lib.Paths {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -54,8 +55,14 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 			if audioExts[strings.ToLower(filepath.Ext(path))] {
 				files = append(files, path)
 			} else if coverRank(d.Name()) >= 0 {
+				// A cover in a disc folder belongs to the album above it.
 				dir := filepath.Dir(path)
-				covers[dir] = append(covers[dir], d)
+				if albumDir, disc := albumDirOf(path); albumDir != dir {
+					covers[albumDir] = append(covers[albumDir],
+						discCover{DirEntry: d, name: filepath.Join(filepath.Base(dir), d.Name()), disc: disc})
+				} else {
+					covers[dir] = append(covers[dir], d)
+				}
 			}
 			return nil
 		})
@@ -295,6 +302,36 @@ func coverRank(name string) int {
 	return -1
 }
 
+// discCover is a cover file found in a disc folder (Album/CD1/cover.jpg),
+// listed with the album folder's own covers. Its name is relative to the
+// album folder ("CD1/cover.jpg"), which is what albumArtwork reads and what
+// the album's fingerprint is taken over; the album folder's own covers keep
+// their bare names, so an album without disc folders fingerprints as it
+// always did.
+type discCover struct {
+	fs.DirEntry
+	name string
+	disc int
+}
+
+func (c discCover) Name() string { return c.name }
+
+// coverOrder ranks an album's cover files: the album folder's own first,
+// then each disc folder's, first disc first, and within a folder by
+// coverNames.
+func coverOrder(a, b fs.DirEntry) int {
+	folder := func(d fs.DirEntry) int {
+		if c, ok := d.(discCover); ok {
+			return 1 + c.disc
+		}
+		return 0
+	}
+	if fa, fb := folder(a), folder(b); fa != fb {
+		return fa - fb
+	}
+	return coverRank(filepath.Base(a.Name())) - coverRank(filepath.Base(b.Name()))
+}
+
 // splitGenres splits a genre tag that holds several ("Rock; Pop",
 // "Jazz/Funk"), dropping blanks and repeats.
 func splitGenres(tag string) []string {
@@ -353,7 +390,8 @@ func (m *Manager) rereadChangedCovers(ctx context.Context, files, todo []string,
 }
 
 // albumArtwork caches the album's cover image — a cover file in the album
-// folder, else art embedded in the track — and returns its serve path.
+// folder, else one in its disc folders (first disc first), else art
+// embedded in the track — and returns its serve path.
 //
 // The cached file is named for the folder and rewritten each time (see
 // writeArtwork). Worked out once per album per scan (art).
@@ -366,7 +404,7 @@ func (m *Manager) albumArtwork(trackPath, albumDir string, coverFiles []fs.DirEn
 	}
 	var img []byte
 	ranked := slices.Clone(coverFiles)
-	slices.SortStableFunc(ranked, func(a, b fs.DirEntry) int { return coverRank(a.Name()) - coverRank(b.Name()) })
+	slices.SortStableFunc(ranked, coverOrder)
 	for _, d := range ranked {
 		if data, err := os.ReadFile(filepath.Join(albumDir, d.Name())); err == nil && len(data) > 0 {
 			img = data

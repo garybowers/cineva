@@ -315,6 +315,11 @@ func (s *server) withPlayState(c echo.Context, libraryID string, items []store.I
 	if err != nil {
 		counts = nil
 	}
+	// And the viewer's star ratings, for a track list's stars.
+	ratings, err := s.store.RatingsByLibrary(c.Request().Context(), uid, libraryID)
+	if err != nil {
+		ratings = nil
+	}
 	for i := range items {
 		if ps, ok := states[items[i].ID]; ok {
 			items[i].Watched = ps.Watched
@@ -325,6 +330,7 @@ func (s *server) withPlayState(c echo.Context, libraryID string, items []store.I
 			items[i].PlayCount = pc.Plays
 			items[i].LastPlayedAt = pc.LastPlayedAt
 		}
+		items[i].UserRating = ratings[items[i].ID]
 	}
 	return items
 }

@@ -5,17 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
+// Repo is what the service needs from the store: the preference layers, and
+// the languages the libraries hold for the language preferences' choices.
+type Repo interface {
+	store.PrefRepo
+	store.TrackLanguageRepo
+}
+
 // Service reads and writes preferences through the store, applying the
 // registry's types and the admin's locks.
 type Service struct {
-	store store.PrefRepo
+	store Repo
+	langs languageCache
+	now   func() time.Time
 }
 
-func NewService(st store.PrefRepo) *Service { return &Service{store: st} }
+func NewService(st Repo) *Service { return &Service{store: st, now: time.Now} }
 
 // LockedError is a write to a preference an admin has locked.
 type LockedError struct {
