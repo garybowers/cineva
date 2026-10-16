@@ -116,3 +116,33 @@ func TestUpright(t *testing.T) {
 		}
 	}
 }
+
+func TestBackdrop(t *testing.T) {
+	tests := []struct {
+		name         string
+		w, h         int
+		wantW, wantH int
+	}{
+		{"small stays its size", 800, 600, 800, 600},
+		{"wide is scaled to fit", 5120, 2880, 2560, 1440},
+		{"tall is scaled by its height", 2000, 4000, 1280, 2560},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jpg, err := Backdrop(bytes.NewReader(encodePNG(t, tt.w, tt.h)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := jpeg.DecodeConfig(bytes.NewReader(jpg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Width != tt.wantW || cfg.Height != tt.wantH {
+				t.Fatalf("size = %d×%d, want %d×%d", cfg.Width, cfg.Height, tt.wantW, tt.wantH)
+			}
+		})
+	}
+	if _, err := Backdrop(strings.NewReader("not a picture")); !errors.Is(err, ErrNotImage) {
+		t.Fatalf("not a picture: %v", err)
+	}
+}

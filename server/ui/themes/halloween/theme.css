@@ -1,0 +1,22 @@
+/* Cineva theme: Halloween. Pumpkin orange on a violet night, a harvest
+   moon behind, and leaves drifting past (theme.json). Switches itself on
+   in October for anyone with Holiday themes on. */
+:root {
+  --bg: #120c16;
+  --panel: #1b1321;
+  --border: #2e2136;
+  --text: #f3ecf7;
+  --muted: #a797b0;
+  --accent: #f28c28;
+  --accent-2: #b48cff;
+  --on-accent: #1a0e05; /* text and icons on an --accent fill */
+  --ok: #5fd38d;
+  --err: #ff6b6b;
+  /* Chart series (categorical, fixed order; validated for CVD against --panel) */
+  --chart-1: #7c5cff;
+  --chart-2: #1f8fcc;
+  --chart-3: #ad8312;
+  /* The background picture, and how strongly --bg covers it (0 to 1). */
+  --bg-image: url("/themes/halloween/background.svg");
+  --bg-dim: 0.7;
+}

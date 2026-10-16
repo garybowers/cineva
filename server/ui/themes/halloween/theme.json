@@ -1,0 +1,8 @@
+{
+  "name": "Halloween",
+  "appearance": "dark",
+  "occasion": "halloween",
+  "background": "background.svg",
+  "dim": 70,
+  "effect": "leaves"
+}

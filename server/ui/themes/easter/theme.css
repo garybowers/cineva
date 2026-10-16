@@ -1,0 +1,22 @@
+/* Cineva theme: Easter. Spring pastels, a meadow of painted eggs behind,
+   and blossom falling (theme.json). Switches itself on around Easter for
+   anyone with Holiday themes on. */
+:root {
+  --bg: #fbf7ee;
+  --panel: #ffffff;
+  --border: #e8e0cf;
+  --text: #2b2721;
+  --muted: #6b6354;
+  --accent: #7b55c7;
+  --accent-2: #1d7356;
+  --on-accent: #ffffff; /* text and icons on an --accent fill */
+  --ok: #1f7d4c;
+  --err: #c63b3b;
+  /* Chart series (categorical, fixed order; validated for CVD against --panel) */
+  --chart-1: #6a48ff;
+  --chart-2: #0b78c2;
+  --chart-3: #c96d00;
+  /* The background picture, and how strongly --bg covers it (0 to 1). */
+  --bg-image: url("/themes/easter/background.svg");
+  --bg-dim: 0.62;
+}

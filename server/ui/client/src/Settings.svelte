@@ -10,7 +10,7 @@
   import {
     User as UserIcon, MonitorPlay, Palette, Lock, MonitorSmartphone, Smartphone, KeyRound, Info,
     ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy, SlidersHorizontal,
-    Bell, Plus,
+    Bell, Plus, Pencil,
   } from '@lucide/svelte'
   import {
     AVATAR_COLOURS, changePassword, createAPIKey, deleteAPIKey, listAPIKeys, nameDevice,
@@ -24,6 +24,8 @@
   import type { ThemeInfo } from './lib/theme'
   import { ha, loadHA } from './lib/homeassistant.svelte'
   import Sheet from './Sheet.svelte'
+  import ThemeEditor from './ThemeEditor.svelte'
+  import { holidayKey, type Occasion } from './lib/theme'
 
   let {
     me,
@@ -32,6 +34,8 @@
     onme,
     themes,
     theme,
+    occasion,
+    onthemeschanged,
     onsettheme,
     devices,
     onreloaddevices,
@@ -47,6 +51,11 @@
     onme: (u: User) => void
     themes: ThemeInfo[]
     theme: string
+    /** The holiday on now, whose theme shows instead of the chosen one
+        while Holiday themes is on. */
+    occasion: Occasion | null
+    /** A theme was made, changed or deleted here. */
+    onthemeschanged: () => void
     onsettheme: (id: string) => void
     devices: Device[]
     onreloaddevices: () => void
@@ -140,7 +149,7 @@
   // it picks tracks, so setting one is all there is.
   const inSection = (id: string) =>
     (prefs?.registry ?? []).filter((p) => {
-      if (p.section !== id) return false
+      if (p.section !== id || p.hidden) return false
       const hide = p.hideWhen
       return !hide || prefs?.prefs[hide.key]?.value !== hide.value
     })
@@ -151,10 +160,26 @@
   // tokens the mini screen draws with, each from that theme's own set.
   const previewTokens = ['bg', 'panel', 'border', 'text', 'muted', 'accent', 'accent-2']
   const previewStyle = (t: ThemeInfo) =>
-    previewTokens
-      .filter((k) => t.tokens?.[k])
-      .map((k) => `--p-${k}: ${t.tokens![k]}`)
-      .join('; ')
+    [
+      ...previewTokens.filter((k) => t.tokens?.[k]).map((k) => `--p-${k}: ${t.tokens![k]}`),
+      // The picture, covered a little less than on the page so it shows
+      // at this size. Its URL comes from the server's own paths.
+      ...(t.background ? [`--p-image: url("${t.background.replace(/["\\()]/g, '')}")`, `--p-dim: ${((t.dim ?? 70) / 100) * 0.6}`] : []),
+    ].join('; ')
+
+  // ---- Themes: holidays, and making your own ----
+  const holidayOn = $derived(prefs?.prefs['holiday-themes']?.value !== 'off')
+  const holidayTheme = $derived(occasion?.themeId ? themes.find((t) => t.id === occasion?.themeId) : undefined)
+  // Set aside this year by choosing another theme while it showed.
+  const holidaySkipped = $derived(!!occasion && prefs?.prefs['holiday-skip']?.value === holidayKey(occasion))
+  const holidayNow = $derived(holidayOn && !holidaySkipped ? holidayTheme : undefined)
+  // Everyday themes, then the holidays', then those people made.
+  const themeOrder = (t: ThemeInfo) => (t.custom ? 2 : t.occasion ? 1 : 0)
+  const orderedThemes = $derived([...themes].sort((a, b) => themeOrder(a) - themeOrder(b)))
+  const untilLabel = (d: string) => new Date(d + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'long' })
+  // The editor: null closed, 'new' to make one, or the theme being changed.
+  let editingTheme: ThemeInfo | 'new' | null = $state(null)
+  const canEdit = (t: ThemeInfo) => !!t.custom && (t.mine || me.role === 'admin')
   const fromAdmin = (o?: PrefOrigin) => o?.source === 'server' || o?.source === 'group'
   function save(key: string, value: string) {
     try {
@@ -567,8 +592,20 @@
             <span class="sd">Follows you to every device you sign in on.</span>
             {#if fromAdmin(themePref)}<span class="sd">The default here is your administrator's choice.</span>{/if}
           </div>
+          {#if holidayNow && occasion}
+            <p class="holnote">
+              It is the {holidayNow.name} theme until {untilLabel(occasion.until)}; yours comes back after.
+              Choose another theme to use it instead.
+            </p>
+          {:else if holidayOn && holidaySkipped && holidayTheme}
+            <p class="holnote">
+              You chose your own theme over the {holidayTheme.name} one this year.
+              <button class="linkish" onclick={() => save('holiday-skip', '')}>Bring {holidayTheme.name} back</button>
+            </p>
+          {/if}
           <div class="tgrid" role="radiogroup" aria-label="Theme">
-            {#each themes as t (t.id)}
+            {#each orderedThemes as t (t.id)}
+              <div class="tslot">
               <button class="tcard" class:sel={theme === t.id} role="radio" aria-checked={theme === t.id} onclick={() => onsettheme(t.id)}>
                 <!-- A small screen of the app in this theme's own colours. -->
                 <span class="mini" style={previewStyle(t)} aria-hidden="true">
@@ -585,14 +622,44 @@
                   <span>{t.name}</span>
                   {#if theme === t.id}<Check size={15} class="tick" />{/if}
                 </span>
+                {#if holidayNow?.id === t.id}<span class="tbadge now">On now</span>
+                {:else if t.occasion}<span class="tbadge">{t.occasion === 'christmas' ? 'December' : t.occasion === 'halloween' ? 'October' : 'Around Easter'}</span>
+                {:else if t.household}<span class="tbadge">Shared</span>
+                {:else if t.mine}<span class="tbadge">Yours</span>{/if}
               </button>
+              {#if canEdit(t) && !tv.on}
+                <button class="tedit" title="Edit {t.name}" aria-label="Edit {t.name}" onclick={() => (editingTheme = t)}><Pencil size={14} /></button>
+              {/if}
+              </div>
             {/each}
+            {#if !tv.on}
+              <button class="tcard tnew" onclick={() => (editingTheme = 'new')}>
+                <span class="mini plus" aria-hidden="true"><Plus size={26} /></span>
+                <span class="tname"><span>Make a theme</span></span>
+              </button>
+            {/if}
           </div>
         </div>
         {#each inSection('appearance').filter((p) => p.key !== 'theme') as p (p.key)}
           {@render prefRow(p)}
         {/each}
       </div>
+      {#if editingTheme}
+        <ThemeEditor
+          {themes}
+          editing={editingTheme === 'new' ? null : editingTheme}
+          startFrom={theme}
+          admin={me.role === 'admin'}
+          onclose={() => (editingTheme = null)}
+          onsaved={(t) => {
+            const made = editingTheme === 'new'
+            editingTheme = null
+            onthemeschanged()
+            // A theme just made is the one you wanted to see.
+            if (t && made) onsettheme(t.id)
+          }}
+        />
+      {/if}
 
     {:else if shown === 'notifications'}
       <h2>Notifications</h2>
@@ -1084,9 +1151,27 @@
   .tcard :global(.tick) { color: var(--accent); flex: none; }
   /* Sized from the card's width, so it keeps its shape at any size. */
   .mini {
+    --p-scrim: color-mix(in srgb, var(--p-bg, var(--bg)) calc(var(--p-dim, 1) * 100%), transparent);
     display: flex; flex-direction: column; overflow: hidden;
-    border-radius: 7px; border: 1px solid var(--p-border, var(--border)); background: var(--p-bg, var(--bg));
+    border-radius: 7px; border: 1px solid var(--p-border, var(--border));
+    background: linear-gradient(var(--p-scrim), var(--p-scrim)), var(--p-image, none) center / cover, var(--p-bg, var(--bg));
   }
+  .mini.plus { aspect-ratio: 16 / 10.4; display: grid; place-items: center; color: var(--muted); border-style: dashed; background: none; }
+  .tslot { position: relative; display: flex; min-width: 0; }
+  .tslot .tcard { flex: 1; }
+  .tbadge {
+    align-self: flex-start; margin: -0.2rem 0.2rem 0; padding: 0.05rem 0.45rem; border-radius: 999px;
+    font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border);
+  }
+  .tbadge.now { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+  .tedit {
+    position: absolute; top: 0.9rem; right: 0.9rem; display: grid; place-items: center;
+    width: 1.9rem; height: 1.9rem; border-radius: 50%;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  }
+  .tedit:hover { border-color: var(--accent); }
+  .holnote { margin: 0 0 0.2rem; font-size: 0.85rem; color: var(--muted); }
+  .holnote .linkish { color: var(--accent-2); font-size: inherit; padding: 0; }
   .mini-bar {
     display: flex; align-items: center; gap: 5%; padding: 4% 7%;
     background: var(--p-panel, var(--panel)); border-bottom: 1px solid var(--p-border, var(--border));

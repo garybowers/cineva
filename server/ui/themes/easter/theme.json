@@ -1,0 +1,8 @@
+{
+  "name": "Easter",
+  "appearance": "light",
+  "occasion": "easter",
+  "background": "background.svg",
+  "dim": 62,
+  "effect": "blossom"
+}

@@ -1,11 +1,15 @@
 import { mount } from 'svelte'
 import '@fontsource-variable/inter'
 import './app.css'
-import { applyTheme, currentTheme } from './lib/theme'
+import { applyTheme, currentTheme, paintedTheme } from './lib/theme'
 import { applyInterface, installSpatial } from './lib/tv.svelte'
 import App from './App.svelte'
 
-applyTheme(currentTheme())
+// The theme painted last time (a holiday's, perhaps), so the first paint
+// matches what the app settles on once the list and calendar have loaded.
+const painted = paintedTheme()
+if (painted) applyTheme(painted.id, painted.css)
+else applyTheme(currentTheme())
 // TV mode, from this device's preference (its local copy, so it is right
 // before sign-in) or from what browser this is.
 applyInterface()

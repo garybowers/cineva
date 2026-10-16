@@ -326,7 +326,7 @@ The user is in charge of their own experience; the admin sets defaults and locks
 - [ ] **Continue Watching and Next Up controls**: merge into one row, drop entries after N weeks idle, remove from the row (clearing or keeping the position), rewatches, new seasons returning a finished series, user thresholds within an admin range.
 - [ ] **Display**: spoiler protection (off, stills only, full), density, per-library default tab, sort, filter and view, sidebar hiding and ordering, original titles, start page.
 - [ ] Subtitle appearance (size, box, outline, position) from theme-safe choices; quality on mobile data versus wifi as a device preference.
-- [ ] **Seasonal rows**: TMDB keywords stored at scan time and back-filled by a refresh; an occasion calendar (Halloween and Christmas first, then New Year, Valentine's Day, Easter, Thanksgiving off outside the US); a `seasonal` row that appears in its window, and is inserted after Continue Watching when the layout has none; Christmas specials found among episodes by title and air date; "Add to Christmas" / "Not a Christmas film" per user and for everyone; watched favourites included by default; optional banner takeover; a seasonal entry on the library's Recommended and Genres tabs.
+- [ ] **Seasonal rows**: TMDB keywords stored at scan time and back-filled by a refresh; the occasion calendar (`internal/occasion`, built for holiday themes with Halloween, Christmas and Easter; New Year, Valentine's Day and Thanksgiving, off outside the US, to add); a `seasonal` row that appears in its window, and is inserted after Continue Watching when the layout has none; Christmas specials found among episodes by title and air date; "Add to Christmas" / "Not a Christmas film" per user and for everyone; watched favourites included by default; optional banner takeover; a seasonal entry on the library's Recommended and Genres tabs.
 - [ ] Occasions on calendars other than the Gregorian (Hanukkah, Diwali, Eid, Lunar New Year) as date tables, when someone asks for them.
 - [ ] **Admin**: content rating ceiling per user and group with an unrated policy, applied to rows, search, libraries and person pages; pinned rows with date and time windows; previewing the client as a user or group; branding (server name, sign-in backdrop, notice line); per-user and per-group permissions for editing home, overrides and saved views.
 
@@ -344,6 +344,13 @@ Groundwork that is cheap before federation and expensive after it ("Preparing no
 - [ ] `play_state` keyed by content key as well as item id, with a backfill, so watch state can follow a user across copies and servers.
 - [ ] Users carry their home server's identity (this server's key + user id).
 - [ ] A federation protocol version constant and capabilities list.
+
+## Themes (`server/docs/themes.md`)
+- [x] Custom themes (migration 0044): anyone makes their own in Settings — every colour with a contrast check, a background picture and how much the background colour covers it, an effect — previewed live on the app behind the dialogue; an admin shares one with the household. Served as a stylesheet like a theme folder, carrying only colours and an /artwork/ picture.
+- [x] Holiday themes: Christmas, Halloween and Easter, with drawn SVG backgrounds and snow, leaves (and bats) or blossom, switch themselves on in their window (`internal/occasion`) for anyone with `holiday-themes` on; choosing another theme sets that holiday aside for the year (`holiday-skip`), with a way back in Settings. Effects never while anything plays, nor with reduced motion, and `theme-effects` turns them off.
+- [ ] The admin pages take a theme's colours but not its background picture or effect.
+- [ ] Export and import a theme as a file, to share one between servers.
+- [ ] A theme's own font or corner radius: tokens beyond colour, once the token contract has room for them.
 
 ## Live TV and DVR (not designed yet)
 Watching and recording broadcast TV, the way people use an HDHomeRun with
