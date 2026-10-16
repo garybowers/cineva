@@ -1,5 +1,7 @@
 // Package avatar turns an uploaded picture into a user's avatar: a small
 // square JPEG, upright, whatever shape and orientation the original was.
+// Backdrop does the same for a theme's background picture, keeping its
+// shape.
 package avatar
 
 import (
@@ -66,6 +68,47 @@ func Process(r io.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: 88}); err != nil {
 		return nil, fmt.Errorf("encode avatar: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// BackdropMax bounds a theme background's longer side: sharp on a 1440p
+// screen, and small enough to load quickly on a phone.
+const BackdropMax = 2560
+
+// Backdrop reads an uploaded image and returns it as a theme background:
+// upright, its shape kept, scaled down to fit BackdropMax, as JPEG bytes.
+func Backdrop(r io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, MaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read image: %w", err)
+	}
+	if len(raw) > MaxBytes {
+		return nil, fmt.Errorf("image is larger than %d MB", MaxBytes>>20)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, ErrNotImage
+	}
+	if cfg.Width*cfg.Height > maxPixels {
+		return nil, fmt.Errorf("image is too large (%d×%d)", cfg.Width, cfg.Height)
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, ErrNotImage
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if long := max(w, h); long > BackdropMax {
+		w, h = w*BackdropMax/long, h*BackdropMax/long
+	}
+	scaled := image.NewRGBA(image.Rect(0, 0, max(w, 1), max(h, 1)))
+	draw.CatmullRom.Scale(scaled, scaled.Bounds(), img, b, draw.Src, nil)
+	out := upright(scaled, orientation(raw))
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, fmt.Errorf("encode background: %w", err)
 	}
 	return buf.Bytes(), nil
 }

@@ -91,8 +91,14 @@ software under the AGPL, so it stays that way.
   (Fire TV, Android TV, LG, Samsung).
 - **Downloads** — any title can be downloaded for offline viewing; albums and
   artists as a ZIP, original or transcoded.
+- **Themes** — six built in, and your own: pick every colour (with a
+  readability check as you go), add a background picture and a gentle
+  effect, and an admin can share one with the household. Halloween,
+  Christmas and Easter themes switch themselves on for the season, with
+  snow, drifting leaves or blossom, and step aside when you would rather
+  keep yours.
 - **Installable** — the web client works at phone width and installs as an
-  app (PWA). Three themes, each a preference that follows you.
+  app (PWA).
 
 ### Your household
 

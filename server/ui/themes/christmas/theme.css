@@ -1,0 +1,22 @@
+/* Cineva theme: Christmas. Pine green and berry red, a snowy night behind,
+   and snow falling (theme.json). Switches itself on in December for anyone
+   with Holiday themes on. */
+:root {
+  --bg: #0c1612;
+  --panel: #13221c;
+  --border: #22382e;
+  --text: #f2efe6;
+  --muted: #9db3a6;
+  --accent: #c8323f;
+  --accent-2: #e9c46a;
+  --on-accent: #ffffff; /* text and icons on an --accent fill */
+  --ok: #4fbf85;
+  --err: #ff7b7b;
+  /* Chart series (categorical, fixed order; validated for CVD against --panel) */
+  --chart-1: #7c5cff;
+  --chart-2: #1f8fcc;
+  --chart-3: #ad8312;
+  /* The background picture, and how strongly --bg covers it (0 to 1). */
+  --bg-image: url("/themes/christmas/background.svg");
+  --bg-dim: 0.72;
+}

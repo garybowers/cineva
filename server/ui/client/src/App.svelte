@@ -13,7 +13,9 @@
     requestStatus, discoverSearch, discoverTitle, listRequests, createRequest, withdrawRequest, itemMissing, searchMissing,
     type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
   } from './lib/api'
-  import { applyTheme, chooseTheme, currentTheme, listThemes, type ThemeInfo } from './lib/theme'
+  import { chooseTheme, holidayKey } from './lib/theme'
+  import { activeTheme, installLooks, looks, paint, refreshLooks } from './lib/looks.svelte'
+  import ThemeEffect from './ThemeEffect.svelte'
   import { tv } from './lib/tv.svelte'
   import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
   import { onDismiss } from './lib/dismiss'
@@ -524,8 +526,13 @@
       .map(([type, meta]) => ({ type, ...meta, libs: libraries.filter((l) => l.mediaType === type) }))
       .filter((g) => g.libs.length > 0),
   )
-  let themes: ThemeInfo[] = $state([])
-  let theme = $state(currentTheme())
+  // Themes: the list, the user's choice and the holiday on now live in
+  // lib/looks.svelte.ts, which paints whichever should be on screen.
+  // The effect (snow, leaves, blossom) waits while anything plays.
+  const shownEffect = $derived.by(() => {
+    const e = looks.list.find((t) => t.id === looks.painted)?.effect ?? ''
+    return looks.effects && !playing && !music ? e : ''
+  })
 
   // Libraries browse state: a simple drill-down stack.
   let libraries: Library[] = $state([])
@@ -1604,8 +1611,15 @@
   }
 
   function setTheme(id: string) {
-    theme = id
+    // Choosing a theme while a holiday's shows means "mine, for the rest of
+    // this holiday"; choosing the holiday's own brings it back.
+    if (looks.occasion) {
+      if (id === looks.occasion.themeId) setPref('holiday-skip', '')
+      else if (activeTheme()?.occasion) setPref('holiday-skip', holidayKey(looks.occasion))
+    }
+    looks.chosen = id
     chooseTheme(id) // a deliberate choice, so it is remembered
+    paint()
   }
 
   async function poll() {
@@ -2335,18 +2349,11 @@
     // so they pick the server's values up on their own; the theme was
     // already painted from the local mirror and needs re-applying.
     //
-    // The comparison is against what is *painted*, not against
-    // currentTheme(): once loadPrefs has populated the cache that function
-    // already returns the new value, so comparing with it always looks
-    // equal and the stylesheet is never swapped — which is exactly what
-    // happened on a browser whose local mirror had been cleared.
-    const painted = () =>
-      document.getElementById('theme-css')?.getAttribute('href')?.match(/themes\/([^/]+)/)?.[1]
+    // Adopting is not choosing: the stored choice is taken as it is, and
+    // paint() decides what is on screen (a holiday's theme may be).
     const adoptPrefs = () => loadPrefs().then((p) => {
-      if (p.theme && p.theme !== painted()) {
-        applyTheme(p.theme) // adopt, not re-choose
-        theme = p.theme
-      }
+      if (p.theme) looks.chosen = p.theme
+      paint()
     }).catch(() => {})
     adoptPrefs()
     poll()
@@ -2358,6 +2365,9 @@
     // anything a dropped event missed.
     const closeEvents = subscribeEvents(
       {
+        // A custom theme was made, changed or deleted: the list (and what
+        // is painted, if it was that one) catches up.
+        themes: () => refreshLooks().catch(() => {}),
         // A track rated on another of this viewer's screens.
         rating: (data) => {
           const d = data as { itemId?: string; stars?: number } | null
@@ -2437,7 +2447,8 @@
   }
 
   onMount(() => {
-    listThemes().then((t) => (themes = t)).catch(() => {})
+    installLooks()
+    refreshLooks().catch(() => {})
     checkAuth().then(() => { if (gate === 'in') boot() })
     // Any 401 from the API means the session ended: back to sign-in.
     const onUnauthorised = () => {
@@ -2710,7 +2721,7 @@
 {/snippet}
 
 {#if gate !== 'in'}
-  <div class="gate">
+  <div class="gate theme-backdrop">
     {#if gate === 'checking'}
       <span class="muted">Connecting…</span>
     {:else if gate === 'login' && loginMode === 'picker' && profiles.length > 0 && !usePassword && !picked}
@@ -2773,6 +2784,9 @@
     {/if}
   </div>
 {/if}
+
+<div class="backdrop theme-backdrop" aria-hidden="true"></div>
+{#if shownEffect && gate === 'in'}<ThemeEffect kind={shownEffect} />{/if}
 
 <div class="shell" style:--poster-scale={posterScales[posterZoom] ?? 1}>
   <div class="topbar">
@@ -4311,8 +4325,10 @@
           section={settingsSection}
           onsection={openSettings}
           onme={(u) => (me = u)}
-          {themes}
-          {theme}
+          themes={looks.list}
+          theme={looks.chosen}
+          occasion={looks.occasion}
+          onthemeschanged={() => refreshLooks().catch(() => {})}
           onsettheme={setTheme}
           {devices}
           onreloaddevices={loadDevices}
@@ -4369,12 +4385,15 @@
 {/if}
 
 <style>
-  .shell { min-height: 100vh; display: flex; flex-direction: column; }
+  /* The theme's picture and its effect sit behind the app: the shell is
+     its own layer above them. */
+  .backdrop { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+  .shell { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; }
   .body { flex: 1; display: flex; }
   .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
   /* ---- Sign-in / first-run gate ---- */
-  .gate { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: var(--bg); padding: 1rem; }
+  .gate { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 1rem; }
   .gate form {
     width: min(22rem, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
     padding: 1.6rem; display: flex; flex-direction: column; gap: 0.7rem;

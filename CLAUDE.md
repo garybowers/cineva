@@ -114,7 +114,8 @@ server/                 Go module (all backend code)
   internal/importer/    importing from Plex and Jellyfin: sources, title matching, the runner
   internal/notify/      notifications: destinations by kind, the event catalogue, routing, the send queue
   internal/homeassistant/ Home Assistant: websocket connection and state, the controls allow-list, camera proxy, modes, playback events
-  internal/avatar/      uploaded pictures turned into avatars (upright, square, small JPEG)
+  internal/avatar/      uploaded pictures turned into avatars (upright, square, small JPEG) and theme backgrounds
+  internal/occasion/    the holiday calendar (Halloween, Christmas, Easter): holiday themes now, seasonal rows later
   internal/events/      in-process event bus behind the /events stream; events can be addressed to one user or device
   internal/stats/       host and transcode statistics for the admin dashboard
   internal/store/       repository interfaces + SQLite implementation, migrations
@@ -166,7 +167,7 @@ CI (`.github/workflows/ci.yml`) builds, lints and tests linux/amd64 and linux/ar
 - API routes are versioned under `/api/v1/`. Breaking the API means a new version, not a changed response shape.
 - Database schema changes always come as a new migration file — never edit an applied migration.
 - Frontend: TypeScript, Svelte 5 runes, no component library lock-in yet; keep the API client in one generated/typed module. Build mobile-first: new screens are designed at phone width and scale up, not the reverse.
-- Theming: all UI colours come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--on-accent` (text on an accent fill), `--ok`, `--err`, plus `--chart-1..3` for chart series — categorical, fixed order, validated for colour-vision deficiency against `--panel`) — never hardcode a colour in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change.
+- Theming: all UI colours come from the CSS custom-property token set (`--bg`, `--panel`, `--border`, `--text`, `--muted`, `--accent`, `--accent-2`, `--on-accent` (text on an accent fill), `--ok`, `--err`, plus `--chart-1..3` for chart series — categorical, fixed order, validated for colour-vision deficiency against `--panel`) — never hardcode a colour in a component. Themes live in `server/ui/themes/<id>/` (served at `/themes/`, listed by `/api/v1/themes`) and one theme skins both UIs; adding a token means updating every theme folder in the same change. A theme may also set a background picture (`--bg-image`, `--bg-dim`) and, in `theme.json`, an effect and the holiday it is for; people make their own in Settings, and holiday themes switch themselves on (design in [server/docs/themes.md](server/docs/themes.md)).
 
 ## Milestones
 

@@ -82,7 +82,10 @@ type Pref struct {
 	Lockable bool `json:"lockable"`
 	// Section is the Settings section it appears in (see Sections), so
 	// every client lays out the same page.
-	Section     string     `json:"section"`
+	Section string `json:"section"`
+	// Hidden is a preference the client keeps for itself rather than a
+	// row in Settings or on the admin's Defaults page.
+	Hidden      bool       `json:"hidden,omitempty"`
 	Label       string     `json:"label"`
 	Description string     `json:"description"`
 	Options     []Option   `json:"options,omitempty"`
@@ -209,6 +212,23 @@ var registry = []Pref{
 		Key: "theme", Type: TypeString, Default: "midnight", Scope: ScopePerson, Lockable: false,
 		Section: "appearance", Label: "Theme",
 		Description: "Follows you to every device you sign in on.",
+	},
+	{
+		Key: "holiday-themes", Type: TypeBool, Default: On, Scope: ScopePerson, Lockable: true,
+		Section: "appearance", Label: "Holiday themes",
+		Description: "Switches to the holiday's own theme for Halloween, Christmas and Easter, then back to yours.",
+	},
+	{
+		// Not a row in Settings: set by choosing a theme while a holiday's
+		// is showing, which keeps that choice for the rest of the holiday.
+		Key: "holiday-skip", Type: TypeString, Default: "", Scope: ScopePerson, Lockable: false, Hidden: true,
+		Section: "appearance", Label: "Holiday theme set aside",
+		Description: "The holiday whose theme you chose your own over, this year (\"halloween-2026\").",
+	},
+	{
+		Key: "theme-effects", Type: TypeBool, Default: On, Scope: ScopePerson, Lockable: false,
+		Section: "appearance", Label: "Theme effects",
+		Description: "The gentle snow, leaves or blossom some themes have. Never while something plays, nor when your system asks for less motion.",
 	},
 	{
 		Key: "interface", Type: TypeEnum, Default: "auto", Scope: ScopeDevice, Lockable: false,

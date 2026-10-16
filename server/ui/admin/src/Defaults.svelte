@@ -135,7 +135,7 @@
   {/if}
 
   {#each data.sections as sec (sec.id)}
-    {@const rows = data.registry.filter((p) => p.section === sec.id)}
+    {@const rows = data.registry.filter((p) => p.section === sec.id && !p.hidden)}
     {#if rows.length > 0}
       <h2>{sec.label}</h2>
       <div class="tablewrap">

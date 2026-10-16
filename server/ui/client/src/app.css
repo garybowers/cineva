@@ -44,3 +44,15 @@ button {
 @media (hover: none) {
   .trackstars .stars.unrated { display: none; }
 }
+
+/* A theme's background picture (--bg-image) under its background colour,
+   which covers it by --bg-dim (0 to 1) so text and posters stay readable.
+   Without a picture it is just the background colour. Behind the whole
+   app (App.svelte) and the sign-in screen. */
+.theme-backdrop {
+  --scrim: color-mix(in srgb, var(--bg) calc(var(--bg-dim, 0.7) * 100%), transparent);
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--scrim), var(--scrim)), var(--bg-image, none);
+  background-size: cover;
+  background-position: center;
+}

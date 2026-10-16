@@ -296,6 +296,22 @@ type autoUser struct {
 
 // GET /auth/status — public: does the server need its first admin, and
 // who (if anyone) is the caller.
+// optionalUser is the signed-in caller on a public route, or nil when
+// anonymous: resolved without failing the request.
+func (s *server) optionalUser(c echo.Context) *store.User {
+	ctx := c.Request().Context()
+	if ck, err := c.Cookie(sessionCookie); err == nil && ck.Value != "" {
+		if _, u, err := s.store.SessionByHash(ctx, auth.HashToken(ck.Value)); err == nil && !u.Disabled {
+			return &u
+		}
+	} else if key := bearerKey(c); key != "" {
+		if _, u, err := s.store.APIKeyByHash(ctx, auth.HashToken(key)); err == nil && !u.Disabled {
+			return &u
+		}
+	}
+	return nil
+}
+
 func (s *server) authStatusHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 	n, err := s.store.CountUsers(ctx)
@@ -304,16 +320,7 @@ func (s *server) authStatusHandler(c echo.Context) error {
 	}
 	out := authStatus{SetupRequired: n == 0, LoginMode: s.loginMode(c)}
 	if n > 0 {
-		// Resolve the caller without failing the request when anonymous.
-		if ck, err := c.Cookie(sessionCookie); err == nil && ck.Value != "" {
-			if _, u, err := s.store.SessionByHash(ctx, auth.HashToken(ck.Value)); err == nil && !u.Disabled {
-				out.User = &u
-			}
-		} else if key := bearerKey(c); key != "" {
-			if _, u, err := s.store.APIKeyByHash(ctx, auth.HashToken(key)); err == nil && !u.Disabled {
-				out.User = &u
-			}
-		}
+		out.User = s.optionalUser(c)
 		auto, err := s.deviceAutoUser(c)
 		if err != nil {
 			return err

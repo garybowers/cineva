@@ -1,0 +1,8 @@
+{
+  "name": "Christmas",
+  "appearance": "dark",
+  "occasion": "christmas",
+  "background": "background.svg",
+  "dim": 72,
+  "effect": "snow"
+}

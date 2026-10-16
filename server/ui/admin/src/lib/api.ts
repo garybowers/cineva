@@ -137,6 +137,8 @@ export interface PrefEntry {
   scope: 'person' | 'device'
   lockable: boolean
   section: string
+  /** Kept by the client for itself; not a row in Settings or Defaults. */
+  hidden?: boolean
   label: string
   description: string
   options?: PrefOption[]

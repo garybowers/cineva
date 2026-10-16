@@ -87,17 +87,147 @@ paths:
   /themes:
     get:
       summary: List UI themes
+      description: >
+        The built-in themes (folders under /themes, holiday themes among
+        them), then the custom ones the caller may pick: everyone's shared
+        ones, and when signed in their own. Public, so the sign-in screen can
+        be drawn in the household's theme.
       operationId: listThemes
       tags: [System]
       security: []
       responses:
         "200":
-          description: Available themes (folders under /themes)
+          description: Available themes
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Theme" }
+    post:
+      summary: Make a custom theme
+      description: >
+        Every colour of the token set is required, as #rrggbb. Appearance
+        (dark or light) follows from the background colour. household
+        (share with everyone) is for admins only.
+      operationId: createTheme
+      tags: [System]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ThemeRequest" }
+      responses:
+        "201": { description: Made, content: { application/json: { schema: { $ref: "#/components/schemas/Theme" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Only an administrator can share a theme with everyone }
+  /themes/occasion:
+    get:
+      summary: The holiday on now, and its theme
+      description: >
+        Halloween (1 October to 1 November), Christmas (1 December to 1
+        January) and Easter (ten days before Easter Sunday to Easter Monday),
+        read in the server's time zone. A client with the holiday-themes
+        preference on shows themeId instead of the chosen theme until the
+        day after until. 204 outside every holiday.
+      operationId: currentOccasion
+      tags: [System]
+      security: []
+      responses:
+        "200":
+          description: The holiday
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, until, themeId]
+                properties:
+                  id: { type: string, enum: [easter, halloween, christmas] }
+                  name: { type: string }
+                  until: { type: string, format: date, description: The last day of its window }
+                  themeId: { type: string, description: The built-in theme for it; "" when there is none }
+        "204": { description: No holiday now }
+  /themes/{id}/theme.css:
+    get:
+      summary: A custom theme as a stylesheet
+      description: >
+        The same shape as a built-in theme's file: the token set on :root,
+        and --bg-image and --bg-dim for its background picture. Public, like
+        the theme folders. Built-in themes are at /themes/{id}/theme.css
+        instead.
+      operationId: customThemeCSS
+      tags: [System]
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, example: c-0f6d2c4e-1b2a-4c3d-9e8f-7a6b5c4d3e2f }
+      responses:
+        "200": { description: The stylesheet, content: { text/css: { schema: { type: string } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /themes/{id}:
+    patch:
+      summary: Change a custom theme
+      description: >
+        Its maker can change it, and an admin can change any. Fields left out
+        keep their values; tokens, when sent, must be the whole set.
+      operationId: updateTheme
+      tags: [System]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ThemeRequest" }
+      responses:
+        "200": { description: Changed, content: { application/json: { schema: { $ref: "#/components/schemas/Theme" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Not its maker or an administrator }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Delete a custom theme
+      description: Anyone who had chosen it is shown the default theme.
+      operationId: deleteTheme
+      tags: [System]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+        "403": { description: Not its maker or an administrator }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /themes/{id}/background:
+    put:
+      summary: Set a custom theme's background picture
+      description: >
+        Multipart field "image": a JPEG, PNG, GIF or WebP of at most 15 MB.
+        It is turned upright and scaled to fit 2560 pixels, keeping its
+        shape.
+      operationId: putThemeBackground
+      tags: [System]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, format: binary }
+      responses:
+        "200": { description: Set, content: { application/json: { schema: { $ref: "#/components/schemas/Theme" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: Not its maker or an administrator }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Take a custom theme's background picture away
+      operationId: deleteThemeBackground
+      tags: [System]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Removed, content: { application/json: { schema: { $ref: "#/components/schemas/Theme" } } } }
+        "403": { description: Not its maker or an administrator }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   # ---- Authentication & users (milestone 4) ----
   # Every endpoint except /health, /themes, /auth/status, /auth/login and
@@ -1823,8 +1953,10 @@ paths:
         (to the user who started it: {runId, modeId, modeName, status:
         running|done|failed, step, steps, error, playedOn, playedOnName} —
         playedOn is the device the title was sent to, empty when that
-        device was already playing it), and "rating" (to the user who rated:
-        {itemId, stars}, 0 when cleared). Events are advisory; clients refetch what
+        device was already playing it), "rating" (to the user who rated:
+        {itemId, stars}, 0 when cleared), and "themes" (no data — refetch
+        /themes: a custom theme was made, changed or deleted; to everyone
+        for a shared one, otherwise to its maker). Events are advisory; clients refetch what
         they display on receipt, and a dropped event costs staleness until
         the next one, not correctness.
       operationId: eventStream
@@ -4722,6 +4854,27 @@ components:
             (bg, panel, border, text, muted, accent, accent-2, on-accent, ok, err, chart-1..3), so a
             client can draw a preview of the theme without switching to it.
           example: { bg: "#0e1116", panel: "#161b23", text: "#e8ebf0", accent: "#7c5cff" }
+        css: { type: string, description: "The stylesheet to load: /themes/{id}/theme.css, or for a custom theme /api/v1/themes/{id}/theme.css with a version" }
+        background: { type: string, description: The background picture's URL, absent when it has none }
+        dim: { type: integer, minimum: 0, maximum: 95, description: How strongly the background colour covers the picture, in per cent }
+        effect: { type: string, enum: [snow, leaves, blossom], description: The animated touch it shows; absent for none }
+        occasion: { type: string, enum: [easter, halloween, christmas], description: The holiday a built-in theme is for }
+        custom: { type: boolean, description: Made by someone in Settings; its id starts "c-" }
+        ownerId: { type: string, description: Who made a custom theme }
+        household: { type: boolean, description: Shared with everyone by an admin }
+        mine: { type: boolean, description: The caller made it }
+    ThemeRequest:
+      type: object
+      description: On create name and tokens are required.
+      properties:
+        name: { type: string, maxLength: 60 }
+        tokens:
+          type: object
+          additionalProperties: { type: string, pattern: "^#[0-9a-fA-F]{6}$" }
+          description: The whole token set (bg, panel, border, text, muted, accent, accent-2, on-accent, ok, err, chart-1..3) as #rrggbb
+        dim: { type: integer, minimum: 0, maximum: 95, default: 70 }
+        effect: { type: string, enum: ["", snow, leaves, blossom] }
+        household: { type: boolean, description: Share with everyone (admins only) }
 
     Library:
       type: object
