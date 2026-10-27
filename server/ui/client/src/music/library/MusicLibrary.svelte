@@ -26,6 +26,7 @@
     onartist,
     onplaylists,
     page = false,
+    heading,
     children,
   }: {
     lib: Library
@@ -41,6 +42,10 @@
     onplaylists: () => void
     /** An open page (artist, album) is in children, shown instead of the tabs. */
     page?: boolean
+    /** The library's heading, shown above the tabs. It lives in the content
+     *  column rather than above the whole block so the rail stays at the
+     *  same height when a page replaces the tabs. */
+    heading?: Snippet<[Library]>
     children?: Snippet
   } = $props()
 
@@ -68,6 +73,7 @@
     {#if page}
       {@render children?.()}
     {:else}
+      {@render heading?.(lib)}
       <header class="mhead">
         <nav class="subtabs" aria-label="{lib.name} views" data-nav-group="musictabs">
           {#each tabs as t (t.id)}

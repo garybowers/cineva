@@ -3487,12 +3487,12 @@
         <!-- The artist rail stays beside whatever is open: the tabs, an
              artist's page or an album's, so moving between artists is one
              click rather than a trip back (server/docs/music.md, part 1). -->
-        {#if !detail}
-          <h1>{currentLib.name}</h1>
-          {@render storageWarning(currentLib.id)}
-        {/if}
         <MusicLibrary lib={currentLib} tab={musicTab} genre={musicGenre} compilations={musicComp} railCurrent={railCurrent}
           ontab={setMusicTab} onartist={(a) => openArtist(a)} onplaylists={() => openPlaylist(null)} page={!!detail}>
+          {#snippet heading(lib: Library)}
+            <h1>{lib.name}</h1>
+            {@render storageWarning(lib.id)}
+          {/snippet}
           {@render musicPage()}
         </MusicLibrary>
       {:else if detail && detail.item.kind === 'artist'}

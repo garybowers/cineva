@@ -108,10 +108,9 @@
 </div>
 
 <style>
-  .albumpage { position: relative; }
-  .albumpage > :not(.artbg) { position: relative; }
+  .albumpage { position: relative; isolation: isolate; }
   .artbg {
-    position: absolute; top: 0; left: 0; right: 0; height: 24rem;
+    position: absolute; top: 0; left: 0; right: 0; height: 24rem; z-index: -1; pointer-events: none;
     margin: -1.25rem -1.5rem 0;
     background-size: cover; background-position: center 30%;
     opacity: 0.25; filter: saturate(0.7) blur(26px); transform: scale(1.06);

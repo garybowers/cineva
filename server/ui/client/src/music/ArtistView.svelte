@@ -164,10 +164,9 @@
 </div>
 
 <style>
-  .artist { position: relative; }
-  .artist > :not(.artbg) { position: relative; }
+  .artist { position: relative; isolation: isolate; }
   .artbg {
-    position: absolute; top: 0; left: 0; right: 0; height: 26rem;
+    position: absolute; top: 0; left: 0; right: 0; height: 26rem; z-index: -1; pointer-events: none;
     margin: -1.25rem -1.5rem 0;
     background-size: cover; background-position: center 30%;
     opacity: 0.28; filter: saturate(0.8) blur(24px); transform: scale(1.06);
