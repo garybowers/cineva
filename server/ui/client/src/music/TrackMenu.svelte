@@ -3,7 +3,7 @@
   // go to its album or artist. The same menu wherever a track is listed.
   // The stars are here as well as in the row because a phone has no
   // pointer to reveal the row's.
-  import { Ellipsis, ListPlus, ListMusic, Disc3, MicVocal, Trash2, ArrowUp, ArrowDown } from '@lucide/svelte'
+  import { Ellipsis, ListPlus, ListStart, ListMusic, Disc3, MicVocal, Trash2, ArrowUp, ArrowDown, Download, Sparkles } from '@lucide/svelte'
   import { onDismiss } from '../lib/dismiss'
   import { itemDetail, type Item } from '../lib/api'
   import { music, addToPlaylist } from './actions.svelte'
@@ -59,10 +59,12 @@
     <Ellipsis size={18} />
   </button>
   {#if open}
-    <div class="tm-pop" role="menu">
+    <div class="tm-pop" role="menu" data-nav-scope>
       <div class="tm-rate"><span>Rating</span><Stars {track} size={17} /></div>
+      <button class="tm-item" role="menuitem" onclick={() => act(() => music().playNext([track]))}><ListStart size={15} /> Play next</button>
       <button class="tm-item" role="menuitem" onclick={() => act(() => music().queue([track]))}><ListPlus size={15} /> Add to queue</button>
       <button class="tm-item" role="menuitem" onclick={() => act(() => addToPlaylist([track.id], track.title))}><ListMusic size={15} /> Add to playlist…</button>
+      <button class="tm-item" role="menuitem" onclick={() => act(() => music().mix(track))} title="This song, then what belongs beside it"><Sparkles size={15} /> Mix from this</button>
       {#if onmove}
         <button class="tm-item" role="menuitem" onclick={() => act(() => onmove?.(-1))}><ArrowUp size={15} /> Move up</button>
         <button class="tm-item" role="menuitem" onclick={() => act(() => onmove?.(1))}><ArrowDown size={15} /> Move down</button>
@@ -76,8 +78,9 @@
       {#if artist}
         <button class="tm-item" role="menuitem" onclick={() => act(goToArtist)}><MicVocal size={15} /> Go to artist</button>
       {/if}
+      <button class="tm-item" role="menuitem" onclick={() => act(() => music().download(track.id, 'original'))}><Download size={15} /> Download</button>
       {#if onremove}
-        <button class="tm-item danger" role="menuitem" onclick={() => act(() => onremove?.())}><Trash2 size={15} /> Remove from playlist</button>
+        <button class="tm-item danger" role="menuitem" onclick={() => act(() => onremove?.())}><Trash2 size={15} /> Remove</button>
       {/if}
     </div>
   {/if}
@@ -101,6 +104,7 @@
     text-align: left; font-size: 0.88rem; color: var(--text); white-space: nowrap;
   }
   .tm-item:hover { background: var(--bg); }
+  :global(html.tv) .tm-item:focus { outline: none; background: var(--accent); color: var(--on-accent); }
   .tm-rate {
     display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
     padding: 0.3rem 0.35rem 0.4rem 0.6rem; margin-bottom: 0.2rem;

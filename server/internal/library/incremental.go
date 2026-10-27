@@ -50,6 +50,29 @@ type scanPlan struct {
 	// added is what this scan created that the library did not have
 	// before (films, episodes, albums), for "new in the library" messages.
 	added []store.Item
+	// deferLookups says this run registers files without asking the
+	// provider: more than enrichThreshold new films or series are coming,
+	// so the lookups go to the enrichment job afterwards
+	// (server/docs/scanning.md). toEnrich is how many titles that is.
+	deferLookups bool
+	toEnrich     int
+	// scanID is the scan's row; registerDone is closed when its register
+	// pass ends, which the enrichment job running alongside watches; and
+	// enriching says that job took this scan on (startEnrich), so it is
+	// the job that closes the phase and starts the readers.
+	scanID       string
+	registerDone chan struct{}
+	enriching    bool
+}
+
+// decideDeferral counts the films or series this run will create that the
+// library did not have, and defers their lookups when there are many: a
+// first scan or a bulk import should be on every screen in minutes, with
+// the details arriving behind. A handful of new titles stays inline, so a
+// new episode from Sonarr appears with its details in one go.
+func (p *scanPlan) decideDeferral(newTitles int, provider bool) {
+	p.toEnrich = newTitles
+	p.deferLookups = provider && newTitles > enrichThreshold
 }
 
 // noteNew records a saved item as new to the library when no item had its
@@ -82,6 +105,8 @@ func (m *Manager) newScanPlan(ctx context.Context, lib store.Library, full bool)
 		keep:   map[string]bool{},
 		adopt:  map[string]int64{},
 		looked: map[string]bool{},
+
+		registerDone: make(chan struct{}),
 	}
 	for _, st := range stamps {
 		p.byID[st.ID] = st

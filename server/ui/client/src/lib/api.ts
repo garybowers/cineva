@@ -31,6 +31,22 @@ export interface Item {
   libraryId: string
   kind: 'movie' | 'series' | 'season' | 'episode' | 'artist' | 'album' | 'track'
   artist?: string
+  /** A track's album title and album artist (the name its album sits under). */
+  album?: string
+  albumArtist?: string
+  /** An album by various artists. */
+  compilation?: boolean
+  /** What a track's file is: kbit/s, Hz, bits per sample (lossless only), channels. */
+  bitrate?: number
+  sampleRate?: number
+  bitDepth?: number
+  channels?: number
+  /** The MusicBrainz id, from tags or a lookup. */
+  mbid?: string
+  /** The title as it sorts: folded, lower-cased, a leading article dropped. */
+  sortTitle?: string
+  /** An artist's albums or an album's tracks, in the music listings. */
+  childCount?: number
   trackNum?: number
   discNum?: number
   parentId?: string
@@ -67,6 +83,8 @@ export interface Item {
   /** On a series in a recently added row, when an episode of it arrived in
    *  the last six weeks: the newest one, to label the tile with what is new. */
   latestEpisode?: EpisodeBrief
+  /** The file's extension, lower-cased. */
+  container?: string
   videoCodec?: string
   audioCodec?: string
   width?: number
@@ -286,16 +304,46 @@ export interface Device {
   /** The Home Assistant area it is in (its room); "" for none. */
   areaId?: string
 }
-/** A queue on its way between devices. */
+/** What a queue was made from, for "Playing from" and "Save as playlist". */
+export interface QueueSource { kind: string; id?: string; title?: string }
+/** A device's queue as the server keeps it (see docs/openapi.yaml QueueRequest). */
+/** The queue is, or ends in, a mix (server/docs/mix.md): what it grew from and where it has got to. */
+export interface QueueMix {
+  seedId: string
+  kind?: 'track' | 'album' | 'artist'
+  title?: string
+  /** The last track the mix was asked to continue from. */
+  after?: string
+  /** The queue index the mix's entries begin at. */
+  from?: number
+  basis?: string[]
+}
+export interface QueueRecord {
+  entries: { id: string; ord: number }[]
+  index: number
+  shuffle?: boolean
+  repeat?: 'off' | 'all' | 'one'
+  positionSecs?: number
+  source?: QueueSource | null
+  mix?: QueueMix | null
+}
+/** A queue on its way between devices, its entries resolved to items in play order. */
 export interface HandoffQueue {
   items: Item[]
   index: number
+  shuffle?: boolean
+  repeat?: 'off' | 'all' | 'one'
+  positionSecs?: number
+  source?: QueueSource | null
+  mix?: QueueMix | null
 }
 export interface APIKey {
   id: string
   name: string
   createdAt: string
   lastUsedAt?: string
+  /** Usable as the password in a music app (a sealed copy is kept). */
+  forApps?: boolean
 }
 export const UNAUTHORISED = 'cineva:unauthorised'
 
@@ -340,7 +388,7 @@ export const updateMe = (displayName: string) => req<User>('/auth/me', {
 export const setPIN = (password: string, pin: string) => post<void>('/auth/pin/set', { password, pin })
 export const changePassword = (current: string, next: string) => post<void>('/auth/password', { current, new: next })
 export const listAPIKeys = () => get<APIKey[]>('/auth/keys')
-export const createAPIKey = (name: string) => post<APIKey & { key: string }>('/auth/keys', { name })
+export const createAPIKey = (name: string, forApps = false) => post<APIKey & { key: string }>('/auth/keys', { name, forApps })
 export const deleteAPIKey = (id: string) => req<void>(`/auth/keys/${id}`, { method: 'DELETE' })
 
 /** A photo as chosen, or as framed in the crop dialogue (a JPEG Blob). */
@@ -362,12 +410,14 @@ export const revokeDevice = (id: string) => req<void>(`/auth/sessions/${id}`, { 
 /** Forget a device: its name, room and settings go, and it is signed out. */
 export const forgetDevice = (id: string) => req<void>(`/auth/sessions/${id}?forget=true`, { method: 'DELETE' })
 export const revokeOtherDevices = () => post<{ revoked: number }>('/auth/sessions/revoke-others')
-/** Records this device's queue so another can take it over. */
-export const saveDeviceQueue = (itemIds: string[], index: number) =>
-  req<void>('/auth/sessions/current/queue', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ itemIds, index }) })
+/** Records this device's queue, whole, so another can take it over and a reload can carry on. */
+export const saveDeviceQueue = (q: QueueRecord) =>
+  req<void>('/auth/sessions/current/queue', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(q) })
 export const deviceQueue = (id: string) => get<HandoffQueue>(`/auth/sessions/${id}/queue`)
-export const playOnDevice = (id: string, itemIds: string[], index: number) =>
-  post<void>(`/auth/sessions/${id}/play`, { itemIds, index })
+/** This device's own saved queue, to carry on after a reload. */
+export const myQueue = () => get<HandoffQueue>('/auth/sessions/current/queue')
+export const playOnDevice = (id: string, q: QueueRecord) =>
+  post<void>(`/auth/sessions/${id}/play`, q)
 /** Continue here what another device plays: it pauses, and this is what
     to play from where it stopped (positionSecs for a track, which keeps no
     resume state). */
@@ -486,7 +536,8 @@ export interface PersonProfile extends Person {
 
 export const personDetail = (id: string) => get<PersonProfile>(`/people/${id}`)
 
-export interface GenreCount { genre: string; count: number }
+/** count is titles (films, series, albums); tracks is a music library's tracks carrying it. */
+export interface GenreCount { genre: string; count: number; tracks?: number }
 
 /** One shelf on the Recommended tab, decided server-side. */
 export interface RecRow {
@@ -840,6 +891,41 @@ export interface Listening {
 }
 export const libraryListening = (id: string) => get<Listening>(`/libraries/${id}/listening`)
 
+/** The paged music listings (server/docs/music.md, part 1). */
+export interface MusicPage {
+  items: Item[]
+  total: number
+  page: number
+  size: number
+  /** On the name sort: how many file under each letter, "#" for the rest. */
+  index?: Record<string, number>
+}
+export type MusicParams = Record<string, string | number | boolean | undefined>
+const qs = (params: MusicParams) => {
+  const u = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === '' || v === false) continue
+    u.set(k, String(v))
+  }
+  const q = u.toString()
+  return q ? `?${q}` : ''
+}
+export const libraryArtists = (id: string, params: MusicParams = {}) => get<MusicPage>(`/libraries/${id}/artists${qs(params)}`)
+export const libraryAlbums = (id: string, params: MusicParams = {}) => get<MusicPage>(`/libraries/${id}/albums${qs(params)}`)
+export const libraryTracks = (id: string, params: MusicParams = {}) => get<MusicPage>(`/libraries/${id}/tracks${qs(params)}`)
+export interface LibrarySearch { artists: Item[]; albums: Item[]; tracks: Item[] }
+export const librarySearch = (id: string, q: string) => get<LibrarySearch>(`/libraries/${id}/search?q=${encodeURIComponent(q)}`)
+/** Every track under an artist or album in play order, shuffled on request. */
+export const itemTracks = (id: string, shuffle = false) => get<Item[]>(`/items/${id}/tracks${shuffle ? '?shuffle=true' : ''}`)
+export interface Lyrics { synced: boolean; text: string }
+/** A track's lyrics; null when it has none. */
+export async function itemLyrics(id: string): Promise<Lyrics | null> {
+  const res = await fetch(`/api/v1/items/${id}/lyrics`)
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  return res.json() as Promise<Lyrics>
+}
+
 export type SmartField = 'artist' | 'album' | 'title' | 'genre' | 'year' | 'format' | 'added' | 'plays' | 'lastPlayed' | 'rating'
 export type SmartOp = 'is' | 'isNot' | 'contains' | 'gt' | 'lt' | 'inLast' | 'notInLast' | 'atLeast' | 'atMost'
 export type SmartSort = 'random' | 'title' | 'artist' | 'album' | 'year' | 'added' | 'plays' | 'lastPlayed' | 'leastRecent' | 'rating'
@@ -849,6 +935,10 @@ export interface SmartRules { match: 'all' | 'any'; rules: SmartRule[]; sort: Sm
 export interface Playlist {
   id: string
   name: string
+  /** When a track was last added; absent when never. */
+  lastAddedAt?: string
+  /** With listPlaylists(forTrack): the playlist already has that track. */
+  holds?: boolean
   /** Present on a smart playlist: its rules, evaluated each time it is read. */
   smart?: SmartRules
   trackCount: number
@@ -866,7 +956,8 @@ const send = <T>(method: string, path: string, body: unknown) =>
 /** Rate an item 1 to 5 stars; 0 clears the rating. */
 export const setRating = (id: string, stars: number) => send<void>('PUT', `/items/${id}/rating`, { stars })
 
-export const listPlaylists = () => get<Playlist[]>('/playlists')
+/** With a track id, the picker's order: most recently added to first, each saying whether it holds the track. */
+export const listPlaylists = (forTrack?: string) => get<Playlist[]>(forTrack ? `/playlists?for=${encodeURIComponent(forTrack)}` : '/playlists')
 export const createPlaylist = (name: string, smart?: SmartRules) => post<Playlist>('/playlists', { name, smart })
 export const playlistDetail = (id: string) => get<PlaylistDetail>(`/playlists/${id}`)
 export const updatePlaylist = (id: string, change: { name?: string; smart?: SmartRules }) =>
@@ -874,6 +965,21 @@ export const updatePlaylist = (id: string, change: { name?: string; smart?: Smar
 export const deletePlaylist = (id: string) => req<void>(`/playlists/${id}`, { method: 'DELETE' })
 /** Tracks, albums or artists, added to the end in listening order. */
 export const addToPlaylist = (id: string, itemIds: string[]) => post<PlaylistDetail>(`/playlists/${id}/items`, { itemIds })
+/** Undo an append: the last count entries go. */
+export const removeLastFromPlaylist = (id: string, count = 1) =>
+  req<{ removed: number }>(`/playlists/${id}/items/last?count=${count}`, { method: 'DELETE' })
+
+/** One batch of a mix grown from a track, album or artist (server/docs/mix.md). */
+export interface MixResult { seed: Item; basis: string[]; tracks: Item[] }
+export const itemMix = (id: string, opts: { size?: number; exclude?: string[]; after?: string; start?: boolean } = {}) => {
+  const q = new URLSearchParams()
+  if (opts.size) q.set('size', String(opts.size))
+  if (opts.exclude?.length) q.set('exclude', opts.exclude.slice(0, 1000).join(','))
+  if (opts.after) q.set('after', opts.after)
+  if (opts.start) q.set('start', 'true')
+  const qs = q.toString()
+  return get<MixResult>(`/items/${id}/mix${qs ? `?${qs}` : ''}`)
+}
 /** The playlist's tracks, replaced with these in this order. */
 export const setPlaylistTracks = (id: string, itemIds: string[]) =>
   send<PlaylistDetail>('PUT', `/playlists/${id}/items`, { itemIds })

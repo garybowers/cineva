@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 
 	"github.com/labstack/echo/v4"
 
@@ -142,12 +143,36 @@ type playlistBody struct {
 }
 
 // GET /playlists — the viewer's playlists.
+// GET /playlists — the user's playlists by name; with ?for=<track> the
+// ones to add that track to, most recently added to first, each saying
+// whether it holds the track already (server/docs/mix.md).
 func (s *server) listPlaylists(c echo.Context) error {
-	lists, err := s.store.Playlists(c.Request().Context(), userID(c), visibleLibraryIDs(currentUser(c)))
+	libs := visibleLibraryIDs(currentUser(c))
+	var lists []store.Playlist
+	var err error
+	if forTrack := c.QueryParam("for"); forTrack != "" {
+		lists, err = s.store.PlaylistsFor(c.Request().Context(), userID(c), libs, forTrack)
+	} else {
+		lists, err = s.store.Playlists(c.Request().Context(), userID(c), libs)
+	}
 	if err != nil {
 		return err
 	}
 	return c.JSON(http.StatusOK, lists)
+}
+
+// DELETE /playlists/:id/items/last?count=n — undo an append: the last n
+// entries (1 by default) go. Answers how many went.
+func (s *server) removeLastPlaylistItems(c echo.Context) error {
+	n, err := strconv.Atoi(c.QueryParam("count"))
+	if err != nil || n < 1 {
+		n = 1
+	}
+	removed, err := s.store.RemoveLastPlaylistTracks(c.Request().Context(), userID(c), c.Param("id"), min(n, 1000))
+	if err != nil {
+		return playlistError(err)
+	}
+	return c.JSON(http.StatusOK, map[string]int{"removed": removed})
 }
 
 // POST /playlists — a new playlist: manual, or smart when rules are given.

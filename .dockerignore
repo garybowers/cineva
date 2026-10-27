@@ -1,3 +1,21 @@
-# The image is built from prebuilt binaries only (see Dockerfile).
+# What the Dockerfile's stages need and nothing else: the server's source,
+# the FFmpeg submodule without the library the host may have built (the
+# ffmpeg stage builds its own), the patch, and a prebuilt binary when
+# SOURCE=prebuilt. Everything local (databases, artwork, node_modules, the
+# host's UI builds, the Android toolchain) stays out of the context.
 *
+!server
+!third_party/ffmpeg-statigo
+!third_party/patches
 !dist/cineva-linux-*
+!docker-entrypoint.sh
+server/ui/*/node_modules
+server/ui/*/dist
+server/bin
+server/cineva.db*
+server/cineva.yaml
+server/artwork
+server/previews
+third_party/ffmpeg-statigo/lib
+third_party/ffmpeg-statigo/build
+third_party/ffmpeg-statigo/.build

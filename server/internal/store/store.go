@@ -24,7 +24,16 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	// synchronous(NORMAL): in WAL mode the database is never corrupted by
+	// a crash or a power cut at this level, and only the last transactions
+	// before one can be lost, which a media index can afford, as it would
+	// be rebuilt by the next scan anyway; FULL flushes the log to disk at
+	// every commit, which is what made every row a scan wrote cost a disk
+	// flush. _txlock=immediate: a transaction takes the write lock as it
+	// begins and waits busy_timeout for it, rather than reading first and
+	// failing at its first write when another writer has committed since.
+	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database %s: %w", path, err)

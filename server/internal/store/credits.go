@@ -34,7 +34,7 @@ var _ CreditRepo = (*Store)(nil)
 
 // upsertPerson returns the row id for a provider person, inserting them the
 // first time they are seen and refreshing the name and headshot after that.
-func upsertPerson(ctx context.Context, tx *sql.Tx, p Person) (string, error) {
+func upsertPerson(ctx context.Context, tx dbtx, p Person) (string, error) {
 	var id string
 	err := tx.QueryRowContext(ctx, `SELECT id FROM people WHERE tmdb_id = ?`, p.TmdbID).Scan(&id)
 	switch {
@@ -66,6 +66,14 @@ func (s *Store) ReplaceCredits(ctx context.Context, itemID string, cast, crew []
 		return fmt.Errorf("replace credits: %w", err)
 	}
 	defer tx.Rollback()
+	if err := replaceCredits(ctx, tx, itemID, cast, crew); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replaceCredits is ReplaceCredits inside a transaction the caller holds.
+func replaceCredits(ctx context.Context, tx dbtx, itemID string, cast, crew []Person) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM credits WHERE item_id = ?`, itemID); err != nil {
 		return fmt.Errorf("clear credits: %w", err)
 	}
@@ -92,10 +100,7 @@ func (s *Store) ReplaceCredits(ctx context.Context, itemID string, cast, crew []
 	if err := add(cast, "cast"); err != nil {
 		return err
 	}
-	if err := add(crew, "crew"); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return add(crew, "crew")
 }
 
 func (s *Store) creditsOfKind(ctx context.Context, itemID, kind string) ([]Person, error) {

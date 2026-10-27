@@ -31,6 +31,10 @@ export interface Scan {
   error?: string
   startedAt: string
   finishedAt?: string
+  /** registering (files), enriching (details, after the files), done. */
+  phase?: 'registering' | 'enriching' | 'done'
+  enriched?: number
+  toEnrich?: number
 }
 
 export interface User {

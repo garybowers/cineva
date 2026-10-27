@@ -28,6 +28,11 @@ type Playlist struct {
 	Covers       []string `json:"covers"`
 	CreatedAt    string   `json:"createdAt"`
 	UpdatedAt    string   `json:"updatedAt"`
+	// LastAddedAt is when a track was last appended, which orders the
+	// pickers that add to playlists (server/docs/mix.md); empty when never.
+	LastAddedAt string `json:"lastAddedAt,omitempty"`
+	// Holds is set by PlaylistsFor: this playlist already has the track.
+	Holds bool `json:"holds,omitempty"`
 }
 
 // SmartRules define a smart playlist: tracks matching all (or any) of the
@@ -316,9 +321,11 @@ func encodeSmart(smart *SmartRules) (string, error) {
 func (s *Store) playlistRow(ctx context.Context, userID, id string) (Playlist, error) {
 	var p Playlist
 	var raw string
+	var lastAdded sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, smart, created_at, updated_at FROM playlists WHERE id = ? AND user_id = ?`,
-		id, userID).Scan(&p.ID, &p.Name, &raw, &p.CreatedAt, &p.UpdatedAt)
+		`SELECT id, name, smart, created_at, updated_at, last_added_at FROM playlists WHERE id = ? AND user_id = ?`,
+		id, userID).Scan(&p.ID, &p.Name, &raw, &p.CreatedAt, &p.UpdatedAt, &lastAdded)
+	p.LastAddedAt = lastAdded.String
 	if errors.Is(err, sql.ErrNoRows) {
 		return Playlist{}, ErrNotFound
 	}
@@ -353,8 +360,23 @@ func summarise(p *Playlist, tracks []Item) {
 // Playlists lists a user's playlists by name, each summarised over the
 // tracks they can play in the given libraries (nil for all).
 func (s *Store) Playlists(ctx context.Context, userID string, libraryIDs []string) ([]Playlist, error) {
+	return s.playlists(ctx, userID, libraryIDs, "")
+}
+
+// PlaylistsFor lists a user's playlists for adding a track to: the ones
+// added to most recently first (never-added ones by name after them),
+// each saying whether it already holds the track.
+func (s *Store) PlaylistsFor(ctx context.Context, userID string, libraryIDs []string, trackID string) ([]Playlist, error) {
+	return s.playlists(ctx, userID, libraryIDs, trackID)
+}
+
+func (s *Store) playlists(ctx context.Context, userID string, libraryIDs []string, forTrack string) ([]Playlist, error) {
+	order := `ORDER BY name COLLATE NOCASE, created_at`
+	if forTrack != "" {
+		order = `ORDER BY last_added_at IS NULL, last_added_at DESC, name COLLATE NOCASE, created_at`
+	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id FROM playlists WHERE user_id = ? ORDER BY name COLLATE NOCASE, created_at`, userID)
+		`SELECT id FROM playlists WHERE user_id = ? `+order, userID)
 	if err != nil {
 		return nil, fmt.Errorf("playlists: %w", err)
 	}
@@ -377,9 +399,46 @@ func (s *Store) Playlists(ctx context.Context, userID string, libraryIDs []strin
 		if err != nil {
 			return nil, err
 		}
+		if forTrack != "" {
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT EXISTS (SELECT 1 FROM playlist_items WHERE playlist_id = ? AND item_id = ?)`,
+				id, forTrack).Scan(&p.Holds); err != nil {
+				return nil, fmt.Errorf("playlist %s holds: %w", id, err)
+			}
+		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// RemoveLastPlaylistTracks takes the last n entries off a manual playlist:
+// the undo of an append, which a client knows the size of. Returns how
+// many went.
+func (s *Store) RemoveLastPlaylistTracks(ctx context.Context, userID, id string, n int) (int, error) {
+	p, err := s.playlistRow(ctx, userID, id)
+	if err != nil {
+		return 0, err
+	}
+	if p.Smart != nil {
+		return 0, fmt.Errorf("%w: a smart playlist's tracks come from its rules", ErrInvalidPlaylist)
+	}
+	if n < 1 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM playlist_items WHERE playlist_id = ? AND position IN (
+		   SELECT position FROM playlist_items WHERE playlist_id = ? ORDER BY position DESC LIMIT ?)`,
+		id, id, n)
+	if err != nil {
+		return 0, fmt.Errorf("playlist %s undo: %w", id, err)
+	}
+	removed, _ := res.RowsAffected()
+	if removed > 0 {
+		if _, err := s.db.ExecContext(ctx, `UPDATE playlists SET updated_at = datetime('now') WHERE id = ?`, id); err != nil {
+			return int(removed), fmt.Errorf("playlist %s undo: %w", id, err)
+		}
+	}
+	return int(removed), nil
 }
 
 // PlaylistWithTracks returns one of a user's playlists and its tracks, in
@@ -541,8 +600,14 @@ func (s *Store) writePlaylistTracks(ctx context.Context, userID, id string, trac
 			next++
 		}
 	}
+	// last_added_at orders the pickers that add to playlists (mix.md): an
+	// append is an add; replacing the list is editing, not adding.
+	stamp := `updated_at = datetime('now')`
+	if !replace && len(trackIDs) > 0 {
+		stamp += `, last_added_at = datetime('now')`
+	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE playlists SET updated_at = datetime('now') WHERE id = ?`, id); err != nil {
+		`UPDATE playlists SET `+stamp+` WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("playlist %s tracks: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {

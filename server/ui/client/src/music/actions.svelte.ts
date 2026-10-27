@@ -8,24 +8,32 @@
  * same half-dozen callbacks through every layer.
  */
 
-import { setRating, type Item } from '../lib/api'
+import { setRating, type Item, type QueueSource } from '../lib/api'
 
 export interface MusicActions {
-  /** Start these tracks from index and open the listening view. */
-  play(tracks: Item[], index?: number, shuffle?: boolean): void
+  /** Replace the queue with these tracks and play from index. */
+  play(tracks: Item[], index?: number, shuffle?: boolean, source?: QueueSource | null): void
+  /** Put these after the track playing. */
+  playNext(tracks: Item[]): void
   /** Add to the end of the music queue, starting it if nothing is playing. */
   queue(tracks: Item[]): void
   /** An album or artist, by item, or by id when only the id is to hand. */
   openAlbum(album: Item | ItemRef): void
   openArtist(artist: Item | ItemRef): void
   openPlaylist(id: string): void
-  notify(kind: 'info' | 'error', text: string): void
+  /** Start a mix from a track, album or artist (server/docs/mix.md). */
+  mix(seed: Item): void
+  /** A notice; an action is a button on it ("Undo"). */
+  notify(kind: 'info' | 'error', text: string, action?: NoticeAction): void
   /** A ZIP of an album or artist: "original", "mp3-320", "mp3-192", "ogg-192". */
   download(id: string, format: string): void
 }
 
 /** An item known only by id, and the library it is in. */
 export type ItemRef = { id: string; libraryId: string }
+
+/** A button on a notice: "Undo". */
+export type NoticeAction = { label: string; run: () => void }
 
 let registered: MusicActions | null = null
 
@@ -42,11 +50,13 @@ export function music(): MusicActions {
  * The "Add to playlist" picker, mounted once by App. Setting ids opens it;
  * label names what is being added ("Blue Lines", "3 tracks").
  */
-export const picker = $state({ ids: [] as string[], label: '' })
+export const picker = $state({ ids: [] as string[], label: '', suggest: '' })
 
-export function addToPlaylist(ids: string[], label: string): void {
+/** suggest names a new playlist in advance ("Mix from Dancing Queen"). */
+export function addToPlaylist(ids: string[], label: string, suggest = ''): void {
   picker.ids = ids
   picker.label = label
+  picker.suggest = suggest
 }
 
 /**

@@ -102,7 +102,12 @@ What is registered (`internal/prefs/registry.go`):
 | `skip-intro` | enum: auto, button, off | button | person |
 | `skip-credits` | enum: next, card, end | card | person |
 | `music-quality` | enum: original, opus-128, opus-64 | original | device |
+| `gapless` | bool | on | device |
+| `music-start` | enum: bar, now-playing | bar | device |
+| `music-bar` | enum: top, bottom | top | person |
+| `music-autoplay` | bool | on | person |
 | `theme` | string, not lockable | midnight | person |
+| `sidebar-size` | enum: compact, regular, large | regular | device |
 
 `skip-credits`: `next` starts the next episode as soon as detected credits
 begin (only with autoplay on; with it off it behaves as `card`), `card` is

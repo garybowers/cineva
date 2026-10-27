@@ -108,14 +108,23 @@ type Section struct {
 // (profile, devices, API keys) that hold no preferences.
 var Sections = []Section{
 	{ID: "playback", Label: "Playback"},
+	{ID: "music", Label: "Music"},
 	{ID: "appearance", Label: "Appearance"},
 }
 
 // Track preferences, read by the server when playback starts.
 const (
 	AudioLang = "audio-lang" // a lang.Code, ISO 639-1 where there is one; "" = the file's default
-	SubMode   = "sub-mode"   // off | forced | foreign | always
-	SubLang   = "sub-lang"   // a lang.Code; "" = the audio preference, else any
+	// MusicQuality is the music stream the device asks for: "original",
+	// "opus-128" or "opus-64"; resolved by the server when a track plays.
+	MusicQuality = "music-quality"
+	// MusicBar is where the web client shows the music bar: "top" or
+	// "bottom". A person's choice, not a device's.
+	MusicBar = "music-bar"
+	// MusicAutoplay carries a queue on with a mix when it ends.
+	MusicAutoplay = "music-autoplay"
+	SubMode       = "sub-mode" // off | forced | foreign | always
+	SubLang       = "sub-lang" // a lang.Code; "" = the audio preference, else any
 )
 
 // Language preferences offer the languages the libraries hold, not a fixed
@@ -200,12 +209,39 @@ var registry = []Pref{
 	},
 	{
 		Key: "music-quality", Type: TypeEnum, Default: "original", Scope: ScopeDevice, Lockable: true,
-		Section: "playback", Label: "Music quality",
+		Section: "music", Label: "Music quality",
 		Description: "Data saver streams a smaller copy, for phones on mobile data. From the next track.",
 		Options: []Option{
 			{Value: "original", Label: "Original"},
 			{Value: "opus-128", Label: "High (Opus 128k)"},
 			{Value: "opus-64", Label: "Data saver (Opus 64k)"},
+		},
+	},
+	{
+		Key: "gapless", Type: TypeBool, Default: On, Scope: ScopeDevice, Lockable: false,
+		Section: "music", Label: "Gapless playback",
+		Description: "Decodes the next track ahead and joins it exactly, so an album plays without a gap. Costs memory; a phone that struggles can turn it off.",
+	},
+	{
+		Key: "music-start", Type: TypeEnum, Default: "bar", Scope: ScopeDevice, Lockable: false,
+		Section: "music", Label: "When music starts",
+		Options: []Option{
+			{Value: "bar", Label: "Show the bar", Description: "The music bar appears and the page stays where it is."},
+			{Value: "now-playing", Label: "Open Now playing", Description: "The now-playing screen opens with the cover, the controls and what is up next."},
+		},
+	},
+	{
+		Key: MusicAutoplay, Type: TypeBool, Default: On, Scope: ScopePerson, Lockable: false,
+		Section: "music", Label: "Keep playing when the queue ends",
+		Description: "When the last track ends, a mix from it carries on: more of what belongs beside it, shown in Up next before it plays (server/docs/mix.md).",
+	},
+	{
+		Key: MusicBar, Type: TypeEnum, Default: "top", Scope: ScopePerson, Lockable: false,
+		Section: "music", Label: "Player bar",
+		Description: "Where the music bar sits while something plays. Follows you to every device.",
+		Options: []Option{
+			{Value: "top", Label: "Top of the screen", Description: "Under the top bar; the page moves down to make room."},
+			{Value: "bottom", Label: "Bottom of the screen", Description: "Above the tab bar on a phone."},
 		},
 	},
 	{
@@ -238,6 +274,16 @@ var registry = []Pref{
 			{Value: "auto", Label: "Automatic", Description: "TV on a television's own browser (Fire TV, Android TV, LG, Samsung), desktop everywhere else."},
 			{Value: "desktop", Label: "Desktop", Description: "For a mouse, keyboard or touch."},
 			{Value: "tv", Label: "TV", Description: "Large, and worked with a remote's arrows, OK and Back."},
+		},
+	},
+	{
+		Key: "sidebar-size", Type: TypeEnum, Default: "regular", Scope: ScopeDevice, Lockable: false,
+		Section: "appearance", Label: "Sidebar size",
+		Description: "How big the sidebar's entries and icons are on this screen.",
+		Options: []Option{
+			{Value: "compact", Label: "Compact", Description: "Small type and icons; the narrowest rail."},
+			{Value: "regular", Label: "Regular", Description: "A little larger, easy to read at a desk."},
+			{Value: "large", Label: "Large", Description: "For a desktop looked at from further away."},
 		},
 	},
 }

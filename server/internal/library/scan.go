@@ -79,8 +79,15 @@ type Manager struct {
 	// time is quiet.
 	Quiet func() string
 
-	// artists holds the ids of artists being looked up (see LookUpArtist).
-	artists sync.Map
+	// artists holds the ids of artists being looked up (see LookUpArtist);
+	// enriching the ids of libraries whose albums are (see enrichMusic);
+	// enrichJobs the film and TV enrichment jobs by library (see enrich.go).
+	artists    sync.Map
+	enriching  sync.Map
+	enrichJobs map[string]*enrichJob
+	// openSeries is, per library, the series folder the TV register pass
+	// is still writing episodes into (see setOpenSeriesLocked).
+	openSeries map[string]string
 
 	mu      sync.Mutex
 	queued  map[string]bool               // libraryID -> full rescan waiting for a quiet time
@@ -95,18 +102,25 @@ type Manager struct {
 	// when nil. retryPace spaces the retries' provider lookups.
 	clock     func() time.Time
 	retryPace time.Duration
+	// enrichDelay is how long after a scan defers its lookups the
+	// enrichment job starts, and roundWait how long the job waits between
+	// rounds while the pass is still registering (enrichStartDelay and
+	// enrichRoundWait; shorter in tests).
+	enrichDelay, roundWait time.Duration
 }
 
 func NewManager(st *store.Store, video metadata.VideoProvider, artworkDir string) *Manager {
 	return &Manager{
-		Store:      st,
-		Video:      video,
-		ArtworkDir: artworkDir,
-		Probe:      media.Probe,
-		retryPace:  refreshRate,
-		running:    map[string]context.CancelFunc{},
-		again:      map[string]bool{},
-		waiting:    map[string]bool{},
+		Store:       st,
+		Video:       video,
+		ArtworkDir:  artworkDir,
+		Probe:       media.Probe,
+		retryPace:   refreshRate,
+		enrichDelay: enrichStartDelay,
+		roundWait:   enrichRoundWait,
+		running:     map[string]context.CancelFunc{},
+		again:       map[string]bool{},
+		waiting:     map[string]bool{},
 	}
 }
 
@@ -138,6 +152,11 @@ func (m *Manager) CancelScan(ctx context.Context, scanID string) error {
 		return err
 	}
 	if sc.Status != "running" {
+		// The register pass is over; the enrichment job may still be
+		// fetching the details, and that is what the button stops then.
+		if sc.Phase == store.PhaseEnriching && m.cancelEnrich(sc.LibraryID) {
+			return nil
+		}
 		return fmt.Errorf("scan is not running")
 	}
 	m.mu.Lock()
@@ -145,6 +164,8 @@ func (m *Manager) CancelScan(ctx context.Context, scanID string) error {
 	m.mu.Unlock()
 	if ok {
 		cancel() // runScan records the row as cancelled
+		// The job fetching details alongside the pass stops with it.
+		m.cancelEnrich(sc.LibraryID)
 		return nil
 	}
 	return m.Store.FinishScan(ctx, scanID, "failed", "cancelled", sc.FilesSeen, sc.ItemsCreated)
@@ -323,6 +344,12 @@ type itemsEvent struct {
 	// without it a first scan of an empty library tells a non-admin to "run
 	// a scan from the admin UI" while one is already running.
 	Scanning bool `json:"scanning"`
+	// Enriched of ToEnrich titles have their details so far, while the
+	// enrichment job after a big scan runs (server/docs/scanning.md); both
+	// zero otherwise. Counts of titles, nothing more, so every user may see
+	// them.
+	Enriched int `json:"enriched,omitempty"`
+	ToEnrich int `json:"toEnrich,omitempty"`
 }
 
 func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Library, full bool) {
@@ -345,13 +372,17 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		lastReport = time.Now()
 		snap := scan
 		snap.FilesSeen, snap.ItemsCreated = seen, created
+		// The job fetching details alongside the pass reports on the
+		// same row, so its counts ride along rather than reading as zero
+		// between its reports.
+		snap.Enriched, snap.ToEnrich = m.enrichProgress(lib.ID)
 		if err := m.Store.UpdateScanProgress(context.WithoutCancel(ctx), scan.ID, seen, created); err != nil {
 			logger.Warn("saving scan progress failed", "library", lib.Name, "err", err)
 		}
 		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: snap, FilesTotal: total}})
 		if created > itemsSent {
 			itemsSent = created
-			m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID, Scanning: true}})
+			m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID, Scanning: true, Enriched: snap.Enriched, ToEnrich: snap.ToEnrich}})
 		}
 	}
 
@@ -365,6 +396,7 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		plan, scanErr = m.newScanPlan(ctx, lib, full)
 	}
 	if scanErr == nil {
+		plan.scanID = scan.ID
 		switch lib.MediaType {
 		case store.MediaMovies:
 			filesSeen, itemsCreated, scanErr = m.scanMovies(ctx, lib, plan, report)
@@ -392,9 +424,14 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 			logger.Info("pruned stale items", "library", lib.Name, "count", pruned)
 		}
 		// Before grouping, so a film matched here joins its other versions
-		// straight away.
-		if err := m.retryUnmatched(ctx, lib, plan.looked); err != nil && !errors.Is(err, context.Canceled) {
-			metadataLog.Warn("retrying unmatched titles failed", "library", lib.Name, "err", err)
+		// straight away. A run that deferred its lookups leaves every
+		// unmatched title to the enrichment job instead, and so does a
+		// rescan while that job is still running, or the two would look
+		// the same titles up at once.
+		if !plan.deferLookups && !m.enrichRunning(lib.ID) {
+			if err := m.retryUnmatched(ctx, lib, plan.looked); err != nil && !errors.Is(err, context.Canceled) {
+				metadataLog.Warn("retrying unmatched titles failed", "library", lib.Name, "err", err)
+			}
 		}
 		// After pruning, so a removed file cannot leave an item pointing at
 		// a primary that no longer exists.
@@ -440,13 +477,35 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 		logger.Error("recording scan audit entry failed", "library", lib.Name, "err", err)
 	}
 	m.Events.Publish(events.Event{Type: "logs"})
-	if status == "completed" && m.OnScanDone != nil {
-		m.OnScanDone(lib)
-	}
 	done := scan
 	done.Status, done.Error = status, errMsg
 	done.FilesSeen, done.ItemsCreated = filesSeen, itemsCreated
-	m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
+	done.Phase = store.PhaseDone
+	// The lookups a big scan deferred: without an event bus (the CLI) they
+	// run now, in line, so the command ends with the details fetched; in
+	// the server the job started alongside the pass carries on and closes
+	// the phase itself. Either way the job starts the readers (detection,
+	// previews) when it ends, rather than racing them; a scan that
+	// deferred nothing starts them now, as it always did.
+	inline := false
+	if status == "completed" && plan != nil && plan.deferLookups && !plan.enriching && m.Events == nil {
+		plan.enriching = m.startEnrich(lib, scan.ID, closedChan, 0)
+		inline = plan.enriching // ran to its end just now, readers included
+	}
+	published, readers := false, true
+	if plan != nil {
+		var enriched, toEnrich int
+		enriched, toEnrich, published, readers = m.registerEnded(context.WithoutCancel(ctx), lib, plan, done, status)
+		if published {
+			done.Phase, done.Enriched, done.ToEnrich = store.PhaseEnriching, enriched, toEnrich
+		}
+	}
+	if status == "completed" && readers && !inline && m.OnScanDone != nil {
+		m.OnScanDone(lib)
+	}
+	if !published {
+		m.Events.Publish(events.Event{Type: "scan", Data: scanEvent{Scan: done}})
+	}
 	if m.OnScanFinished != nil && errMsg != "cancelled" {
 		var added []store.Item
 		if plan != nil && status == "completed" {
@@ -458,8 +517,12 @@ func (m *Manager) runScan(ctx context.Context, scan store.Scan, lib store.Librar
 	// final report, so close with an unconditional refetch hint. Scanning is
 	// false here: this fires once the scan is over, and a client left
 	// believing one is still running would show the wrong empty state for
-	// good.
-	m.Events.Publish(events.Event{Type: "items", Data: itemsEvent{LibraryID: lib.ID, Scanning: false}})
+	// good. A job still fetching details says so, with its count.
+	closing := itemsEvent{LibraryID: lib.ID, Scanning: false}
+	if done.Phase == store.PhaseEnriching {
+		closing.Enriched, closing.ToEnrich = done.Enriched, done.ToEnrich
+	}
+	m.Events.Publish(events.Event{Type: "items", Data: closing})
 	m.Events.Publish(events.Event{Type: "libraries"})
 }
 
@@ -510,135 +573,154 @@ func (m *Manager) scanMovies(ctx context.Context, lib store.Library, plan *scanP
 	todo := plan.changed(files)
 	skipped := len(files) - len(todo)
 	created := 0
+	newFilms := 0
+	for _, path := range todo {
+		if _, known := plan.stamps[path]; !known {
+			newFilms++
+		}
+	}
+	plan.decideDeferral(newFilms, m.Video != nil)
+	video := m.providerFor(lib, plan)
 	// Files are probed a batch at a time in parallel (see probeBatch); the
-	// rest of the loop stays serial, because metadata lookups are rate
-	// limited and SQLite takes one writer.
+	// rest stays serial, because metadata lookups are rate limited and
+	// SQLite takes one writer. Each batch is prepared in full, with every
+	// lookup and download done, then written in one transaction
+	// (store.SaveFilms): one commit a batch rather than half a dozen a
+	// film, and the write lock held for the writes alone.
 	for start := 0; start < len(todo); start += probeBatchSize {
 		end := min(start+probeBatchSize, len(todo))
 		batch := todo[start:end]
 		probes := m.probeBatch(ctx, batch)
 
+		saves := make([]store.VideoSave, 0, len(batch))
 		for bi, path := range batch {
-			i := skipped + start + bi
 			if err := ctx.Err(); err != nil {
 				return len(files), created, err
 			}
-			report(i, created, len(files))
-			info := ParseMovie(path)
-			item := store.Item{
-				LibraryID: lib.ID, Kind: store.KindMovie,
-				Title: info.Title, Year: info.Year, Path: path,
-			}
-			m.applyProbe(&item, probes[bi])
-
-			// A sidecar written by Kodi, Jellyfin, Radarr or Sonarr is the
-			// operator's own curation, so it outranks anything we would guess:
-			// its title and year drive the search, and its tmdb id skips the
-			// search entirely.
-			nfo, hasNFO, nerr := ReadNFO(path)
-			if nerr != nil {
-				logger.Warn("nfo unreadable", "path", path, "err", nerr)
-			}
-			if hasNFO {
-				if t := strings.TrimSpace(nfo.Title); t != "" {
-					item.Title = t
-				} else if t := strings.TrimSpace(nfo.OriginalTitle); t != "" {
-					item.Title = t
-				}
-				if y := nfo.ReleaseYear(); y > 0 {
-					item.Year = y
-				}
-				if id, _ := nfo.ResolvedIDs(); id > 0 && info.TmdbID == 0 {
-					info.TmdbID = id
-				}
-			}
-
-			var videoResult metadata.VideoResult
-			var lookupErr error
-			if m.Video != nil {
-				// An explicit id in the filename is the operator telling us the
-				// answer, so it skips searching entirely — that is the whole
-				// point of the convention. Anything else searches with the
-				// tag-corrected title/year, since embedded tags restore
-				// punctuation the filename mangles.
-				var r metadata.VideoResult
-				var err error
-				if info.TmdbID > 0 {
-					r, err = m.Video.MovieByID(ctx, info.TmdbID)
-					if err != nil {
-						// A bad hint must not silently become a wrong match, so
-						// fall back to searching rather than to nothing.
-						metadataLog.Warn("tmdb id hint failed, searching instead", "path", path, "tmdb_id", info.TmdbID, "err", err)
-						r, err = m.Video.SearchMovie(ctx, item.Title, item.Year)
-					}
-				} else {
-					r, err = m.Video.SearchMovie(ctx, item.Title, item.Year)
-				}
-				if err == nil && r.TmdbID == 0 {
-					err = metadata.ErrNotFound
-				}
-				if err == nil {
-					videoResult = r
-					m.applyVideoResult(ctx, &item, r)
-				}
-				lookupErr = err
-			}
-			// Applied after the provider so the operator's own files win: they
-			// chose to put them there, and a local poster is the whole point of
-			// curating one.
-			if hasNFO {
-				applyNFO(&item, nfo)
-			}
-			m.applyLocalArtwork(&item, path)
-			plan.stamp(&item, path)
-
-			saved, err := m.Store.UpsertItem(ctx, item)
-			if err != nil {
-				return len(files), created, err
-			}
-			plan.keep[saved.ID] = true
-			plan.looked[saved.ID] = true
-			// Spaces out the automatic retries of a film the provider does
-			// not know (see retryUnmatched).
-			if saved.TmdbID == 0 && errors.Is(lookupErr, metadata.ErrNotFound) {
-				m.recordMatchFailure(ctx, saved.ID)
-			}
-			m.saveGenres(ctx, saved.ID, item.Genres)
-			m.saveCredits(ctx, saved.ID, videoResult)
-			m.saveFilmCredits(ctx, saved.ID, item.FileMtime, probes[bi])
-			m.syncSubtitles(ctx, saved.ID, path)
-			m.syncAudioTracks(ctx, saved.ID, path)
-			plan.noteNew(path, saved)
+			report(skipped+start+bi, created+len(saves), len(files))
+			saves = append(saves, m.prepareFilm(ctx, lib, plan, path, probes[bi], video))
+		}
+		saved, err := m.Store.SaveFilms(ctx, saves)
+		if err != nil {
+			return len(files), created, err
+		}
+		for _, it := range saved {
+			plan.keep[it.ID] = true
+			plan.looked[it.ID] = true
+			plan.noteNew(it.Path, it)
 			created++
 		}
 	}
 	return len(files), created, nil
 }
 
-// saveFilmCredits records where a film's end credits start, read from its
-// chapter names, or that it has none to find: the chapters are already in
-// the probe, so this costs no read of the file. A file the probe could not
-// read is left for detection to try again; credits set by hand are kept
-// (SaveSegmentAnalysis leaves them alone).
-func (m *Manager) saveFilmCredits(ctx context.Context, itemID string, fileMtime int64, r probed) {
-	if !m.FilmCredits || r.Err != nil || fileMtime == 0 {
-		return
+// prepareFilm reads everything a film's row and the rows that hang off it
+// are made from: the filename, the probe, a sidecar .nfo and artwork, and
+// the provider's match when there is a provider for this run. Nothing is
+// written; the batch is (SaveFilms).
+func (m *Manager) prepareFilm(ctx context.Context, lib store.Library, plan *scanPlan, path string, probe probed, video metadata.VideoProvider) store.VideoSave {
+	info := ParseMovie(path)
+	item := store.Item{
+		LibraryID: lib.ID, Kind: store.KindMovie,
+		Title: info.Title, Year: info.Year, Path: path,
 	}
-	var seg *store.Segment
-	if start, end, ok := media.CreditsChapter(r.Info.Chapters, r.Info.RuntimeSecs); ok {
-		seg = &store.Segment{Kind: store.SegmentCredits, StartSecs: start, EndSecs: end}
+	m.applyProbe(&item, probe)
+
+	// A sidecar written by Kodi, Jellyfin, Radarr or Sonarr is the
+	// operator's own curation, so it outranks anything we would guess:
+	// its title and year drive the search, and its tmdb id skips the
+	// search entirely.
+	nfo, hasNFO, nerr := ReadNFO(path)
+	if nerr != nil {
+		logger.Warn("nfo unreadable", "path", path, "err", nerr)
 	}
-	if err := m.Store.SaveSegmentAnalysis(ctx, itemID, store.SegmentCredits, fileMtime, seg); err != nil {
-		logger.Warn("saving film credits failed", "path", r.Path, "err", err)
+	if hasNFO {
+		if t := strings.TrimSpace(nfo.Title); t != "" {
+			item.Title = t
+		} else if t := strings.TrimSpace(nfo.OriginalTitle); t != "" {
+			item.Title = t
+		}
+		if y := nfo.ReleaseYear(); y > 0 {
+			item.Year = y
+		}
+		if id, _ := nfo.ResolvedIDs(); id > 0 && info.TmdbID == 0 {
+			info.TmdbID = id
+		}
 	}
+
+	var videoResult metadata.VideoResult
+	var lookupErr error
+	if video != nil {
+		// An explicit id in the filename is the operator telling us the
+		// answer, so it skips searching entirely — that is the whole
+		// point of the convention. Anything else searches with the
+		// tag-corrected title/year, since embedded tags restore
+		// punctuation the filename mangles.
+		var r metadata.VideoResult
+		var err error
+		if info.TmdbID > 0 {
+			r, err = video.MovieByID(ctx, info.TmdbID)
+			if err != nil {
+				// A bad hint must not silently become a wrong match, so
+				// fall back to searching rather than to nothing.
+				metadataLog.Warn("tmdb id hint failed, searching instead", "path", path, "tmdb_id", info.TmdbID, "err", err)
+				r, err = video.SearchMovie(ctx, item.Title, item.Year)
+			}
+		} else {
+			r, err = video.SearchMovie(ctx, item.Title, item.Year)
+		}
+		if err == nil && r.TmdbID == 0 {
+			err = metadata.ErrNotFound
+		}
+		if err == nil {
+			videoResult = r
+			m.applyVideoResult(ctx, &item, r)
+		}
+		lookupErr = err
+	}
+	// Applied after the provider so the operator's own files win: they
+	// chose to put them there, and a local poster is the whole point of
+	// curating one.
+	if hasNFO {
+		applyNFO(&item, nfo)
+	}
+	m.applyLocalArtwork(&item, path)
+	plan.stamp(&item, path)
+
+	save := store.VideoSave{Item: item, Genres: item.Genres, Streams: true}
+	save.Cast, save.Crew = m.creditsOf(ctx, videoResult)
+	save.Subtitles, save.AudioTracks = streamsOf(path, probe)
+	// Spaces out the automatic retries of a film the provider does not
+	// know (see retryUnmatched).
+	if errors.Is(lookupErr, metadata.ErrNotFound) {
+		save.MatchFailedAt = m.now()
+	}
+	save.CreditsAnalysed, save.Credits = m.filmCredits(item.FileMtime, probe)
+	return save
 }
 
-// saveCredits stores an item's cast and crew, downloading each headshot
-// once. People are shared across films, so a cast member in twenty titles
-// costs one row and one image, not twenty.
-func (m *Manager) saveCredits(ctx context.Context, itemID string, r metadata.VideoResult) {
+// filmCredits reads where a film's end credits start from its chapter
+// names, or that it has none to find: the chapters are already in the
+// probe, so this costs no read of the file. It reports whether there is
+// an analysis to record: a file the probe could not read is left for
+// detection to try again. Credits set by hand are kept when it is
+// written (saveSegmentAnalysis leaves them alone).
+func (m *Manager) filmCredits(fileMtime int64, r probed) (bool, *store.Segment) {
+	if !m.FilmCredits || r.Err != nil || fileMtime == 0 {
+		return false, nil
+	}
+	if start, end, ok := media.CreditsChapter(r.Info.Chapters, r.Info.RuntimeSecs); ok {
+		return true, &store.Segment{Kind: store.SegmentCredits, StartSecs: start, EndSecs: end}
+	}
+	return true, nil
+}
+
+// creditsOf converts a match's cast and crew for storing, downloading
+// each headshot once. People are shared across films, so a cast member in
+// twenty titles costs one row and one image, not twenty.
+func (m *Manager) creditsOf(ctx context.Context, r metadata.VideoResult) (cast, crew []store.Person) {
 	if len(r.Cast) == 0 && len(r.Crew) == 0 {
-		return
+		return nil, nil
 	}
 	convert := func(people []metadata.Person, roleOf func(metadata.Person) string) []store.Person {
 		out := make([]store.Person, 0, len(people))
@@ -656,8 +738,18 @@ func (m *Manager) saveCredits(ctx context.Context, itemID string, r metadata.Vid
 		}
 		return out
 	}
-	cast := convert(r.Cast, func(p metadata.Person) string { return p.Character })
-	crew := convert(r.Crew, func(p metadata.Person) string { return p.Job })
+	cast = convert(r.Cast, func(p metadata.Person) string { return p.Character })
+	crew = convert(r.Crew, func(p metadata.Person) string { return p.Job })
+	return cast, crew
+}
+
+// saveCredits stores an item's cast and crew (creditsOf) on their own,
+// outside a scan's batches.
+func (m *Manager) saveCredits(ctx context.Context, itemID string, r metadata.VideoResult) {
+	cast, crew := m.creditsOf(ctx, r)
+	if len(cast) == 0 && len(crew) == 0 {
+		return
+	}
 	if err := m.Store.ReplaceCredits(ctx, itemID, cast, crew); err != nil {
 		logger.Error("saving credits failed", "item", itemID, "err", err)
 	}
@@ -694,128 +786,174 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 	// date-stamped episodes
 	premieres := map[string][]metadata.SeasonPremiere{}
 	seasonIDs := map[string]string{} // season row path -> item id
-	seasons := newSeasonCache(m.Video)
+	newSeries := map[string]bool{}
+	for _, path := range todo {
+		if dir := seriesDirFor(lib.Paths, path); dir != "" {
+			if _, known := plan.stamps[dir]; !known {
+				newSeries[dir] = true
+			}
+		}
+	}
+	plan.decideDeferral(len(newSeries), m.Video != nil)
+	video := m.providerFor(lib, plan)
+	seasons := newSeasonCache(video)
 
 	// Files are probed a batch at a time in parallel, as the film scanner
 	// does; the rest stays serial for the provider's rate limit and
 	// SQLite's single writer. Probing one file at a time made a first scan
-	// of a ten-thousand-episode library take most of a day.
-	var probes []probed
-	batchStart := 0
-	for i, path := range todo {
-		if err := ctx.Err(); err != nil {
-			return len(files), created, err
-		}
-		if i%probeBatchSize == 0 {
-			probes = m.probeBatch(ctx, todo[i:min(i+probeBatchSize, len(todo))])
-			batchStart = i
-		}
-		report(skipped+i, created, len(files))
-		ep, ok := ParseEpisode(path)
-		if !ok {
-			logger.Debug("no episode number or date, skipping", "path", path)
-			continue
-		}
-		showDir := seriesDirFor(lib.Paths, path)
-		if showDir == "" {
-			// A video sitting loose in the library root has no series
-			// folder, and guessing one from the filename is how a stray
-			// file becomes a series of its own.
-			logger.Debug("no series folder, skipping", "path", path)
-			continue
-		}
+	// of a ten-thousand-episode library take most of a day. Each batch is
+	// prepared in full, grouped by series and season, then written one
+	// series at a time, each in one transaction (store.SaveSeries).
+	for start := 0; start < len(todo); start += probeBatchSize {
+		end := min(start+probeBatchSize, len(todo))
+		batch := todo[start:end]
+		probes := m.probeBatch(ctx, batch)
 
-		// Only reached for a changed file, so its series and season are
-		// matched again: a new episode is the likeliest moment for the
-		// provider's series and season data to have moved on too.
-		seriesID, ok := seriesIDs[showDir]
-		if !ok {
-			saved, err := m.saveSeries(ctx, lib, showDir, ep.Show, ep.Year)
-			if err != nil {
+		var groups []*seriesGroup
+		byDir := map[string]*seriesGroup{}
+		for bi, path := range batch {
+			if err := ctx.Err(); err != nil {
 				return len(files), created, err
 			}
-			plan.keep[saved.ID] = true
-			plan.looked[saved.ID] = true
-			seriesID, seriesIDs[showDir] = saved.ID, saved.ID
-			seriesTmdb[showDir] = saved.TmdbID
-			premieres[showDir] = saved.result.SeasonPremieres
-			created++
-		}
-		// A daily show's episode numbered by its date has nothing to fetch:
-		// the provider was just asked about every season it could be in.
-		numberedByDate := ep.Dated() && !m.placeDatedEpisode(ctx, &ep, seriesTmdb[showDir], premieres[showDir], seasons)
-		seasonPath := seasonItemPath(showDir, seasonDirFor(showDir, path), ep.Season)
-		var sr metadata.SeasonResult
-		haveSeason := false
-		if !numberedByDate {
-			sr, haveSeason = seasons.get(ctx, seriesTmdb[showDir], ep.Season)
-		}
-
-		seasonID, ok := seasonIDs[seasonPath]
-		if !ok {
-			season := store.Item{
-				LibraryID: lib.ID, Kind: store.KindSeason, ParentID: seriesID,
-				Title: fmt.Sprintf("Season %02d", ep.Season), SeasonNum: ep.Season, Path: seasonPath,
+			report(skipped+start+bi, created, len(files))
+			ep, ok := ParseEpisode(path)
+			if !ok {
+				logger.Debug("no episode number or date, skipping", "path", path)
+				continue
 			}
-			// Season-level TMDB data: poster + overview for the season item,
-			// plus per-episode titles/overviews/stills applied below.
+			showDir := seriesDirFor(lib.Paths, path)
+			if showDir == "" {
+				// A video sitting loose in the library root has no series
+				// folder, and guessing one from the filename is how a stray
+				// file becomes a series of its own.
+				logger.Debug("no series folder, skipping", "path", path)
+				continue
+			}
+
+			g := byDir[showDir]
+			if g == nil {
+				g = &seriesGroup{dir: showDir, seasonIdx: map[string]int{}}
+				g.save.SeriesID = seriesIDs[showDir]
+				if g.save.SeriesID == "" {
+					// Only reached for a changed file, so its series is
+					// matched again: a new episode is the likeliest moment
+					// for the provider's series data to have moved on too.
+					series, res, _ := m.prepareSeries(ctx, lib, showDir, ep.Show, ep.Year, video)
+					g.save.Series = &series
+					// A series registered without a lookup keeps the id
+					// an earlier scan found for it (upsertItem leaves a
+					// zero id alone), so its seasons can still be fetched.
+					if res.TmdbID == 0 {
+						res.TmdbID = plan.stamps[showDir].TmdbID
+					}
+					seriesTmdb[showDir] = res.TmdbID
+					premieres[showDir] = res.SeasonPremieres
+				}
+				groups = append(groups, g)
+				byDir[showDir] = g
+			}
+			// A daily show's episode numbered by its date has nothing to
+			// fetch: the provider was just asked about every season it
+			// could be in.
+			numberedByDate := ep.Dated() && !m.placeDatedEpisode(ctx, &ep, seriesTmdb[showDir], premieres[showDir], seasons)
+			seasonPath := seasonItemPath(showDir, seasonDirFor(showDir, path), ep.Season)
+			var sr metadata.SeasonResult
+			haveSeason := false
+			if !numberedByDate {
+				sr, haveSeason = seasons.get(ctx, seriesTmdb[showDir], ep.Season)
+			}
+
+			si, ok := g.seasonIdx[seasonPath]
+			if !ok {
+				ss := store.SeasonSave{SeasonID: seasonIDs[seasonPath]}
+				if ss.SeasonID == "" {
+					season := store.Item{
+						LibraryID: lib.ID, Kind: store.KindSeason,
+						Title: fmt.Sprintf("Season %02d", ep.Season), SeasonNum: ep.Season, Path: seasonPath,
+					}
+					// Season-level TMDB data: poster + overview for the
+					// season item, plus per-episode titles/overviews/stills
+					// applied below.
+					if haveSeason {
+						m.applySeasonData(ctx, &season, seriesTmdb[showDir], sr)
+					}
+					ss.Season = &season
+				}
+				g.save.Seasons = append(g.save.Seasons, ss)
+				si = len(g.save.Seasons) - 1
+				g.seasonIdx[seasonPath] = si
+			}
+
+			item := store.Item{
+				LibraryID: lib.ID, Kind: store.KindEpisode,
+				Title: ep.Title, SeasonNum: ep.Season, EpisodeNum: ep.Episode, Path: path,
+				AirDate: ep.AirDate,
+			}
+			// Probe first: the placeholder below must not stand in for a
+			// parsed title, or a genuine title tag would be rejected as a
+			// mismatch.
+			m.applyProbe(&item, probes[bi])
+			if item.Title == "" {
+				item.Title = fmt.Sprintf("Episode %d", ep.Episode)
+			}
+			// TMDB episode data fills whatever tags and filenames didn't
+			// provide.
+			var guests []metadata.Person
 			if haveSeason {
-				m.applySeasonData(ctx, &season, seriesTmdb[showDir], sr)
+				guests = m.applyEpisodeData(ctx, &item, seriesTmdb[showDir], ep.Season, ep.Episode, sr)
 			}
-			saved, err := m.Store.UpsertItem(ctx, season)
-			if err != nil {
-				return len(files), created, err
+			if item.Title == fmt.Sprintf("Episode %d", ep.Episode) && ep.AirDate != "" {
+				// A daily show's episode the provider could not place is
+				// better known by its date than by a number derived from it.
+				item.Title = ep.AirDate
 			}
-			plan.keep[saved.ID] = true
-			seasonID, seasonIDs[seasonPath] = saved.ID, saved.ID
-			created++
+			// The TMDB still is the episode's image: a landscape frame from
+			// this episode, which is what an episode list shows. Embedded
+			// cover art is only the fallback, read when there is no still,
+			// because in an episode it is nearly always the series' or
+			// season's portrait cover and would make every row of a season
+			// look the same.
+			if item.Poster == "" {
+				item.Poster = m.embeddedArt(probes[bi])
+			}
+			plan.stamp(&item, path)
+			save := store.VideoSave{Item: item, Streams: true}
+			// Guest stars are the people in this episode and no other,
+			// which is the only thing an episode-level cast is for — the
+			// regulars are already credited on the series.
+			save.Cast, _ = m.creditsOf(ctx, metadata.VideoResult{Cast: guests})
+			save.Subtitles, save.AudioTracks = streamsOf(path, probes[bi])
+			g.save.Seasons[si].Episodes = append(g.save.Seasons[si].Episodes, save)
 		}
 
-		item := store.Item{
-			LibraryID: lib.ID, Kind: store.KindEpisode, ParentID: seasonID,
-			Title: ep.Title, SeasonNum: ep.Season, EpisodeNum: ep.Episode, Path: path,
-			AirDate: ep.AirDate,
+		for _, g := range groups {
+			if err := m.Store.SaveSeries(ctx, &g.save); err != nil {
+				return len(files), created, err
+			}
+			if g.save.Series != nil {
+				plan.keep[g.save.Saved.ID] = true
+				plan.looked[g.save.Saved.ID] = true
+				seriesIDs[g.dir] = g.save.Saved.ID
+				created++
+			}
+			for _, ss := range g.save.Seasons {
+				if ss.Season != nil {
+					plan.keep[ss.Saved.ID] = true
+					seasonIDs[ss.Saved.Path] = ss.Saved.ID
+					created++
+				}
+				for _, ep := range ss.SavedEpisodes {
+					plan.keep[ep.ID] = true
+					plan.noteNew(ep.Path, ep)
+					created++
+				}
+			}
 		}
-		// Probe first: the placeholder below must not stand in for a parsed
-		// title, or a genuine title tag would be rejected as a mismatch.
-		m.applyProbe(&item, probes[i-batchStart])
-		if item.Title == "" {
-			item.Title = fmt.Sprintf("Episode %d", ep.Episode)
+		// The batch's last series may carry on into the next batch; the
+		// enrichment job running alongside leaves it until it is whole.
+		if plan.deferLookups && len(groups) > 0 {
+			m.setOpenSeries(lib.ID, groups[len(groups)-1].dir)
 		}
-		// TMDB episode data fills whatever tags and filenames didn't provide.
-		var guests []metadata.Person
-		if haveSeason {
-			guests = m.applyEpisodeData(ctx, &item, seriesTmdb[showDir], ep.Season, ep.Episode, sr)
-		}
-		if item.Title == fmt.Sprintf("Episode %d", ep.Episode) && ep.AirDate != "" {
-			// A daily show's episode the provider could not place is better
-			// known by its date than by a number derived from it.
-			item.Title = ep.AirDate
-		}
-		// The TMDB still is the episode's image: a landscape frame from this
-		// episode, which is what an episode list shows. Embedded cover art is
-		// only the fallback, read when there is no still, because in an
-		// episode it is nearly always the series' or season's portrait cover
-		// and would make every row of a season look the same.
-		if item.Poster == "" {
-			item.Poster = m.embeddedArt(probes[i-batchStart])
-		}
-		plan.stamp(&item, path)
-		saved, err := m.Store.UpsertItem(ctx, item)
-		if err != nil {
-			return len(files), created, err
-		}
-		plan.keep[saved.ID] = true
-		// Guest stars are the people in this episode and no other, which is
-		// the only thing an episode-level cast is for — the regulars are
-		// already credited on the series.
-		if len(guests) > 0 {
-			m.saveCredits(ctx, saved.ID, metadata.VideoResult{Cast: guests})
-		}
-		m.syncSubtitles(ctx, saved.ID, path)
-		m.syncAudioTracks(ctx, saved.ID, path)
-		plan.noteNew(path, saved)
-		created++
 	}
 
 	// A series still on air changes without any file changing: its next
@@ -823,7 +961,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 	// every scan when every scan redid everything, so the series that were
 	// skipped above are still refreshed here — one lookup each, and only
 	// for series that have not ended.
-	if !plan.full && m.Video != nil {
+	if !plan.full && video != nil {
 		for dir, st := range plan.stamps {
 			if ctx.Err() != nil {
 				return len(files), created, ctx.Err()
@@ -838,7 +976,7 @@ func (m *Manager) scanTV(ctx context.Context, lib store.Library, plan *scanPlan,
 			if t, _ := showName(filepath.Base(dir)); t == "" {
 				continue
 			}
-			if _, err := m.saveSeries(ctx, lib, dir, "", 0); err != nil {
+			if _, err := m.saveSeriesWith(ctx, lib, dir, "", 0, video); err != nil {
 				return len(files), created, err
 			}
 		}
@@ -864,6 +1002,28 @@ type savedSeries struct {
 // folder name yields nothing. A series the provider does not know has the
 // failed lookup recorded, which spaces out its retries.
 func (m *Manager) saveSeries(ctx context.Context, lib store.Library, showDir, fallbackTitle string, fallbackYear int) (savedSeries, error) {
+	return m.saveSeriesWith(ctx, lib, showDir, fallbackTitle, fallbackYear, m.Video)
+}
+
+// saveSeriesWith is saveSeries against the given provider: nil when a big
+// scan registers series without looking them up, leaving that to the
+// enrichment job (scanPlan.deferLookups).
+func (m *Manager) saveSeriesWith(ctx context.Context, lib store.Library, showDir, fallbackTitle string, fallbackYear int, video metadata.VideoProvider) (savedSeries, error) {
+	series, res, lookupErr := m.prepareSeries(ctx, lib, showDir, fallbackTitle, fallbackYear, video)
+	sv := store.SeriesSave{Series: &series}
+	if err := m.Store.SaveSeries(ctx, &sv); err != nil {
+		return savedSeries{}, err
+	}
+	return savedSeries{Item: sv.Saved, result: res, lookupErr: lookupErr}, nil
+}
+
+// prepareSeries matches a series folder against the provider and gathers
+// what its row is made of: the match, its genres and credits (headshots
+// downloaded here), and the failed lookup to record when the provider
+// does not know it. The folder names the series; the fallback title and
+// year (from an episode's filename) are used only when the folder name
+// yields nothing. Nothing is written.
+func (m *Manager) prepareSeries(ctx context.Context, lib store.Library, showDir, fallbackTitle string, fallbackYear int, video metadata.VideoProvider) (store.VideoSave, metadata.VideoResult, error) {
 	title, year := showName(filepath.Base(showDir))
 	if title == "" {
 		title, year = fallbackTitle, fallbackYear
@@ -871,34 +1031,37 @@ func (m *Manager) saveSeries(ctx context.Context, lib store.Library, showDir, fa
 	series := store.Item{
 		LibraryID: lib.ID, Kind: store.KindSeries, Title: title, Path: showDir, Year: year,
 	}
-	var out savedSeries
-	if m.Video != nil {
-		r, err := m.Video.SearchTV(ctx, title, year)
+	var res metadata.VideoResult
+	var lookupErr error
+	if video != nil {
+		r, err := video.SearchTV(ctx, title, year)
 		if err == nil && r.TmdbID == 0 {
 			err = metadata.ErrNotFound
 		}
 		if err == nil {
-			out.result = r
+			res = r
 			m.applyVideoResult(ctx, &series, r)
 		} else {
-			out.lookupErr = err
+			lookupErr = err
 		}
 	}
-	saved, err := m.Store.UpsertItem(ctx, series)
-	if err != nil {
-		return savedSeries{}, err
+	// Genres and credits live in their own tables. The film scanner has
+	// always saved them; the series scanner never did, which is why every
+	// series had an empty genre list and no cast while every film had both.
+	save := store.VideoSave{Item: series, Genres: series.Genres}
+	save.Cast, save.Crew = m.creditsOf(ctx, res)
+	if errors.Is(lookupErr, metadata.ErrNotFound) {
+		save.MatchFailedAt = m.now()
 	}
-	out.Item = saved
-	// Genres and credits live in their own tables, so they need saving
-	// explicitly after the row has an id. The film scanner has always done
-	// this; the series scanner never did, which is why every series had an
-	// empty genre list and no cast while every film had both.
-	m.saveGenres(ctx, saved.ID, series.Genres)
-	m.saveCredits(ctx, saved.ID, out.result)
-	if saved.TmdbID == 0 && errors.Is(out.lookupErr, metadata.ErrNotFound) {
-		m.recordMatchFailure(ctx, saved.ID)
-	}
-	return out, nil
+	return save, res, lookupErr
+}
+
+// seriesGroup is one series' share of a probe batch, on its way to
+// SaveSeries: which season of the batch each season path is.
+type seriesGroup struct {
+	dir       string
+	save      store.SeriesSave
+	seasonIdx map[string]int
 }
 
 // applyProbe copies an already-read probe onto an item: technical info plus
@@ -961,49 +1124,31 @@ func (m *Manager) embeddedArt(r probed) string {
 	return m.cacheArtwork("embed", r.Path, img)
 }
 
-// syncSubtitles records an item's subtitle tracks: embedded streams plus
-// sidecar files next to the media.
-func (m *Manager) syncSubtitles(ctx context.Context, itemID, path string) {
-	tracks := []store.SubtitleTrack{}
-	embedded, err := media.ProbeSubtitles(path)
-	if err != nil {
-		logger.Warn("subtitle probe failed", "path", path, "err", err)
-	}
-	for _, s := range embedded {
-		tracks = append(tracks, store.SubtitleTrack{
+// streamsOf is a file's subtitle tracks, the embedded streams from its
+// probe plus sidecar files next to it, and its audio tracks from the
+// probe, so the player can offer its pickers without reprobing.
+func streamsOf(path string, r probed) ([]store.SubtitleTrack, []store.AudioTrack) {
+	subs := []store.SubtitleTrack{}
+	for _, s := range r.Info.Subtitles {
+		subs = append(subs, store.SubtitleTrack{
 			Source: "embedded", StreamIndex: s.Index, Codec: s.Codec,
 			Language: s.Language, Title: s.Title, Forced: s.Forced,
 		})
 	}
 	for _, s := range media.SidecarSubtitles(path) {
-		tracks = append(tracks, store.SubtitleTrack{
+		subs = append(subs, store.SubtitleTrack{
 			Source: "sidecar", StreamIndex: -1, Path: s.Path, Codec: s.Codec,
 			Language: s.Language, Forced: s.Forced,
 		})
 	}
-	if err := m.Store.ReplaceSubtitles(ctx, itemID, tracks); err != nil {
-		logger.Error("saving subtitles failed", "path", path, "err", err)
-	}
-}
-
-// syncAudioTracks catalogues the file's audio streams so the player can
-// offer a picker without reprobing, mirroring syncSubtitles.
-func (m *Manager) syncAudioTracks(ctx context.Context, itemID, path string) {
-	streams, err := media.ProbeAudioTracks(path)
-	if err != nil {
-		logger.Warn("audio track probe failed", "path", path, "err", err)
-		return
-	}
-	tracks := make([]store.AudioTrack, 0, len(streams))
-	for _, a := range streams {
-		tracks = append(tracks, store.AudioTrack{
+	audio := make([]store.AudioTrack, 0, len(r.Info.AudioTracks))
+	for _, a := range r.Info.AudioTracks {
+		audio = append(audio, store.AudioTrack{
 			StreamIndex: a.Index, Codec: a.Codec, Language: a.Language,
 			Title: a.Title, Channels: a.Channels, BitRate: a.BitRate, Default: a.Default,
 		})
 	}
-	if err := m.Store.ReplaceAudioTracks(ctx, itemID, tracks); err != nil {
-		logger.Error("saving audio tracks failed", "path", path, "err", err)
-	}
+	return subs, audio
 }
 
 func (m *Manager) applyVideoResult(ctx context.Context, item *store.Item, r metadata.VideoResult) {

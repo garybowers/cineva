@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -51,24 +52,29 @@ var serveCmd = &cobra.Command{
 
 		artworkDir := viper.GetString("libraries.artwork_dir")
 		return api.Serve(api.Config{
-			Host:         viper.GetString("server.host"),
-			Port:         viper.GetInt("server.port"),
-			ArtworkDir:   artworkDir,
-			TranscodeDir: viper.GetString("transcode.dir"),
-			SegmentSecs:  viper.GetInt("transcode.segment_secs"),
-			HWAccel:      viper.GetString("transcode.hwaccel"),
-			CertRegion:   viper.GetString("metadata.cert_region"),
-			ScanInterval: viper.GetDuration("libraries.scan_interval"),
-			RetainDays:   viper.GetInt("libraries.history_retention_days"),
-			IntroDetect:  viper.GetBool("libraries.intro_detection"),
-			PreviewsDir:  viper.GetString("libraries.previews_dir"),
-			TranscodeMax: viper.GetInt64("transcode.max_bytes"),
-			SampleSecs:   viper.GetInt("stats.sample_secs"),
-			StatsHours:   viper.GetInt("stats.retention_hours"),
-			SessionDays:  viper.GetInt("auth.session_days"),
-			SecureCookie: viper.GetBool("auth.secure_cookies"),
-			LoginMode:    viper.GetString("auth.login_mode"),
-			Ready:        announce,
+			Host:              viper.GetString("server.host"),
+			Port:              viper.GetInt("server.port"),
+			ArtworkDir:        artworkDir,
+			TranscodeDir:      viper.GetString("transcode.dir"),
+			SegmentSecs:       viper.GetInt("transcode.segment_secs"),
+			HWAccel:           viper.GetString("transcode.hwaccel"),
+			CertRegion:        viper.GetString("metadata.cert_region"),
+			ScanInterval:      viper.GetDuration("libraries.scan_interval"),
+			RetainDays:        viper.GetInt("libraries.history_retention_days"),
+			IntroDetect:       viper.GetBool("libraries.intro_detection"),
+			PreviewsDir:       viper.GetString("libraries.previews_dir"),
+			TranscodeMax:      viper.GetInt64("transcode.max_bytes"),
+			DataDir:           filepath.Dir(viper.GetString("database.path")),
+			AudioCacheMB:      viper.GetInt("transcode.audio_cache_mb"),
+			SampleSecs:        viper.GetInt("stats.sample_secs"),
+			StatsHours:        viper.GetInt("stats.retention_hours"),
+			SessionDays:       viper.GetInt("auth.session_days"),
+			SecureCookie:      viper.GetBool("auth.secure_cookies"),
+			LoginMode:         viper.GetString("auth.login_mode"),
+			Subsonic:          viper.GetBool("subsonic.enabled"),
+			ListenBrainzToken: viper.GetString("metadata.listenbrainz.token"),
+			Jellyfin:          viper.GetBool("jellyfin.enabled"),
+			Ready:             announce,
 		}, st, newManager(st, artworkDir))
 	},
 }

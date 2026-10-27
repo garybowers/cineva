@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -22,6 +23,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/playback"
+	"github.com/garybowers/cineva/server/internal/prefs"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -206,6 +208,12 @@ type Source struct {
 	// Audio is "direct" or "transcode", with the codec being sent.
 	Audio      string `json:"audio"`
 	AudioCodec string `json:"audioCodec,omitempty"`
+	// What the audio being sent is, for a music player's quality badge
+	// ("FLAC 24/96", "Opus 128k"): kbit/s, Hz and bits per sample (the
+	// last only for a lossless original).
+	Bitrate    int `json:"bitrate,omitempty"`
+	SampleRate int `json:"sampleRate,omitempty"`
+	BitDepth   int `json:"bitDepth,omitempty"`
 	// Accel names the transcode path actually built — the device, or "none"
 	// for software. The session reports it after the pipeline is up (a
 	// device that opens but cannot allocate frames falls back), so it is
@@ -240,36 +248,37 @@ func (s *server) playItem(c echo.Context) error {
 	if err := s.storageReady(c.Request().Context(), item); err != nil {
 		return err
 	}
-	// Play history for the dashboard; a failure here must not block playback.
-	// The id closes the row when the playback ends (see onPlaybackEnd); zero
-	// means the row was never opened, and ending is then a no-op.
-	eventID, err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind)
-	if err != nil {
-		playbackLog.Error("recording play history failed", "item", item.ID, "err", err)
-	} else {
-		s.events.Publish(events.Event{Type: "plays"})
+	var body capabilities
+	if err := c.Bind(&body); err != nil {
+		body = capabilities{}
 	}
-	c.Set(playEventKey, eventID)
-	s.audit(c, "play.start", string(item.Kind), item.ID, item.Title, "")
-	// Music always direct plays: browsers decode flac/mp3/aac/ogg/opus
-	// natively, and the files are small. (Transcode fallback: BACKLOG.md.)
 	if item.Kind == store.KindTrack {
-		s.registerPlayback(c, item, "direct", "original", "")
-		return c.JSON(http.StatusOK, playInfo{
-			Mode: "direct", URL: "/api/v1/items/" + item.ID + "/stream",
-			DurationSecs: item.RuntimeSecs, Subtitles: []subtitleInfo{},
-		})
+		return s.playTrack(c, item, body)
 	}
+	info, err := s.decidePlay(c, item, body)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, info)
+}
+
+// decidePlay is the video playback decision: direct play when the device
+// can, else an HLS session, remuxed or re-encoded as the file and the
+// device require. It opens the play history row and registers the
+// playback, and returns what the client should play. Shared by playItem
+// and the Jellyfin-compatible PlaybackInfo call, so a Jellyfin app gets
+// the same answer Cineva's own player would.
+func (s *server) decidePlay(c echo.Context, item store.Item, body capabilities) (playInfo, error) {
+	s.openPlayHistory(c, item)
 
 	caps := defaultCaps
-	var body capabilities
-	if err := c.Bind(&body); err == nil && len(body.Containers) > 0 {
+	if len(body.Containers) > 0 {
 		caps = capabilities{Containers: body.Containers, VideoCodecs: body.VideoCodecs, AudioCodecs: body.AudioCodecs}
 	}
 	quality := body.Quality
 	ps, err := s.store.PlayStateFor(c.Request().Context(), userID(c), item.ID)
 	if err != nil {
-		return err
+		return playInfo{}, err
 	}
 	resume := ps.PositionSecs
 	if ps.Watched || body.FromStart {
@@ -278,7 +287,7 @@ func (s *server) playItem(c echo.Context) error {
 
 	tracks, err := s.store.SubtitlesForItem(c.Request().Context(), item.ID)
 	if err != nil {
-		return err
+		return playInfo{}, err
 	}
 	subs := subtitleInfos(tracks)
 
@@ -288,7 +297,7 @@ func (s *server) playItem(c echo.Context) error {
 	// the zero Info reads as "no Dolby Vision", which is the common case.
 	vinfo, err := library.WithinFile(item.Path, mediaTimeout, func() (media.Info, error) { return media.Probe(item.Path) })
 	if errors.Is(err, library.ErrNotResponding) {
-		return s.storageFailed(c.Request().Context(), item, err)
+		return playInfo{}, s.storageFailed(c.Request().Context(), item, err)
 	}
 	if err != nil {
 		playbackLog.Warn("probe failed", "title", item.Title, "err", err)
@@ -296,7 +305,7 @@ func (s *server) playItem(c echo.Context) error {
 
 	audio, err := s.store.AudioTracksForItem(c.Request().Context(), item.ID)
 	if err != nil {
-		return err
+		return playInfo{}, err
 	}
 	// A library scanned before migration 0011 has no audio_tracks rows, so
 	// the picker would silently offer nothing on a file with several
@@ -378,7 +387,7 @@ func (s *server) playItem(c echo.Context) error {
 		// returning a direct-play URL that cannot play (mkv, most often).
 		if directPlayReason(item, caps) == "" {
 			s.registerPlayback(c, item, "direct", "original", "")
-			return c.JSON(http.StatusOK, direct)
+			return direct, nil
 		}
 		if remuxSafe(item, vinfo) {
 			sessionQuality = media.Quality{Label: "original"} // zero height = copy the video
@@ -403,7 +412,7 @@ func (s *server) playItem(c echo.Context) error {
 			// other paths are: left to the first heartbeat, the row was
 			// never closed and the play never counted.
 			s.registerPlayback(c, item, "direct", "original", "")
-			return c.JSON(http.StatusOK, direct)
+			return direct, nil
 		}
 		// A container or audio-only mismatch is fixed by a remux, which
 		// copies the video stream untouched and costs almost nothing.
@@ -424,7 +433,7 @@ func (s *server) playItem(c echo.Context) error {
 	default:
 		level, ok := qualityLevels[quality]
 		if !ok {
-			return echo.NewHTTPError(http.StatusBadRequest, "unknown quality "+quality)
+			return playInfo{}, echo.NewHTTPError(http.StatusBadRequest, "unknown quality "+quality)
 		}
 		sessionQuality = level
 		reason = "quality " + quality + " requested"
@@ -444,7 +453,7 @@ func (s *server) playItem(c echo.Context) error {
 		BurnSubtitle: burn,
 	})
 	if err != nil {
-		return err
+		return playInfo{}, err
 	}
 	s.registerPlayback(c, item, "hls", session.Quality.Label, session.ID)
 	src.Video, src.OutHeight = "transcode", sessionQuality.Height
@@ -455,14 +464,14 @@ func (s *server) playItem(c echo.Context) error {
 	src.Accel = session.Accel
 	// Only the re-encode path tone maps; a copied stream keeps its HDR.
 	src.HDRToneMapped = sessionQuality.Height > 0 && vinfo.HDRFormat != ""
-	return c.JSON(http.StatusOK, playInfo{
+	return playInfo{
 		Mode: "hls", URL: "/api/v1/play/" + session.ID + "/index.m3u8",
 		SessionID: session.ID, DurationSecs: item.RuntimeSecs, PositionSecs: resume,
 		Reason: reason, Subtitles: subs, Audio: audio, AudioTrack: chosen,
 		Subtitle: subtitle, BurnedSubtitle: burn,
 		Chapters: vinfo.Chapters, Segments: segs,
 		Source: src,
-	})
+	}, nil
 }
 
 // GET /items/:id/stream — direct play with HTTP range support.
@@ -476,11 +485,7 @@ func (s *server) streamItem(c echo.Context) error {
 	}
 	if format := c.QueryParam("format"); format != "" && format != "original" && item.Kind == store.KindTrack {
 		quality, _ := strconv.Atoi(c.QueryParam("quality"))
-		path, _, err := s.transcodedTrack(c.Request().Context(), item, format, quality)
-		if err != nil {
-			return err
-		}
-		return c.File(path) // the cache, on local disk
+		return s.streamTranscodedTrack(c, item, format, quality)
 	}
 	// Refused at once when the library is known to be down; otherwise every
 	// touch of the file has a deadline, so a hung share cannot hold the
@@ -520,57 +525,124 @@ func (s *server) downloadItem(c echo.Context) error {
 
 var allowedBitrates = map[int]bool{64: true, 96: true, 128: true, 192: true, 256: true, 320: true}
 
-// transcodedTrack ensures a cached transcode of a track exists and returns
-// its path plus the download filename.
-func (s *server) transcodedTrack(ctx context.Context, item store.Item, format string, quality int) (string, string, error) {
+// audioTranscode is what the cache needs to encode a track: its key (the
+// item and what its file is now, so a replaced file is encoded again), the
+// extension, the encoder bound by the storage deadlines, and the download
+// name. The quality is normalised to an allowed step.
+func (s *server) audioTranscode(ctx context.Context, item store.Item, format string, quality int) (key, ext string, enc media.Encoder, name string, kbps int, err error) {
 	f, ok := media.AudioDownloadFormat(format)
 	if !ok {
-		return "", "", echo.NewHTTPError(http.StatusBadRequest, "unknown format "+format)
+		return "", "", nil, "", 0, echo.NewHTTPError(http.StatusBadRequest, "unknown format "+format)
 	}
 	if !allowedBitrates[quality] {
 		quality = 192
 	}
-	dir := filepath.Join(s.dlCacheDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", err
+	// The source is read from media storage; the cache is local.
+	if err := s.storageReady(ctx, item); err != nil {
+		return "", "", nil, "", 0, err
 	}
-	cached := filepath.Join(dir, fmt.Sprintf("%s-%s-%d.%s", item.ID, format, quality, f.Ext))
-	// A crashed transcode can leave an empty/partial file: only trust
-	// non-empty caches, and build new ones atomically via rename.
-	if st, err := os.Stat(cached); err != nil || st.Size() == 0 {
-		// The source is read from media storage; the cache is local.
-		if err := s.storageReady(ctx, item); err != nil {
-			return "", "", err
-		}
-		part := cached + ".part." + f.Ext // keep the extension so the muxer resolves
-		// Bounded by progress rather than by total time: a long track on a
-		// slow share may take a while, but one that stops reading is given
-		// up on. The cancel stops an abandoned transcode as soon as its
-		// blocked read returns.
-		tctx, cancel := context.WithCancel(ctx)
-		defer cancel()
+	// The file's modification time is part of the key; a stat the storage
+	// does not answer is treated like any other read of it.
+	var mtime int64
+	if st, err := library.WithinFile(item.Path, mediaTimeout, func() (os.FileInfo, error) { return os.Stat(item.Path) }); err == nil {
+		mtime = st.ModTime().Unix()
+	} else if errors.Is(err, library.ErrNotResponding) {
+		return "", "", nil, "", 0, s.storageFailed(ctx, item, err)
+	}
+	enc = func(ctx context.Context, dst string) error {
+		// Bounded by progress rather than by total time: a long track on
+		// a slow share may take a while, but one that stops reading is
+		// given up on.
 		_, err := library.WithinIdleFile(item.Path, mediaTimeout, func(progress func()) (struct{}, error) {
-			return struct{}{}, media.TranscodeAudio(tctx, item.Path, part, f.Encoder, quality, progress)
+			return struct{}{}, media.TranscodeAudio(ctx, item.Path, dst, f.Encoder, quality, progress)
 		})
-		if err != nil {
-			cancel()
-			if rerr := os.Remove(part); rerr != nil && !os.IsNotExist(rerr) {
-				downloadLog.Warn("removing a partial transcode failed", "path", part, "err", rerr)
-			}
-			if errors.Is(err, library.ErrNotResponding) {
-				return "", "", s.storageFailed(ctx, item, err)
-			}
-			return "", "", echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		if err := os.Rename(part, cached); err != nil {
-			return "", "", err
-		}
+		return err
 	}
 	nice := item.Title
 	if item.Artist != "" {
 		nice = item.Artist + " - " + item.Title
 	}
-	return cached, zipNameSanitiser.Replace(nice) + "." + f.Ext, nil
+	return media.Key(item.ID, item.SizeBytes, mtime, format, quality), f.Ext, enc,
+		zipNameSanitiser.Replace(nice) + "." + f.Ext, quality, nil
+}
+
+// transcodeError maps an encode failure onto a response: storage that
+// stopped answering is 503 with the library named, anything else 500.
+func (s *server) transcodeError(ctx context.Context, item store.Item, err error) error {
+	if errors.Is(err, library.ErrNotResponding) {
+		return s.storageFailed(ctx, item, err)
+	}
+	var he *echo.HTTPError
+	if errors.As(err, &he) {
+		return err
+	}
+	return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+}
+
+// transcodedTrack ensures a cached transcode of a track exists, whole, and
+// returns its path plus the download filename. Waits for the encode when
+// one is running; downloads and archives want the finished file. Playback
+// uses streamTranscodedTrack, which does not wait.
+func (s *server) transcodedTrack(ctx context.Context, item store.Item, format string, quality int) (string, string, error) {
+	key, ext, enc, name, _, err := s.audioTranscode(ctx, item, format, quality)
+	if err != nil {
+		return "", "", err
+	}
+	path, err := s.audioCache.Wait(ctx, key, ext, enc)
+	if err != nil {
+		return "", "", s.transcodeError(ctx, item, err)
+	}
+	return path, name, nil
+}
+
+// audioContentTypes are the media types of the cache's formats.
+var audioContentTypes = map[string]string{"mp3": "audio/mpeg", "ogg": "audio/ogg", "opus": "audio/ogg", "m4a": "audio/mp4"}
+
+// streamTranscodedTrack serves a track's transcode, from the first packet
+// while it is still being encoded (chunked, no ranges) or with ranges once
+// it is on disk in full. The first play of a track no longer waits for the
+// whole encode.
+func (s *server) streamTranscodedTrack(c echo.Context, item store.Item, format string, quality int) error {
+	ctx := c.Request().Context()
+	key, ext, enc, name, _, err := s.audioTranscode(ctx, item, format, quality)
+	if err != nil {
+		return err
+	}
+	stream, err := s.audioCache.Open(ctx, key, ext, enc)
+	if err != nil {
+		return s.transcodeError(ctx, item, err)
+	}
+	defer stream.Close()
+	res := c.Response()
+	res.Header().Set(echo.HeaderContentType, audioContentTypes[ext])
+	if stream.Complete() {
+		http.ServeContent(res, c.Request(), name, stream.ModTime, stream)
+		return nil
+	}
+	res.Header().Set("Cache-Control", "no-store")
+	res.WriteHeader(http.StatusOK)
+	// Flushed as it comes, so the player has sound before the encoder has
+	// finished. A client that goes away ends the copy; the encode carries
+	// on into the cache for the next play.
+	buf := make([]byte, 32<<10)
+	flusher, _ := res.Writer.(http.Flusher)
+	for {
+		n, rerr := stream.Read(buf)
+		if n > 0 {
+			if _, werr := res.Write(buf[:n]); werr != nil {
+				return nil
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				playbackLog.Warn("transcode stream ended early", "title", item.Title, "err", rerr)
+			}
+			return nil
+		}
+	}
 }
 
 func (s *server) downloadTranscoded(c echo.Context, item store.Item, format string, quality int) error {
@@ -652,10 +724,40 @@ func (s *server) downloadArchive(c echo.Context, root store.Item, format string,
 		s.recheckStorage(context.WithoutCancel(ctx), root)
 		return nil
 	}
-	for _, f := range files {
-		// Music archives can transcode per entry (format=mp3/ogg).
-		if format != "" && format != "original" && f.track != nil {
-			path, name, err := s.transcodedTrack(ctx, *f.track, format, quality)
+	// Music archives can transcode per entry (format=mp3/ogg). The encodes
+	// are prepared ahead, four at a time (an artist's worth of tracks took
+	// as long as the encodes in series), through the same cache playback
+	// uses; the loop below waits for each entry's in turn.
+	type prepared struct {
+		path, name string
+		err        error
+	}
+	var ahead []chan prepared
+	if format != "" && format != "original" {
+		ahead = make([]chan prepared, len(files))
+		sem := make(chan struct{}, 4)
+		for i, f := range files {
+			if f.track == nil {
+				continue
+			}
+			ahead[i] = make(chan prepared, 1)
+			go func(i int, tr store.Item) {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					ahead[i] <- prepared{err: ctx.Err()}
+					return
+				}
+				defer func() { <-sem }()
+				path, name, err := s.transcodedTrack(ctx, tr, format, quality)
+				ahead[i] <- prepared{path: path, name: name, err: err}
+			}(i, *f.track)
+		}
+	}
+	for i, f := range files {
+		if ahead != nil && ahead[i] != nil {
+			p := <-ahead[i]
+			path, name, err := p.path, p.name, p.err
 			if err == nil {
 				f.path = path
 				f.name = f.name[:len(f.name)-len(filepath.Ext(f.name))] + filepath.Ext(name)
@@ -911,8 +1013,14 @@ func (s *server) postProgress(c echo.Context) error {
 		s.events.Publish(events.Event{Type: "devices", User: userID(c)})
 	}
 	// Music positions are not resume state: tracks are short and would
-	// otherwise litter Continue Watching.
+	// otherwise litter Continue Watching. They do move the device's queue
+	// on, so another device can carry the track on from the same second.
 	if item.Kind == store.KindTrack {
+		if hash, ok := c.Get(ctxSession).(string); ok && hash != "" {
+			if err := s.store.SetSessionQueuePosition(c.Request().Context(), hash, item.ID, float64(req.PositionSecs)); err != nil {
+				playbackLog.Warn("saving queue position failed", "item", item.ID, "err", err)
+			}
+		}
 		return c.JSON(http.StatusOK, store.PlayState{ItemID: item.ID, PositionSecs: req.PositionSecs})
 	}
 	ps, err := s.store.SetProgress(c.Request().Context(), userID(c), item.ID, req.PositionSecs, item.RuntimeSecs)
@@ -1059,4 +1167,155 @@ func (s *server) nextUpFor(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	return c.JSON(http.StatusOK, up)
+}
+
+// openPlayHistory opens the play history row for a playback and audits
+// the start. The id closes the row when the playback ends (see
+// onPlaybackEnd); zero means the row was never opened, and ending is then
+// a no-op. A failure here must not block playback.
+func (s *server) openPlayHistory(c echo.Context, item store.Item) {
+	eventID, err := s.store.RecordPlay(c.Request().Context(), userID(c), item.ID, item.Kind)
+	if err != nil {
+		playbackLog.Error("recording play history failed", "item", item.ID, "err", err)
+	} else {
+		s.events.Publish(events.Event{Type: "plays"})
+	}
+	c.Set(playEventKey, eventID)
+	s.audit(c, "play.start", string(item.Kind), item.ID, item.Title, "")
+}
+
+// musicQualities maps the music-quality preference (and a player's one-off
+// choice) onto a stream: the original file, or an Opus transcode at a bit
+// rate.
+var musicQualities = map[string]struct {
+	format string
+	kbps   int
+}{
+	"original": {"", 0},
+	"opus-128": {"opus", 128},
+	"opus-64":  {"opus", 64},
+}
+
+// playRepeatWindow is how long a second play request for the same track
+// from the same device answers the first one again rather than counting a
+// new play: a player seeking to the start, or restarting after a hiccup,
+// has not played the track twice.
+const playRepeatWindow = 30 * time.Second
+
+// recentPlays remembers each device's last answer per track for
+// playRepeatWindow. The zero value is ready to use.
+type recentPlays struct {
+	mu   sync.Mutex
+	last map[string]recentPlay
+}
+
+type recentPlay struct {
+	at   time.Time
+	info playInfo
+}
+
+func (r *recentPlays) get(key string, now time.Time) (playInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.last[key]
+	if !ok || now.Sub(p.at) > playRepeatWindow {
+		return playInfo{}, false
+	}
+	return p.info, true
+}
+
+func (r *recentPlays) put(key string, info playInfo, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		r.last = map[string]recentPlay{}
+	}
+	// Entries past the window go on each write, so the map never grows
+	// past the tracks played in the last half minute.
+	for k, p := range r.last {
+		if now.Sub(p.at) > playRepeatWindow {
+			delete(r.last, k)
+		}
+	}
+	r.last[key] = recentPlay{at: now, info: info}
+}
+
+// playTrack answers POST /items/:id/play for a track: what to stream and in
+// what form, decided here as it is for video so every client gets the same
+// answer. The device's music-quality preference is resolved on the server
+// (an administrator's lock holds, and a client need not know the
+// preference exists); a client's own quality choice applies when nothing
+// locks it; and a device that says what it decodes is not sent a codec it
+// cannot play. A repeat request within playRepeatWindow is the same play.
+func (s *server) playTrack(c echo.Context, item store.Item, body capabilities) error {
+	ctx := c.Request().Context()
+	device, _ := c.Get(ctxSessionID).(string)
+	now := time.Now()
+	// The same request again is the same play; a different quality or a
+	// different set of codecs is a new decision, as a quality change in
+	// the player is.
+	key := userID(c) + "/" + device + "/" + item.ID + "/" + body.Quality + "/" + strings.Join(body.AudioCodecs, ",")
+	if info, ok := s.recent.get(key, now); ok {
+		// Still the same play: keep the registry entry warm and answer as
+		// before, without a second history row or audit entry.
+		s.playbacks.Touch(userID(c), item.ID, 0, false)
+		return c.JSON(http.StatusOK, info)
+	}
+
+	choice := "original"
+	resolved, err := s.prefs.Resolve(ctx, userID(c), device)
+	if err != nil {
+		playbackLog.Warn("loading music quality preference failed", "err", err)
+	}
+	pref, hasPref := resolved[prefs.MusicQuality]
+	if hasPref {
+		if _, known := musicQualities[pref.Value]; known {
+			choice = pref.Value
+		}
+	}
+	if _, known := musicQualities[body.Quality]; known && (!hasPref || !pref.Locked) {
+		choice = body.Quality
+	}
+	// A device that lists its codecs is believed; one that lists none is
+	// taken to decode everything, as the web client does.
+	can := func(codec string) bool { return len(body.AudioCodecs) == 0 || contains(body.AudioCodecs, codec) }
+
+	format, kbps := musicQualities[choice].format, musicQualities[choice].kbps
+	var reason string
+	if format == "" && !can(item.AudioCodec) {
+		format, kbps = "aac", 192
+		if can("opus") {
+			format, kbps = "opus", 128
+		}
+		reason = "audio codec " + item.AudioCodec + " not supported by device"
+	}
+	if format == "opus" && !can("opus") {
+		format = "aac"
+		if kbps < 96 {
+			kbps = 96 // AAC at Opus's lowest step is not worth hearing
+		}
+	}
+
+	src := Source{Container: item.Container, Audio: "direct", AudioCodec: item.AudioCodec,
+		Bitrate: item.Bitrate, SampleRate: item.SampleRate, BitDepth: item.BitDepth}
+	url := "/api/v1/items/" + item.ID + "/stream"
+	mode := "direct"
+	if format != "" {
+		url += "?format=" + format + "&quality=" + strconv.Itoa(kbps)
+		mode = "transcode"
+		src.Audio, src.AudioCodec, src.Bitrate, src.BitDepth = "transcode", format, kbps, 0
+		if format == "opus" {
+			src.SampleRate = 48000 // Opus is 48 kHz by definition
+		} else if src.SampleRate == 0 {
+			src.SampleRate = 44100
+		}
+	}
+	info := playInfo{
+		Mode: "direct", URL: url, DurationSecs: item.RuntimeSecs, Reason: reason,
+		Subtitles: []subtitleInfo{}, Source: src,
+	}
+	s.openPlayHistory(c, item)
+	s.registerPlayback(c, item, mode, choice, "")
+	s.recent.put(key, info, now)
+	return c.JSON(http.StatusOK, info)
 }

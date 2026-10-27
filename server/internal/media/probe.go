@@ -33,6 +33,12 @@ type Info struct {
 	Height      int
 	Tags        Tags
 	HasCoverArt bool
+	// Subtitles and AudioTracks are the file's embedded subtitle and
+	// audio streams, read from the same open as the rest: a scan records
+	// them per file, and opening a file three times for three lists was
+	// most of what a file cost a scan.
+	Subtitles   []SubtitleStream
+	AudioTracks []AudioStream
 
 	// HDRFormat is "pq", "hlg" or "" — set from the transfer characteristic.
 	// Re-encoding HDR without tone mapping produces the washed-out, flat
@@ -125,6 +131,8 @@ func Probe(path string) (Info, error) {
 			break
 		}
 	}
+	info.Subtitles = subtitleStreams(in)
+	info.AudioTracks = audioStreams(in)
 	return info, nil
 }
 

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Search</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0e1116;color:#e8ebf0;font-family:Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#e8ebf0;text-decoration:none}a:hover{color:#ffffff}
+input::placeholder{color:#8a93a3}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #0e1116; position: relative; overflow: hidden; display: flex; flex-direction: column">
+
+  <div style="display: flex; align-items: center; gap: 10px; padding: 44px 20px 0 20px">
+    <label for="q" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Search your music</label>
+    <div style="flex: 1; display: flex; align-items: center; gap: 10px; height: 44px; padding: 0 14px; border-radius: 12px; background: #161b23">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#8a93a3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+      <input id="q" type="search" value="oas" style="flex: 1; min-width: 0; border: 0; background: transparent; color: #e8ebf0; font: inherit; font-size: 16px; outline: none">
+      <button aria-label="Clear" style="width: 28px; height: 28px; border: 0; border-radius: 50%; background: #2a3140; color: #e8ebf0; display: flex; align-items: center; justify-content: center; cursor: pointer">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+      </button>
+    </div>
+    <a href="Main.dc.html" style="font-size: 15px; font-weight: 600; color: #e0a04a">Cancel</a>
+  </div>
+
+  <div style="flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: 22px; padding-top: 22px">
+
+    <div style="display: flex; flex-direction: column; gap: 10px">
+      <span style="font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8a93a3; padding: 0 20px">Artists</span>
+      <div style="display: flex; gap: 16px; padding: 0 20px; overflow: hidden">
+        <a href="#oasis" style="display: flex; flex-direction: column; align-items: center; gap: 8px; width: 84px; flex: none">
+          <img src="/_blob/3600e83a110e5f89d1e3cd55b35f49c5" alt="" style="width: 84px; height: 84px; border-radius: 50%; object-fit: cover">
+          <span style="font-size: 13px; font-weight: 600">Oasis</span>
+        </a>
+        <a href="#oasis-tribute" style="display: flex; flex-direction: column; align-items: center; gap: 8px; width: 84px; flex: none">
+          <span aria-hidden="true" style="width: 84px; height: 84px; border-radius: 50%; background: linear-gradient(135deg, #2a3140, #161b23); display: flex; align-items: center; justify-content: center; font-size: 26px; font-weight: 800; color: #4a5366">B</span>
+          <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 84px">Beady Eye</span>
+        </a>
+      </div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 10px">
+      <span style="font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8a93a3; padding: 0 20px">Albums</span>
+      <div style="display: flex; gap: 12px; padding: 0 20px; overflow: hidden">
+        <a href="Album.dc.html" style="display: flex; flex-direction: column; gap: 7px; width: 112px; flex: none">
+          <img src="/_blob/fd6f897890667b221814bdf77fc17755" alt="" style="width: 112px; height: 112px; border-radius: 8px; object-fit: cover">
+          <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Be Here Now</span>
+          <span style="font-size: 12px; color: #8a93a3; margin-top: -4px">1997</span>
+        </a>
+        <a href="Album.dc.html" style="display: flex; flex-direction: column; gap: 7px; width: 112px; flex: none">
+          <img src="/_blob/c42097fce497c2a072a56dfe023dee7d" alt="" style="width: 112px; height: 112px; border-radius: 8px; object-fit: cover">
+          <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">(What’s the Story) Morning Glory?</span>
+          <span style="font-size: 12px; color: #8a93a3; margin-top: -4px">1995</span>
+        </a>
+        <a href="Album.dc.html" style="display: flex; flex-direction: column; gap: 7px; width: 112px; flex: none">
+          <img src="/_blob/3600e83a110e5f89d1e3cd55b35f49c5" alt="" style="width: 112px; height: 112px; border-radius: 8px; object-fit: cover">
+          <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Definitely Maybe</span>
+          <span style="font-size: 12px; color: #8a93a3; margin-top: -4px">1994</span>
+        </a>
+      </div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 2px">
+      <span style="font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8a93a3; padding: 0 20px 8px 20px">Songs</span>
+      <a href="NowPlaying.dc.html" style="display: flex; align-items: center; gap: 12px; padding: 7px 20px">
+        <img src="/_blob/c42097fce497c2a072a56dfe023dee7d" alt="" style="width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none">
+        <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+          <span style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Wonderwall</span>
+          <span style="font-size: 12px; color: #8a93a3">Oasis · (What’s the Story) Morning Glory?</span>
+        </span>
+        <span style="font-size: 12px; color: #8a93a3">4:18</span>
+      </a>
+      <a href="NowPlaying.dc.html" style="display: flex; align-items: center; gap: 12px; padding: 7px 20px">
+        <img src="/_blob/c42097fce497c2a072a56dfe023dee7d" alt="" style="width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none">
+        <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+          <span style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Don’t Look Back in Anger</span>
+          <span style="font-size: 12px; color: #8a93a3">Oasis · (What’s the Story) Morning Glory?</span>
+        </span>
+        <span style="font-size: 12px; color: #8a93a3">4:48</span>
+      </a>
+      <a href="NowPlaying.dc.html" style="display: flex; align-items: center; gap: 12px; padding: 7px 20px">
+        <img src="/_blob/3600e83a110e5f89d1e3cd55b35f49c5" alt="" style="width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none">
+        <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+          <span style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Live Forever</span>
+          <span style="font-size: 12px; color: #8a93a3">Oasis · Definitely Maybe</span>
+        </span>
+        <span style="font-size: 12px; color: #8a93a3">4:36</span>
+      </a>
+      <a href="NowPlaying.dc.html" style="display: flex; align-items: center; gap: 12px; padding: 7px 20px">
+        <img src="/_blob/fd6f897890667b221814bdf77fc17755" alt="" style="width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none">
+        <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+          <span style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Stand by Me</span>
+          <span style="font-size: 12px; color: #8a93a3">Oasis · Be Here Now</span>
+        </span>
+        <span style="font-size: 12px; color: #8a93a3">5:56</span>
+      </a>
+    </div>
+  </div>
+
+  <div style="position: absolute; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column">
+    <a href="NowPlaying.dc.html" aria-label="Now playing: D’You Know What I Mean? by Oasis. Open" style="display: flex; align-items: center; gap: 12px; margin: 0 10px 8px 10px; padding: 8px 10px; border-radius: 12px; background: #1b2029; box-shadow: 0 8px 24px rgba(0,0,0,0.4); position: relative; overflow: hidden">
+      <img src="/_blob/fd6f897890667b221814bdf77fc17755" alt="" style="width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex: none">
+      <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px">
+        <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">D’You Know What I Mean?</span>
+        <span style="font-size: 12px; color: #8a93a3">Oasis</span>
+      </span>
+      <span style="display: flex; align-items: center; gap: 4px">
+        <span aria-hidden="true" style="width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; color: #e8ebf0"><svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"></path></svg></span>
+        <span aria-hidden="true" style="width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; color: #e8ebf0"><svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M6 5l10 7-10 7zM17 5h2v14h-2z"></path></svg></span>
+      </span>
+      <span style="position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: #2a3140"><span style="display: block; width: 6%; height: 100%; background: #e0a04a"></span></span>
+    </a>
+    <nav aria-label="Sections" style="display: flex; justify-content: space-around; padding: 10px 8px 26px 8px; background: #0e1116; border-top: 1px solid #1a1f28">
+      <a href="Main.dc.html" style="display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; color: #8a93a3">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg>
+        <span style="font-size: 11px; font-weight: 500">Listen</span>
+      </a>
+      <a href="Library.dc.html" style="display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; color: #8a93a3">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 6 4 14"></path><path d="M12 6v14"></path><path d="M8 8v12"></path><path d="M4 4v16"></path></svg>
+        <span style="font-size: 11px; font-weight: 500">Library</span>
+      </a>
+      <a href="Search.dc.html" aria-current="page" style="display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; color: #e0a04a">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+        <span style="font-size: 11px; font-weight: 600">Search</span>
+      </a>
+      <a href="Sync.dc.html" style="display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; color: #8a93a3">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12a9 9 0 0 1 15.5-6.2"></path><path d="M3 18v-6h6"></path><path d="M21 6v6h-6"></path></svg>
+        <span style="font-size: 11px; font-weight: 500">Sync</span>
+      </a>
+    </nav>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

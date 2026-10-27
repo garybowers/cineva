@@ -710,6 +710,9 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		SeasonCount: 5, EpisodeCount: 62,
 		LastAirDate: "2013-09-29", NextAirDate: "2026-01-01",
 		OriginalTitle: "Breaking Bad (original)", Country: "US",
+		Album: "Soundtrack", AlbumArtist: "Various", Compilation: true,
+		Bitrate: 1411, SampleRate: 44100, BitDepth: 16, Channels: 2,
+		MBID: "b1a9c0ff-0000-4000-8000-000000000000",
 	}
 	// Upserted twice on purpose, with *different* values the second time.
 	// The first call inserts, the second takes the UPDATE branch — the one
@@ -748,6 +751,7 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 	serverSet := map[string]bool{
 		"ID": true, "LibraryID": true, "AddedAt": true, "UpdatedAt": true,
 		"Kind": true, "ParentID": true, "Path": true,
+		"SortTitle": true, // derived from Title on every save, see SortKey
 	}
 	elsewhere := map[string]bool{
 		"LockedFields":  true, // its own CSV column, checked below
@@ -759,6 +763,7 @@ func TestItemRoundTripsEveryField(t *testing.T) {
 		"PlayCount":     true, // per-user play counts, see play_counts
 		"LastPlayedAt":  true,
 		"UserRating":    true, // per-user ratings, see the ratings table
+		"ChildCount":    true, // counted by the music listings, see Artists
 		"VersionOf":     true, // set by version grouping, not the caller
 		"FileMtime":     true, // write-only; read back through FileStamps, below
 		"SidecarStamp":  true, // likewise

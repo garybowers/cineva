@@ -50,8 +50,10 @@ func SweepOrphans(root string, keep ...string) (int, int64, error) {
 			continue
 		}
 		// Sibling caches that are not session directories and must survive.
+		// (Transcoded tracks once lived in "dlcache" here; they are in the
+		// data directory now, see AudioCache, so a leftover one is swept.)
 		switch e.Name() {
-		case "subtitles", "dlcache", "trickplay":
+		case "subtitles", "trickplay":
 			continue
 		}
 		// A session restored from the previous run owns its directory; its
@@ -90,7 +92,7 @@ func enforceCap(root string, maxBytes int64, keep map[string]bool) (int, int64) 
 			continue
 		}
 		switch e.Name() {
-		case "subtitles", "dlcache", "trickplay":
+		case "subtitles", "trickplay":
 			continue
 		}
 		p := filepath.Join(root, e.Name())

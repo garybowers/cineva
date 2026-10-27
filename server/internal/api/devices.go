@@ -122,9 +122,9 @@ func (s *server) devicesFor(c echo.Context, owner store.User) ([]device, error) 
 		if err != nil {
 			return nil, err
 		}
-		if len(q.ItemIDs) > 0 {
-			sum := &queueSummary{Count: len(q.ItemIDs), Index: q.Index, UpdatedAt: sess.QueueUpdatedAt}
-			if it, err := s.store.Item(ctx, q.ItemIDs[q.Index]); err == nil && canSeeLibrary(owner, it.LibraryID) {
+		if len(q.Entries) > 0 {
+			sum := &queueSummary{Count: len(q.Entries), Index: q.Index, UpdatedAt: sess.QueueUpdatedAt}
+			if it, err := s.store.Item(ctx, q.CurrentID()); err == nil && canSeeLibrary(owner, it.LibraryID) {
 				sum.Current = &it
 				sum.SeriesTitle = s.seriesTitleOf(c, it)
 			}
@@ -278,8 +278,9 @@ func (s *server) revokeOtherDevices(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]int{"revoked": n})
 }
 
-// PUT /auth/sessions/current/queue {itemIds, index} — this device's play
-// queue, kept so another device can take it over.
+// PUT /auth/sessions/current/queue — this device's play queue, whole
+// (entries, index, shuffle, repeat, position, source; see store.SessionQueue),
+// kept so another device can take it over and a reload can carry on.
 func (s *server) saveDeviceQueue(c echo.Context) error {
 	hash, err := currentSessionHash(c)
 	if err != nil {
@@ -289,8 +290,9 @@ func (s *server) saveDeviceQueue(c echo.Context) error {
 	if err := c.Bind(&q); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if len(q.ItemIDs) > store.MaxQueueItems {
-		return echo.NewHTTPError(http.StatusBadRequest, "a queue holds at most 500 items")
+	q.Normalise()
+	if len(q.Entries) > store.MaxQueueItems {
+		return echo.NewHTTPError(http.StatusBadRequest, "a queue holds at most 1000 items")
 	}
 	if err := s.store.SetSessionQueue(c.Request().Context(), hash, q); err != nil {
 		return err
@@ -300,28 +302,37 @@ func (s *server) saveDeviceQueue(c echo.Context) error {
 }
 
 // handoffQueue is a queue on its way between devices, with its items
-// resolved for the receiving one.
+// resolved for the receiving one and the rest of the record as it was:
+// shuffle, repeat, where in the current entry, and what it was made from.
 type handoffQueue struct {
-	Items []store.Item `json:"items"`
-	Index int          `json:"index"`
+	Items        []store.Item       `json:"items"`
+	Index        int                `json:"index"`
+	Shuffle      bool               `json:"shuffle,omitempty"`
+	Repeat       string             `json:"repeat,omitempty"`
+	PositionSecs float64            `json:"positionSecs,omitempty"`
+	Source       *store.QueueSource `json:"source,omitempty"`
+	Mix          *store.QueueMix    `json:"mix,omitempty"`
 }
 
 // resolveQueue turns stored ids into the items the viewer may still see,
 // carrying their watch state, and keeps the index on the same item when
-// some have dropped out.
+// some have dropped out. Entries come back in play order; the unshuffled
+// order travels with them as Item order is what the receiver plays.
 func (s *server) resolveQueue(c echo.Context, q store.SessionQueue) (handoffQueue, error) {
-	out := handoffQueue{Items: []store.Item{}}
-	items, err := s.store.ItemsByIDs(c.Request().Context(), q.ItemIDs)
+	q.Normalise()
+	out := handoffQueue{Items: []store.Item{}, Shuffle: q.Shuffle, Repeat: q.Repeat, PositionSecs: q.PositionSecs, Source: q.Source, Mix: q.Mix}
+	items, err := s.store.ItemsByIDs(c.Request().Context(), q.IDs())
 	if err != nil {
 		return out, err
 	}
 	me := currentUser(c)
+	current := q.CurrentID()
 	byLibrary := map[string][]int{}
 	for _, it := range items {
 		if !canSeeLibrary(me, it.LibraryID) {
 			continue
 		}
-		if len(q.ItemIDs) > 0 && q.Index < len(q.ItemIDs) && it.ID == q.ItemIDs[q.Index] {
+		if current != "" && it.ID == current {
 			out.Index = len(out.Items)
 		}
 		byLibrary[it.LibraryID] = append(byLibrary[it.LibraryID], len(out.Items))
@@ -338,6 +349,28 @@ func (s *server) resolveQueue(c echo.Context, q store.SessionQueue) (handoffQueu
 		}
 	}
 	return out, nil
+}
+
+// GET /auth/sessions/current/queue — this device's own saved queue, to
+// carry on after a reload.
+func (s *server) myQueue(c echo.Context) error {
+	hash, err := currentSessionHash(c)
+	if err != nil {
+		return err
+	}
+	sess, _, err := s.store.SessionByHash(c.Request().Context(), hash)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "session not found")
+	}
+	q, err := sess.ParsedQueue()
+	if err != nil {
+		return err
+	}
+	out, err := s.resolveQueue(c, q)
+	if err != nil {
+		return err
+	}
+	return c.JSON(http.StatusOK, out)
 }
 
 // GET /auth/sessions/:id/queue — another device's queue, to take over.
@@ -433,18 +466,18 @@ func (s *server) takeOverDevice(c echo.Context) error {
 	if err != nil || !canSeeLibrary(me, item.LibraryID) {
 		return echo.NewHTTPError(http.StatusNotFound, "what "+deviceLabel(source)+" is playing cannot be played here")
 	}
-	q := store.SessionQueue{ItemIDs: []string{item.ID}}
-	if sq, err := source.ParsedQueue(); err == nil && sq.Index >= 0 && sq.Index < len(sq.ItemIDs) && sq.ItemIDs[sq.Index] == item.ID {
+	q := store.SessionQueue{Entries: []store.QueueEntry{{ID: item.ID}}}
+	if sq, err := source.ParsedQueue(); err == nil && sq.CurrentID() == item.ID {
 		q = sq
 	} else if item.Kind == store.KindTrack && item.ParentID != "" {
 		if tracks, err := s.store.ItemsByParent(ctx, item.ParentID); err == nil {
-			q.ItemIDs = q.ItemIDs[:0]
+			q.Entries = q.Entries[:0]
 			for _, t := range tracks {
 				if t.Kind == store.KindTrack {
-					q.ItemIDs = append(q.ItemIDs, t.ID)
+					q.Entries = append(q.Entries, store.QueueEntry{ID: t.ID, Ord: len(q.Entries)})
 				}
 				if t.ID == item.ID {
-					q.Index = len(q.ItemIDs) - 1
+					q.Index = len(q.Entries) - 1
 				}
 			}
 		}
@@ -453,6 +486,9 @@ func (s *server) takeOverDevice(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	// The registry's position is the freshest: the pause just reported, or
+	// the last heartbeat, which also wrote the queue's own.
+	resolved.PositionSecs = float64(p.PositionSecs)
 	return c.JSON(http.StatusOK, takeover{handoffQueue: resolved, PositionSecs: p.PositionSecs, From: deviceLabel(source)})
 }
 
@@ -462,9 +498,10 @@ type handoff struct {
 	handoffQueue
 }
 
-// POST /auth/sessions/:id/play {itemIds, index} — send a queue to another
-// of the caller's devices, which starts playing it. Only an online device
-// can receive one; the sender stops its own playback once this succeeds.
+// POST /auth/sessions/:id/play — send a queue (whole, as saveDeviceQueue
+// takes it) to another of the caller's devices, which starts playing it.
+// Only an online device can receive one; the sender stops its own playback
+// once this succeeds.
 func (s *server) playOnDevice(c echo.Context) error {
 	ctx := c.Request().Context()
 	me := currentUser(c)
@@ -484,8 +521,9 @@ func (s *server) playOnDevice(c echo.Context) error {
 	if err := c.Bind(&q); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	if len(q.ItemIDs) == 0 || len(q.ItemIDs) > store.MaxQueueItems {
-		return echo.NewHTTPError(http.StatusBadRequest, "send between 1 and 500 items")
+	q.Normalise()
+	if len(q.Entries) == 0 || len(q.Entries) > store.MaxQueueItems {
+		return echo.NewHTTPError(http.StatusBadRequest, "send between 1 and 1000 items")
 	}
 	resolved, err := s.resolveQueue(c, q)
 	if err != nil {

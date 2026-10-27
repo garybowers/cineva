@@ -1,0 +1,55 @@
+# Cineva with Docker Compose. Copy to docker-compose.yml, set the media
+# paths and the render group, then `docker compose up -d`. Everything
+# here is the plain `docker run` from the README, spelt out; the server's
+# own settings are in cineva.example.yaml and can be given as CINEVA_*
+# environment variables below.
+services:
+  cineva:
+    image: garybowers/cineva:latest
+    container_name: cineva
+    restart: unless-stopped
+    ports:
+      - "4747:4747"
+    volumes:
+      # The database, the artwork cache, the audio transcode cache and an
+      # optional cineva.yaml. Keep it: it is the library's whole memory.
+      - cineva-data:/data
+      # Media, read-only; libraries point at the paths inside the container
+      # (/media/Movies, /media/TV, /media/Music).
+      - /path/to/movies:/media/Movies:ro
+      - /path/to/tv:/media/TV:ro
+      - /path/to/music:/media/Music:ro
+    # Video transcodes are short-lived HLS segments; RAM keeps them off the
+    # disk. 2 GiB is plenty for a few streams at once (transcode.max_bytes
+    # caps what is kept).
+    tmpfs:
+      - /tmp/cineva-transcode:size=2g
+    # Hardware transcoding on AMD or Intel (VA-API). Leave both out to
+    # transcode in software. The group is the host's render group:
+    #   stat -c %g /dev/dri/renderD128
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "989"
+    environment:
+      # Who the server runs as, so /data and the media are readable and
+      # /data writable; the ids of the user who owns the media on the host
+      # (id -u, id -g). /data is made theirs at every start.
+      - PUID=1000
+      - PGID=1000
+      # Optional. Any key in cineva.example.yaml, upper-cased with CINEVA_
+      # in front and dots as underscores.
+      # - CINEVA_METADATA_TMDB_API_KEY=your-tmdb-key
+      # - CINEVA_METADATA_LISTENBRAINZ_TOKEN=your-listenbrainz-token
+      # - CINEVA_LOG_LEVEL=info
+      # - CINEVA_LIBRARIES_SCAN_INTERVAL=15m
+      - TZ=Europe/London
+    healthcheck:
+      test: ["CMD", "cineva", "health", "--url", "http://localhost:4747"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  cineva-data:

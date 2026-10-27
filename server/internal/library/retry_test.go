@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,13 +14,29 @@ import (
 )
 
 // fakeVideo is a provider whose answers a test can change between scans,
-// counting what it was asked.
+// counting what it was asked. Safe to ask from several goroutines, as the
+// enrichment job's workers do.
 type fakeVideo struct {
 	movie   func(title string, year int) (metadata.VideoResult, error)
 	tv      func(title string, year int) (metadata.VideoResult, error)
 	season  func(tvID, season int) (metadata.SeasonResult, error)
+	mu      sync.Mutex
 	asked   map[string]int // "movie", "tv", "season" -> calls
 	seasons []int          // season numbers fetched, in order
+}
+
+func (f *fakeVideo) count(what string, season ...int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked[what]++
+	f.seasons = append(f.seasons, season...)
+}
+
+// calls is how many times the provider was asked about what.
+func (f *fakeVideo) calls(what string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.asked[what]
 }
 
 func newFakeVideo() *fakeVideo {
@@ -32,16 +49,15 @@ func newFakeVideo() *fakeVideo {
 }
 
 func (f *fakeVideo) SearchMovie(_ context.Context, title string, year int) (metadata.VideoResult, error) {
-	f.asked["movie"]++
+	f.count("movie")
 	return f.movie(title, year)
 }
 func (f *fakeVideo) SearchTV(_ context.Context, title string, year int) (metadata.VideoResult, error) {
-	f.asked["tv"]++
+	f.count("tv")
 	return f.tv(title, year)
 }
 func (f *fakeVideo) TVSeason(_ context.Context, tvID, season int) (metadata.SeasonResult, error) {
-	f.asked["season"]++
-	f.seasons = append(f.seasons, season)
+	f.count("season", season)
 	return f.season(tvID, season)
 }
 func (f *fakeVideo) SearchMovies(context.Context, string, int) ([]metadata.VideoResult, error) {

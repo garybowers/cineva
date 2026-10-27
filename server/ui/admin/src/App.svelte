@@ -1644,7 +1644,7 @@
     const i = scans.findIndex((x) => x.id === s.id)
     if (i >= 0) scans[i] = s
     else scans = [s, ...scans]
-    if (s.status !== 'running') {
+    if (s.status !== 'running' && s.phase !== 'enriching') {
       // Finished scans change item counts.
       listLibraries().then((l) => (libraries = l)).catch(() => {})
       cancelling = cancelling.filter((x) => x !== s.id)
@@ -1655,6 +1655,11 @@
     const total = scanTotals.get(s.id)
     return s.status === 'running' && total ? Math.min(100, Math.round((s.filesSeen / total) * 100)) : null
   }
+  // The details of a big scan, fetched alongside the files and after
+  // them: its own bar, under the files one, for as long as it runs.
+  const fetching = (s: Scan): boolean => !!s.toEnrich && s.phase !== 'done'
+  const enrichPct = (s: Scan): number | null =>
+    fetching(s) && s.toEnrich ? Math.min(100, Math.round(((s.enriched ?? 0) / s.toEnrich) * 100)) : null
 
   let booted = false
   let teardown: (() => void) | null = null
@@ -3158,15 +3163,22 @@
                          while and otherwise looks like a stalled "0 files". -->
                     {#if s.status === 'running' && !scanTotals.get(s.id)}<div class="muted small">Checking files…</div>{/if}
                     {#if pct(s) !== null}
+                      <div class="muted small">Scanning files</div>
                       <div class="scanbar"><div class="scanbar-fill" style="width: {pct(s)}%"></div></div>
+                    {/if}
+                    {#if fetching(s)}
+                      <div class="muted small">Fetching details · {s.enriched ?? 0} of {s.toEnrich ?? 0} titles</div>
+                      {#if enrichPct(s) !== null}
+                        <div class="scanbar"><div class="scanbar-fill" style="width: {enrichPct(s)}%"></div></div>
+                      {/if}
                     {/if}
                   </td>
                   <td>{s.filesSeen}{#if s.status === 'running' && scanTotals.get(s.id)}<span class="muted"> / {scanTotals.get(s.id)}</span>{/if}</td>
                   <td>{s.itemsCreated}</td>
                   <td class="muted">{s.startedAt}</td>
                   <td class="actions">
-                    {#if s.status === 'running'}
-                      <button class="danger" disabled={cancelling.includes(s.id)} onclick={() => requestCancel(s.id)}>{cancelling.includes(s.id) ? 'Cancelling…' : 'Cancel'}</button>
+                    {#if s.status === 'running' || s.phase === 'enriching'}
+                      <button class="danger" disabled={cancelling.includes(s.id)} onclick={() => requestCancel(s.id)}>{cancelling.includes(s.id) ? 'Cancelling…' : s.status === 'running' ? 'Cancel' : 'Stop fetching'}</button>
                     {/if}
                   </td>
                 </tr>

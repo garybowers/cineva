@@ -39,6 +39,15 @@ func (s *Store) ReplaceAudioTracks(ctx context.Context, itemID string, tracks []
 		return fmt.Errorf("replace audio tracks: %w", err)
 	}
 	defer tx.Rollback()
+	if err := replaceAudioTracks(ctx, tx, itemID, tracks); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replaceAudioTracks is ReplaceAudioTracks inside a transaction the
+// caller holds.
+func replaceAudioTracks(ctx context.Context, tx dbtx, itemID string, tracks []AudioTrack) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM audio_tracks WHERE item_id = ?`, itemID); err != nil {
 		return fmt.Errorf("clear audio tracks: %w", err)
 	}
@@ -54,7 +63,7 @@ func (s *Store) ReplaceAudioTracks(ctx context.Context, itemID string, tracks []
 			return fmt.Errorf("insert audio track: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 const audioTrackCols = `id, item_id, stream_index, codec, language, title, channels, bitrate, is_default`

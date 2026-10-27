@@ -13,10 +13,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
-	"github.com/garybowers/cineva/server/internal/metadata"
 	"github.com/garybowers/cineva/server/internal/store"
 )
 
@@ -30,20 +30,101 @@ var audioExts = map[string]bool{
 // "1995 - Album Name" directory pattern.
 var albumDirRe = regexp.MustCompile(`^(\d{4})\s*-\s*(.+)$`)
 
-// "CD1" / "Disc 2" / "disk3" subdirectory inside a multi-disc album.
-var discDirRe = regexp.MustCompile(`(?i)^(?:cd|disc|disk)\s*(\d{1,2})$`)
+// "CD1", "Disc 2", "disk3", "CD 1 - Live", "Disc One": a disc folder
+// inside a multi-disc album. The number may be followed by a title.
+var discDirRe = regexp.MustCompile(`(?i)^(?:cd|disc|disk)\s*(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)(?:\s*[-:–.]\s*.*|\s+.*)?$`)
 
 // "03 - Title.flac" filename pattern.
 var trackFileRe = regexp.MustCompile(`^(\d{1,3})\s*-\s*(.+)$`)
 
+// discWords are the spelled-out disc numbers a folder name may use.
+var discWords = map[string]int{
+	"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+	"six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+// discNumberOf is the disc number a folder name gives, or 0 when the folder
+// is not a disc folder: "CD1", "Disc 2", "disk3", "CD 1 - Live", "Disc One".
+func discNumberOf(name string) int {
+	md := discDirRe.FindStringSubmatch(name)
+	if md == nil {
+		return 0
+	}
+	if n, err := strconv.Atoi(md[1]); err == nil {
+		return n
+	}
+	return discWords[strings.ToLower(md[1])]
+}
+
+// audioFile is one changed file of an album, probed.
+type audioFile struct {
+	path string
+	info media.AudioInfo
+	// disc is the disc number the file's folder gives, 0 outside a disc
+	// folder.
+	disc int
+}
+
+// albumGroup is the changed files of one album folder, written together.
+type albumGroup struct {
+	dir   string
+	files []audioFile
+}
+
+// probedAudio is one file's probe result, in the batch's order.
+type probedAudio struct {
+	path string
+	info media.AudioInfo
+	err  error
+}
+
+// probeAudioBatch reads a batch of files' tags in parallel (see probeBatch,
+// which does the same for video), in the input's order.
+func (m *Manager) probeAudioBatch(ctx context.Context, probe func(string) (media.AudioInfo, error), paths []string) []probedAudio {
+	out := make([]probedAudio, len(paths))
+	sem := make(chan struct{}, probeWorkers())
+	var wg sync.WaitGroup
+	for i, p := range paths {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(i int, p string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				out[i] = probedAudio{path: p, err: ctx.Err()}
+				return
+			}
+			r := probedAudio{path: p}
+			r.info, r.err = probe(p)
+			out[i] = r
+		}(i, p)
+	}
+	wg.Wait()
+	return out
+}
+
 // scanMusic builds artist -> album -> track from tags first, directory
 // layout (Artist/Year - Album/NN - Title.ext) as fallback.
+//
+// Changed files are probed in parallel batches and written an album at a
+// time, each album in one transaction (store.SaveAlbum), with the
+// compilation decision made over the whole album rather than its first
+// track. Nothing here waits on MusicBrainz: albums missing a cover, a year
+// or an id are looked up afterwards in the background (enrichMusic), so a
+// first scan of a large untagged library finishes in minutes and fills in
+// over the following hours.
 func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPlan, report reportFunc) (int, int, error) {
 	var files []string
 	// The cover images the walk passes, by album folder (a disc folder's
 	// filed under its album): what albumArtwork reads, and what an album's
 	// sidecar fingerprint is taken over.
 	covers := map[string][]fs.DirEntry{}
+	// How many files each album folder holds, changed or not, so a partly
+	// rescanned album knows it is partly rescanned.
+	albumFiles := map[string]int{}
 	for _, root := range lib.Paths {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -54,6 +135,8 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 			}
 			if audioExts[strings.ToLower(filepath.Ext(path))] {
 				files = append(files, path)
+				dir, _ := albumDirOf(path)
+				albumFiles[dir]++
 			} else if coverRank(d.Name()) >= 0 {
 				// A cover in a disc folder belongs to the album above it.
 				dir := filepath.Dir(path)
@@ -78,63 +161,194 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 	m.rereadChangedCovers(ctx, files, todo, covers, plan, art)
 
 	created := 0
-	artistIDs := map[string]string{}              // artist name -> item id
-	albumIDs := map[string]string{}               // album dir -> item id
-	mbData := map[string]*metadata.MusicRelease{} // album dir -> MB release (nil = looked up, no match)
+	artistIDs := map[string]string{} // artist name -> item id
+	// untitled is, per saved album, the tracks whose files carry no title
+	// tag, by track id: the ones the MusicBrainz pass may name.
+	untitled := map[string]map[string]discPos{}
 	probe := m.ProbeAudio
 	if probe == nil {
 		probe = media.ProbeAudio
 	}
 
+	flush := func(g *albumGroup) error {
+		n, err := m.saveAlbumGroup(ctx, lib, plan, g, covers, art, artistIDs, albumFiles[g.dir], untitled)
+		created += n
+		return err
+	}
+
+	var batch []probedAudio
+	var group *albumGroup
 	for i, path := range todo {
 		if err := ctx.Err(); err != nil {
 			return len(files), created, err
 		}
+		if i%probeBatchSize == 0 {
+			batch = m.probeAudioBatch(ctx, probe, todo[i:min(i+probeBatchSize, len(todo))])
+		}
+		pr := batch[i%probeBatchSize]
 		report(skipped+i, created, len(files))
-		info, err := probe(path)
-		if err != nil {
-			musicLog.Warn("audio probe failed", "path", path, "err", err)
+		if pr.err != nil {
+			musicLog.Warn("audio probe failed", "path", path, "err", pr.err)
 			continue
 		}
-		albumDir, discFromDir := albumDirOf(path)
-		artistDir := filepath.Dir(albumDir)
+		albumDir, disc := albumDirOf(path)
+		if group != nil && group.dir != albumDir {
+			if err := flush(group); err != nil {
+				return len(files), created, err
+			}
+			group = nil
+		}
+		if group == nil {
+			group = &albumGroup{dir: albumDir}
+		}
+		group.files = append(group.files, audioFile{path: path, info: pr.info, disc: disc})
+	}
+	if group != nil {
+		if err := flush(group); err != nil {
+			return len(files), created, err
+		}
+	}
+	m.enrichMusic(lib, untitled)
+	return len(files), created, nil
+}
 
-		artistName := info.AlbumArtist
-		if artistName == "" {
-			artistName = info.Artist
+// primaryArtist is the first artist of a credit: "A feat. B", "A & B" and
+// "A, B" all credit A first, and one guest on one track does not make an
+// album a compilation.
+func primaryArtist(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, joiner := range []string{" feat", " ft.", " ft ", " & ", ", ", " / ", " x ", " with "} {
+		if i := strings.Index(n, joiner); i > 0 {
+			n = n[:i]
 		}
-		if artistName == "" {
-			artistName = filepath.Base(artistDir)
-			// Album folders directly under a library root have no artist
-			// folder — don't invent an artist named after the root dir.
-			for _, root := range lib.Paths {
-				if artistDir == filepath.Clean(root) {
-					artistName = "Unknown Artist"
-					break
-				}
-			}
-		}
-		if info.Compilation {
-			artistName = "Various Artists"
-		}
+	}
+	return strings.TrimSpace(n)
+}
 
-		albumName := info.Album
-		albumYear := info.Year
-		if md := albumDirRe.FindStringSubmatch(filepath.Base(albumDir)); md != nil {
-			if albumYear == 0 {
-				albumYear, _ = strconv.Atoi(md[1])
+// saveAlbumGroup works out an album's artist, title and year from its
+// changed files, writes the album and those tracks in one transaction and
+// returns how many items that made.
+func (m *Manager) saveAlbumGroup(ctx context.Context, lib store.Library, plan *scanPlan, g *albumGroup,
+	covers map[string][]fs.DirEntry, art map[string]string, artistIDs map[string]string,
+	filesInAlbum int, untitled map[string]map[string]discPos) (int, error) {
+	albumDir := g.dir
+	artistDir := filepath.Dir(albumDir)
+	first := g.files[0].info
+
+	// The album artist: the tag, else the one artist the tracks share,
+	// else "Various Artists", else the folder.
+	var albumArtistTag, mbArtist string
+	compilation := false
+	primaries := map[string]bool{}
+	var firstArtist string
+	for _, f := range g.files {
+		if albumArtistTag == "" && f.info.AlbumArtist != "" {
+			albumArtistTag = f.info.AlbumArtist
+		}
+		if mbArtist == "" {
+			mbArtist = f.info.MBArtistID
+		}
+		if f.info.Compilation {
+			compilation = true
+		}
+		if f.info.Artist != "" {
+			if firstArtist == "" {
+				firstArtist = f.info.Artist
 			}
-			if albumName == "" {
-				albumName = md[2]
+			primaries[primaryArtist(f.info.Artist)] = true
+		}
+	}
+	// A partly rescanned album: the unchanged tracks' artists count too,
+	// or an untagged compilation would move under whichever artist's
+	// track happened to change.
+	if st, ok := plan.stamps[albumDir]; ok && st.Kind == store.KindAlbum && len(g.files) < filesInAlbum {
+		if names, err := m.Store.TrackArtists(ctx, st.ID); err == nil {
+			for _, n := range names {
+				primaries[primaryArtist(n)] = true
 			}
+		}
+	}
+	artistName := albumArtistTag
+	if artistName == "" {
+		if len(primaries) > 1 {
+			compilation = true
+		} else {
+			artistName = firstArtist
+		}
+	}
+	if compilation && (artistName == "" || strings.HasPrefix(strings.ToLower(artistName), "various")) {
+		artistName = "Various Artists"
+	}
+	if strings.HasPrefix(strings.ToLower(artistName), "various") {
+		compilation = true
+	}
+	if artistName == "" {
+		artistName = filepath.Base(artistDir)
+		// Album folders directly under a library root have no artist
+		// folder — don't invent an artist named after the root dir.
+		for _, root := range lib.Paths {
+			if artistDir == filepath.Clean(root) {
+				artistName = "Unknown Artist"
+				break
+			}
+		}
+	}
+
+	albumName := first.Album
+	albumYear := first.Year
+	if md := albumDirRe.FindStringSubmatch(filepath.Base(albumDir)); md != nil {
+		if albumYear == 0 {
+			albumYear, _ = strconv.Atoi(md[1])
 		}
 		if albumName == "" {
-			albumName = filepath.Base(albumDir)
+			albumName = md[2]
 		}
+	}
+	if albumName == "" {
+		albumName = filepath.Base(albumDir)
+	}
 
+	// Artist: keyed by name; path is synthetic (an artist may span dirs).
+	created := 0
+	artistID, ok := artistIDs[artistName]
+	if !ok {
+		artist := store.Item{
+			LibraryID: lib.ID, Kind: store.KindArtist,
+			Title: artistName, Artist: artistName,
+			Path: "artist://" + strings.ToLower(artistName),
+		}
+		if !compilation {
+			artist.MBID = mbArtist
+		}
+		saved, err := m.Store.UpsertItem(ctx, artist)
+		if err != nil {
+			return 0, err
+		}
+		plan.keep[saved.ID] = true
+		artistID, artistIDs[artistName] = saved.ID, saved.ID
+		created++
+	}
+
+	album := store.Item{
+		LibraryID: lib.ID, Kind: store.KindAlbum, ParentID: artistID,
+		Title: albumName, Artist: artistName, Year: albumYear, Path: albumDir,
+		Compilation: compilation, SidecarStamp: fingerprint(covers[albumDir]),
+	}
+	for _, f := range g.files {
+		if f.info.MBReleaseID != "" {
+			album.MBID = f.info.MBReleaseID
+			break
+		}
+	}
+	album.Poster = m.albumArtwork(g.files[0].path, albumDir, covers[albumDir], art)
+
+	tracks := make([]store.TrackSave, 0, len(g.files))
+	var noTitle []int // indexes into tracks of files without a title tag
+	for _, f := range g.files {
+		info := f.info
 		title := info.Title
 		trackNum := info.TrackNum
-		base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		base := strings.TrimSuffix(filepath.Base(f.path), filepath.Ext(f.path))
 		if mt := trackFileRe.FindStringSubmatch(base); mt != nil {
 			if trackNum == 0 {
 				trackNum, _ = strconv.Atoi(mt[1])
@@ -148,107 +362,81 @@ func (m *Manager) scanMusic(ctx context.Context, lib store.Library, plan *scanPl
 		if title == "" {
 			title = base
 		}
-
-		// Artist: keyed by name; path is synthetic (an artist may span dirs).
-		artistID, ok := artistIDs[artistName]
-		if !ok {
-			saved, err := m.Store.UpsertItem(ctx, store.Item{
-				LibraryID: lib.ID, Kind: store.KindArtist,
-				Title: artistName, Artist: artistName,
-				Path: "artist://" + strings.ToLower(artistName),
-			})
-			if err != nil {
-				return len(files), created, err
-			}
-			plan.keep[saved.ID] = true
-			artistID, artistIDs[artistName] = saved.ID, saved.ID
-			created++
-		}
-
-		albumID, ok := albumIDs[albumDir]
-		if !ok {
-			album := store.Item{
-				LibraryID: lib.ID, Kind: store.KindAlbum, ParentID: artistID,
-				Title: albumName, Artist: artistName, Year: albumYear, Path: albumDir,
-				SidecarStamp: fingerprint(covers[albumDir]),
-			}
-			album.Poster = m.albumArtwork(path, albumDir, covers[albumDir], art)
-			// MusicBrainz fills what tags and local art couldn't: only
-			// queried when this album is actually missing something (the
-			// 1 req/s limit makes blanket lookups unaffordable).
-			if m.Music != nil && artistName != "Unknown Artist" &&
-				(album.Poster == "" || album.Year == 0 || info.Title == "") {
-				if rel, err := m.Music.SearchRelease(ctx, artistName, albumName); err == nil {
-					mbData[albumDir] = &rel
-					if album.Year == 0 {
-						album.Year = rel.Year
-					}
-					if album.Poster == "" {
-						if img, err := m.Music.FrontCover(ctx, rel.MBID); err == nil && img != nil {
-							album.Poster = m.cacheArtwork("mb", albumDir, img)
-						}
-					}
-					musicLog.Debug("musicbrainz match", "artist", artistName, "album", albumName, "mbid", rel.MBID)
-				} else {
-					mbData[albumDir] = nil
-				}
-			}
-			saved, err := m.Store.UpsertItem(ctx, album)
-			if err != nil {
-				return len(files), created, err
-			}
-			plan.keep[saved.ID] = true
-			plan.noteNew(albumDir, saved)
-			albumID, albumIDs[albumDir] = saved.ID, saved.ID
-			created++
-		}
-
 		displayArtist := info.Artist
 		if displayArtist == "" {
 			displayArtist = artistName
 		}
-		// Untagged files get canonical track titles from MusicBrainz.
-		if info.Title == "" && trackNum > 0 {
-			if rel := mbData[albumDir]; rel != nil {
-				for _, mt := range rel.Tracks {
-					if mt.Pos == trackNum && mt.Title != "" {
-						title = mt.Title
-						break
-					}
-				}
-			}
-		}
 		discNum := info.DiscNum
 		if discNum == 0 {
-			discNum = discFromDir
+			discNum = f.disc
 		}
 		track := store.Item{
-			LibraryID: lib.ID, Kind: store.KindTrack, ParentID: albumID,
+			LibraryID: lib.ID, Kind: store.KindTrack,
 			Title: title, Artist: displayArtist, Year: albumYear,
-			TrackNum: trackNum, DiscNum: discNum, Path: path,
+			TrackNum: trackNum, DiscNum: discNum, Path: f.path,
 			RuntimeSecs: info.RuntimeSecs, Container: info.Container,
-			AudioCodec: info.Codec,
+			AudioCodec: info.Codec, Bitrate: info.Bitrate, SampleRate: info.SampleRate,
+			BitDepth: info.BitDepth, Channels: info.Channels, MBID: info.MBRecordingID,
 		}
-		plan.stamp(&track, path)
-		saved, err := m.Store.UpsertItem(ctx, track)
-		if err != nil {
-			return len(files), created, err
+		plan.stamp(&track, f.path)
+		if info.Title == "" && trackNum > 0 {
+			noTitle = append(noTitle, len(tracks))
 		}
-		plan.keep[saved.ID] = true
-		// Written even when empty, so a genre removed from the tags goes.
-		if err := m.Store.ReplaceGenres(ctx, saved.ID, splitGenres(info.Genre)); err != nil {
-			musicLog.Error("saving track genres failed", "path", path, "err", err)
-		}
-		// Tracks inherit their album's cover for player/list display.
-		if album, err := m.Store.Item(ctx, albumID); err == nil && album.Poster != "" && saved.Poster != album.Poster {
-			saved.Poster = album.Poster
-			if _, err := m.Store.UpsertItem(ctx, saved); err != nil {
-				musicLog.Error("saving track poster failed", "path", path, "err", err)
-			}
-		}
+		tracks = append(tracks, store.TrackSave{
+			Item: track, Genres: splitGenres(info.Genre), Lyrics: readLyrics(f.path, info.Lyrics),
+		})
+	}
+
+	saved, savedTracks, err := m.Store.SaveAlbum(ctx, album, tracks)
+	if err != nil {
+		return created, err
+	}
+	plan.keep[saved.ID] = true
+	if _, existed := plan.stamps[albumDir]; !existed {
 		created++
 	}
-	return len(files), created, nil
+	plan.noteNew(albumDir, saved)
+	for _, t := range savedTracks {
+		plan.keep[t.ID] = true
+		if _, existed := plan.stamps[t.Path]; !existed {
+			created++
+		}
+	}
+	for _, i := range noTitle {
+		if i >= len(savedTracks) {
+			continue
+		}
+		t := savedTracks[i]
+		if untitled[saved.ID] == nil {
+			untitled[saved.ID] = map[string]discPos{}
+		}
+		untitled[saved.ID][t.ID] = discPos{disc: max(t.DiscNum, 1), pos: t.TrackNum}
+	}
+	return created, nil
+}
+
+// lrcTimed matches a timed lyrics line, "[01:23.45] words".
+var lrcTimed = regexp.MustCompile(`(?m)^\[\d{1,3}:\d{2}`)
+
+// lyricsMax is the most lyrics read from a file beside a track; a bigger
+// one is not lyrics.
+const lyricsMax = 256 << 10
+
+// readLyrics returns a track's lyrics: an .lrc file beside it first (the
+// timed form people add by hand), else the tag. Nil when it has none.
+func readLyrics(trackPath, tag string) *store.Lyrics {
+	text := tag
+	lrc := strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + ".lrc"
+	if fi, err := os.Stat(lrc); err == nil && fi.Size() > 0 && fi.Size() <= lyricsMax {
+		if data, err := os.ReadFile(lrc); err == nil {
+			text = string(data)
+		}
+	}
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if text == "" {
+		return nil
+	}
+	return &store.Lyrics{Synced: lrcTimed.MatchString(text), Text: text}
 }
 
 // cacheArtwork writes an image into the artwork cache under a stable name
@@ -279,8 +467,7 @@ func (m *Manager) cacheArtwork(prefix, key string, img []byte) string {
 // disc folder is part of the album, not an album itself.
 func albumDirOf(trackPath string) (string, int) {
 	dir := filepath.Dir(trackPath)
-	if md := discDirRe.FindStringSubmatch(filepath.Base(dir)); md != nil {
-		disc, _ := strconv.Atoi(md[1])
+	if disc := discNumberOf(filepath.Base(dir)); disc > 0 {
 		return filepath.Dir(dir), disc
 	}
 	return dir, 0

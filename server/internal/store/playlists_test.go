@@ -188,3 +188,72 @@ func TestSmartRulesInvalid(t *testing.T) {
 		t.Fatalf("limit = %d (%v), want capped at %d", r.Limit, err, SmartMaxLimit)
 	}
 }
+
+// The picker's listing: playlists added to most recently first, those
+// never added to by name after them, each saying whether it holds the
+// track; and the undo of an append takes the last entries off.
+func TestPlaylistsForAndUndo(t *testing.T) {
+	f := newMusicFixture(t)
+	ctx := context.Background()
+	mk := func(name string) Playlist {
+		t.Helper()
+		p, err := f.s.CreatePlaylist(ctx, f.user, name, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	zed, gym, apple := mk("Zed"), mk("Gym"), mk("Apple")
+	if err := f.s.AppendPlaylistTracks(ctx, f.user, zed.ID, []string{f.a1.ID}); err != nil {
+		t.Fatal(err)
+	}
+	// SQLite's datetime('now') has one-second resolution; make the order
+	// unambiguous rather than racing it.
+	if _, err := f.s.db.ExecContext(ctx, `UPDATE playlists SET last_added_at = '2026-01-01 10:00:00' WHERE id = ?`, zed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.AppendPlaylistTracks(ctx, f.user, gym.ID, []string{f.a1.ID, f.a2.ID}); err != nil {
+		t.Fatal(err)
+	}
+	lists, err := f.s.PlaylistsFor(ctx, f.user, nil, f.a2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(lists))
+	for i, p := range lists {
+		names[i] = p.Name
+	}
+	if len(lists) != 3 || names[0] != "Gym" || names[1] != "Zed" || names[2] != "Apple" {
+		t.Fatalf("order = %v, want [Gym Zed Apple]", names)
+	}
+	if !lists[0].Holds || lists[1].Holds || lists[2].Holds {
+		t.Fatalf("holds = %v %v %v, want only Gym to hold the track", lists[0].Holds, lists[1].Holds, lists[2].Holds)
+	}
+	if lists[0].LastAddedAt == "" || lists[2].LastAddedAt != "" {
+		t.Fatalf("lastAddedAt = %q, %q", lists[0].LastAddedAt, lists[2].LastAddedAt)
+	}
+	// By name without a track, as before.
+	plain, err := f.s.Playlists(ctx, f.user, nil)
+	if err != nil || plain[0].Name != "Apple" || plain[0].Holds {
+		t.Fatalf("plain listing: %v %+v", err, plain)
+	}
+	// Undo: the last two entries go, the first stays; a smart playlist refuses.
+	removed, err := f.s.RemoveLastPlaylistTracks(ctx, f.user, gym.ID, 2)
+	if err != nil || removed != 2 {
+		t.Fatalf("undo: %d %v", removed, err)
+	}
+	if _, list, _ := f.s.PlaylistWithTracks(ctx, f.user, gym.ID, nil); len(list) != 0 {
+		t.Fatalf("after undo: %v", titles(list))
+	}
+	if removed, err := f.s.RemoveLastPlaylistTracks(ctx, f.user, gym.ID, 1); err != nil || removed != 0 {
+		t.Fatalf("undo on empty: %d %v", removed, err)
+	}
+	smart, err := f.s.CreatePlaylist(ctx, f.user, "Smart", &SmartRules{Match: "all", Sort: "title", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.RemoveLastPlaylistTracks(ctx, f.user, smart.ID, 1); err == nil {
+		t.Fatal("undo on a smart playlist should refuse")
+	}
+	_ = apple
+}

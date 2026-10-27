@@ -41,6 +41,22 @@ func (s *server) authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx := c.Request().Context()
 		if key := bearerKey(c); key != "" {
+			// An API key, by its prefix; anything else is a session token
+			// a native app was handed at sign-in (docs/offline.md), looked
+			// up, touched and renewed as the cookie's is, without a cookie.
+			if !strings.HasPrefix(key, auth.APIKeyPrefix) {
+				hash := auth.HashToken(key)
+				sess, u, err := s.store.SessionByHash(ctx, hash)
+				if err != nil || u.Disabled {
+					return echo.NewHTTPError(http.StatusUnauthorized, "session expired")
+				}
+				_ = s.store.TouchSession(ctx, hash)
+				s.extendSession(c, hash, sess.ExpiresAt)
+				c.Set(ctxUser, u)
+				c.Set(ctxSession, hash)
+				c.Set(ctxSessionID, sess.ID)
+				return next(c)
+			}
 			_, u, err := s.store.APIKeyByHash(ctx, auth.HashToken(key))
 			if err != nil || u.Disabled {
 				return echo.NewHTTPError(http.StatusUnauthorized, "invalid API key")
@@ -159,16 +175,25 @@ const sessionTimeLayout = "2006-01-02 15:04:05"
 // does. Renewed at most once a day, so requests do not each rewrite the
 // row and the cookie. A failure costs only the renewal.
 func (s *server) renewSession(c echo.Context, hash, token, expiresAt string) {
+	if next, ok := s.extendSession(c, hash, expiresAt); ok {
+		s.setSessionCookie(c, token, next)
+	}
+}
+
+// extendSession slides a session's expiry once a day of its life has been
+// used, and reports the new expiry when it did; the cookie path hands that
+// on to the browser, a bearer session needs nothing more.
+func (s *server) extendSession(c echo.Context, hash, expiresAt string) (time.Time, bool) {
 	exp, err := time.Parse(sessionTimeLayout, expiresAt)
 	if err != nil || time.Until(exp) > s.sessionTTL-24*time.Hour {
-		return
+		return time.Time{}, false
 	}
 	next := time.Now().UTC().Add(s.sessionTTL)
 	if err := s.store.ExtendSession(c.Request().Context(), hash, next.Format(sessionTimeLayout)); err != nil {
 		authLog.Warn("renewing a session failed", "err", err)
-		return
+		return time.Time{}, false
 	}
-	s.setSessionCookie(c, token, next)
+	return next, true
 }
 
 // setDeviceCookie hands the browser its device's secret, or renews it.
@@ -372,6 +397,28 @@ type credentials struct {
 	Username    string `json:"username"`
 	Password    string `json:"password"`
 	DisplayName string `json:"displayName"`
+	// Bearer asks for the session token in the answer and no cookies: how
+	// a native app signs in (docs/offline.md). Device then names the app's
+	// own device, stable across sign-ins.
+	Bearer bool       `json:"bearer"`
+	Device *appDevice `json:"device"`
+}
+
+// appDevice is what a native app says about the device it runs on.
+type appDevice struct {
+	// ID is the app's own stable id for this install; the device's secret
+	// is derived from it (appDeviceSecret).
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Client string `json:"client"`
+}
+
+// bearerLogin is the answer to a bearer sign-in: the user and the token.
+type bearerLogin struct {
+	store.User
+	Token string `json:"token"`
+	// SessionID is the session's public id, which is the device's.
+	SessionID string `json:"sessionId"`
 }
 
 // POST /auth/setup — create the first admin. Refused once any user exists.
@@ -445,12 +492,68 @@ func (s *server) authLogin(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "incorrect username or password")
 	}
 	s.throttle.Reset(key)
+	if req.Bearer {
+		sess, token, err := s.startAppSession(c, u, req.Device)
+		if err != nil {
+			return err
+		}
+		c.Set(ctxUser, u)
+		s.audit(c, "login", "user", u.ID, u.Username, "app")
+		return c.JSON(http.StatusOK, bearerLogin{User: u, Token: token, SessionID: sess.ID})
+	}
 	if _, err := s.startSession(c, u); err != nil {
 		return err
 	}
 	c.Set(ctxUser, u)
 	s.audit(c, "login", "user", u.ID, u.Username, "")
 	return c.JSON(http.StatusOK, u)
+}
+
+// startAppSession signs a native app in: a session on the device its own
+// id names (made on first sight, named as the app says), with the token
+// returned rather than set as a cookie. An app that sends no device gets
+// one of its own, as a cookie-less browser would.
+func (s *server) startAppSession(c echo.Context, u store.User, dev *appDevice) (store.Session, string, error) {
+	ctx := c.Request().Context()
+	if dev == nil {
+		dev = &appDevice{}
+	}
+	label := strings.TrimSpace(dev.Client)
+	if label == "" {
+		label = clientLabel(c)
+	}
+	var d store.Device
+	if dev.ID != "" {
+		secret, err := s.appDeviceSecret(ctx, dev.ID)
+		if err != nil {
+			return store.Session{}, "", err
+		}
+		if d, err = s.store.DeviceBySecret(ctx, auth.HashToken(secret)); err != nil {
+			if d, err = s.store.CreateDevice(ctx, auth.HashToken(secret), label, c.RealIP()); err != nil {
+				return store.Session{}, "", err
+			}
+			if name := strings.TrimSpace(dev.Name); name != "" {
+				if err := s.store.SetDeviceName(ctx, d.ID, name); err != nil {
+					authLog.Warn("naming a device failed", "err", err)
+				}
+			}
+		}
+	} else {
+		var err error
+		if d, err = s.store.CreateDevice(ctx, "", label, c.RealIP()); err != nil {
+			return store.Session{}, "", err
+		}
+	}
+	token, hash, err := auth.NewToken()
+	if err != nil {
+		return store.Session{}, "", err
+	}
+	expires := time.Now().UTC().Add(s.sessionTTL)
+	sess, err := s.store.SignInOnDevice(ctx, d.ID, hash, u.ID, expires.Format(sessionTimeLayout), label, c.RealIP())
+	if err != nil {
+		return store.Session{}, "", err
+	}
+	return sess, token, nil
 }
 
 var dummyHash, _ = auth.HashPassword("cineva-dummy-timing-equaliser")
@@ -712,10 +815,13 @@ func (s *server) listAPIKeys(c echo.Context) error {
 	return c.JSON(http.StatusOK, keys)
 }
 
-// POST /auth/keys {name} — the key itself is returned exactly once.
+// POST /auth/keys {name, forApps} — the key itself is returned exactly
+// once. forApps keeps a sealed copy so the key can be typed into a music
+// app as the password, token sign-in included (docs/subsonic.md).
 func (s *server) createAPIKey(c echo.Context) error {
 	var req struct {
-		Name string `json:"name"`
+		Name    string `json:"name"`
+		ForApps bool   `json:"forApps"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -725,7 +831,17 @@ func (s *server) createAPIKey(c echo.Context) error {
 		return err
 	}
 	key := auth.APIKeyPrefix + token
-	k, err := s.store.CreateAPIKey(c.Request().Context(), userID(c), req.Name, auth.HashToken(key))
+	var sealed []byte
+	if req.ForApps {
+		sk, err := s.store.SecretsKey(c.Request().Context())
+		if err != nil {
+			return err
+		}
+		if sealed, err = auth.Seal(sk, key); err != nil {
+			return err
+		}
+	}
+	k, err := s.store.CreateAPIKey(c.Request().Context(), userID(c), req.Name, auth.HashToken(key), sealed)
 	if err != nil {
 		return err
 	}

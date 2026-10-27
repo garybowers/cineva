@@ -52,7 +52,7 @@ func TestUsersSessionsGrants(t *testing.T) {
 	}
 
 	// API keys.
-	k, err := s.CreateAPIKey(ctx, kid.ID, "phone", "kh1")
+	k, err := s.CreateAPIKey(ctx, kid.ID, "phone", "kh1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,11 +145,36 @@ func TestSessionDevices(t *testing.T) {
 		t.Fatal(err)
 	}
 	q, err := got.ParsedQueue()
-	if err != nil || got.Name != "Study laptop" || len(q.ItemIDs) != 3 || q.Index != 2 {
+	if err != nil || got.Name != "Study laptop" || len(q.Entries) != 3 || q.Index != 2 || q.Entries[2].Ord != 2 || q.Repeat != "off" {
 		t.Fatalf("session = %+v, queue %+v (%v): want the trimmed name and the index clamped to 2", got, q, err)
 	}
 	if err := s.SetSessionQueue(ctx, "laptop", SessionQueue{ItemIDs: make([]string, MaxQueueItems+1)}); err == nil {
 		t.Fatal("accepted an oversized queue")
+	}
+	// A heartbeat moves the position on, but only for the entry the queue
+	// is on; the whole record survives with it.
+	if err := s.SetSessionQueue(ctx, "laptop", SessionQueue{Entries: []QueueEntry{{ID: "a", Ord: 1}, {ID: "b", Ord: 0}}, Index: 1,
+		Shuffle: true, Repeat: "all", Source: &QueueSource{Kind: "album", ID: "al", Title: "AM"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSessionQueuePosition(ctx, "laptop", "a", 41.5); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSessionQueuePosition(ctx, "laptop", "b", 12); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.UserSession(ctx, gary.ID, laptop.ID)
+	q, err = got.ParsedQueue()
+	if err != nil || q.PositionSecs != 12 || !q.Shuffle || q.Repeat != "all" || q.Source == nil || q.Source.Title != "AM" || q.CurrentID() != "b" || q.UpdatedAt == "" {
+		t.Fatalf("queue after heartbeats = %+v (%v)", q, err)
+	}
+	// The shape before migration 0046 reads as entries in order.
+	if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET queue = '{"itemIds":["x","y"],"index":1}' WHERE token_hash = 'laptop'`); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.UserSession(ctx, gary.ID, laptop.ID)
+	if q, err := got.ParsedQueue(); err != nil || len(q.Entries) != 2 || q.Entries[1].ID != "y" || q.Entries[1].Ord != 1 || q.Index != 1 || q.ItemIDs != nil {
+		t.Fatalf("old shape = %+v (%v)", q, err)
 	}
 
 	if n, err := s.DeleteOtherSessions(ctx, gary.ID, "laptop"); err != nil || n != 2 {
@@ -185,5 +210,34 @@ func TestAvatarFields(t *testing.T) {
 	got, err := s.UserByID(ctx, u.ID)
 	if err != nil || got.Avatar != "/artwork/avatar-x.jpg" || got.AvatarColour != "chart-2" {
 		t.Fatalf("user = %+v (%v)", got, err)
+	}
+}
+
+// A queue that is, or ends in, a mix keeps that with it (server/docs/mix.md).
+func TestSessionQueueMix(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "mixer", "", "h", RoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSession(ctx, "mixhash", u.ID, "2099-01-01 00:00:00", "test", "::1", ""); err != nil {
+		t.Fatal(err)
+	}
+	q := SessionQueue{Entries: []QueueEntry{{ID: "a"}, {ID: "b"}}, Index: 1,
+		Mix: &QueueMix{SeedID: "seed", Kind: "track", Title: "Dancing Queen", After: "b", From: 1, Basis: []string{"genre"}}}
+	if err := s.SetSessionQueue(ctx, "mixhash", q); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.SessionByHash(ctx, "mixhash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := got.ParsedQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Mix == nil || back.Mix.SeedID != "seed" || back.Mix.Title != "Dancing Queen" || back.Mix.From != 1 || len(back.Mix.Basis) != 1 {
+		t.Fatalf("mix did not round-trip: %+v", back.Mix)
 	}
 }

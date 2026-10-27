@@ -5,30 +5,39 @@
     libraryCollections, collectionDetail, type CollectionInfo,
     libraryRecommended, libraryNewEpisodes, type RecRow, homeFeed, type HomeFeed,
     personDetail, type PersonProfile, type PersonCredit, type Person as PersonT, itemDetail, itemSubtitles, playItem, continueWatching, downloadURL, searchItems, subscribeEvents, setWatched,
+    itemTracks, librarySearch, myQueue, type QueueSource,
     seriesNextUp, type NextUpInfo,
     authStatus, login, setupAdmin, logout, UNAUTHORISED, authProfiles, pinLogin, type User as UserT, type Profile,
     uploadAvatar,
-    listDevices, saveDeviceQueue, deviceQueue, playOnDevice, takeOverDevice, TAKEN_OVER, type Device,
-    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack,
+    listDevices, deviceQueue, playOnDevice, takeOverDevice, TAKEN_OVER, type Device,
+    type Health, type Library, type Item, type ItemDetail, type PlayInfo, type ResumeItem, type PlayQuality, type SubtitleTrack, type HandoffQueue,
     requestStatus, discoverSearch, discoverTitle, listRequests, createRequest, withdrawRequest, itemMissing, searchMissing,
     type RequestStatus, type RequestState, type DiscoverResult, type DiscoverTitle, type MediaRequest, type MissingInfo,
+    itemMix,
   } from './lib/api'
   import { chooseTheme, holidayKey } from './lib/theme'
   import { activeTheme, installLooks, looks, paint, refreshLooks } from './lib/looks.svelte'
   import ThemeEffect from './ThemeEffect.svelte'
   import { tv } from './lib/tv.svelte'
-  import { pref, setPref, loadPrefs, clearPrefs } from './lib/prefs'
+  import { pref, setPref, loadPrefs, clearPrefs, onPrefs } from './lib/prefs'
   import { onDismiss } from './lib/dismiss'
-  import { loadQueue, saveQueue } from './lib/queue'
+  import { loadQueue, saveQueue, fromHandoff, recordOf, setQueueRemote, emptyQueue as blankQueue, type StoredQueue } from './lib/queue'
   import Player from './Player.svelte'
-  import MusicPlayer from './MusicPlayer.svelte'
+  import MusicPlayer from './music/player/MusicPlayer.svelte'
+  import MiniBar from './music/player/MiniBar.svelte'
+  import NowPlaying from './music/player/NowPlaying.svelte'
+  import {
+    mq, play as playMusic, playNext as playNextMusic, append as appendMusic, clear as clearMusic,
+    adopt as adoptMusicQueue, restore as restoreMusicQueue, snapshot as musicSnapshot, startMix,
+  } from './music/player/queue.svelte'
+  import MusicLibrary, { type MusicTab } from './music/library/MusicLibrary.svelte'
   import ArtistView from './music/ArtistView.svelte'
-  import ListeningRows from './music/ListeningRows.svelte'
+  import AlbumPage from './music/AlbumPage.svelte'
   import PlaylistsView from './music/PlaylistsView.svelte'
   import AddToPlaylist from './music/AddToPlaylist.svelte'
   import TrackMenu from './music/TrackMenu.svelte'
   import Stars from './music/Stars.svelte'
-  import { setMusicActions, addToPlaylist, plays as playsLabel, ratedElsewhere, type ItemRef } from './music/actions.svelte'
+  import { setMusicActions, addToPlaylist, plays as playsLabel, ratedElsewhere, trackTime, type ItemRef, type NoticeAction } from './music/actions.svelte'
   import AvatarCrop from './AvatarCrop.svelte'
   import SegmentEditor from './SegmentEditor.svelte'
   import DetectMenu from './DetectMenu.svelte'
@@ -253,7 +262,7 @@
     try { await logout() } catch { /* already gone */ }
     me = null
     playing = null
-    music = null
+    clearMusic()
     picked = null
     gate = 'login'
     loadProfiles()
@@ -318,6 +327,19 @@
   type ViewCrumb = { label: string; go: () => void }
   const viewCrumbs = $derived.by<ViewCrumb[]>(() => {
     const out: ViewCrumb[] = []
+    if (currentLib?.mediaType === 'music') {
+      if (detail) return out
+      if (musicGenre) {
+        out.push({ label: 'Genres', go: () => setMusicTab('genres') })
+        out.push({ label: musicGenre, go: () => setMusicTab('albums', { genre: musicGenre }) })
+      } else if (musicComp) {
+        out.push({ label: 'Compilations', go: () => setMusicTab('albums', { compilations: true }) })
+      } else if (musicTab !== 'listen') {
+        const label = musicTab[0].toUpperCase() + musicTab.slice(1)
+        out.push({ label, go: () => setMusicTab(musicTab) })
+      }
+      return out
+    }
     if (libTab === 'genres') {
       out.push({ label: 'Genres', go: () => { detail = null; trail = []; genre = null; syncURL() } })
       if (genre) out.push({ label: genre, go: () => { detail = null; trail = []; syncURL() } })
@@ -328,8 +350,15 @@
     return out
   })
 
+  // The music library's own views, as route segments (/libraries/Music/albums).
+  function musicViewPath(): string {
+    if (musicGenre) return '/genres/' + encodeURIComponent(musicGenre)
+    if (musicComp) return '/albums/compilations'
+    return musicTab === 'listen' ? '' : '/' + musicTab
+  }
+
   function buildPath(): string {
-    if (listening && music) return '/listening'
+    if (nowPlayingOpen && mq.active) return '/now-playing'
     if (tab === 'home') return '/'
     if (tab === 'queue') return '/queue'
     if (tab === 'settings') return '/settings' + (settingsSection ? '/' + settingsSection : '')
@@ -342,7 +371,7 @@
       p += '/' + encodeURIComponent(currentLib.name)
       // Kept on item URLs too, so opening a film from inside a collection
       // and reloading still shows where you came from.
-      p += viewPath()
+      p += currentLib.mediaType === 'music' ? (detail ? '' : musicViewPath()) : viewPath()
     }
     if (detail) {
       for (const a of trail) p += '/' + encodeURIComponent(a.title)
@@ -367,7 +396,7 @@
   function setTab(t: Tab) {
     tab = t
     if (t === 'settings') settingsSection = ''
-    listening = false
+    nowPlayingOpen = false
     syncURL()
   }
 
@@ -423,9 +452,9 @@
         await openDiscover(parts[1], Number(parts[2]))
         return
       }
-      if (parts[0] === 'listening') {
-        listening = !!music
-        if (!music) tab = 'home'
+      if (parts[0] === 'listening' || parts[0] === 'now-playing') {
+        nowPlayingOpen = mq.active
+        if (!mq.active) tab = 'home'
         return
       }
       if (parts[0] !== 'libraries') {
@@ -449,6 +478,10 @@
       }
       await openLibrary(lib)
       let segs = parts.slice(2)
+      if (lib.mediaType === 'music') {
+        await applyMusicRoute(lib, segs)
+        return
+      }
 
       // A reserved view segment, and then the genre or collection name —
       // which is unambiguous here because we are already inside that view.
@@ -513,6 +546,48 @@
     }
   }
 
+  // /libraries/<Music>[/artists|albums|songs|genres[/<Genre>]|albums/compilations]
+  // or /libraries/<Music>/<Artist>[/<Album>]: a tab, or a page found by
+  // title through the library's search (nothing fetches the library whole).
+  async function applyMusicRoute(lib: Library, segs: string[]) {
+    const tabs: MusicTab[] = ['artists', 'albums', 'songs', 'genres']
+    musicTab = 'listen'
+    musicGenre = ''
+    musicComp = false
+    if (segs.length === 0) return
+    if ((tabs as string[]).includes(segs[0])) {
+      musicTab = segs[0] as MusicTab
+      if (segs[0] === 'genres' && segs[1]) {
+        musicTab = 'albums'
+        musicGenre = segs[1]
+      } else if (segs[0] === 'albums' && segs[1] === 'compilations') {
+        musicComp = true
+      }
+      return
+    }
+    try {
+      const found = await librarySearch(lib.id, segs[0])
+      const artist = found.artists.find((a) => a.title === segs[0])
+      if (!artist) return
+      let target: Item = artist
+      let ancestors: Item[] = []
+      if (segs[1]) {
+        const more = await librarySearch(lib.id, segs[1])
+        const album = more.albums.find((a) => a.title === segs[1] && a.parentId === artist.id)
+        if (album) {
+          ancestors = [artist]
+          target = album
+        }
+      }
+      detail = await itemDetail(target.id)
+      trail = ancestors
+      selEpId = null
+      detailSubs = []
+    } catch {
+      /* not found: the library's own page shows */
+    }
+  }
+
   const typeLabels: Record<string, { label: string; icon: typeof House }> = {
     movies: { label: 'Movies', icon: Clapperboard },
     tv: { label: 'TV Shows', icon: Tv },
@@ -531,7 +606,7 @@
   // The effect (snow, leaves, blossom) waits while anything plays.
   const shownEffect = $derived.by(() => {
     const e = looks.list.find((t) => t.id === looks.painted)?.effect ?? ''
-    return looks.effects && !playing && !music ? e : ''
+    return looks.effects && !playing && !mq.active ? e : ''
   })
 
   // Libraries browse state: a simple drill-down stack.
@@ -543,9 +618,6 @@
   let trail: Item[] = $state([]) // breadcrumb ancestors of the current detail
   let resume: ResumeItem[] = $state([])
   let playing: { item: Item; info: PlayInfo; quality: PlayQuality; gen: number } | null = $state(null)
-  // offset: seconds into the first track, when continuing from another
-  // device.
-  let music: { queue: Item[]; startIndex: number; shuffle: boolean; offset?: number; gen: number } | null = $state(null)
   let playGen = 0 // bumps on quality change so the player remounts
   let playingPos = $state(0) // live playhead seconds, reported by the Player
 
@@ -647,55 +719,46 @@
     queueDownloads(await collectEpisodes(root))
   }
 
-  // Video and music playback are mutually exclusive.
-  function startMusic(tracks: Item[], startIndex: number, shuffleAll = false, offset = 0) {
+  // Video and music playback are mutually exclusive: the music queue
+  // (music/player/queue.svelte.ts) holds the music; starting a track stops
+  // the video player, and starting a video (startPlay) clears the music.
+  function startMusic(tracks: Item[], startIndex: number, shuffleAll = false, offset = 0, source: QueueSource | null = null) {
     playing = null
-    music = { queue: tracks, startIndex, shuffle: shuffleAll, offset, gen: ++playGen }
+    playMusic(tracks, startIndex, { shuffle: shuffleAll, offset, source, startHere: true })
   }
+  // The video player must stop when music starts, wherever it starts from.
+  $effect(() => {
+    void mq.gen
+    if (mq.active && mq.autoplay) untrack(() => { if (playing) closePlayer() })
+  })
 
-  // ---- Listening session: full-page album view over the playing queue ----
-  let listening = $state(false)
-  let musicNow: { track: Item; index: number } | null = $state(null)
-  let musicPos = $state(0)
-  let sessionAlbums: Map<string, Item> = $state(new Map())
-  let mpRef: { jumpTo: (i: number) => void } | undefined = $state()
-
-  function onTrackChange(track: Item, index: number) {
-    musicNow = { track, index }
-    musicPos = 0
-    const albumId = track.parentId
-    if (albumId && !sessionAlbums.has(albumId)) {
-      itemDetail(albumId)
-        .then((d) => (sessionAlbums = new Map(sessionAlbums).set(albumId, d.item)))
-        .catch(() => {})
-    }
-  }
-
-  function openListening() {
-    listening = true
+  // ---- Now playing: the screen over the queue ----
+  let nowPlayingOpen = $state(false)
+  function openNowPlaying() {
+    nowPlayingOpen = true
     syncURL()
   }
-
-  function closeListening() {
-    listening = false
-    syncURL()
+  function closeNowPlaying() {
+    nowPlayingOpen = false
+    if (location.pathname === '/now-playing') history.back()
+    else syncURL()
   }
-
-  // "Pop the CD in": start the queue and open the session view.
-  function startSession(tracks: Item[], startIndex = 0, shuffleAll = false) {
-    startMusic(tracks, startIndex, shuffleAll)
-    openListening()
-  }
-
-  async function leaveSessionToLibrary(lib: Library) {
-    listening = false
-    tab = 'libraries'
-    await openLibrary(lib)
-  }
-
-  async function leaveSessionToArtist(lib: Library, album: Item) {
-    listening = false
-    if (album.parentId) await openArtist({ id: album.parentId, libraryId: lib.id })
+  $effect(() => {
+    if (!mq.active && nowPlayingOpen) closeNowPlaying()
+  })
+  // The music-start preference: Play opens the screen, or just the bar.
+  let lastStartGen = 0
+  $effect(() => {
+    const g = mq.gen
+    if (g === lastStartGen || !mq.active || !mq.autoplay) return
+    lastStartGen = g
+    if (pref('music-start', 'bar') === 'now-playing') untrack(openNowPlaying)
+  })
+  // The engine stopped: an administrator ended playback, or another
+  // device carried the track on ("Continued on ..." is said by the event).
+  function onMusicStopped(why: 'admin' | 'takeover') {
+    if (why === 'takeover') clearMusic()
+    else notify('error', 'Playback was stopped by an administrator.')
   }
 
   // Open the album containing a track (from the music bar or search).
@@ -707,16 +770,11 @@
   async function openAlbumOf(track: Item) {
     const albumId = track.parentId
     if (!albumId) return
+    nowPlayingOpen = false
     tab = 'libraries'
-    const lib = libraries.find((l) => l.id === track.libraryId)
-    if (lib && lib.id !== currentLib?.id) {
-      currentLib = lib
-      libraryItems(lib.id).then((items) => {
-        gridItems = items.filter(gridFilter(lib))
-      })
-    }
+    switchLibraryTo(track.libraryId)
     const find = (i: Item) => i.id === albumId
-    const album = sessionAlbums.get(albumId) ?? albumById.get(albumId) ?? gridItems.find(find) ?? searchResults.find(find)
+    const album = gridItems.find(find) ?? searchResults.find(find)
     await openItem(albumId, false, album)
   }
 
@@ -737,41 +795,54 @@
   // An artist's page: the artist item's own detail route
   // (/libraries/<Music>/<Artist>), which renders as ArtistView.
   async function openArtist(a: Item | ItemRef) {
-    listening = false
+    nowPlayingOpen = false
     if ('kind' in a && a.title) return showItem(a)
     tab = 'libraries'
-    const lib = libraries.find((l) => l.id === a.libraryId)
-    if (lib && lib.id !== currentLib?.id) {
-      currentLib = lib
-      libraryItems(lib.id).then((items) => {
-        if (lib.mediaType === 'music') musicAll = items
-        else gridItems = items.filter(gridFilter(lib))
-      })
-    }
+    switchLibraryTo(a.libraryId)
     await openItem(a.id)
+  }
+
+  // Makes a library current on the way to one of its items, loading what
+  // its view needs: the shelves and rail of a music library, the grid of a
+  // video one. Already current, or already loaded, costs nothing.
+  function switchLibraryTo(libraryId: string) {
+    const lib = libraries.find((l) => l.id === libraryId)
+    if (!lib) return
+    if (lib.mediaType === 'music') {
+      // A music library's pages fetch what they show; nothing is loaded whole.
+      if (lib.id !== currentLib?.id) {
+        currentLib = lib
+        musicTab = 'listen'
+        musicGenre = ''
+        musicComp = false
+      }
+      return
+    }
+    if (lib.id === currentLib?.id && gridItems.length > 0) return
+    currentLib = lib
+    libraryItems(lib.id).then((items) => {
+      gridItems = items.filter(gridFilter(lib))
+    })
   }
 
   // ---- Playlists (their own route, /playlists[/<id>]) ----
   let playlistId: string | null = $state(null)
   function openPlaylist(id: string | null) {
-    listening = false
+    nowPlayingOpen = false
     tab = 'playlists'
     playlistId = id
     syncURL()
   }
 
-  // Add to the end of the music queue; start it when nothing is playing.
-  function queueMusic(tracks: Item[]) {
-    if (tracks.length === 0) return
-    if (music) music = { ...music, queue: [...music.queue, ...tracks] }
-    else startMusic(tracks, 0)
-  }
-
   setMusicActions({
-    play: (tracks, index = 0, shuffle = false) => startSession(tracks, index, shuffle),
-    queue: queueMusic,
+    play: (tracks, index = 0, shuffle = false, source = null) => {
+      playing = null
+      playMusic(tracks, index, { shuffle, source, startHere: index > 0 })
+    },
+    playNext: playNextMusic,
+    queue: appendMusic,
     openAlbum: (al) => {
-      listening = false
+      nowPlayingOpen = false
       if ('kind' in al && al.title) return void showItem(al)
       const lib = libraries.find((l) => l.id === al.libraryId)
       tab = 'libraries'
@@ -780,9 +851,26 @@
     },
     openArtist: (a) => void openArtist(a),
     openPlaylist: (id) => openPlaylist(id),
-    notify: (kind, text) => notify(kind, text),
+    mix: (seed) => void startMixFrom(seed),
+    notify: (kind, text, action) => notify(kind, text, undefined, action),
     download: (id, format) => dlNavigate(id, format),
   })
+
+  // A mix started on purpose (server/docs/mix.md): the first batch opens
+  // with the seed's best and replaces the queue.
+  async function startMixFrom(seed: Item) {
+    try {
+      const res = await itemMix(seed.id, { start: true, size: 20 })
+      if (res.tracks.length === 0) {
+        notify('info', `Nothing to mix from ${seed.title} yet.`)
+        return
+      }
+      playing = null
+      startMix(res, seed)
+    } catch (err) {
+      notify('error', errText(err))
+    }
+  }
 
   // A search hit on a song plays it in album context: queue the whole album
   // starting at that track.
@@ -791,7 +879,7 @@
     let start = 0
     if (t.parentId) {
       try {
-        const tracks = (await itemDetail(t.parentId)).children.filter((c) => c.kind === 'track')
+        const tracks = await itemTracks(t.parentId)
         if (tracks.length > 0) {
           queue = tracks
           start = Math.max(0, tracks.findIndex((c) => c.id === t.id))
@@ -800,7 +888,7 @@
         /* album gone — play the bare track */
       }
     }
-    startMusic(queue, start)
+    startMusic(queue, start, false, 0, t.album ? { kind: 'album', id: t.parentId, title: t.album } : null)
   }
 
   // "Go to song": the album page with the track picked out.
@@ -809,7 +897,7 @@
     hlTrackId = t.id
     await openAlbumOf(t)
     setTimeout(() => {
-      document.querySelector('.children li.hl')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      document.querySelector('.tl li.hl, .children li.hl')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     }, 50)
     setTimeout(() => (hlTrackId = null), 5000)
   }
@@ -1212,125 +1300,35 @@
   /** "S6 · E5", as an episode card or a series' newest arrival reads. */
   const epLabel = (season?: number, episode?: number) => `S${season ?? 0} · E${episode ?? 0}`
 
-  // ---- Music view: artist rail + album shelves ----
-  let musicAll: Item[] = $state([])
-  let selArtist = $state('ALL') // artist item id | 'ALL' | 'COMP'
-  let selAlbumId: string | null = $state(null) // expanded album panel
-
-  const mArtists = $derived(
-    musicAll.filter((i) => i.kind === 'artist').sort((a, b) => a.title.localeCompare(b.title)),
-  )
-  const mAlbums = $derived(musicAll.filter((i) => i.kind === 'album'))
-  const mTracks = $derived(musicAll.filter((i) => i.kind === 'track'))
-  const albumById = $derived(new Map(mAlbums.map((a) => [a.id, a])))
-  // Compilations: tagged Various Artists, or tracks by 2+ different artists.
-  const compAlbumIds = $derived.by(() => {
-    const artistsPer = new Map<string, Set<string>>()
-    for (const t of mTracks) {
-      if (!t.parentId) continue
-      const s = artistsPer.get(t.parentId) ?? new Set<string>()
-      s.add(t.artist ?? '')
-      artistsPer.set(t.parentId, s)
+  // ---- Music library: which tab, and what the rail highlights ----
+  let musicTab: MusicTab = $state('listen')
+  let musicGenre = $state('') // the Albums and Songs tabs narrowed to a genre
+  let musicComp = $state(false) // the Albums tab narrowed to compilations
+  function setMusicTab(t: MusicTab, opts: { genre?: string; compilations?: boolean } = {}) {
+    musicTab = t
+    musicGenre = opts.genre ?? ''
+    musicComp = opts.compilations ?? false
+    if (detail) {
+      detail = null
+      trail = []
     }
-    const ids = new Set<string>()
-    for (const a of mAlbums) {
-      if ((a.artist ?? '').toLowerCase().startsWith('various') || (artistsPer.get(a.id)?.size ?? 0) > 1) {
-        ids.add(a.id)
-      }
-    }
-    return ids
-  })
-  const byYear = (a: Item, b: Item) => (a.year ?? 0) - (b.year ?? 0) || a.title.localeCompare(b.title)
-
-  // Shelf groups: one per artist for "All", a single group otherwise.
-  const shelfGroups = $derived.by(() => {
-    if (selArtist === 'COMP') {
-      return [{ id: 'COMP', title: 'Compilations', albums: mAlbums.filter((a) => compAlbumIds.has(a.id)).sort(byYear) }]
-    }
-    if (selArtist !== 'ALL') {
-      const a = mArtists.find((x) => x.id === selArtist)
-      return [{ id: selArtist, title: a?.title ?? '', albums: mAlbums.filter((al) => al.parentId === selArtist).sort(byYear) }]
-    }
-    return mArtists
-      .map((a) => ({ id: a.id, title: a.title, albums: mAlbums.filter((al) => al.parentId === a.id).sort(byYear) }))
-      .filter((g) => g.albums.length > 0)
-  })
-  const shelfAlbumCount = $derived(shelfGroups.reduce((n, g) => n + g.albums.length, 0))
-
-  // Tracks grouped by album, computed once per library load — the filter
-  // and shelf code call this per album, so it must be O(1), not a scan.
-  const tracksByAlbum = $derived.by(() => {
-    const m = new Map<string, Item[]>()
-    for (const t of mTracks) {
-      if (!t.parentId) continue
-      const arr = m.get(t.parentId)
-      if (arr) arr.push(t)
-      else m.set(t.parentId, [t])
-    }
-    for (const arr of m.values()) {
-      arr.sort((x, y) => (x.discNum ?? 0) - (y.discNum ?? 0) || (x.trackNum ?? 0) - (y.trackNum ?? 0))
-    }
-    return m
-  })
-  const tracksOf = (albumId: string) => tracksByAlbum.get(albumId) ?? []
-
-  const shelfQueue = () => shelfGroups.flatMap((g) => g.albums.flatMap((a) => tracksOf(a.id)))
-
-  function selectArtist(id: string) {
-    selArtist = id
-    selAlbumId = null
-    musicFilter = ''
+    syncURL()
   }
 
-  // Artist rail filter (name narrowing for very large libraries).
-  let railFilter = $state('')
-  const railArtists = $derived.by(() => {
-    const q = railFilter.trim().toLowerCase()
-    return q ? mArtists.filter((a) => a.title.toLowerCase().includes(q)) : mArtists
+  // An artist's or album's page from the current music library, shown
+  // with the rail beside it.
+  const musicDetail = $derived.by(() => {
+    const d = detail
+    return !!d && !!currentLib && d.item.libraryId === currentLib.id &&
+      (d.item.kind === 'artist' || d.item.kind === 'album' || d.item.kind === 'track')
   })
-
-  // Filter within the current artist/album scope: albums by title or by
-  // containing a matching song; matching songs listed for direct play.
-  let musicFilter = $state('')
-  let mfTimer: ReturnType<typeof setTimeout> | undefined
-  function onMusicFilterInput(e: Event) {
-    const v = (e.target as HTMLInputElement).value
-    clearTimeout(mfTimer)
-    mfTimer = setTimeout(() => (musicFilter = v), 200)
-  }
-  const filterQ = $derived(musicFilter.trim().toLowerCase())
-  const filteredShelfGroups = $derived.by(() => {
-    if (!filterQ) return shelfGroups
-    return shelfGroups
-      .map((g) => ({
-        ...g,
-        albums: g.albums.filter(
-          (a) =>
-            a.title.toLowerCase().includes(filterQ) ||
-            tracksOf(a.id).some((t) => t.title.toLowerCase().includes(filterQ)),
-        ),
-      }))
-      .filter((g) => g.albums.length > 0)
+  // What the rail highlights: the open artist (an album's is its parent),
+  // else the chosen listing.
+  const railCurrent = $derived.by(() => {
+    const d = detail
+    if (!d || !musicDetail) return musicComp ? 'COMP' : 'ALL'
+    return d.item.kind === 'artist' ? d.item.id : (d.item.parentId ?? '')
   })
-  const matchedSongs = $derived.by(() => {
-    if (!filterQ) return []
-    const out: { t: Item; album: Item; idx: number; tracks: Item[] }[] = []
-    outer: for (const g of shelfGroups) {
-      for (const a of g.albums) {
-        const ts = tracksOf(a.id)
-        for (let i = 0; i < ts.length; i++) {
-          if (ts[i].title.toLowerCase().includes(filterQ)) {
-            out.push({ t: ts[i], album: a, idx: i, tracks: ts })
-            if (out.length >= 60) break outer
-          }
-        }
-      }
-    }
-    return out
-  })
-
-  const trackTime = (secs?: number) =>
-    secs ? `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}` : ''
 
   // Search
   let searchQ = $state('')
@@ -1420,7 +1418,7 @@
   let requestMsg = $state('')
   async function openDiscover(type: 'movie' | 'tv', id: number) {
     tab = 'discover'
-    listening = false
+    nowPlayingOpen = false
     discoverKey = { type, id }
     discover = null
     discoverErr = ''
@@ -1592,13 +1590,7 @@
   async function showItem(target: Item) {
     if (target.kind === 'track') return openAlbumOf(target)
     tab = 'libraries'
-    const lib = libraries.find((l) => l.id === target.libraryId)
-    if (lib && lib.id !== currentLib?.id) {
-      currentLib = lib
-      libraryItems(lib.id).then((items) => {
-        gridItems = items.filter(gridFilter(lib))
-      })
-    }
+    switchLibraryTo(target.libraryId)
     await openItem(target.id, false, target)
   }
 
@@ -1646,28 +1638,30 @@
   // and the player rolls through it.
   // Restored synchronously so a reload shows the queue at first paint
   // rather than blanking it and filling it in a moment later.
+  // One record holds whichever queue this device has, films or tracks
+  // (lib/queue.ts): the mirror says which kind it was; the music one is
+  // restored by the queue store once signed in.
   const restoredQueue = loadQueue()
-  let queue: Item[] = $state(restoredQueue.items)
-  let queueIndex = $state(restoredQueue.index)
+  const restoredVideo = restoredQueue.kind === 'video' ? restoredQueue : blankQueue()
+  let queue: Item[] = $state(restoredVideo.items)
+  let queueIndex = $state(restoredVideo.index)
   const upNext = $derived(queue.slice(queueIndex + 1))
 
-  // Kept across reloads. Reading both values here is what subscribes this
-  // effect to them.
+  // Kept across reloads and told to the server, so another device can take
+  // it over. Reading both values here is what subscribes this effect to
+  // them; an empty queue that was empty already is not a change, so a
+  // music queue in the record is left alone.
+  let lastVideoLen = restoredVideo.items.length
   $effect(() => {
-    saveQueue(queue, queueIndex)
-  })
-
-  // ---- Handing the queue between devices ----
-  // This device keeps the server told what its queue is, so another device
-  // can take it over; and it can send its queue to another, which plays it.
-  // Positions travel by themselves: resume points are per user and item.
-  let queueSync: ReturnType<typeof setTimeout> | undefined
-  $effect(() => {
-    const ids = queue.map((q) => q.id)
+    const n = queue.length
     const at = queueIndex
-    if (!me) return
-    clearTimeout(queueSync)
-    queueSync = setTimeout(() => saveDeviceQueue(ids, at).catch(() => {}), 1000)
+    if (n === 0 && lastVideoLen === 0) return
+    lastVideoLen = n
+    saveQueue({ ...blankQueue('video'), items: queue, ords: queue.map((_, i) => i), index: at })
+  })
+  // Saves reach the server once signed in.
+  $effect(() => {
+    setQueueRemote(!!me)
   })
   let devMenu = $state<'send' | 'take' | null>(null)
   $effect(() => {
@@ -1693,20 +1687,23 @@
   // playing is not the queue's current entry — the next episode rolled on
   // by itself, or a title played on its own — it is that title and what is
   // queued after it.
-  function handoffList(): { ids: string[]; index: number } {
+  function handoffList(): StoredQueue {
+    if (mq.active) return musicSnapshot()
     const now = playing?.item
-    if (!now || queue[queueIndex]?.id === now.id) return { ids: queue.map((q) => q.id), index: queueIndex }
-    return { ids: [now.id, ...upNext.map((q) => q.id)], index: 0 }
+    const items = !now || queue[queueIndex]?.id === now.id ? queue : [now, ...upNext]
+    const index = !now || queue[queueIndex]?.id === now.id ? queueIndex : 0
+    return { ...blankQueue('video'), items, ords: items.map((_, i) => i), index }
   }
   async function sendTo(d: Device) {
-    const { ids, index } = handoffList()
+    const rec = recordOf(handoffList())
     try {
-      await playOnDevice(d.id, ids, index)
+      await playOnDevice(d.id, rec)
     } catch (err) {
       notify('error', errText(err))
       throw err
     }
     if (playing) closePlayer()
+    if (mq.active) clearMusic()
     notify('info', `Playing on ${deviceTitle(d)}.`)
   }
   async function takeQueueFrom(d: Device) {
@@ -1718,7 +1715,10 @@
         notify('info', `Nothing on ${deviceTitle(d)}'s queue can be played here.`)
         return
       }
-      playList(q.items, q.index)
+      if (q.items[q.index]?.kind === 'track') {
+        playing = null
+        adoptMusicQueue(fromHandoff(q), { autoplay: true })
+      } else playList(q.items, q.index)
     } catch (err) {
       notify('error', errText(err))
     }
@@ -1760,8 +1760,10 @@
         notify('info', `Nothing ${deviceTitle(d)} is playing can be played here.`)
         return
       }
-      if (cur.kind === 'track') startMusic(t.items, t.index, false, t.positionSecs)
-      else playList(t.items, t.index)
+      if (cur.kind === 'track') {
+        playing = null
+        adoptMusicQueue(fromHandoff(t), { autoplay: true })
+      } else playList(t.items, t.index)
     } catch (err) {
       notify('error', errText(err))
     } finally {
@@ -1772,10 +1774,13 @@
 
   // Another device sent its queue here.
   function receiveHandoff(data: unknown) {
-    const h = data as { from?: string; items?: Item[]; index?: number } | null
+    const h = data as ({ from?: string } & HandoffQueue) | null
     if (!h?.items?.length) return
     notify('info', `Playing from ${h.from ?? 'another device'}.`)
-    playList(h.items, h.index ?? 0)
+    if (h.items[h.index ?? 0]?.kind === 'track') {
+      playing = null
+      adoptMusicQueue(fromHandoff(h), { autoplay: true })
+    } else playList(h.items, h.index ?? 0)
   }
 
   /** Queue a collection (or any list) and start at the given position. */
@@ -1878,12 +1883,12 @@
   // One line at the bottom of the screen for what the viewer asked for and
   // did not get — a title that would not start, and why. Errors stay until
   // dismissed or replaced; anything else fades on its own.
-  let notice = $state<{ kind: 'info' | 'error'; text: string } | null>(null)
+  let notice = $state<{ kind: 'info' | 'error'; text: string; action?: NoticeAction } | null>(null)
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
-  function notify(kind: 'info' | 'error', text: string, ms = kind === 'error' ? 15000 : 4000) {
+  function notify(kind: 'info' | 'error', text: string, ms?: number, action?: NoticeAction) {
     clearTimeout(noticeTimer)
-    notice = { kind, text }
-    noticeTimer = setTimeout(() => (notice = null), ms)
+    notice = { kind, text, action }
+    noticeTimer = setTimeout(() => (notice = null), ms ?? (kind === 'error' ? 15000 : 4000))
   }
 
   // The item being started, if any. Starting can take a few seconds (a
@@ -1893,6 +1898,7 @@
   let starting = $state<string | null>(null)
 
   async function startPlay(item: Item, quality: PlayQuality = readQuality(), fromStart = false, audioTrack?: number, keepQueue = false) {
+    if (mq.active) clearMusic()
     if (starting === item.id) return
     // Anything the viewer starts directly is a fresh queue of one; only the
     // queue itself plays on without resetting it.
@@ -1912,7 +1918,6 @@
       }
       clearTimeout(slow)
       if (notice?.kind === 'info') notice = null
-      music = null // video and music are mutually exclusive
       playingPos = info.positionSecs || 0
       playing = { item, info, quality, gen: ++playGen }
       const inContext = detail && (detail.item.id === item.id || detail.item.id === item.parentId)
@@ -1962,25 +1967,25 @@
     detail = null
     trail = []
     gridItems = [] // never show the previous library's tiles under the new name
-    musicAll = []
     libTab = 'recommended'
     gridQuery = ''
     activeLetter = ''
     genre = null
     genreItems = []
     itemsMark = ''
+    if (lib.mediaType === 'music') {
+      // Its tabs fetch a page at a time; nothing is loaded whole.
+      musicTab = 'listen'
+      musicGenre = ''
+      musicComp = false
+      syncURL()
+      return
+    }
     loadGenres(lib)
     loadCollections(lib)
     loadRecommended(lib)
     const items = await libraryItems(lib.id)
-    if (lib.mediaType === 'music') {
-      musicAll = items
-      selArtist = 'ALL'
-      selAlbumId = null
-      gridItems = []
-    } else {
-      gridItems = items.filter(gridFilter(lib))
-    }
+    gridItems = items.filter(gridFilter(lib))
     syncURL()
   }
 
@@ -2164,6 +2169,9 @@
     libTab = 'recommended'
     genre = null
     collection = null
+    // Reached from Home, search or the music bar, the library's own list
+    // may never have been fetched; the crumb would then land on "no items".
+    if (currentLib) switchLibraryTo(currentLib.id)
     syncURL()
   }
 
@@ -2299,9 +2307,12 @@
   // "items" event, which carries the same one bit for every user.
   let scanningNow = $state(false)
   const libraryScanning = $derived(scanningNow || (currentLib?.scanning ?? false))
+  // The details pass after a big scan: titles are on screen, their posters
+  // and synopses still arriving. Counts only, from the items event.
+  let enriching = $state<{ done: number; total: number } | null>(null)
 
   async function refreshLibraryItems(full = false) {
-    if (!currentLib) return
+    if (!currentLib || currentLib.mediaType === 'music') return
     if (refreshing) {
       refreshPending = true
       return
@@ -2324,9 +2335,8 @@
       // A delta is merged into what is on screen; a full fetch replaces it,
       // which is also how rows that were pruned or folded into a version
       // finally disappear.
-      const next = full || !itemsMark ? items : merge(lib.mediaType === 'music' ? musicAll : gridItems, items)
-      if (lib.mediaType === 'music') musicAll = next
-      else gridItems = next.filter(gridFilter(lib))
+      const next = full || !itemsMark ? items : merge(gridItems, items)
+      gridItems = next.filter(gridFilter(lib))
     } finally {
       refreshing = false
       if (refreshPending) {
@@ -2356,6 +2366,13 @@
       paint()
     }).catch(() => {})
     adoptPrefs()
+    // The music queue as it was: the mirror first, else the server's copy
+    // (storage cleared, or another browser profile), paused where it was.
+    if (!restoreMusicQueue()) {
+      myQueue().then((q) => {
+        if (q.items.length > 0 && q.items[q.index]?.kind === 'track' && !mq.active) adoptMusicQueue(fromHandoff(q), { autoplay: false })
+      }).catch(() => {})
+    }
     poll()
     loadRequestStatus()
     applyRoute(location.pathname)
@@ -2427,9 +2444,10 @@
         settings: loadRequestStatus,
         // Fired throughout a scan as items land, so the grid fills in live.
         items: (data) => {
-          const e = data as { libraryId?: string; scanning?: boolean } | null
+          const e = data as { libraryId?: string; scanning?: boolean; enriched?: number; toEnrich?: number } | null
           if (e?.libraryId && currentLib?.id === e.libraryId) {
             scanningNow = e.scanning ?? false
+            enriching = e.toEnrich ? { done: e.enriched ?? 0, total: e.toEnrich } : null
             refreshLibraryItems().catch(() => {})
           }
         },
@@ -2445,6 +2463,31 @@
       window.removeEventListener('popstate', onPop)
     }
   }
+
+  // Where the music bar sits: the music-bar preference, read at first
+  // paint from the local mirror and followed as the server's answer and
+  // Settings change it.
+  let musicBarAt = $state<'top' | 'bottom'>(pref('music-bar', 'top') === 'bottom' ? 'bottom' : 'top')
+  $effect(() => onPrefs((s) => (musicBarAt = s.prefs['music-bar']?.value === 'bottom' ? 'bottom' : 'top')))
+
+  // How big the sidebar is: the sidebar-size preference (a device's, like
+  // the interface). "compact" is the size the sidebar had before the
+  // preference existed; "regular" is about 15 percent larger; "large" is
+  // for a desktop looked at from a distance. The scale drives the rail's
+  // widths, type and spacing through --side-scale on .body; the icons take
+  // their size as a number.
+  type SidebarSize = 'compact' | 'regular' | 'large'
+  const sidebarSizes: Record<SidebarSize, { scale: number; icon: number; small: number }> = {
+    compact: { scale: 1, icon: 16, small: 14 },
+    regular: { scale: 1.15, icon: 19, small: 16 },
+    large: { scale: 1.35, icon: 22, small: 18 },
+  }
+  const asSidebarSize = (v: string): SidebarSize => (v === 'compact' || v === 'large' ? v : 'regular')
+  let sidebarSize = $state<SidebarSize>(asSidebarSize(pref('sidebar-size', 'regular')))
+  $effect(() => onPrefs((s) => (sidebarSize = asSidebarSize(s.prefs['sidebar-size']?.value ?? 'regular'))))
+  const sideScale = $derived(sidebarSizes[sidebarSize].scale)
+  const sideIcon = $derived(sidebarSizes[sidebarSize].icon)
+  const sideIconSmall = $derived(sidebarSizes[sidebarSize].small)
 
   onMount(() => {
     installLooks()
@@ -2585,6 +2628,9 @@
       <TriangleAlert size={16} />
       <span>This library's storage isn't reachable ({st.path}: {st.error}), so its titles can't be played until it's back. Check that the share is connected.</span>
     </div>
+  {/if}
+  {#if enriching && currentLib?.id === libraryId}
+    <p class="enrich-note muted" role="status">Details are still arriving: {enriching.done} of {enriching.total} titles have their artwork and synopsis.</p>
   {/if}
 {/snippet}
 
@@ -2899,14 +2945,14 @@
     </div>
   </div>
 
-  <div class="body" class:sidepinned={sidePinned}>
+  <div class="body" class:sidepinned={sidePinned} style:--music-bar={mq.active && musicBarAt === 'top' ? 'var(--music-bar-h)' : '0rem'} style:--side-scale={sideScale}>
   <aside
     data-nav-group
     class="side"
     class:pinned={sidePinned}
     class:open={sideOpen}
     class:expanded={sideExpanded}
-    class:raised={(playing && playerCompact) || !!music}
+    class:raised={(playing && playerCompact) || (mq.active && musicBarAt === 'bottom')}
     aria-label="Navigation"
     onpointerenter={(e) => sideHoverTo(true, e)}
     onpointerleave={(e) => sideHoverTo(false, e)}
@@ -2915,7 +2961,7 @@
   >
     <div class="side-head">
       {#if !sidePinned}
-        <button class="side-btn side-toggle" title="Open the sidebar" aria-label="Open the sidebar" aria-expanded={sideOpen} onclick={() => (sideOpen = !sideOpen)}><PanelLeftOpen size={16} /></button>
+        <button class="side-btn side-toggle" title="Open the sidebar" aria-label="Open the sidebar" aria-expanded={sideOpen} onclick={() => (sideOpen = !sideOpen)}><PanelLeftOpen size={sideIcon} /></button>
       {/if}
       <button
         class="side-btn side-pin"
@@ -2923,23 +2969,23 @@
         aria-label={sidePinned ? 'Unpin the sidebar' : 'Pin the sidebar open'}
         aria-pressed={sidePinned}
         onclick={() => setSidePinned(!sidePinned)}
-      >{#if sidePinned}<PinOff size={15} />{:else}<Pin size={15} />{/if}</button>
+      >{#if sidePinned}<PinOff size={sideIconSmall} />{:else}<Pin size={sideIconSmall} />{/if}</button>
     </div>
-    <button class="side-item" class:active={tab === 'home'} title="Home" onclick={() => setTab('home')}><House size={16} /> <span class="side-label">Home</span></button>
+    <button class="side-item" class:active={tab === 'home'} title="Home" onclick={() => setTab('home')}><House size={sideIcon} /> <span class="side-label">Home</span></button>
     <button class="side-item" class:active={tab === 'queue'} title="Queue" onclick={() => setTab('queue')}>
-      <ListVideo size={16} /> <span class="side-label">Queue</span>
+      <ListVideo size={sideIcon} /> <span class="side-label">Queue</span>
       <!-- The count is the feedback for "Add all to queue": without it the
            button appeared to do nothing at all. -->
       {#if queue.length > 0}<span class="side-count">{queue.length}</span>{/if}
     </button>
     {#if reqStatus && reqStatus.level !== 'none'}
       <button class="side-item" class:active={tab === 'requests'} title="Requests" onclick={() => { setTab('requests'); loadMyRequests() }}>
-        <Inbox size={16} /> <span class="side-label">Requests</span>
+        <Inbox size={sideIcon} /> <span class="side-label">Requests</span>
       </button>
     {/if}
     {#if haVisible()}
       <button class="side-item" class:active={tab === 'rooms'} title="Rooms" onclick={() => setTab('rooms')}>
-        <Lamp size={16} /> <span class="side-label">Rooms</span>
+        <Lamp size={sideIcon} /> <span class="side-label">Rooms</span>
       </button>
     {/if}
     <div class="tree">
@@ -2954,11 +3000,11 @@
             class:active={tab === 'libraries' && currentLib?.id === lib.id}
             title={lib.name}
             onclick={() => { tab = 'libraries'; openLibrary(lib) }}
-          ><TypeIcon size={16} /> <span class="side-label">{lib.name}</span>{#if lib.storage && !lib.storage.available}<span class="side-warn" title="Storage not reachable: {lib.storage.path}: {lib.storage.error}"><TriangleAlert size={14} /></span>{/if}</button>
+          ><TypeIcon size={sideIcon} /> <span class="side-label">{lib.name}</span>{#if lib.storage && !lib.storage.available}<span class="side-warn" title="Storage not reachable: {lib.storage.path}: {lib.storage.error}"><TriangleAlert size={sideIconSmall} /></span>{/if}</button>
         {/each}
         {#if group.type === 'music'}
           <button class="side-item" class:active={tab === 'playlists'} title="Playlists" onclick={() => openPlaylist(null)}>
-            <ListMusic size={16} /> <span class="side-label">Playlists</span>
+            <ListMusic size={sideIcon} /> <span class="side-label">Playlists</span>
           </button>
         {/if}
       {/each}
@@ -2982,11 +3028,15 @@
     <div class="notice" class:error={notice.kind === 'error'} role={notice.kind === 'error' ? 'alert' : 'status'}>
       {#if notice.kind === 'error'}<TriangleAlert size={16} />{/if}
       <span>{notice.text}</span>
+      {#if notice.action}
+        {@const act = notice.action}
+        <button class="notice-act" onclick={() => { notice = null; act.run() }}>{act.label}</button>
+      {/if}
       <button class="notice-x" aria-label="Dismiss" onclick={() => (notice = null)}><X size={14} /></button>
     </div>
   {/if}
-  <main class:withbar={(playing && playerCompact) || !!music || (!!elsewhere && !playing)}>
-    {#if tab === 'libraries' && currentLib && !listening}
+  <main class:withbar={(playing && playerCompact) || (!!elsewhere && !playing) || (mq.active && musicBarAt === 'bottom')} class:withmusic={mq.active && musicBarAt === 'top'}>
+    {#if tab === 'libraries' && currentLib}
       <nav class="crumbs" aria-label="Breadcrumb">
         <button class="crumb" onclick={toLibraries}>Libraries</button>
         <span class="sep">›</span>
@@ -3017,21 +3067,10 @@
         {/if}
       </nav>
     {/if}
-    {#if music}
-      {#key music.gen}
-        <MusicPlayer
-          bind:this={mpRef}
-          queue={music.queue}
-          startIndex={music.startIndex}
-          startShuffle={music.shuffle}
-          startOffset={music.offset}
-          onclose={() => { music = null; musicNow = null; if (listening) closeListening() }}
-          onlocate={openAlbumOf}
-          onexpand={openListening}
-          onchange={onTrackChange}
-          ontime={(t) => (musicPos = t)}
-        />
-      {/key}
+    {#if mq.active}
+      <MusicPlayer onstopped={onMusicStopped} />
+      <MiniBar onlocate={() => { const t = mq.items[mq.index]; if (t) openAlbumOf(t) }}
+        onexpand={() => (nowPlayingOpen ? closeNowPlaying() : openNowPlaying())} expanded={nowPlayingOpen} at={musicBarAt} />
     {/if}
     {#if playing}
       {#key playing.gen}
@@ -3078,69 +3117,7 @@
         </section>
       {/if}
     {/if}
-    {#if listening && music && musicNow}
-      {@const albumId = musicNow.track.parentId ?? ''}
-      {@const albumTracks = music.queue.filter((t) => t.parentId === albumId)}
-      {@const album = sessionAlbums.get(albumId)}
-      {@const queueAlbums = [...new Map(music.queue.map((t) => [t.parentId ?? '', t])).values()]}
-      {@const slib = libraries.find((l) => l.id === musicNow.track.libraryId)}
-      <section class="session">
-        <nav class="crumbs" aria-label="Breadcrumb">
-          <button class="crumb" onclick={() => { listening = false; toLibraries() }}>Libraries</button>
-          {#if slib}
-            <span class="sep">›</span>
-            <button class="crumb" onclick={() => slib && leaveSessionToLibrary(slib)}>{slib.name}</button>
-          {/if}
-          {#if album?.parentId && album.artist}
-            <span class="sep">›</span>
-            <button class="crumb" onclick={() => slib && album && leaveSessionToArtist(slib, album)}>{album.artist}</button>
-          {/if}
-          <span class="sep">›</span>
-          <span class="crumb-current">{album?.title ?? musicNow.track.title}</span>
-        </nav>
-        <div class="session-body">
-          <div class="session-side">
-            {#if musicNow.track.poster}
-              <img class="session-cover" src={musicNow.track.poster} alt="" />
-            {:else}
-              <div class="session-cover ph"><MusicIcon size={64} /></div>
-            {/if}
-            <h2 class="session-album">{album?.title ?? ''}</h2>
-            <p class="muted">{musicNow.track.artist}{album?.year ? ` · ${album.year}` : ''}</p>
-            {#if queueAlbums.length > 1}
-              <p class="muted small">Album {queueAlbums.findIndex((t) => (t.parentId ?? '') === albumId) + 1} of {queueAlbums.length} in this session</p>
-            {/if}
-          </div>
-          <ul class="session-tracks">
-            {#each albumTracks as t (t.id)}
-              {@const qi = music.queue.findIndex((q) => q.id === t.id)}
-              <li class="trackstars">
-                <button class="strack" class:current={t.id === musicNow.track.id} onclick={() => mpRef?.jumpTo(qi)}>
-                  <span class="tno">{t.trackNum || ''}</span>
-                  <span class="tname">{t.title}</span>
-                  <span class="ttm muted">{trackTime(t.runtimeSecs)}</span>
-                  {#if t.id === musicNow.track.id && t.runtimeSecs}
-                    <span class="strack-progress"><span style="width: {Math.min(100, (musicPos / t.runtimeSecs) * 100)}%"></span></span>
-                  {/if}
-                </button>
-                <Stars track={t} />
-                <TrackMenu track={t} album={false} />
-              </li>
-            {/each}
-          </ul>
-        </div>
-        {#if queueAlbums.length > 1}
-          <div class="session-shelf">
-            {#each queueAlbums as qa (qa.parentId ?? qa.id)}
-              {@const firstIdx = music.queue.findIndex((q) => q.parentId === qa.parentId)}
-              <button class="session-disc" class:cur={(qa.parentId ?? '') === albumId} onclick={() => mpRef?.jumpTo(firstIdx)} title={sessionAlbums.get(qa.parentId ?? '')?.title ?? ''}>
-                {#if qa.poster}<img src={qa.poster} alt="" />{:else}<span class="ph"><MusicIcon size={20} /></span>{/if}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </section>
-    {:else if tab === 'playlists'}
+    {#if tab === 'playlists'}
       <PlaylistsView {playlistId} onopen={openPlaylist} />
     {:else if tab === 'rooms'}
       <RoomsPage />
@@ -3506,533 +3483,22 @@
         {/if}
       </section>
     {:else if tab === 'libraries'}
-      {#if detail && detail.item.kind === 'artist'}
+      {#if currentLib && currentLib.mediaType === 'music' && (!detail || musicDetail)}
+        <!-- The artist rail stays beside whatever is open: the tabs, an
+             artist's page or an album's, so moving between artists is one
+             click rather than a trip back (server/docs/music.md, part 1). -->
+        {#if !detail}
+          <h1>{currentLib.name}</h1>
+          {@render storageWarning(currentLib.id)}
+        {/if}
+        <MusicLibrary lib={currentLib} tab={musicTab} genre={musicGenre} compilations={musicComp} railCurrent={railCurrent}
+          ontab={setMusicTab} onartist={(a) => openArtist(a)} onplaylists={() => openPlaylist(null)} page={!!detail}>
+          {@render musicPage()}
+        </MusicLibrary>
+      {:else if detail && detail.item.kind === 'artist'}
         <ArtistView artist={detail.item} />
       {:else if detail}
-        {#if detail.item.backdrop || detail.item.poster}
-          <!-- The film's own artwork behind the page. The backdrop is the
-               wide still meant for this; the poster is a fallback and is
-               blurred harder, since cropping a 2:3 image to a wide band
-               magnifies it. -->
-          <div
-            class="pagebg"
-            class:from-poster={!detail.item.backdrop}
-            style="background-image: url({detail.item.backdrop || detail.item.poster})"
-            aria-hidden="true"
-          ></div>
-        {/if}
-        <div class="detail">
-          {@render poster(detail.item)}
-          <div class="detail-body">
-            {@render storageWarning(detail.item.libraryId)}
-            <h1>
-              {detail.item.title}
-              {#if detail.item.year}<span class="muted">({detail.item.year})</span>{/if}
-            </h1>
-            {#if detail.item.kind === 'season' || detail.item.kind === 'series'}
-              <div class="actions wrap">
-                <!-- A series had no way to start watching at all: only a
-                     download button, while a film gets Play and an album
-                     gets Listen. The server decides which episode (see
-                     CLAUDE.md) so the apps cannot disagree about it. -->
-                {#if upNextHere}
-                  {@const up = upNextHere}
-                  <button class="play" onclick={() => startPlay(up.item, readQuality(), up.reason === 'restart')}>
-                    <Play size={15} />
-                    {#if up.reason === 'resume'}Resume
-                    {:else if up.reason === 'restart'}Watch again
-                    {:else}Play{/if}
-                    <span class="epcode">S{String(up.item.seasonNum).padStart(2, '0')}E{String(up.item.episodeNum).padStart(2, '0')}</span>
-                  </button>
-                  <button class="dl" onclick={() => playSeriesFrom(up.item)} title="Play this and everything after it">
-                    Play all
-                  </button>
-                  <PlayInMode itemId={up.item.id} />
-                {/if}
-                <button class="dl" onclick={() => detail && downloadAll(detail.item)}>
-                  <Download size={14} /> Download {detail.item.kind === 'season' ? 'season' : 'show'}
-                </button>
-                {#if canEditSegments(me)}
-                  <DetectMenu item={detail.item} />
-                {/if}
-              </div>
-            {/if}
-            {#if detail.item.kind === 'album'}
-              <p class="meta">
-                {#if detail.item.parentId}<button class="artistlink" onclick={() => detail && goToArtistOf(detail.item)}>{detail.item.artist}</button>{:else}{detail.item.artist}{/if}
-                · {detail.children.length} tracks
-              </p>
-              <div class="actions wrap">
-                <button class="play" onclick={() => detail && startSession(detail.children, 0)}><Play size={15} /> Listen</button>
-                <button class="dl" onclick={() => detail && startMusic(detail.children, 0)}>Queue</button>
-                <button class="dl" onclick={() => detail && startMusic(detail.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
-                <button class="dl" onclick={() => detail && addToPlaylist([detail.item.id], detail.item.title)} title="Add to playlist"><ListMusic size={14} /> Playlist</button>
-                <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { detail && dlNavigate(detail.item.id, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
-                  <option value="">Download…</option>
-                  <option value="original">Original (ZIP)</option>
-                  <option value="mp3-320">MP3 320 (ZIP)</option>
-                  <option value="mp3-192">MP3 192 (ZIP)</option>
-                  <option value="ogg-192">OGG 192 (ZIP)</option>
-                </select>
-              </div>
-            {/if}
-            <p class="meta">
-              {#if detail.item.kind === 'episode'}S{String(detail.item.seasonNum).padStart(2, '0')}E{String(detail.item.episodeNum).padStart(2, '0')} · {/if}
-              {runtime(detail.item.runtimeSecs)}
-              {#if detail.item.width}· {detail.item.width}x{detail.item.height} {detail.item.videoCodec}{/if}
-            </p>
-            {#if detail.item.overview}<p class="overview">{detail.item.overview}</p>{/if}
-            {#if detail.item.kind === 'movie' || detail.item.kind === 'episode'}
-              <div class="actions wrap">
-                <button class="play" onclick={() => detail && startPlay(detail.item)}>
-                  <Play size={15} /> {resumable ? 'Resume' : 'Play'}
-                </button>
-                {#if resumable}
-                  <span class="muted">{minutesLeft} min left</span>
-                  <button class="dl" onclick={() => detail && startPlay(detail.item, undefined, true)}>
-                    <RotateCcw size={14} /> Start over
-                  </button>
-                {/if}
-                <button class="dl" onclick={toggleWatched} title={detail.playState?.watched ? 'Mark as unwatched' : 'Mark as watched'}>
-                  {#if detail.playState?.watched}
-                    <EyeOff size={14} /> Mark unwatched
-                  {:else}
-                    <Eye size={14} /> Mark watched
-                  {/if}
-                </button>
-                {#if detail.item.kind === 'movie'}
-                  <button class="dl" onclick={() => detail && enqueue(detail.item)} title="Play after what is queued">
-                    Add to queue
-                  </button>
-                {/if}
-                <PlayInMode itemId={detail.item.id} />
-                <a class="dl" href={downloadURL(detail.item.id)} download><Download size={14} /> Download</a>
-                {#if detail.item.kind === 'movie' && canEditSegments(me)}
-                  {@const film = detail.item}
-                  <DetectMenu item={film} onedit={() => (segmentsFor = film)} />
-                {/if}
-              </div>
-              {#if detail.versions && detail.versions.length > 1}
-                <div class="versions">
-                  <span class="muted small">This film is held {detail.versions.length} times:</span>
-                  <div class="vchips">
-                    {#each detail.versions as v (v.id)}
-                      <button
-                        class="chip" class:sel={v.id === detail.item.id}
-                        onclick={() => openItem(v.id, false, v)}
-                        title={v.path}>{versionLabel(v)}</button>
-                    {/each}
-                  </div>
-                </div>
-              {/if}
-              <!-- Shown only when it differs from the title, which the
-                   server already decides — an English-language series would
-                   otherwise carry its own name twice. -->
-              {#if detail.item.originalTitle}
-                <p class="origtitle muted">{detail.item.originalTitle}</p>
-              {/if}
-              {#if detail.item.tagline}
-                <p class="tagline">{detail.item.tagline}</p>
-              {/if}
-              {#if detail.item.rating || detail.item.certification || detail.item.genres?.length}
-                <p class="facts">
-                  {#if detail.item.rating}
-                    <span class="score" title="{detail.item.voteCount} votes on TMDB">★ {detail.item.rating.toFixed(1)}</span>
-                  {/if}
-                  {#if detail.item.certification}
-                    <span class="cert" title="Content rating">{detail.item.certification}</span>
-                  {/if}
-                  {#if detail.item.genres?.length}
-                    <span class="muted">{detail.item.genres.join(' · ')}</span>
-                  {/if}
-                  {#if detail.item.collectionName}
-                    <span class="muted">· {detail.item.collectionName}</span>
-                  {/if}
-                  <!-- Television only. "Ended" and "Canceled" are different
-                       news to someone deciding whether to start a series, so
-                       TMDB's own wording is shown rather than a tidied-up
-                       "finished". -->
-                  {#if detail.item.network}
-                    <span class="muted">· {detail.item.network}</span>
-                  {/if}
-                  {#if detail.item.status}
-                    <span class="status" class:ongoing={detail.item.status === 'Returning Series'}>
-                      {detail.item.status === 'Returning Series' ? 'Returning' : detail.item.status}
-                    </span>
-                  {/if}
-                  <!-- Only a running series has one, and it stops being
-                       true the moment that episode airs, so it is never
-                       shown for anything finished. -->
-                  {#if detail.item.nextAirDate}
-                    <span class="muted" title="Next episode">· next {airLabel(detail.item.nextAirDate)}</span>
-                  {/if}
-                  {#if detail.item.kind === 'series' && detail.item.seasonCount}
-                    <span class="muted" title="Seasons held of the {detail.item.seasonCount} that exist">
-                      · {seasonsHeld} of {detail.item.seasonCount} seasons
-                    </span>
-                  {/if}
-                </p>
-              {/if}
-              {#if detail.crew?.length}
-                <dl class="crew">
-                  {#each crewByRole(detail.crew) as g (g.role)}
-                    <div>
-                      <dt>{g.role}</dt>
-                      <dd>
-                        {#each g.people as c, i (c.id)}
-                          {#if i > 0}<span class="muted">, </span>{/if}
-                          <button class="linkish" onclick={() => openPerson(c.id)}>{c.name}</button>
-                        {/each}
-                      </dd>
-                    </div>
-                  {/each}
-                </dl>
-              {/if}
-              <dl class="tech">
-                <!-- An item that has not been probed has no height; "p (h264)"
-                     reads as a glitch, so show just the codec. -->
-                <div><dt>Video</dt><dd>{detail.item.height ? `${detail.item.height}p ` : ''}({detail.item.videoCodec})</dd></div>
-                <div><dt>Audio</dt><dd>{(detail.item.audioCodec ?? '').toUpperCase()}</dd></div>
-                <div>
-                  <dt>Subtitles</dt>
-                  <dd>{detailSubs.length ? detailSubs.map((s) => s.title || s.language || s.codec).join(' · ') : 'None'}</dd>
-                </div>
-              </dl>
-            {/if}
-          </div>
-        </div>
-        {#if detail.cast?.length}
-          <section class="castsec">
-            <h2>Cast</h2>
-            <div class="castrow">
-              {#each detail.cast as c (c.id)}
-                <button class="castcard" onclick={() => openPerson(c.id)} title="More with {c.name}">
-                  {#if c.profile}
-                    <img class="headshot" src={c.profile} alt="" loading="lazy" />
-                  {:else}
-                    <span class="headshot ph"><User size={20} /></span>
-                  {/if}
-                  <span class="castname">{c.name}</span>
-                  {#if c.role}<span class="castrole muted">{c.role}</span>{/if}
-                </button>
-              {/each}
-            </div>
-          </section>
-        {/if}
-        {#if detail.children.length > 0}
-          {#if detail.item.kind === 'series'}
-            <!-- Seasons as a poster grid -->
-            <div class="grid seasons">
-              {#each detail.children as child (child.id)}
-                {@const gaps = missing?.seasons.find((m) => m.seasonNumber === child.seasonNum)?.episodes.filter((e) => e.status === 'missing').length ?? 0}
-                <button class="cell" onclick={() => openItem(child.id, true, child)}>
-                  {@render poster(child)}
-                  <span class="cell-title">{child.title}</span>
-                  {#if gaps > 0}<span class="cell-sub">{gaps} not in library</span>{/if}
-                </button>
-              {/each}
-            </div>
-          {:else if detail.item.kind === 'season'}
-            <!-- Episodes: terminal level. Each row carries everything —
-                 the thumbnail plays, the overview expands in place, and
-                 the rarer actions sit in the ⋯ menu. -->
-            <ul class="eplist">
-              {#each detail.children as child (child.id)}
-                {@const live = playing?.item.id === child.id}
-                {@const resumeAt = epResumable(child)}
-                <li id="ep-{child.id}" class="eprow" class:sel={selEpId === child.id} class:nowplaying={live}>
-                  <button class="epthumb" onclick={() => startPlay(child)} title={resumeAt ? 'Resume' : 'Play'}>
-                    {#if child.poster}
-                      <img src={child.poster} alt="" loading="lazy" />
-                    {:else}
-                      <span class="ph"><Tv size={20} /></span>
-                    {/if}
-                    <span class="epplay"><Play size={18} /></span>
-                    {#if child.watched && !live}<span class="epseen" title="Watched"><Check size={12} /></span>{/if}
-                    {#if live || resumeAt}
-                      <span class="ep-progress"><span style="width: {epProgress(child)}%"></span></span>
-                    {/if}
-                  </button>
-                  <div class="epmain">
-                    <div class="eptop">
-                      <span class="eptitle"><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
-                      {#if live}<span class="ep-live" title="Now playing"><AudioLines size={15} /></span>{/if}
-                      <span class="epmeta muted">
-                        {runtime(child.runtimeSecs)}{#if child.airDate}<span class="epair" title="First broadcast">{' · '}{airLabel(child.airDate)}</span>{/if}{#if resumeAt && !live && child.runtimeSecs}{' · '}{Math.max(1, Math.round((child.runtimeSecs - (child.positionSecs ?? 0)) / 60))} min left{/if}
-                      </span>
-                    </div>
-                    {#if child.overview}
-                      <button class="epover muted" class:open={epOpen === child.id} onclick={() => (epOpen = epOpen === child.id ? null : child.id)}>
-                        {child.overview}
-                      </button>
-                    {/if}
-                    {#if epDetect?.id === child.id}
-                      <p class="epdetect muted" role="status">{epDetect.text}</p>
-                    {/if}
-                  </div>
-                  <div class="epmenuwrap">
-                    <button class="epmore" title="More" aria-haspopup="menu" onclick={() => (epMenu = epMenu === child.id ? null : child.id)}>
-                      <Ellipsis size={18} />
-                    </button>
-                    {#if epMenu === child.id}
-                      <div class="usermenu" role="menu">
-                        {#if resumeAt}
-                          <button class="um-item" role="menuitem" onclick={() => { epMenu = null; startPlay(child, undefined, true) }}>
-                            <RotateCcw size={14} /> Start over
-                          </button>
-                        {/if}
-                        <button class="um-item" role="menuitem" onclick={() => toggleEpWatched(child)}>
-                          {#if child.watched}<EyeOff size={14} /> Mark unwatched{:else}<Eye size={14} /> Mark watched{/if}
-                        </button>
-                        <a class="um-item" role="menuitem" href={downloadURL(child.id)} download onclick={() => (epMenu = null)}>
-                          <Download size={14} /> Download
-                        </a>
-                        {#if canEditSegments(me)}
-                          <button class="um-item" role="menuitem" onclick={() => { epMenu = null; segmentsFor = child }}>
-                            <Clock size={14} /> Intro &amp; credits…
-                          </button>
-                          <button class="um-item" role="menuitem" onclick={() => detectEpisode(child)}>
-                            <ScanSearch size={14} /> Detect intro &amp; credits
-                          </button>
-                        {/if}
-                      </div>
-                    {/if}
-                  </div>
-                </li>
-              {/each}
-            </ul>
-          {:else}
-            <ul class="children">
-              {#each detail.children as child, ci (child.id)}
-                <li class:hl={child.id === hlTrackId} class:trackrow={child.kind === 'track'} class:trackstars={child.kind === 'track'}>
-                  {#if child.kind === 'track'}
-                    <button onclick={() => detail && startMusic(detail.children, ci)}>
-                      <span>
-                        <span class="epnum">{child.trackNum || ci + 1}.</span>
-                        {child.title}
-                        {#if child.artist && child.artist !== detail.item.artist}<span class="muted"> — {child.artist}</span>{/if}
-                      </span>
-                      <span class="trackend">
-                        {#if child.playCount}<span class="muted trackplays">{playsLabel(child.playCount)}</span>{/if}
-                        <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
-                      </span>
-                    </button>
-                    <Stars track={child} />
-                    <TrackMenu track={child} album={false} />
-                  {:else}
-                    <button onclick={() => openItem(child.id, true, child)}>
-                      <span>
-                        {child.title}
-                        {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
-                      </span>
-                      <span class="muted">{runtime(child.runtimeSecs)}</span>
-                    </button>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        {/if}
-        {#if detail.item.kind === 'series' && absentSeasons.length > 0}
-          <!-- Seasons Sonarr knows of with nothing on disk: greyed, after
-               what can be played. -->
-          <section class="missingsec" aria-label="Seasons not in your library">
-            <header class="missinghead"><h2>Not in your library</h2></header>
-            <div class="grid seasons">
-              {#each absentSeasons as ms (ms.seasonNumber)}
-                {@const unaired = ms.episodes.length > 0 && ms.episodes.every((e) => e.status === 'upcoming')}
-                {@const firstAir = ms.episodes.find((e) => e.airDate)?.airDate}
-                <div class="cell ghostcell">
-                  <div class="poster placeholder"><span>{#if unaired}<CalendarClock size={26} />{:else}<Tv size={26} />{/if}</span></div>
-                  <span class="cell-title">Season {ms.seasonNumber}</span>
-                  <span class="cell-sub">{unaired ? (firstAir ? `Airs ${airLabel(firstAir)}` : 'Not aired yet') : `${ms.total} episodes`}</span>
-                  {#if !unaired}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
-                </div>
-              {/each}
-            </div>
-          </section>
-        {:else if detail.item.kind === 'season' && missingSeason && missingSeason.episodes.length > 0}
-          {@const ms = missingSeason}
-          {@const aired = ms.episodes.filter((e) => e.status === 'missing').length}
-          {@const coming = ms.episodes.length - aired}
-          <section class="missingsec" aria-label="Episodes not in your library">
-            <header class="missinghead">
-              <h2>Not in your library</h2>
-              <span class="muted small">
-                {[aired ? `${aired} missing` : '', coming ? `${coming} still to air` : ''].filter(Boolean).join(' · ')}
-              </span>
-              {#if aired > 1}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
-            </header>
-            <ul class="eplist">
-              {#each ms.episodes as ep (ep.episode)}
-                <li class="eprow ghost">
-                  <span class="epthumb"><span class="ph">{#if ep.status === 'upcoming'}<CalendarClock size={18} />{:else}<Tv size={18} />{/if}</span></span>
-                  <div class="epmain">
-                    <div class="eptop">
-                      <span class="eptitle"><span class="epnum">{ep.episode}.</span> {ep.title || `Episode ${ep.episode}`}</span>
-                      <span class="epmeta muted">
-                        {#if ep.status === 'upcoming'}{ep.airDate ? `Airs ${airLabel(ep.airDate)}` : 'Not aired yet'}{:else}{ep.airDate ? `Aired ${airLabel(ep.airDate)}` : 'Aired'}{/if}
-                      </span>
-                    </div>
-                  </div>
-                  {#if ep.status === 'missing'}{@render askButton(ep.season, ep.episode)}{/if}
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
-      {:else if currentLib && currentLib.mediaType === 'music'}
-        <h1>{currentLib.name}</h1>
-        {@render storageWarning(currentLib.id)}
-        {#if musicAll.length === 0}
-          {@render emptyLibrary()}
-        {:else}
-          <div class="music">
-            <aside class="mrail">
-              <div class="rail-top">
-                <input
-                  class="rail-filter"
-                  type="search"
-                  placeholder="Filter artists…"
-                  bind:value={railFilter}
-                  onkeydown={(e) => e.key === 'Escape' && (railFilter = '')}
-                />
-                <button class="rail-item" class:sel={selArtist === 'ALL'} onclick={() => selectArtist('ALL')}>
-                  All Artists <span class="rail-n">{mArtists.length}</span>
-                </button>
-                {#if compAlbumIds.size > 0}
-                  <button class="rail-item" class:sel={selArtist === 'COMP'} onclick={() => selectArtist('COMP')}>
-                    Compilations <span class="rail-n">{compAlbumIds.size}</span>
-                  </button>
-                {/if}
-                <div class="rail-div"></div>
-              </div>
-              {#each railArtists as a (a.id)}
-                <button class="rail-item" class:sel={selArtist === a.id} onclick={() => openArtist(a)}>{a.title}</button>
-              {/each}
-              {#if railArtists.length === 0}
-                <div class="rail-empty muted">No artists match</div>
-              {/if}
-            </aside>
-
-            <section class="mcontent">
-              <header class="mhead">
-                <div>
-                  <h2 class="mtitle">
-                    {selArtist === 'ALL' ? 'All Artists' : selArtist === 'COMP' ? 'Compilations' : shelfGroups[0]?.title}
-                  </h2>
-                  <span class="muted">{shelfAlbumCount} albums</span>
-                </div>
-                <div class="mactions">
-                  <input
-                    class="mfilter"
-                    type="search"
-                    placeholder="Filter songs & albums…"
-                    oninput={onMusicFilterInput}
-                    onkeydown={(e) => { if (e.key === 'Escape') { musicFilter = ''; (e.target as HTMLInputElement).value = '' } }}
-                  />
-                  <button class="play" onclick={() => startSession(shelfQueue(), 0)}><Play size={15} /> Listen</button>
-                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0)}>Queue</button>
-                  <button class="dl" onclick={() => startMusic(shelfQueue(), 0, true)}><Shuffle size={14} /> Shuffle</button>
-                  {#if selArtist !== 'ALL' && selArtist !== 'COMP'}
-                    <select class="dlsel" title="Download artist (ZIP)" onchange={(e) => { dlNavigate(selArtist, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
-                      <option value="">Download…</option>
-                      <option value="original">Original (ZIP)</option>
-                      <option value="mp3-320">MP3 320 (ZIP)</option>
-                      <option value="mp3-192">MP3 192 (ZIP)</option>
-                      <option value="ogg-192">OGG 192 (ZIP)</option>
-                    </select>
-                  {:else}
-                    <button class="dl" onclick={() => queueDownloads(shelfQueue())} title="Download all shown"><Download size={14} /></button>
-                  {/if}
-                </div>
-              </header>
-
-              {#if selArtist === 'ALL' && !filterQ && currentLib}
-                <ListeningRows libraryId={currentLib.id} onplaylists={() => openPlaylist(null)} />
-              {/if}
-              {#if filterQ && matchedSongs.length > 0}
-                <div class="msongs">
-                  <div class="msongs-h">Songs</div>
-                  {#each matchedSongs as m (m.t.id)}
-                    <button class="msong" onclick={() => startMusic(m.tracks, m.idx)}>
-                      <span class="tname">{m.t.title}</span>
-                      <span class="muted">{m.album.artist} — {m.album.title}</span>
-                      <span class="muted ttm">{trackTime(m.t.runtimeSecs)}</span>
-                    </button>
-                  {/each}
-                </div>
-              {:else if filterQ && filteredShelfGroups.length === 0}
-                <div class="empty">No matches for “{musicFilter}”.</div>
-              {/if}
-
-              {#each filteredShelfGroups as group (group.id)}
-                {#if selArtist === 'ALL'}
-                  <button class="shelf-h" onclick={() => { const a = mArtists.find((x) => x.id === group.id); if (a) openArtist(a) }}>{group.title} <span class="muted">· {group.albums.length} albums</span></button>
-                {/if}
-                <div class="shelf">
-                  {#each group.albums as album (album.id)}
-                    <button class="acard" class:sel={selAlbumId === album.id} onclick={() => (selAlbumId = selAlbumId === album.id ? null : album.id)}>
-                      {#if album.poster}
-                        <img class="acover" src={album.poster} alt={album.title} loading="lazy" />
-                      {:else}
-                        <span class="acover ph"><MusicIcon size={30} /></span>
-                      {/if}
-                      <span class="aname">{album.title}</span>
-                      <span class="asub">{album.year || ''}</span>
-                    </button>
-                  {/each}
-                </div>
-                {#if selAlbumId && group.albums.some((a) => a.id === selAlbumId)}
-                  {@const album = albumById.get(selAlbumId)}
-                  {@const tracks = tracksOf(selAlbumId)}
-                  {#if album}
-                    <div class="apanel">
-                      {#if album.poster}
-                        <img class="apanel-cover" src={album.poster} alt="" />
-                      {:else}
-                        <span class="apanel-cover ph"><MusicIcon size={40} /></span>
-                      {/if}
-                      <div class="apanel-body">
-                        <div class="apanel-head">
-                          <div>
-                            <strong>{album.title}</strong>
-                            <span class="muted"> — {album.artist}{album.year ? ` · ${album.year}` : ''} · {tracks.length} tracks</span>
-                          </div>
-                          <div class="mactions">
-                            <button class="play" onclick={() => startSession(tracks, 0)}><Play size={15} /> Listen</button>
-                            <button class="dl" onclick={() => startMusic(tracks, 0)}>Queue</button>
-                            <button class="dl" onclick={() => startMusic(tracks, 0, true)}><Shuffle size={14} /></button>
-                            <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { selAlbumId && dlNavigate(selAlbumId, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
-                              <option value="">Download…</option>
-                              <option value="original">Original (ZIP)</option>
-                              <option value="mp3-320">MP3 320 (ZIP)</option>
-                              <option value="mp3-192">MP3 192 (ZIP)</option>
-                              <option value="ogg-192">OGG 192 (ZIP)</option>
-                            </select>
-                          </div>
-                        </div>
-                        <ul class="tlist">
-                          {#each tracks as t, ti (t.id)}
-                            <li class="trackstars">
-                              <button onclick={() => startMusic(tracks, ti)}>
-                                <span class="tno">{t.trackNum || ti + 1}</span>
-                                <span class="tname">{t.title}{#if t.artist && t.artist !== album.artist}<span class="muted"> — {t.artist}</span>{/if}</span>
-                                <span class="muted ttm">{trackTime(t.runtimeSecs)}</span>
-                              </button>
-                              <Stars track={t} size={13} />
-                              <TrackMenu track={t} album={false} />
-                            </li>
-                          {/each}
-                        </ul>
-                      </div>
-                    </div>
-                  {/if}
-                {/if}
-              {/each}
-            </section>
-          </div>
-        {/if}
+        {@render detailPage(detail)}
       {:else if currentLib}
         <h1>{currentLib.name}</h1>
         {@render storageWarning(currentLib.id)}
@@ -4340,10 +3806,14 @@
     {/if}
   </main>
   <AddToPlaylist />
+  {#if nowPlayingOpen && mq.active}
+    <NowPlaying onclose={closeNowPlaying} onlocate={openAlbumOf}
+      devices={otherDevices.filter((d) => d.online)} onplayon={sendQueueTo} />
+  {/if}
 
   {@render personPanel()}
 
-  {#if elsewhere?.playing && !playing && !music}
+  {#if elsewhere?.playing && !playing && !mq.active}
     {@const np = elsewhere.playing}
     {@const at = elsewhereAt(elsewhere)}
     <div class="elsewhere" role="region" aria-label="Playing on {deviceTitle(elsewhere)}">
@@ -4383,6 +3853,390 @@
 {#if segmentsFor}
   <SegmentEditor item={segmentsFor} onclose={() => (segmentsFor = null)} />
 {/if}
+
+{#snippet musicPage()}
+  {#if detail && detail.item.kind === 'artist'}
+    <ArtistView artist={detail.item} />
+  {:else if detail && detail.item.kind === 'album'}
+    <AlbumPage album={detail.item} tracks={detail.children.filter((c) => c.kind === 'track')} highlightId={hlTrackId ?? undefined} />
+  {:else if detail}
+    {@render detailPage(detail)}
+  {/if}
+{/snippet}
+
+{#snippet detailPage(d: ItemDetail)}
+  {#if d.item.backdrop || d.item.poster}
+    <!-- The film's own artwork behind the page. The backdrop is the
+         wide still meant for this; the poster is a fallback and is
+         blurred harder, since cropping a 2:3 image to a wide band
+         magnifies it. -->
+    <div
+      class="pagebg"
+      class:from-poster={!d.item.backdrop}
+      style="background-image: url({d.item.backdrop || d.item.poster})"
+      aria-hidden="true"
+    ></div>
+  {/if}
+  <div class="detail">
+    {@render poster(d.item)}
+    <div class="detail-body">
+      {@render storageWarning(d.item.libraryId)}
+      <h1>
+        {d.item.title}
+        {#if d.item.year}<span class="muted">({d.item.year})</span>{/if}
+      </h1>
+      {#if d.item.kind === 'season' || d.item.kind === 'series'}
+        <div class="actions wrap">
+          <!-- A series had no way to start watching at all: only a
+               download button, while a film gets Play and an album
+               gets Listen. The server decides which episode (see
+               CLAUDE.md) so the apps cannot disagree about it. -->
+          {#if upNextHere}
+            {@const up = upNextHere}
+            <button class="play" onclick={() => startPlay(up.item, readQuality(), up.reason === 'restart')}>
+              <Play size={15} />
+              {#if up.reason === 'resume'}Resume
+              {:else if up.reason === 'restart'}Watch again
+              {:else}Play{/if}
+              <span class="epcode">S{String(up.item.seasonNum).padStart(2, '0')}E{String(up.item.episodeNum).padStart(2, '0')}</span>
+            </button>
+            <button class="dl" onclick={() => playSeriesFrom(up.item)} title="Play this and everything after it">
+              Play all
+            </button>
+            <PlayInMode itemId={up.item.id} />
+          {/if}
+          <button class="dl" onclick={() => d && downloadAll(d.item)}>
+            <Download size={14} /> Download {d.item.kind === 'season' ? 'season' : 'show'}
+          </button>
+          {#if canEditSegments(me)}
+            <DetectMenu item={d.item} />
+          {/if}
+        </div>
+      {/if}
+      {#if d.item.kind === 'album'}
+        <p class="meta">
+          {#if d.item.parentId}<button class="artistlink" onclick={() => d && goToArtistOf(d.item)}>{d.item.artist}</button>{:else}{d.item.artist}{/if}
+          · {d.children.length} tracks
+        </p>
+        <div class="actions wrap">
+          <button class="play" onclick={() => d && startMusic(d.children, 0)}><Play size={15} /> Play</button>
+          <button class="dl" onclick={() => d && startMusic(d.children, 0, true)}><Shuffle size={14} /> Shuffle</button>
+          <button class="dl" onclick={() => d && addToPlaylist([d.item.id], d.item.title)} title="Add to playlist"><ListMusic size={14} /> Playlist</button>
+          <select class="dlsel" title="Download album (ZIP)" onchange={(e) => { d && dlNavigate(d.item.id, (e.target as HTMLSelectElement).value); (e.target as HTMLSelectElement).value = '' }}>
+            <option value="">Download…</option>
+            <option value="original">Original (ZIP)</option>
+            <option value="mp3-320">MP3 320 (ZIP)</option>
+            <option value="mp3-192">MP3 192 (ZIP)</option>
+            <option value="ogg-192">OGG 192 (ZIP)</option>
+          </select>
+        </div>
+      {/if}
+      <p class="meta">
+        {#if d.item.kind === 'episode'}S{String(d.item.seasonNum).padStart(2, '0')}E{String(d.item.episodeNum).padStart(2, '0')} · {/if}
+        {runtime(d.item.runtimeSecs)}
+        {#if d.item.width}· {d.item.width}x{d.item.height} {d.item.videoCodec}{/if}
+      </p>
+      {#if d.item.overview}<p class="overview">{d.item.overview}</p>{/if}
+      {#if d.item.kind === 'movie' || d.item.kind === 'episode'}
+        <div class="actions wrap">
+          <button class="play" onclick={() => d && startPlay(d.item)}>
+            <Play size={15} /> {resumable ? 'Resume' : 'Play'}
+          </button>
+          {#if resumable}
+            <span class="muted">{minutesLeft} min left</span>
+            <button class="dl" onclick={() => d && startPlay(d.item, undefined, true)}>
+              <RotateCcw size={14} /> Start over
+            </button>
+          {/if}
+          <button class="dl" onclick={toggleWatched} title={d.playState?.watched ? 'Mark as unwatched' : 'Mark as watched'}>
+            {#if d.playState?.watched}
+              <EyeOff size={14} /> Mark unwatched
+            {:else}
+              <Eye size={14} /> Mark watched
+            {/if}
+          </button>
+          {#if d.item.kind === 'movie'}
+            <button class="dl" onclick={() => d && enqueue(d.item)} title="Play after what is queued">
+              Add to queue
+            </button>
+          {/if}
+          <PlayInMode itemId={d.item.id} />
+          <a class="dl" href={downloadURL(d.item.id)} download><Download size={14} /> Download</a>
+          {#if d.item.kind === 'movie' && canEditSegments(me)}
+            {@const film = d.item}
+            <DetectMenu item={film} onedit={() => (segmentsFor = film)} />
+          {/if}
+        </div>
+        {#if d.versions && d.versions.length > 1}
+          <div class="versions">
+            <span class="muted small">This film is held {d.versions.length} times:</span>
+            <div class="vchips">
+              {#each d.versions as v (v.id)}
+                <button
+                  class="chip" class:sel={v.id === d.item.id}
+                  onclick={() => openItem(v.id, false, v)}
+                  title={v.path}>{versionLabel(v)}</button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+        <!-- Shown only when it differs from the title, which the
+             server already decides — an English-language series would
+             otherwise carry its own name twice. -->
+        {#if d.item.originalTitle}
+          <p class="origtitle muted">{d.item.originalTitle}</p>
+        {/if}
+        {#if d.item.tagline}
+          <p class="tagline">{d.item.tagline}</p>
+        {/if}
+        {#if d.item.rating || d.item.certification || d.item.genres?.length}
+          <p class="facts">
+            {#if d.item.rating}
+              <span class="score" title="{d.item.voteCount} votes on TMDB">★ {d.item.rating.toFixed(1)}</span>
+            {/if}
+            {#if d.item.certification}
+              <span class="cert" title="Content rating">{d.item.certification}</span>
+            {/if}
+            {#if d.item.genres?.length}
+              <span class="muted">{d.item.genres.join(' · ')}</span>
+            {/if}
+            {#if d.item.collectionName}
+              <span class="muted">· {d.item.collectionName}</span>
+            {/if}
+            <!-- Television only. "Ended" and "Canceled" are different
+                 news to someone deciding whether to start a series, so
+                 TMDB's own wording is shown rather than a tidied-up
+                 "finished". -->
+            {#if d.item.network}
+              <span class="muted">· {d.item.network}</span>
+            {/if}
+            {#if d.item.status}
+              <span class="status" class:ongoing={d.item.status === 'Returning Series'}>
+                {d.item.status === 'Returning Series' ? 'Returning' : d.item.status}
+              </span>
+            {/if}
+            <!-- Only a running series has one, and it stops being
+                 true the moment that episode airs, so it is never
+                 shown for anything finished. -->
+            {#if d.item.nextAirDate}
+              <span class="muted" title="Next episode">· next {airLabel(d.item.nextAirDate)}</span>
+            {/if}
+            {#if d.item.kind === 'series' && d.item.seasonCount}
+              <span class="muted" title="Seasons held of the {d.item.seasonCount} that exist">
+                · {seasonsHeld} of {d.item.seasonCount} seasons
+              </span>
+            {/if}
+          </p>
+        {/if}
+        {#if d.crew?.length}
+          <dl class="crew">
+            {#each crewByRole(d.crew) as g (g.role)}
+              <div>
+                <dt>{g.role}</dt>
+                <dd>
+                  {#each g.people as c, i (c.id)}
+                    {#if i > 0}<span class="muted">, </span>{/if}
+                    <button class="linkish" onclick={() => openPerson(c.id)}>{c.name}</button>
+                  {/each}
+                </dd>
+              </div>
+            {/each}
+          </dl>
+        {/if}
+        <dl class="tech">
+          <!-- An item that has not been probed has no height; "p (h264)"
+               reads as a glitch, so show just the codec. -->
+          <div><dt>Video</dt><dd>{d.item.height ? `${d.item.height}p ` : ''}({d.item.videoCodec})</dd></div>
+          <div><dt>Audio</dt><dd>{(d.item.audioCodec ?? '').toUpperCase()}</dd></div>
+          <div>
+            <dt>Subtitles</dt>
+            <dd>{detailSubs.length ? detailSubs.map((s) => s.title || s.language || s.codec).join(' · ') : 'None'}</dd>
+          </div>
+        </dl>
+      {/if}
+    </div>
+  </div>
+  {#if d.cast?.length}
+    <section class="castsec">
+      <h2>Cast</h2>
+      <div class="castrow">
+        {#each d.cast as c (c.id)}
+          <button class="castcard" onclick={() => openPerson(c.id)} title="More with {c.name}">
+            {#if c.profile}
+              <img class="headshot" src={c.profile} alt="" loading="lazy" />
+            {:else}
+              <span class="headshot ph"><User size={20} /></span>
+            {/if}
+            <span class="castname">{c.name}</span>
+            {#if c.role}<span class="castrole muted">{c.role}</span>{/if}
+          </button>
+        {/each}
+      </div>
+    </section>
+  {/if}
+  {#if d.children.length > 0}
+    {#if d.item.kind === 'series'}
+      <!-- Seasons as a poster grid -->
+      <div class="grid seasons">
+        {#each d.children as child (child.id)}
+          {@const gaps = missing?.seasons.find((m) => m.seasonNumber === child.seasonNum)?.episodes.filter((e) => e.status === 'missing').length ?? 0}
+          <button class="cell" onclick={() => openItem(child.id, true, child)}>
+            {@render poster(child)}
+            <span class="cell-title">{child.title}</span>
+            {#if gaps > 0}<span class="cell-sub">{gaps} not in library</span>{/if}
+          </button>
+        {/each}
+      </div>
+    {:else if d.item.kind === 'season'}
+      <!-- Episodes: terminal level. Each row carries everything —
+           the thumbnail plays, the overview expands in place, and
+           the rarer actions sit in the ⋯ menu. -->
+      <ul class="eplist">
+        {#each d.children as child (child.id)}
+          {@const live = playing?.item.id === child.id}
+          {@const resumeAt = epResumable(child)}
+          <li id="ep-{child.id}" class="eprow" class:sel={selEpId === child.id} class:nowplaying={live}>
+            <button class="epthumb" onclick={() => startPlay(child)} title={resumeAt ? 'Resume' : 'Play'}>
+              {#if child.poster}
+                <img src={child.poster} alt="" loading="lazy" />
+              {:else}
+                <span class="ph"><Tv size={20} /></span>
+              {/if}
+              <span class="epplay"><Play size={18} /></span>
+              {#if child.watched && !live}<span class="epseen" title="Watched"><Check size={12} /></span>{/if}
+              {#if live || resumeAt}
+                <span class="ep-progress"><span style="width: {epProgress(child)}%"></span></span>
+              {/if}
+            </button>
+            <div class="epmain">
+              <div class="eptop">
+                <span class="eptitle"><span class="epnum">{child.episodeNum}.</span> {child.title}</span>
+                {#if live}<span class="ep-live" title="Now playing"><AudioLines size={15} /></span>{/if}
+                <span class="epmeta muted">
+                  {runtime(child.runtimeSecs)}{#if child.airDate}<span class="epair" title="First broadcast">{' · '}{airLabel(child.airDate)}</span>{/if}{#if resumeAt && !live && child.runtimeSecs}{' · '}{Math.max(1, Math.round((child.runtimeSecs - (child.positionSecs ?? 0)) / 60))} min left{/if}
+                </span>
+              </div>
+              {#if child.overview}
+                <button class="epover muted" class:open={epOpen === child.id} onclick={() => (epOpen = epOpen === child.id ? null : child.id)}>
+                  {child.overview}
+                </button>
+              {/if}
+              {#if epDetect?.id === child.id}
+                <p class="epdetect muted" role="status">{epDetect.text}</p>
+              {/if}
+            </div>
+            <div class="epmenuwrap">
+              <button class="epmore" title="More" aria-haspopup="menu" onclick={() => (epMenu = epMenu === child.id ? null : child.id)}>
+                <Ellipsis size={18} />
+              </button>
+              {#if epMenu === child.id}
+                <div class="usermenu" role="menu">
+                  {#if resumeAt}
+                    <button class="um-item" role="menuitem" onclick={() => { epMenu = null; startPlay(child, undefined, true) }}>
+                      <RotateCcw size={14} /> Start over
+                    </button>
+                  {/if}
+                  <button class="um-item" role="menuitem" onclick={() => toggleEpWatched(child)}>
+                    {#if child.watched}<EyeOff size={14} /> Mark unwatched{:else}<Eye size={14} /> Mark watched{/if}
+                  </button>
+                  <a class="um-item" role="menuitem" href={downloadURL(child.id)} download onclick={() => (epMenu = null)}>
+                    <Download size={14} /> Download
+                  </a>
+                  {#if canEditSegments(me)}
+                    <button class="um-item" role="menuitem" onclick={() => { epMenu = null; segmentsFor = child }}>
+                      <Clock size={14} /> Intro &amp; credits…
+                    </button>
+                    <button class="um-item" role="menuitem" onclick={() => detectEpisode(child)}>
+                      <ScanSearch size={14} /> Detect intro &amp; credits
+                    </button>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <ul class="children">
+        {#each d.children as child, ci (child.id)}
+          <li class:hl={child.id === hlTrackId} class:trackrow={child.kind === 'track'} class:trackstars={child.kind === 'track'}>
+            {#if child.kind === 'track'}
+              <button onclick={() => d && startMusic(d.children, ci)}>
+                <span>
+                  <span class="epnum">{child.trackNum || ci + 1}.</span>
+                  {child.title}
+                  {#if child.artist && child.artist !== d.item.artist}<span class="muted"> — {child.artist}</span>{/if}
+                </span>
+                <span class="trackend">
+                  {#if child.playCount}<span class="muted trackplays">{playsLabel(child.playCount)}</span>{/if}
+                  <span class="muted">{child.runtimeSecs ? `${Math.floor(child.runtimeSecs / 60)}:${String(child.runtimeSecs % 60).padStart(2, '0')}` : ''}</span>
+                </span>
+              </button>
+              <Stars track={child} />
+              <TrackMenu track={child} album={false} />
+            {:else}
+              <button onclick={() => openItem(child.id, true, child)}>
+                <span>
+                  {child.title}
+                  {#if child.kind === 'album' && child.year}<span class="muted"> ({child.year})</span>{/if}
+                </span>
+                <span class="muted">{runtime(child.runtimeSecs)}</span>
+              </button>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  {/if}
+  {#if d.item.kind === 'series' && absentSeasons.length > 0}
+    <!-- Seasons Sonarr knows of with nothing on disk: greyed, after
+         what can be played. -->
+    <section class="missingsec" aria-label="Seasons not in your library">
+      <header class="missinghead"><h2>Not in your library</h2></header>
+      <div class="grid seasons">
+        {#each absentSeasons as ms (ms.seasonNumber)}
+          {@const unaired = ms.episodes.length > 0 && ms.episodes.every((e) => e.status === 'upcoming')}
+          {@const firstAir = ms.episodes.find((e) => e.airDate)?.airDate}
+          <div class="cell ghostcell">
+            <div class="poster placeholder"><span>{#if unaired}<CalendarClock size={26} />{:else}<Tv size={26} />{/if}</span></div>
+            <span class="cell-title">Season {ms.seasonNumber}</span>
+            <span class="cell-sub">{unaired ? (firstAir ? `Airs ${airLabel(firstAir)}` : 'Not aired yet') : `${ms.total} episodes`}</span>
+            {#if !unaired}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
+          </div>
+        {/each}
+      </div>
+    </section>
+  {:else if d.item.kind === 'season' && missingSeason && missingSeason.episodes.length > 0}
+    {@const ms = missingSeason}
+    {@const aired = ms.episodes.filter((e) => e.status === 'missing').length}
+    {@const coming = ms.episodes.length - aired}
+    <section class="missingsec" aria-label="Episodes not in your library">
+      <header class="missinghead">
+        <h2>Not in your library</h2>
+        <span class="muted small">
+          {[aired ? `${aired} missing` : '', coming ? `${coming} still to air` : ''].filter(Boolean).join(' · ')}
+        </span>
+        {#if aired > 1}{@render askButton(ms.seasonNumber, undefined, 'season')}{/if}
+      </header>
+      <ul class="eplist">
+        {#each ms.episodes as ep (ep.episode)}
+          <li class="eprow ghost">
+            <span class="epthumb"><span class="ph">{#if ep.status === 'upcoming'}<CalendarClock size={18} />{:else}<Tv size={18} />{/if}</span></span>
+            <div class="epmain">
+              <div class="eptop">
+                <span class="eptitle"><span class="epnum">{ep.episode}.</span> {ep.title || `Episode ${ep.episode}`}</span>
+                <span class="epmeta muted">
+                  {#if ep.status === 'upcoming'}{ep.airDate ? `Airs ${airLabel(ep.airDate)}` : 'Not aired yet'}{:else}{ep.airDate ? `Aired ${airLabel(ep.airDate)}` : 'Aired'}{/if}
+                </span>
+              </div>
+            </div>
+            {#if ep.status === 'missing'}{@render askButton(ep.season, ep.episode)}{/if}
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+{/snippet}
 
 <style>
   /* The theme's picture and its effect sit behind the app: the shell is
@@ -4470,7 +4324,8 @@
   /* ---- Persistent top bar: logo, universal search, profile ---- */
   /* --surface-radius rounds the big floating surfaces alike: the sidebar
      and the player. */
-  :root { --topbar-h: 3.4rem; --surface-radius: 16px; }
+  :root { --topbar-h: 3.4rem; --surface-radius: 16px; --music-bar-h: 4.6rem; }
+  @media (max-width: 767px) { :root { --music-bar-h: 3.6rem; } }
   .topbar {
     position: sticky;
     top: 0;
@@ -4694,8 +4549,11 @@
   .side { display: none; }
   @media (min-width: 768px) {
     .body {
-      --rail-w: 3.5rem;
-      --panel-w: 15rem;
+      /* --side-scale is the sidebar-size preference (1 compact, 1.15
+         regular, 1.35 large), set on .body from the script; the rail,
+         the open panel, the rows and their type all follow it. */
+      --rail-w: calc(3.5rem * var(--side-scale, 1.15));
+      --panel-w: calc(15rem * var(--side-scale, 1.15));
       /* One gutter for the whole frame: window to sidebar, sidebar to
          content, top bar to both, and the page's right edge — so the
          sidebar and the page line up as one layout. */
@@ -4707,11 +4565,11 @@
       gap: 0.15rem;
       position: fixed;
       z-index: 30;
-      top: calc(var(--topbar-h) + var(--side-gap));
+      top: calc(var(--topbar-h) + var(--music-bar, 0rem) + var(--side-gap));
       bottom: var(--side-gap);
       left: var(--side-gap);
       width: var(--rail-w);
-      padding: 0.5rem 0.4rem;
+      padding: calc(0.5rem * var(--side-scale, 1.15)) calc(0.4rem * var(--side-scale, 1.15));
       overflow: hidden auto;
       scrollbar-width: none;
       background: color-mix(in srgb, var(--panel) 68%, transparent);
@@ -4744,14 +4602,14 @@
   .side-head {
     display: flex;
     align-items: center;
-    min-height: 2rem;
+    min-height: calc(2rem * var(--side-scale, 1.15));
     margin-bottom: 0.2rem;
   }
   .side-btn {
     display: grid;
     place-items: center;
-    width: 2.1rem;
-    height: 2rem;
+    width: calc(2.1rem * var(--side-scale, 1.15));
+    height: calc(2rem * var(--side-scale, 1.15));
     flex: none;
     border-radius: 8px;
     color: var(--muted);
@@ -4760,6 +4618,8 @@
   .side-pin { margin-left: auto; }
   .side-pin[aria-pressed='true'] { color: var(--accent-2); }
   main.withbar { padding-bottom: 6.5rem; }
+  /* The music bar sits under the top bar, so the page starts under it. */
+  main.withmusic { padding-top: calc(1.25rem + var(--music-bar, 0rem)); }
   /* "Playing on Living-room TV · Continue here": where the music bar sits,
      which it never shares the screen with. */
   .elsewhere {
@@ -4802,12 +4662,12 @@
     position: relative;
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: calc(0.6rem * var(--side-scale, 1.15));
     text-align: left;
-    padding: 0.5rem 0.65rem;
+    padding: calc(0.5rem * var(--side-scale, 1.15)) calc(0.65rem * var(--side-scale, 1.15));
     border-radius: 10px;
     color: var(--muted);
-    font-size: 0.92rem;
+    font-size: calc(0.92rem * var(--side-scale, 1.15));
     white-space: nowrap;
   }
   .side-item :global(svg) { flex: none; }
@@ -4825,12 +4685,12 @@
     position: relative;
     display: flex;
     align-items: center;
-    height: 1.9rem;
+    height: calc(1.9rem * var(--side-scale, 1.15));
     color: var(--muted);
-    font-size: 0.72rem;
+    font-size: calc(0.72rem * var(--side-scale, 1.15));
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    padding: 0.55rem 0.65rem 0;
+    padding: calc(0.55rem * var(--side-scale, 1.15)) calc(0.65rem * var(--side-scale, 1.15)) 0;
     white-space: nowrap;
   }
   /* The rail: labels hidden, headings become a short rule, and the badges
@@ -4846,7 +4706,7 @@
     .side:not(.expanded) :is(.side-count, .side-warn) {
       position: absolute;
       top: 0.1rem;
-      left: 1.45rem;
+      left: calc(1.45rem * var(--side-scale, 1.15));
       margin: 0;
     }
     .side:not(.expanded) .side-pin { display: none; }
@@ -4855,6 +4715,7 @@
   .type-icon { margin-right: 0.35rem; font-size: 1.15rem; vertical-align: -0.2rem; }
   .side-warn { margin-left: auto; color: var(--err); display: inline-grid; }
 
+  .enrich-note { font-size: 0.85rem; margin: -0.3rem 0 0.9rem; }
   .storage-warn {
     display: flex; align-items: flex-start; gap: 0.5rem;
     margin: 0.25rem 0 1rem; padding: 0.65rem 0.9rem;
@@ -4879,6 +4740,8 @@
   .notice.error { border-color: color-mix(in srgb, var(--err) 60%, transparent); }
   .notice.error :global(svg) { color: var(--err); flex: none; margin-top: 0.1rem; }
   .notice-x { color: var(--muted); flex: none; display: grid; place-items: center; }
+  .notice-act { color: var(--accent-2); font-weight: 600; padding: 0.15rem 0.5rem; border-radius: 6px; }
+  .notice-act:hover { background: var(--bg); }
   .side-bottom { margin-top: auto; }
   .side-status {
     display: flex;
@@ -4954,6 +4817,7 @@
      gutter apart. After the base rules above, which it overrides. */
   @media (min-width: 768px) {
     main { padding: var(--side-gap) var(--side-gap) 5rem; }
+    main.withmusic { padding-top: calc(var(--side-gap) + var(--music-bar, 0rem)); }
     /* The backdrop runs on under the sidebar to the window's edge, so the
        glass panel sits over the same picture as the page rather than ending
        it in a hard seam. The clip that keeps it from widening the page moves
@@ -5157,7 +5021,7 @@
   .azrail {
     position: fixed;
     right: 0.3rem;
-    top: var(--topbar-h);
+    top: calc(var(--topbar-h) + var(--music-bar, 0rem));
     bottom: 0;
     z-index: 5;
     width: 1.6rem;
@@ -5211,7 +5075,7 @@
   /* ---- Library filter bar ---- */
   .libhead {
     position: sticky;
-    top: var(--topbar-h);
+    top: calc(var(--topbar-h) + var(--music-bar, 0rem));
     z-index: 4;
     background: var(--bg);
     padding: 0 2rem 0.6rem 0;
@@ -5371,146 +5235,7 @@
   }
   .poster.square { aspect-ratio: 1 / 1; }
 
-  /* ---- Listening session ---- */
-  .session { padding-top: 0.5rem; }
-  .session .crumbs { margin-bottom: 1.4rem; }
-  .session-body { display: flex; gap: 3rem; align-items: flex-start; justify-content: center; }
-  .session-side { flex: none; width: min(26rem, 40vw); text-align: center; position: sticky; top: calc(var(--topbar-h, 3.4rem) + 1.5rem); }
-  .session-cover {
-    width: 100%;
-    aspect-ratio: 1 / 1;
-    object-fit: cover;
-    border-radius: 18px;
-    border: 1px solid var(--border);
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
-    margin-bottom: 1.2rem;
-  }
-  .session-cover.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); }
-  .session-album { font-size: 1.5rem; margin: 0 0 0.3rem; line-height: 1.2; }
   .small { font-size: 0.8rem; }
-  .session-tracks { list-style: none; flex: 1; min-width: 0; max-width: 36rem; padding-top: 0.5rem; }
-  .session-tracks li { display: flex; align-items: center; gap: 0.25rem; }
-  .session-tracks .strack { flex: 1; min-width: 0; }
-  .strack {
-    position: relative;
-    display: flex;
-    align-items: baseline;
-    gap: 0.9rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.6rem 0.9rem;
-    border-radius: 10px;
-    font-size: 0.96rem;
-  }
-  .strack:hover { background: var(--panel); color: var(--accent-2); }
-  .strack.current { background: var(--panel); color: var(--accent-2); font-weight: 600; }
-  .strack .tno { width: 1.6rem; }
-  .strack-progress {
-    position: absolute;
-    left: 0.9rem;
-    right: 0.9rem;
-    bottom: 3px;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--border);
-    overflow: hidden;
-  }
-  .strack-progress span { display: block; height: 100%; background: var(--accent); }
-  .session-shelf { display: flex; gap: 0.6rem; margin-top: 2.2rem; flex-wrap: wrap; justify-content: center; }
-  .session-disc { border-radius: 8px; opacity: 0.5; transition: opacity 0.15s, transform 0.15s; padding: 0; }
-  .session-disc img, .session-disc .ph {
-    width: 4.4rem;
-    height: 4.4rem;
-    object-fit: cover;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    display: grid;
-    place-items: center;
-    color: var(--muted);
-    background: var(--panel);
-  }
-  .session-disc:hover { opacity: 1; transform: translateY(-2px); }
-  .session-disc.cur { opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
-  @media (max-width: 767px) {
-    .session-body { flex-direction: column; align-items: stretch; }
-    .session-side { width: 100%; position: static; }
-  }
-
-  /* ---- Music view: artist rail + album shelves ---- */
-  .music { display: flex; gap: 1.25rem; align-items: flex-start; }
-  .mrail {
-    flex: none;
-    width: 12.5rem;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 0.5rem;
-    position: sticky;
-    top: calc(var(--topbar-h, 3.4rem) + 1rem);
-    max-height: calc(100vh - var(--topbar-h, 3.4rem) - 2rem);
-    overflow-y: auto;
-  }
-  .rail-top {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: var(--panel);
-    padding-bottom: 0.15rem;
-    margin-bottom: 0.15rem;
-  }
-  .rail-filter {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--text);
-    font: inherit;
-    font-size: 0.82rem;
-    padding: 0.35rem 0.8rem;
-    margin-bottom: 0.4rem;
-  }
-  .rail-filter:focus { outline: none; border-color: var(--accent); }
-  .rail-empty { padding: 0.5rem 0.7rem; font-size: 0.85rem; }
-  .rail-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.45rem 0.7rem;
-    border-radius: 8px;
-    font-size: 0.9rem;
-    color: var(--text);
-  }
-  .rail-item:hover { background: var(--bg); }
-  .rail-item.sel { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent-2); font-weight: 600; }
-  .rail-n { color: var(--muted); font-size: 0.75rem; font-weight: 400; }
-  .rail-div { height: 1px; background: var(--border); margin: 0.4rem 0.3rem; }
-
-  .mcontent { flex: 1; min-width: 0; }
-  .mhead {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-  }
-  .mtitle { font-size: 1.6rem; margin: 0; }
-  .mactions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-  .mfilter {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--text);
-    font: inherit;
-    font-size: 0.86rem;
-    padding: 0.4rem 0.9rem;
-    width: 15rem;
-  }
-  .mfilter:focus { outline: none; border-color: var(--accent); }
-
   .dlsel {
     background: var(--panel);
     color: var(--muted);
@@ -5523,126 +5248,6 @@
   }
   .dlsel:hover { color: var(--text); border-color: var(--accent); }
 
-  .msongs {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 0.5rem;
-    margin-bottom: 1rem;
-  }
-  .msongs-h {
-    color: var(--muted);
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    padding: 0.3rem 0.6rem;
-  }
-  .msong {
-    display: flex;
-    align-items: baseline;
-    gap: 0.8rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.35rem 0.6rem;
-    border-radius: 8px;
-    font-size: 0.88rem;
-  }
-  .msong:hover { background: var(--bg); color: var(--accent-2); }
-  .msong .tname { flex: none; max-width: 40%; }
-
-  .shelf-h {
-    display: block;
-    font-size: 1.05rem;
-    font-weight: 600;
-    color: var(--text);
-    padding: 0;
-    margin: 1.4rem 0 0.6rem;
-  }
-  .shelf-h:hover { color: var(--accent-2); }
-  .shelf {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
-    gap: 0.9rem;
-    margin-bottom: 0.75rem;
-  }
-  .acard { display: flex; flex-direction: column; gap: 0.3rem; text-align: left; border-radius: 10px; }
-  .acover {
-    width: 100%;
-    aspect-ratio: 1 / 1;
-    object-fit: cover;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    transition: transform 0.12s ease;
-  }
-  .acover.ph { display: grid; place-items: center; font-size: 2rem; color: var(--muted); }
-  .acard:hover .acover { transform: scale(1.03); border-color: var(--accent); }
-  .acard.sel .acover { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .aname { font-size: 0.85rem; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-  .asub { font-size: 0.75rem; color: var(--muted); }
-
-  .apanel {
-    display: flex;
-    gap: 1.1rem;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1.1rem;
-    margin: 0.25rem 0 1.25rem;
-  }
-  .apanel-cover {
-    width: 11rem;
-    height: 11rem;
-    border-radius: 10px;
-    object-fit: cover;
-    flex: none;
-    border: 1px solid var(--border);
-  }
-  .apanel-cover.ph { display: grid; place-items: center; font-size: 3rem; color: var(--muted); background: var(--bg); }
-  .apanel-body { flex: 1; min-width: 0; }
-  .apanel-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 0.6rem;
-    flex-wrap: wrap;
-  }
-  .tlist { list-style: none; columns: 2; column-gap: 2rem; }
-  .tlist li { break-inside: avoid; display: flex; align-items: center; gap: 0.15rem; }
-  .tlist li > button { flex: 1; min-width: 0; }
-  .tlist button {
-    display: flex;
-    align-items: baseline;
-    gap: 0.6rem;
-    width: 100%;
-    text-align: left;
-    padding: 0.32rem 0.5rem;
-    border-radius: 6px;
-    font-size: 0.88rem;
-  }
-  .tlist button:hover { background: var(--bg); color: var(--accent-2); }
-  .tno { color: var(--muted); font-size: 0.78rem; width: 1.3rem; flex: none; font-variant-numeric: tabular-nums; }
-  .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ttm { flex: none; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
-
-  @media (max-width: 767px) {
-    .music { flex-direction: column; }
-    .mrail {
-      position: static;
-      width: 100%;
-      max-height: none;
-      display: flex;
-      overflow-x: auto;
-      gap: 0.25rem;
-      padding: 0.4rem;
-    }
-    .rail-item { width: auto; white-space: nowrap; }
-    .rail-div { display: none; }
-    .tlist { columns: 1; }
-    .apanel { flex-direction: column; }
-    .apanel-cover { width: 8rem; height: 8rem; }
-  }
   .cell:hover .poster { border-color: var(--accent); }
   /* Titles can be long and, for an unmatched release name, a single
      unbreakable word — break anywhere and clamp so one cell cannot push its
@@ -5927,7 +5532,7 @@
      queue" actually did something. */
   .side-count {
     margin-left: auto;
-    font-size: 0.75rem;
+    font-size: calc(0.75rem * var(--side-scale, 1.15));
     font-variant-numeric: tabular-nums;
     background: var(--bg);
     border: 1px solid var(--border);
@@ -6235,6 +5840,9 @@
     transition: background-color 0.15s ease, color 0.15s ease;
   }
   :global(html.tv) .subtab.on { color: var(--text); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  /* TV mode sets the whole root size from the screen; the sidebar
+     preference does not stack on top of that. */
+  :global(html.tv) .body { --side-scale: 1; }
   :global(html.tv) .side-item { transition: background-color 0.15s ease, color 0.15s ease; }
   :global(html.tv) .subtab:focus,
   :global(html.tv) .side-item:focus,

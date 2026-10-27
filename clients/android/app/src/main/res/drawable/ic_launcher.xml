@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Cineva mark: a record on the accent, its label a quaver. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#7C5CFF"
+        android:pathData="M24,6h60a18,18 0 0 1 18,18v60a18,18 0 0 1 -18,18H24A18,18 0 0 1 6,84V24A18,18 0 0 1 24,6z" />
+    <path
+        android:fillColor="#0E1116"
+        android:pathData="M54,22a32,32 0 1 0 0.01,0z" />
+    <path
+        android:fillColor="#7C5CFF"
+        android:fillAlpha="0.35"
+        android:pathData="M54,30a24,24 0 1 0 0.01,0z M54,36a18,18 0 1 1 -0.01,0z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M60,38v22.2a7,7 0 1 1 -4,-6.3V44l-8,2v16.2a7,7 0 1 1 -4,-6.3V42.5z" />
+</vector>

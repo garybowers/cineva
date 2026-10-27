@@ -26,30 +26,52 @@ const (
 )
 
 type Item struct {
-	ID          string   `json:"id"`
-	LibraryID   string   `json:"libraryId"`
-	Kind        ItemKind `json:"kind"`
-	ParentID    string   `json:"parentId,omitempty"`
-	Title       string   `json:"title"`
-	Year        int      `json:"year,omitempty"`
-	SeasonNum   int      `json:"seasonNum,omitempty"`
-	EpisodeNum  int      `json:"episodeNum,omitempty"`
-	DiscNum     int      `json:"discNum,omitempty"`
-	TrackNum    int      `json:"trackNum,omitempty"`
-	Artist      string   `json:"artist,omitempty"`
-	Path        string   `json:"path"`
-	SizeBytes   int64    `json:"sizeBytes,omitempty"`
-	RuntimeSecs int      `json:"runtimeSecs,omitempty"`
-	Container   string   `json:"container,omitempty"`
-	VideoCodec  string   `json:"videoCodec,omitempty"`
-	AudioCodec  string   `json:"audioCodec,omitempty"`
-	Width       int      `json:"width,omitempty"`
-	Height      int      `json:"height,omitempty"`
-	TmdbID      int      `json:"tmdbId,omitempty"`
-	Overview    string   `json:"overview,omitempty"`
-	Poster      string   `json:"poster,omitempty"`
-	AddedAt     string   `json:"addedAt"`
-	UpdatedAt   string   `json:"updatedAt"`
+	ID         string   `json:"id"`
+	LibraryID  string   `json:"libraryId"`
+	Kind       ItemKind `json:"kind"`
+	ParentID   string   `json:"parentId,omitempty"`
+	Title      string   `json:"title"`
+	Year       int      `json:"year,omitempty"`
+	SeasonNum  int      `json:"seasonNum,omitempty"`
+	EpisodeNum int      `json:"episodeNum,omitempty"`
+	DiscNum    int      `json:"discNum,omitempty"`
+	TrackNum   int      `json:"trackNum,omitempty"`
+	Artist     string   `json:"artist,omitempty"`
+	// Album and AlbumArtist are a track's album title and album artist
+	// (migration 0045), so a track stands alone in a search result or a
+	// song list without a lookup through ParentID. AlbumArtist is the
+	// name the album sits under; Artist is the track's own credit.
+	Album       string `json:"album,omitempty"`
+	AlbumArtist string `json:"albumArtist,omitempty"`
+	// Compilation marks an album by various artists: tagged so, or found
+	// so from its tracks when its folder was scanned.
+	Compilation bool `json:"compilation,omitempty"`
+	// What a track's file is: kbit/s, Hz, bits per sample and channels.
+	// Zero when the probe did not say.
+	Bitrate    int `json:"bitrate,omitempty"`
+	SampleRate int `json:"sampleRate,omitempty"`
+	BitDepth   int `json:"bitDepth,omitempty"`
+	Channels   int `json:"channels,omitempty"`
+	// MBID is the MusicBrainz id of an artist, a release (album) or a
+	// recording (track), from the file's tags or a lookup. The music
+	// content key for federation (server/docs/federation.md).
+	MBID string `json:"mbid,omitempty"`
+	// SortTitle is the title as it sorts and indexes by letter: see
+	// SortKey. Derived from Title on every save, never set by callers.
+	SortTitle   string `json:"sortTitle,omitempty"`
+	Path        string `json:"path"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	RuntimeSecs int    `json:"runtimeSecs,omitempty"`
+	Container   string `json:"container,omitempty"`
+	VideoCodec  string `json:"videoCodec,omitempty"`
+	AudioCodec  string `json:"audioCodec,omitempty"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	TmdbID      int    `json:"tmdbId,omitempty"`
+	Overview    string `json:"overview,omitempty"`
+	Poster      string `json:"poster,omitempty"`
+	AddedAt     string `json:"addedAt"`
+	UpdatedAt   string `json:"updatedAt"`
 	// FileMtime is the file's modification time (Unix seconds) when it was
 	// last scanned; with SizeBytes it decides whether a rescan can skip the
 	// file. Write-only: it is not loaded with the item, and an upsert that
@@ -113,6 +135,10 @@ type Item struct {
 	// Genres it is filled by the query that needs it, not by every item
 	// query.
 	LatestEpisode *EpisodeBrief `json:"latestEpisode,omitempty"`
+	// ChildCount is how many albums an artist has or tracks an album has,
+	// filled by the music listings (see Artists, Albums) for the grid's
+	// "12 albums"; not stored and not filled by the plain item queries.
+	ChildCount int `json:"childCount,omitempty"`
 
 	// Watched and PositionSecs are the viewer's own state, not the item's.
 	// Like Genres they are filled in by the handlers that serve a signed-in
@@ -164,6 +190,8 @@ func itemColumns(alias string) string {
 		p("collection_id"), p("collection_name"), p("certification"),
 		p("status"), p("network"), p("air_date"), p("season_count"), p("episode_count"),
 		p("last_air_date"), p("next_air_date"), p("original_title"), p("country"),
+		p("album"), p("album_artist"), p("compilation"), p("bitrate"), p("sample_rate"),
+		p("bit_depth"), p("channels"), p("mbid"), p("sort_title"),
 		p("locked_fields"),
 	}
 	return strings.Join(cols, ", ")
@@ -185,6 +213,8 @@ func itemScanTargets(it *Item) []any {
 		&it.CollectionID, &it.CollectionName, &it.Certification,
 		&it.Status, &it.Network, &it.AirDate, &it.SeasonCount, &it.EpisodeCount,
 		&it.LastAirDate, &it.NextAirDate, &it.OriginalTitle, &it.Country,
+		&it.Album, &it.AlbumArtist, &it.Compilation, &it.Bitrate, &it.SampleRate,
+		&it.BitDepth, &it.Channels, &it.MBID, &it.SortTitle,
 		// Stored as CSV and split on the way out; see lockedFieldsScanner.
 		lockedFieldsScanner{it},
 	}
@@ -258,30 +288,46 @@ func addedAt(fileMtime int64, now time.Time) string {
 	return t.Format(time.DateTime)
 }
 
+// dbtx is what a query runs on: the database, or a transaction of it.
+type dbtx interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // UpsertItem inserts the item or, if one exists at (library_id, path),
 // refreshes its mutable fields, keeping the original id and added_at.
 func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
+	return s.upsertItem(ctx, s.db, item)
+}
+
+// upsertItem is UpsertItem on the database or inside a transaction (see
+// SaveAlbum, which writes an album and its tracks in one).
+func (s *Store) upsertItem(ctx context.Context, q dbtx, item Item) (Item, error) {
 	var parent any
 	if item.ParentID != "" {
 		parent = item.ParentID
 	}
+	item.SortTitle = SortKey(item.Title)
 
-	existing := s.db.QueryRowContext(ctx,
+	existing := q.QueryRowContext(ctx,
 		`SELECT id FROM items WHERE library_id = ? AND path = ?`, item.LibraryID, item.Path)
 	var id string
 	err := existing.Scan(&id)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		id = uuid.NewString()
-		_, err = s.db.ExecContext(ctx, `INSERT INTO items
+		_, err = q.ExecContext(ctx, `INSERT INTO items
 			(id, library_id, kind, parent_id, title, year, season_num, episode_num,
 			 disc_num, track_num, artist, path,
 			 size_bytes, runtime_secs, container, video_codec, audio_codec, width, height,
 			 tmdb_id, overview, poster,
 			 rating, vote_count, tagline, backdrop, collection_id, collection_name,
 			 certification, status, network, air_date, season_count, episode_count,
-			 last_air_date, next_air_date, original_title, country, file_mtime, sidecar_stamp, added_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 last_air_date, next_air_date, original_title, country, file_mtime, sidecar_stamp, added_at,
+			 album, album_artist, compilation, bitrate, sample_rate, bit_depth, channels, mbid, sort_title)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			        ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, item.LibraryID, string(item.Kind), parent, item.Title, item.Year,
 			item.SeasonNum, item.EpisodeNum, item.DiscNum, item.TrackNum, item.Artist,
 			item.Path, item.SizeBytes, item.RuntimeSecs,
@@ -291,7 +337,9 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			item.CollectionID, item.CollectionName, item.Certification,
 			item.Status, item.Network, item.AirDate, item.SeasonCount, item.EpisodeCount,
 			item.LastAirDate, item.NextAirDate, item.OriginalTitle, item.Country, item.FileMtime,
-			item.SidecarStamp, addedAt(item.FileMtime, time.Now()))
+			item.SidecarStamp, addedAt(item.FileMtime, time.Now()),
+			item.Album, item.AlbumArtist, item.Compilation, item.Bitrate, item.SampleRate,
+			item.BitDepth, item.Channels, item.MBID, item.SortTitle)
 		if err != nil {
 			return Item{}, fmt.Errorf("insert item %q: %w", item.Path, err)
 		}
@@ -306,9 +354,10 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 		locked := func(field string) string {
 			return `instr(',' || locked_fields || ',', ',` + field + `,') > 0`
 		}
-		_, err = s.db.ExecContext(ctx, `UPDATE items SET
+		_, err = q.ExecContext(ctx, `UPDATE items SET
 			kind = ?, parent_id = ?,
 			title = CASE WHEN `+locked("title")+` THEN title ELSE ? END,
+			sort_title = CASE WHEN `+locked("title")+` THEN sort_title ELSE ? END,
 			year = CASE WHEN `+locked("year")+` THEN year ELSE ? END,
 			season_num = ?, episode_num = ?,
 			disc_num = ?, track_num = ?, artist = ?,
@@ -340,9 +389,14 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			-- track picking up its album's cover) never carries it.
 			file_mtime = CASE WHEN ? != 0 THEN ? ELSE file_mtime END,
 			sidecar_stamp = CASE WHEN ? != 0 THEN ? ELSE sidecar_stamp END,
+			album = ?, album_artist = ?, compilation = ?,
+			bitrate = ?, sample_rate = ?, bit_depth = ?, channels = ?,
+			-- Kept when not given, like tmdb_id: a tag-less file keeps the
+			-- id a lookup found for it.
+			mbid = CASE WHEN ? != '' THEN ? ELSE mbid END,
 			updated_at = datetime('now')
 			WHERE id = ?`,
-			string(item.Kind), parent, item.Title, item.Year, item.SeasonNum, item.EpisodeNum,
+			string(item.Kind), parent, item.Title, item.SortTitle, item.Year, item.SeasonNum, item.EpisodeNum,
 			item.DiscNum, item.TrackNum, item.Artist,
 			item.SizeBytes, item.RuntimeSecs, item.Container, item.VideoCodec, item.AudioCodec,
 			item.Width, item.Height,
@@ -358,16 +412,23 @@ func (s *Store) UpsertItem(ctx context.Context, item Item) (Item, error) {
 			item.OriginalTitle, item.OriginalTitle, item.Country, item.Country,
 			item.FileMtime, item.FileMtime,
 			item.SidecarStamp, item.SidecarStamp,
+			item.Album, item.AlbumArtist, item.Compilation,
+			item.Bitrate, item.SampleRate, item.BitDepth, item.Channels,
+			item.MBID, item.MBID,
 			id)
 		if err != nil {
 			return Item{}, fmt.Errorf("update item %q: %w", item.Path, err)
 		}
 	}
-	return s.Item(ctx, id)
+	return s.item(ctx, q, id)
 }
 
 func (s *Store) Item(ctx context.Context, id string) (Item, error) {
-	it, err := scanItem(s.db.QueryRowContext(ctx,
+	return s.item(ctx, s.db, id)
+}
+
+func (s *Store) item(ctx context.Context, q dbtx, id string) (Item, error) {
+	it, err := scanItem(q.QueryRowContext(ctx,
 		`SELECT `+itemCols+` FROM items WHERE id = ?`, id))
 	if err != nil {
 		return Item{}, fmt.Errorf("load item %s: %w", id, err)
@@ -658,10 +719,13 @@ func (s *Store) VersionsOf(ctx context.Context, itemID string) ([]Item, error) {
 
 // ---- Genres ----
 
-// GenreCount is one genre and how many films in the library carry it.
+// GenreCount is one genre and how many titles in the library carry it:
+// films, series or albums. For a music library Tracks is how many tracks
+// do as well.
 type GenreCount struct {
-	Genre string `json:"genre"`
-	Count int    `json:"count"`
+	Genre  string `json:"genre"`
+	Count  int    `json:"count"`
+	Tracks int    `json:"tracks,omitempty"`
 }
 
 // ReplaceGenres sets an item's genres, replacing whatever it had.
@@ -671,19 +735,27 @@ func (s *Store) ReplaceGenres(ctx context.Context, itemID string, genres []strin
 		return fmt.Errorf("replace genres: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM item_genres WHERE item_id = ?`, itemID); err != nil {
+	if err := replaceGenres(ctx, tx, itemID, genres); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replaceGenres is ReplaceGenres inside a transaction the caller holds.
+func replaceGenres(ctx context.Context, q dbtx, itemID string, genres []string) error {
+	if _, err := q.ExecContext(ctx, `DELETE FROM item_genres WHERE item_id = ?`, itemID); err != nil {
 		return fmt.Errorf("clear genres: %w", err)
 	}
 	for _, g := range genres {
 		if g == "" {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`INSERT OR IGNORE INTO item_genres (item_id, genre) VALUES (?, ?)`, itemID, g); err != nil {
 			return fmt.Errorf("insert genre %q: %w", g, err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) GenresForItem(ctx context.Context, itemID string) ([]string, error) {
@@ -709,9 +781,11 @@ func (s *Store) GenresForItem(ctx context.Context, itemID string) ([]string, err
 // collection, and a genre nothing is tagged with never appears.
 //
 // Alternative versions are excluded so a film held twice is counted once.
+// Albums carry their tracks' genres too (migration 0045), so a music
+// library counts albums as the titles and its tracks separately.
 func (s *Store) LibraryGenres(ctx context.Context, libraryID string) ([]GenreCount, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT g.genre, COUNT(*) AS n
+		SELECT g.genre, SUM(i.kind <> 'track') AS n, SUM(i.kind = 'track') AS tracks
 		FROM item_genres g
 		JOIN items i ON i.id = g.item_id
 		WHERE i.library_id = ? AND i.version_of = ''
@@ -724,7 +798,7 @@ func (s *Store) LibraryGenres(ctx context.Context, libraryID string) ([]GenreCou
 	out := []GenreCount{}
 	for rows.Next() {
 		var gc GenreCount
-		if err := rows.Scan(&gc.Genre, &gc.Count); err != nil {
+		if err := rows.Scan(&gc.Genre, &gc.Count, &gc.Tracks); err != nil {
 			return nil, fmt.Errorf("scan genre count: %w", err)
 		}
 		out = append(out, gc)
@@ -732,13 +806,14 @@ func (s *Store) LibraryGenres(ctx context.Context, libraryID string) ([]GenreCou
 	return out, rows.Err()
 }
 
-// ItemsByGenre lists a library's films carrying a genre, primaries only.
+// ItemsByGenre lists a library's titles carrying a genre, primaries only:
+// films, series or albums, never tracks (Tracks lists those).
 func (s *Store) ItemsByGenre(ctx context.Context, libraryID, genre string) ([]Item, error) {
 	return s.queryItems(ctx,
 		`SELECT `+itemColumns("i")+` FROM items i
 		 JOIN item_genres g ON g.item_id = i.id
-		 WHERE i.library_id = ? AND g.genre = ? AND i.version_of = ''
-		 ORDER BY i.title`, libraryID, genre)
+		 WHERE i.library_id = ? AND g.genre = ? AND i.version_of = '' AND i.kind <> 'track'
+		 ORDER BY i.sort_title, i.title`, libraryID, genre)
 }
 
 // ItemEdit is an operator's manual correction. Only non-nil fields are
@@ -796,6 +871,7 @@ func (s *Store) UpdateItem(ctx context.Context, id string, e ItemEdit) (Item, er
 			return Item{}, fmt.Errorf("title cannot be empty")
 		}
 		add("title", strings.TrimSpace(*e.Title))
+		add("sort_title", SortKey(strings.TrimSpace(*e.Title)))
 	}
 	if e.Year != nil {
 		add("year", *e.Year)

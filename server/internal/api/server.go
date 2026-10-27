@@ -29,6 +29,7 @@ import (
 	"github.com/garybowers/cineva/server/internal/logging"
 	"github.com/garybowers/cineva/server/internal/media"
 	"github.com/garybowers/cineva/server/internal/metadata"
+	"github.com/garybowers/cineva/server/internal/mix"
 	"github.com/garybowers/cineva/server/internal/notify"
 	"github.com/garybowers/cineva/server/internal/playback"
 	"github.com/garybowers/cineva/server/internal/prefs"
@@ -69,6 +70,24 @@ type Config struct {
 	// library are worth keeping across a reboot. Empty puts them beside the
 	// transcode scratch, as before.
 	PreviewsDir string
+	// DataDir is where the database lives; transcoded tracks are cached
+	// under it (cache/audio), for the same reason as the previews. Empty
+	// puts them beside the transcode scratch, as before.
+	DataDir string
+	// AudioCacheMB bounds the cached transcodes of tracks; 0 means no
+	// bound.
+	AudioCacheMB int
+	// ListenBrainzToken is a ListenBrainz user token for the mix engine's
+	// top-songs lookups, which ListenBrainz gates behind one; empty
+	// leaves mixes to the open similarity graph and the household's own
+	// listening (see docs/mix.md).
+	ListenBrainzToken string
+	// Subsonic serves the Subsonic-compatible API at /rest/ (see
+	// docs/subsonic.md); off, those routes are not mounted.
+	Subsonic bool
+	// Jellyfin serves the Jellyfin-compatible API at the root (see
+	// docs/jellyfin.md); off, those routes are not mounted.
+	Jellyfin bool
 	// Ready, when set, is called once the server is listening — where the
 	// command prints its startup card.
 	Ready func(Startup)
@@ -101,19 +120,36 @@ type server struct {
 	defaultCertRegion string
 	secureCookies     bool
 	subtitleDir       string
-	dlCacheDir        string
-	trickplayDir      string
-	previews          *trickplay.Builder
-	background        *background.Policy // schedule, pause and read cap for background reading
-	segments          *segments.Detector // nil when intro detection is off
-	storage           *library.StorageMonitor
-	presence          *presence // which sessions have an event stream open
-	requests          *requests.Service
-	ha                *homeassistant.Service
-	notify            *notify.Service
-	importer          *importer.Runner
-	haWho             principals // who users are, for Home Assistant access checks
-	prefs             *prefs.Service
+	audioCache        *media.AudioCache
+	// mixes grows playlists from a seed (server/docs/mix.md).
+	mixes *mix.Engine
+	// recent answers each device's repeated play of a track as one play
+	// (see playTrack).
+	recent       recentPlays
+	trickplayDir string
+	previews     *trickplay.Builder
+	background   *background.Policy // schedule, pause and read cap for background reading
+	segments     *segments.Detector // nil when intro detection is off
+	storage      *library.StorageMonitor
+	presence     *presence // which sessions have an event stream open
+	requests     *requests.Service
+	ha           *homeassistant.Service
+	notify       *notify.Service
+	importer     *importer.Runner
+	haWho        principals // who users are, for Home Assistant access checks
+	prefs        *prefs.Service
+
+	// artworkDir is where posters live, for the Subsonic cover art call;
+	// preparing holds download jobs being encoded (see downloads.go);
+	// prepareDownload encodes one, replaced in tests.
+	preparing       preparing
+	prepareDownload func(ctx context.Context, item store.Item, format string, kbps int) (int64, error)
+
+	// subsonicPasswords remembers passwords the Subsonic shim verified.
+	artworkDir        string
+	subsonicPasswords subsonicPasswordCache
+	// jfState is the Jellyfin shim's own: the server id it reports.
+	jfState
 
 	// Library-wide metadata refreshes in flight, keyed by library id.
 	refreshMu sync.Mutex
@@ -136,8 +172,9 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		defaultLoginMode:  cfg.LoginMode,
 		defaultCertRegion: cfg.CertRegion,
 		subtitleDir:       filepath.Join(cfg.TranscodeDir, "subtitles"),
-		dlCacheDir:        filepath.Join(cfg.TranscodeDir, "dlcache"),
+		audioCache:        media.NewAudioCache(audioCacheDir(cfg), int64(cfg.AudioCacheMB)<<20),
 		trickplayDir:      cfg.PreviewsDir,
+		artworkDir:        cfg.ArtworkDir,
 		background:        background.NewPolicy(),
 		refreshes:         map[string]*refreshJob{},
 		ha:                homeassistant.New(st),
@@ -145,8 +182,21 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 		importer:          &importer.Runner{Store: st},
 		prefs:             prefs.NewService(st),
 	}
+	listenBrainz := mix.NewListenBrainz()
+	listenBrainz.Token = cfg.ListenBrainzToken
+	s.mixes = mix.New(st, listenBrainz)
+	s.mixes.LookupArtist = func(a store.Item) bool {
+		if manager == nil {
+			return false
+		}
+		return manager.LookUpArtistInBackground(a)
+	}
 	if s.trickplayDir == "" {
 		s.trickplayDir = filepath.Join(cfg.TranscodeDir, "trickplay")
+	}
+	// Encodes that died with the previous run, and anything over the bound.
+	if n, freed := s.audioCache.Sweep(); n > 0 {
+		serverLog.Info("audio cache swept", "removed", n, "freed", freed)
 	}
 	// Transcode sessions survive a restart: the segments are on disk and
 	// expensive to remake, so the stored descriptions are re-registered and
@@ -390,6 +440,12 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 	}))
 
 	s.apiRoutes(e)
+	if cfg.Subsonic {
+		s.subsonicRoutes(e)
+	}
+	if cfg.Jellyfin {
+		s.jellyfinRoutes(e)
+	}
 
 	e.StaticFS("/themes", ui.Themes())
 	if cfg.ArtworkDir != "" {
@@ -419,6 +475,10 @@ func Serve(cfg Config, st *store.Store, manager *library.Manager) error {
 			c.Set(errKey, err.Error())
 		}
 		p := c.Request().URL.Path
+		if ok && he.Code == http.StatusNotFound && cfg.Jellyfin && jfRequest(c) {
+			_ = jfProblem(c, http.StatusNotFound, "Not Found")
+			return
+		}
 		if ok && he.Code == http.StatusNotFound && c.Request().Method == http.MethodGet &&
 			!looksLikeAsset(p) &&
 			!hasAnyPrefix(p, "/api/", "/themes/", "/artwork/") {
@@ -542,6 +602,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/auth/sessions", s.listDevices)
 	v1.PATCH("/auth/sessions/current", s.nameDevice)
 	v1.PUT("/auth/sessions/current/queue", s.saveDeviceQueue)
+	v1.GET("/auth/sessions/current/queue", s.myQueue)
 	v1.POST("/auth/sessions/revoke-others", s.revokeOtherDevices)
 	v1.DELETE("/auth/sessions/:id", s.revokeDevice)
 	v1.GET("/auth/sessions/:id/queue", s.deviceQueue)
@@ -591,6 +652,14 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.POST("/items/:id/play", s.playItem)
 	v1.GET("/items/:id/stream", s.streamItem)
 	v1.GET("/items/:id/download", s.downloadItem)
+	// Download jobs and the ids list, for native apps keeping music on
+	// the device (docs/offline.md).
+	v1.POST("/downloads", s.createDownloads)
+	v1.GET("/downloads", s.listDownloads)
+	v1.GET("/downloads/:id", s.getDownload)
+	v1.GET("/downloads/:id/file", s.downloadFile)
+	v1.DELETE("/downloads/:id", s.deleteDownload)
+	v1.GET("/libraries/:id/ids", s.libraryIDs)
 	v1.POST("/items/:id/progress", s.postProgress)
 	v1.PUT("/items/:id/watched", s.putWatched)
 	v1.PUT("/items/:id/rating", s.putRating)
@@ -613,7 +682,14 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.GET("/home", s.home)
 	// Music: artist pages, listening rows and the viewer's own playlists.
 	v1.GET("/items/:id/artist", s.getArtist)
+	v1.GET("/items/:id/mix", s.itemMix)
+	v1.GET("/items/:id/tracks", s.itemTracks)
+	v1.GET("/items/:id/lyrics", s.itemLyrics)
 	v1.GET("/libraries/:id/listening", s.libraryListening)
+	v1.GET("/libraries/:id/artists", s.libraryArtists)
+	v1.GET("/libraries/:id/albums", s.libraryAlbums)
+	v1.GET("/libraries/:id/tracks", s.libraryTracks)
+	v1.GET("/libraries/:id/search", s.librarySearch)
 	v1.GET("/playlists", s.listPlaylists)
 	v1.POST("/playlists", s.createPlaylist)
 	v1.GET("/playlists/:id", s.getPlaylist)
@@ -621,6 +697,7 @@ func (s *server) apiRoutes(e *echo.Echo) {
 	v1.DELETE("/playlists/:id", s.deletePlaylist)
 	v1.POST("/playlists/:id/items", s.appendPlaylistItems)
 	v1.PUT("/playlists/:id/items", s.setPlaylistItems)
+	v1.DELETE("/playlists/:id/items/last", s.removeLastPlaylistItems)
 	v1.GET("/play/:sid/index.m3u8", s.hlsPlaylist)
 	v1.GET("/play/:sid/:file", s.hlsFile)
 	// Anyone can report wrong intro or credits times on what they can see.
@@ -837,5 +914,15 @@ func incompressible(c echo.Context) bool {
 	}
 	// Artwork and transcode segments are served by path rather than by a
 	// name the extension test would catch.
-	return hasAnyPrefix(p, "/artwork/")
+	return hasAnyPrefix(p, "/artwork/", "/rest/stream", "/rest/download", "/rest/getCoverArt", "/rest/getAvatar")
+}
+
+// audioCacheDir is where transcoded tracks are kept: under the data
+// directory, else (no data directory known) beside the transcode scratch
+// as they were before.
+func audioCacheDir(cfg Config) string {
+	if cfg.DataDir != "" {
+		return filepath.Join(cfg.DataDir, "cache", "audio")
+	}
+	return filepath.Join(cfg.TranscodeDir, "dlcache")
 }

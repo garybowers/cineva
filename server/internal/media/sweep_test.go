@@ -30,7 +30,7 @@ func TestSweepOrphans(t *testing.T) {
 	mkSession(t, root, "aaa", 1000, time.Now())
 	mkSession(t, root, "bbb", 2000, time.Now())
 	// Sibling caches that are not session directories must survive.
-	for _, keep := range []string{"subtitles", "dlcache"} {
+	for _, keep := range []string{"subtitles", "trickplay"} {
 		if err := os.MkdirAll(filepath.Join(root, keep), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -49,7 +49,7 @@ func TestSweepOrphans(t *testing.T) {
 	if freed != 3000 {
 		t.Errorf("freed %d bytes, want 3000", freed)
 	}
-	for _, keep := range []string{"subtitles", "dlcache"} {
+	for _, keep := range []string{"subtitles", "trickplay"} {
 		if _, err := os.Stat(filepath.Join(root, keep, "x")); err != nil {
 			t.Errorf("%s was swept away: %v", keep, err)
 		}

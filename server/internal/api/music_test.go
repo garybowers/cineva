@@ -198,3 +198,82 @@ func TestPlaylistHandlers(t *testing.T) {
 		t.Fatalf("album as artist: %d, want 400", code)
 	}
 }
+
+// The picker's listing and the undo of an append (server/docs/mix.md).
+func TestPlaylistPicker(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := st.CreateLibrary(ctx, "Music", store.MediaMusic, []string{"/music"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, _ := st.UpsertItem(ctx, store.Item{LibraryID: lib.ID, Kind: store.KindArtist, Title: "Alpha", Path: "artist://alpha"})
+	album, _ := st.UpsertItem(ctx, store.Item{LibraryID: lib.ID, Kind: store.KindAlbum, ParentID: artist.ID, Title: "First", Artist: "Alpha", Path: "/music/Alpha/First"})
+	one, _ := st.UpsertItem(ctx, store.Item{LibraryID: lib.ID, Kind: store.KindTrack, ParentID: album.ID, Title: "One", Artist: "Alpha", TrackNum: 1, Path: "/music/Alpha/First/01.flac", RuntimeSecs: 200})
+	two, _ := st.UpsertItem(ctx, store.Item{LibraryID: lib.ID, Kind: store.KindTrack, ParentID: album.ID, Title: "Two", Artist: "Alpha", TrackNum: 2, Path: "/music/Alpha/First/02.flac", RuntimeSecs: 200})
+	kid, err := st.CreateUser(ctx, "kid", "", "h", store.RoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid.LibraryIDs = []string{lib.ID}
+	s := &server{store: st}
+	call := func(h echo.HandlerFunc, method, target, id, body string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		c := echo.New().NewContext(req, rec)
+		if id != "" {
+			c.SetParamNames("id")
+			c.SetParamValues(id)
+		}
+		c.Set(ctxUser, kid)
+		err := h(c)
+		var he *echo.HTTPError
+		if errors.As(err, &he) {
+			return he.Code, ""
+		}
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return rec.Code, rec.Body.String()
+	}
+	var gym, zed store.Playlist
+	_, body := call(s.createPlaylist, http.MethodPost, "/", "", `{"name":"Zed"}`)
+	if err := json.Unmarshal([]byte(body), &zed); err != nil {
+		t.Fatal(err)
+	}
+	_, body = call(s.createPlaylist, http.MethodPost, "/", "", `{"name":"Gym"}`)
+	if err := json.Unmarshal([]byte(body), &gym); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := call(s.appendPlaylistItems, http.MethodPost, "/", gym.ID, `{"itemIds":["`+one.ID+`","`+two.ID+`"]}`); code != http.StatusOK {
+		t.Fatalf("append: %d", code)
+	}
+	code, body := call(s.listPlaylists, http.MethodGet, "/?for="+one.ID, "", "")
+	var lists []store.Playlist
+	if err := json.Unmarshal([]byte(body), &lists); err != nil || code != http.StatusOK {
+		t.Fatalf("for: %d %s %v", code, body, err)
+	}
+	if len(lists) != 2 || lists[0].Name != "Gym" || !lists[0].Holds || lists[1].Holds {
+		t.Fatalf("picker listing: %+v", lists)
+	}
+	code, body = call(s.removeLastPlaylistItems, http.MethodDelete, "/?count=1", gym.ID, "")
+	if code != http.StatusOK || !strings.Contains(body, `"removed":1`) {
+		t.Fatalf("undo: %d %s", code, body)
+	}
+	_, body = call(s.getPlaylist, http.MethodGet, "/", gym.ID, "")
+	if !strings.Contains(body, `"title":"One"`) || strings.Contains(body, `"title":"Two"`) {
+		t.Fatalf("after undo: %s", body)
+	}
+	if code, _ := call(s.removeLastPlaylistItems, http.MethodDelete, "/", "nope", ""); code != http.StatusNotFound {
+		t.Fatalf("unknown playlist: %d", code)
+	}
+}

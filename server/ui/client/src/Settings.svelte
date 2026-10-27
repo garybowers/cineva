@@ -9,7 +9,7 @@
   // time — stays with App, which passes it in.
   import {
     User as UserIcon, MonitorPlay, Palette, Lock, MonitorSmartphone, Smartphone, KeyRound, Info,
-    ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy, SlidersHorizontal,
+    ChevronRight, ChevronLeft, ArrowUpRight, ShieldCheck, Upload, Sun, Moon, Check, Copy, SlidersHorizontal, Music,
     Bell, Plus, Pencil,
   } from '@lucide/svelte'
   import {
@@ -74,6 +74,7 @@
   const BASE_SECTIONS = [
     { id: 'profile', label: 'Profile', icon: UserIcon },
     { id: 'playback', label: 'Playback', icon: MonitorPlay },
+    { id: 'music', label: 'Music', icon: Music },
     { id: 'appearance', label: 'Appearance', icon: Palette },
     { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'security', label: 'Sign-in and security', icon: Lock },
@@ -347,6 +348,7 @@
   // ---- API keys ----
   let keys: APIKey[] = $state([])
   let keyName = $state('')
+  let keyForApps = $state(true)
   let revealed = $state('')
   let copied = $state(false)
   let keyMsg = $state('')
@@ -357,7 +359,7 @@
     e.preventDefault()
     keyMsg = ''
     try {
-      const k = await createAPIKey(keyName.trim() || 'API key')
+      const k = await createAPIKey(keyName.trim() || 'API key', keyForApps)
       revealed = k.key
       copied = false
       keyName = ''
@@ -581,6 +583,10 @@
     {:else if shown === 'playback'}
       <h2>Playback</h2>
       {@render prefCard('playback')}
+
+    {:else if shown === 'music'}
+      <h2>Music</h2>
+      {@render prefCard('music')}
 
     {:else if shown === 'appearance'}
       {@const themePref = prefs?.prefs.theme}
@@ -913,8 +919,9 @@
     {:else if shown === 'keys'}
       <h2>API keys</h2>
       <p class="lead">
-        For apps and scripts that use Cineva as you. Send a key as <code>Authorization: Bearer &lt;key&gt;</code>;
-        the <a href="/api/docs/" target="_blank" rel="noopener">API reference</a> lists what it can do.
+        For apps and scripts that use Cineva as you. A music app (Subsonic or Jellyfin) takes a key as its
+        password, with your username; scripts send it as <code>Authorization: Bearer &lt;key&gt;</code>,
+        and the <a href="/api/docs/" target="_blank" rel="noopener">API reference</a> lists what it can do.
       </p>
       {#if revealed}
         <div class="card reveal">
@@ -931,7 +938,7 @@
           <div class="srow">
             <div class="sl">
               <span class="st">{k.name}</span>
-              <span class="sd">Created {ago(k.createdAt)} · {k.lastUsedAt ? `last used ${ago(k.lastUsedAt)}` : 'never used'}</span>
+              <span class="sd">{k.forApps ? 'Music apps · ' : ''}Created {ago(k.createdAt)} · {k.lastUsedAt ? `last used ${ago(k.lastUsedAt)}` : 'never used'}</span>
             </div>
             <div class="sc"><button class="btn quiet" onclick={() => revoke(k.id)}>Revoke</button></div>
           </div>
@@ -945,6 +952,10 @@
             <button class="btn" type="submit">Create</button>
           </div>
         </form>
+        <label class="srow">
+          <span class="sl"><span class="st">Usable as a password in music apps</span><span class="sd">Keeps a sealed copy on the server so an app's token sign-in can be checked. Off makes a plain key for scripts, never read back.</span></span>
+          <span class="sc"><input type="checkbox" bind:checked={keyForApps} /></span>
+        </label>
       </div>
       {#if keyMsg}<p class="msg">{keyMsg}</p>{/if}
 

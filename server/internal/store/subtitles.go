@@ -45,6 +45,15 @@ func (s *Store) ReplaceSubtitles(ctx context.Context, itemID string, tracks []Su
 		return fmt.Errorf("replace subtitles: %w", err)
 	}
 	defer tx.Rollback()
+	if err := replaceSubtitles(ctx, tx, itemID, tracks); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replaceSubtitles is ReplaceSubtitles inside a transaction the caller
+// holds.
+func replaceSubtitles(ctx context.Context, tx dbtx, itemID string, tracks []SubtitleTrack) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM subtitle_tracks WHERE item_id = ?`, itemID); err != nil {
 		return fmt.Errorf("clear subtitles: %w", err)
 	}
@@ -60,7 +69,7 @@ func (s *Store) ReplaceSubtitles(ctx context.Context, itemID string, tracks []Su
 			return fmt.Errorf("insert subtitle: %w", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 const subtitleCols = `id, item_id, source, stream_index, path, codec, language, title, forced`

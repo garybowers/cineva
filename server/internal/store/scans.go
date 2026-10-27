@@ -18,12 +18,29 @@ type Scan struct {
 	Error        string `json:"error,omitempty"`
 	StartedAt    string `json:"startedAt"`
 	FinishedAt   string `json:"finishedAt,omitempty"`
+	// Phase is where a scan in passes has got to (server/docs/scanning.md):
+	// "registering" while the files are walked and their rows written,
+	// "enriching" while the metadata job runs afterwards, "done" after.
+	// Status says whether the register pass is still running; the
+	// enriching phase outlives it.
+	Phase string `json:"phase"`
+	// Enriched of ToEnrich titles have been looked up by the job.
+	Enriched int `json:"enriched"`
+	ToEnrich int `json:"toEnrich"`
 }
+
+// Scan phases.
+const (
+	PhaseRegistering = "registering"
+	PhaseEnriching   = "enriching"
+	PhaseDone        = "done"
+)
 
 type ScanRepo interface {
 	CreateScan(ctx context.Context, libraryID string) (Scan, error)
 	FinishScan(ctx context.Context, id, status, errMsg string, filesSeen, itemsCreated int) error
 	UpdateScanProgress(ctx context.Context, id string, filesSeen, itemsCreated int) error
+	UpdateScanPhase(ctx context.Context, id, phase string, enriched, toEnrich int) error
 	Scans(ctx context.Context, limit int) ([]Scan, error)
 	ScanByID(ctx context.Context, id string) (Scan, error)
 	RunningScan(ctx context.Context, libraryID string) (Scan, bool, error)
@@ -35,7 +52,7 @@ var _ ScanRepo = (*Store)(nil)
 func (s *Store) CreateScan(ctx context.Context, libraryID string) (Scan, error) {
 	id := uuid.NewString()
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO scans (id, library_id) VALUES (?, ?)`, id, libraryID); err != nil {
+		`INSERT INTO scans (id, library_id, phase) VALUES (?, ?, ?)`, id, libraryID, PhaseRegistering); err != nil {
 		return Scan{}, fmt.Errorf("create scan: %w", err)
 	}
 	// Read the row back so callers (and the event stream) get the DB's
@@ -46,9 +63,20 @@ func (s *Store) CreateScan(ctx context.Context, libraryID string) (Scan, error) 
 func (s *Store) FinishScan(ctx context.Context, id, status, errMsg string, filesSeen, itemsCreated int) error {
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE scans SET status = ?, error = ?, files_seen = ?, items_created = ?,
-		 finished_at = datetime('now') WHERE id = ?`,
-		status, errMsg, filesSeen, itemsCreated, id); err != nil {
+		 phase = ?, finished_at = datetime('now') WHERE id = ?`,
+		status, errMsg, filesSeen, itemsCreated, PhaseDone, id); err != nil {
 		return fmt.Errorf("finish scan %s: %w", id, err)
+	}
+	return nil
+}
+
+// UpdateScanPhase records which pass a scan is in and, while enriching,
+// how many titles the job has looked up of how many it has to.
+func (s *Store) UpdateScanPhase(ctx context.Context, id, phase string, enriched, toEnrich int) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE scans SET phase = ?, enriched = ?, to_enrich = ? WHERE id = ?`,
+		phase, enriched, toEnrich, id); err != nil {
+		return fmt.Errorf("scan phase %s: %w", id, err)
 	}
 	return nil
 }
@@ -64,13 +92,14 @@ func (s *Store) UpdateScanProgress(ctx context.Context, id string, filesSeen, it
 	return nil
 }
 
-const scanCols = `id, library_id, status, files_seen, items_created, error, started_at, COALESCE(finished_at, '')`
+const scanCols = `id, library_id, status, files_seen, items_created, error, started_at, COALESCE(finished_at, ''), phase, enriched, to_enrich`
 
 func (s *Store) ScanByID(ctx context.Context, id string) (Scan, error) {
 	var sc Scan
 	err := s.db.QueryRowContext(ctx,
 		`SELECT `+scanCols+` FROM scans WHERE id = ?`, id).
-		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt)
+		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt,
+			&sc.Phase, &sc.Enriched, &sc.ToEnrich)
 	if err != nil {
 		return Scan{}, fmt.Errorf("scan %s: %w", id, err)
 	}
@@ -83,7 +112,8 @@ func (s *Store) RunningScan(ctx context.Context, libraryID string) (Scan, bool, 
 	var sc Scan
 	err := s.db.QueryRowContext(ctx,
 		`SELECT `+scanCols+` FROM scans WHERE library_id = ? AND status = 'running' LIMIT 1`, libraryID).
-		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt)
+		Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen, &sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt,
+			&sc.Phase, &sc.Enriched, &sc.ToEnrich)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Scan{}, false, nil
 	}
@@ -108,8 +138,7 @@ func (s *Store) FailOrphanedScans(ctx context.Context) (int64, error) {
 
 func (s *Store) Scans(ctx context.Context, limit int) ([]Scan, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, library_id, status, files_seen, items_created, error, started_at,
-		 COALESCE(finished_at, '') FROM scans ORDER BY started_at DESC LIMIT ?`, limit)
+		`SELECT `+scanCols+` FROM scans ORDER BY started_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list scans: %w", err)
 	}
@@ -118,7 +147,8 @@ func (s *Store) Scans(ctx context.Context, limit int) ([]Scan, error) {
 	for rows.Next() {
 		var sc Scan
 		if err := rows.Scan(&sc.ID, &sc.LibraryID, &sc.Status, &sc.FilesSeen,
-			&sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt); err != nil {
+			&sc.ItemsCreated, &sc.Error, &sc.StartedAt, &sc.FinishedAt,
+			&sc.Phase, &sc.Enriched, &sc.ToEnrich); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		scans = append(scans, sc)

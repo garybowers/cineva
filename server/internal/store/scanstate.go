@@ -76,10 +76,21 @@ type UnmatchedItem struct {
 // id. Alternative versions are included: a match is what groups them with
 // their primary.
 func (s *Store) UnmatchedItems(ctx context.Context, libraryID string) ([]UnmatchedItem, error) {
+	return s.unmatchedItems(ctx, libraryID, `match_tried_at, title`)
+}
+
+// UnmatchedItemsNewest is UnmatchedItems with the newest arrivals first:
+// what the enrichment job after a big scan works through, so the titles
+// just added get their details before the back catalogue does.
+func (s *Store) UnmatchedItemsNewest(ctx context.Context, libraryID string) ([]UnmatchedItem, error) {
+	return s.unmatchedItems(ctx, libraryID, `added_at DESC, title`)
+}
+
+func (s *Store) unmatchedItems(ctx context.Context, libraryID, order string) ([]UnmatchedItem, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, kind, path, title, year, match_attempts, match_tried_at FROM items
 		 WHERE library_id = ? AND kind IN ('movie', 'series') AND tmdb_id = 0
-		 ORDER BY match_tried_at, title`, libraryID)
+		 ORDER BY `+order, libraryID)
 	if err != nil {
 		return nil, fmt.Errorf("unmatched items %s: %w", libraryID, err)
 	}
@@ -106,7 +117,11 @@ func (s *Store) UnmatchedItems(ctx context.Context, libraryID string) ([]Unmatch
 // pushes its next retry further out. Like SetSidecarStamps it leaves
 // updated_at alone, since nothing visible changed.
 func (s *Store) RecordMatchFailure(ctx context.Context, id string, at time.Time) error {
-	if _, err := s.db.ExecContext(ctx,
+	return recordMatchFailure(ctx, s.db, id, at)
+}
+
+func recordMatchFailure(ctx context.Context, q dbtx, id string, at time.Time) error {
+	if _, err := q.ExecContext(ctx,
 		`UPDATE items SET match_attempts = match_attempts + 1, match_tried_at = ? WHERE id = ?`,
 		at.Unix(), id); err != nil {
 		return fmt.Errorf("record match failure %s: %w", id, err)

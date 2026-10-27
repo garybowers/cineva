@@ -75,7 +75,24 @@ Android wrapper around the web client, with the remote's keys passed
 through) belongs with the native apps in `clients/`; TV mode is what it
 will show.
 
+## Music
+
+The music screens follow the same rules (server/docs/music.md). The
+artist rail, the tabs, the letter index, every grid and every track list
+are navigation groups, so a row remembers where focus left it, and every
+card and track row carries its id, so Back lands on the album or track
+it left from. The library page's Play is the page's main action. The
+track menu and the download menu are scopes of their own: the arrows stay
+inside them and Back closes them (a download `<select>` would have fired
+on an arrow press, so it is a menu). A card's play button shows on focus
+as well as on hover. The music bar sits under the top bar and takes the
+first press of OK; the now-playing screen fills the TV and takes the
+remote: play/pause plays and pauses, Back closes it, and with the play
+button focused left and right skip ten seconds within the track.
+
 ## Not yet
 
 - Search on a TV uses the television's own keyboard in the top bar's box.
+- The Songs tab's search box and the artist rail's filter use the
+  television's keyboard too.
 - The Rooms page and the admin pages are usable but not tuned for a remote.

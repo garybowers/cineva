@@ -36,13 +36,17 @@ func dictValue(dict *ffmpeg.AVDictionary, key string) string {
 }
 
 // ProbeSubtitles lists the embedded subtitle streams of a media file.
+// Probe reads them too (Info.Subtitles), from its one open.
 func ProbeSubtitles(path string) ([]SubtitleStream, error) {
 	in, err := av.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("probe subtitles %s: %w", path, err)
 	}
 	defer in.Close()
+	return subtitleStreams(in), nil
+}
 
+func subtitleStreams(in *av.Input) []SubtitleStream {
 	var out []SubtitleStream
 	streams := in.Streams()
 	for i := uint(0); i < in.NbStreams(); i++ {
@@ -59,7 +63,7 @@ func ProbeSubtitles(path string) ([]SubtitleStream, error) {
 			Forced:   st.Disposition()&ffmpeg.AVDispositionForced != 0,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // cue is one subtitle entry on its way to WebVTT.

@@ -82,6 +82,11 @@ software under the AGPL, so it stays that way.
 - **Music** — albums and artists, gapless playback, play counts, star
   ratings, and playlists: made by hand, or smart playlists that fill
   themselves from rules ("rated four stars or more, not played in a month").
+  A Subsonic-compatible API lets music apps such as Symfonium, DSub,
+  play:Sub and Feishin play the library too (`server/docs/subsonic.md`).
+- **Jellyfin apps** — a Jellyfin-compatible API lets the Jellyfin apps on
+  televisions and phones, Infuse, Swiftfin, Findroid and Kodi sign in and
+  browse and play the film and TV libraries (`server/docs/jellyfin.md`).
 - **Continue here** — while one of your devices plays, the others offer to
   carry on: pick up on your phone what the TV is playing, and the TV pauses.
   A queue can also be sent the other way ("Play on…").
@@ -268,6 +273,11 @@ keeps it sound.
 
 ## Running with Docker
 
+The image on Docker Hub is `garybowers/cineva`. To build your own from
+source, `docker build -t cineva .` at the repository root does the whole
+thing, the static FFmpeg included (most of an hour the first time, cached
+after); add `--secret id=tmdb_key,env=TMDB_KEY` to bake a TMDB key in.
+
 The image is the easiest way in: it runs on any distribution, and includes
 the GPU drivers for hardware transcoding.
 
@@ -279,12 +289,14 @@ docker run -d --name cineva \
   --device /dev/dri \
   --group-add "$(stat -c %g /dev/dri/renderD128)" \
   --restart unless-stopped \
-  <dockerhub-user>/cineva:latest
+  garybowers/cineva:latest
 ```
 
 - `/data` holds the database, the artwork cache and, if you want one, a
   `cineva.yaml`. Keep it on a volume or a host folder so it survives
-  upgrades.
+  upgrades. The server runs as `PUID:PGID` (1000:1000 unless you set them)
+  and makes `/data` that user's at every start, so a host folder needs no
+  chown; set them to the user who owns your media so it can read it.
 - Mount your media read-only and point libraries at the paths inside the
   container (`/media/Movies`, `/media/TV`).
 - `--device /dev/dri` and `--group-add` (the host's `render` group) let it
@@ -292,22 +304,11 @@ docker run -d --name cineva \
 - Settings can also be passed as environment variables, for example
   `-e CINEVA_LOG_LEVEL=debug`.
 
-With Compose:
-
-```yaml
-services:
-  cineva:
-    image: <dockerhub-user>/cineva:latest
-    ports: ["4747:4747"]
-    volumes:
-      - cineva-data:/data
-      - /path/to/media:/media:ro
-    devices: ["/dev/dri:/dev/dri"]
-    group_add: ["989"]  # the host's render group: stat -c %g /dev/dri/renderD128
-    restart: unless-stopped
-volumes:
-  cineva-data:
-```
+With Compose, `docker-compose.example.yml` at the repository root is the
+same set-up spelt out with comments: copy it to `docker-compose.yml`, set
+the media paths and the render group, and `docker compose up -d`. It
+keeps the video transcode directory in RAM and checks the server's health
+with `cineva health`.
 
 Upgrade with `docker pull` and recreating the container; the database
 migrates itself on start.

@@ -185,8 +185,17 @@ func (s *Store) SaveSegmentAnalysis(ctx context.Context, itemID, kind string, fi
 		return fmt.Errorf("save segment analysis: %w", err)
 	}
 	defer tx.Rollback()
+	if err := saveSegmentAnalysis(ctx, tx, itemID, kind, fileMtime, seg); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// saveSegmentAnalysis is SaveSegmentAnalysis inside a transaction the
+// caller holds.
+func saveSegmentAnalysis(ctx context.Context, tx dbtx, itemID, kind string, fileMtime int64, seg *Segment) error {
 	var locked bool
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT locked FROM segment_analysis WHERE item_id = ? AND kind = ?`, itemID, kind).Scan(&locked)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("save segment analysis: %w", err)
@@ -212,7 +221,7 @@ func (s *Store) SaveSegmentAnalysis(ctx context.Context, itemID, kind string, fi
 		itemID, kind, fileMtime); err != nil {
 		return fmt.Errorf("record segment analysis: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
 
 // SegmentStates reports every kind of segment for an item, found or not.

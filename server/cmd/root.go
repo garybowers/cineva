@@ -95,6 +95,7 @@ func initConfig() {
 	// when nothing overrides it.
 	viper.SetDefault("metadata.tmdb.api_key", "")
 	viper.SetDefault("metadata.musicbrainz.enabled", true)
+	viper.SetDefault("metadata.listenbrainz.token", "")
 	viper.SetDefault("transcode.dir", filepath.Join(os.TempDir(), "cineva-transcode"))
 	viper.SetDefault("transcode.segment_secs", 6)
 	viper.SetDefault("transcode.hwaccel", "auto")
@@ -103,11 +104,14 @@ func initConfig() {
 	viper.SetDefault("libraries.history_retention_days", 90)
 	viper.SetDefault("libraries.intro_detection", true)
 	viper.SetDefault("transcode.max_bytes", int64(media.DefaultTranscodeMaxBytes))
+	viper.SetDefault("transcode.audio_cache_mb", 2048)
 	viper.SetDefault("stats.sample_secs", 5)
 	viper.SetDefault("stats.retention_hours", 24)
 	viper.SetDefault("auth.session_days", 30)
 	viper.SetDefault("auth.secure_cookies", false)
 	viper.SetDefault("auth.login_mode", "picker")
+	viper.SetDefault("subsonic.enabled", true)
+	viper.SetDefault("jellyfin.enabled", true)
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.format", "auto")
 

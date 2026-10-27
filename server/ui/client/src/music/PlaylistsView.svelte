@@ -2,7 +2,7 @@
   // The viewer's playlists, and one playlist open. Manual playlists are
   // arranged by hand — dragged on a desktop, moved with buttons on a phone;
   // smart ones are rules the server evaluates each time one is opened.
-  import { Play, Shuffle, ListPlus, Pencil, Trash2, Plus, Sparkles, GripVertical, ArrowUp, ArrowDown, Music as MusicIcon, ChevronLeft } from '@lucide/svelte'
+  import { Play, Shuffle, ListPlus, ListStart, Pencil, Trash2, Plus, Sparkles, GripVertical, ArrowUp, ArrowDown, Music as MusicIcon, ChevronLeft } from '@lucide/svelte'
   import {
     listPlaylists, playlistDetail, createPlaylist, updatePlaylist, deletePlaylist, setPlaylistTracks,
     type Playlist, type PlaylistDetail, type Item, type SmartRules,
@@ -169,8 +169,10 @@
         <p class="stats">{p.trackCount === 1 ? '1 track' : `${p.trackCount} tracks`}{p.durationSecs ? ` · ${totalTime(p.durationSecs)}` : ''}</p>
         {#if p.smart}<p class="rules">{describe(p.smart)}</p>{/if}
         <div class="acts">
-          <button class="primary" disabled={!open.tracks.length} onclick={() => open && music().play(open.tracks, 0)}><Play size={16} /> Play</button>
-          <button class="btn" disabled={!open.tracks.length} onclick={() => open && music().play(open.tracks, Math.floor(Math.random() * open.tracks.length), true)}><Shuffle size={15} /> Shuffle</button>
+          <button class="play primary" disabled={!open.tracks.length} onclick={() => open && music().play(open.tracks, 0, false, { kind: 'playlist', id: p.id, title: p.name })}><Play size={16} /> Play</button>
+          <button class="btn" disabled={!open.tracks.length} onclick={() => open && music().play(open.tracks, 0, true, { kind: 'playlist', id: p.id, title: p.name })}><Shuffle size={15} /> Shuffle</button>
+          <button class="btn icon" disabled={!open.tracks.length} title="Play next" aria-label="Play next"
+            onclick={() => { if (open) { music().playNext(open.tracks); music().notify('info', `Playing next: ${open.tracks.length} tracks.`) } }}><ListStart size={16} /></button>
           <button class="btn icon" disabled={!open.tracks.length} title="Add to queue" aria-label="Add to queue"
             onclick={() => { if (open) { music().queue(open.tracks); music().notify('info', `Queued ${open.tracks.length} tracks.`) } }}><ListPlus size={16} /></button>
           {#if p.smart}
@@ -202,7 +204,7 @@
             ondragend={() => (dragFrom = dragOver = null)}
           >
             {#if manual}<span class="grip" aria-hidden="true"><GripVertical size={15} /></span>{/if}
-            <button class="trow" onclick={() => open && music().play(open.tracks, i)}>
+            <button class="trow" onclick={() => open && music().play(open.tracks, i, false, { kind: 'playlist', id: p.id, title: p.name })}>
               <span class="rank">{i + 1}</span>
               {#if t.poster}<img src={t.poster} alt="" loading="lazy" />{:else}<span class="thumb"><MusicIcon size={14} /></span>{/if}
               <span class="tmain"><span class="ttitle">{t.title}</span><span class="tsub">{t.artist}</span></span>
@@ -215,7 +217,7 @@
                 <button title="Move up" aria-label="Move {t.title} up" disabled={i === 0} onclick={() => move(i, -1)}><ArrowUp size={15} /></button>
                 <button title="Move down" aria-label="Move {t.title} down" disabled={i === open.tracks.length - 1} onclick={() => move(i, 1)}><ArrowDown size={15} /></button>
               </span>
-              <TrackMenu track={t} onremove={() => removeAt(i)} />
+              <TrackMenu track={t} onremove={() => removeAt(i)} onmove={(d) => move(i, d)} />
             {:else}
               <TrackMenu track={t} />
             {/if}

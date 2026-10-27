@@ -3,11 +3,13 @@
   // albums by year and what else they appear on. Reached from the music
   // library's artist rail, album pages, track menus and search.
   import { onDestroy } from 'svelte'
-  import { Play, Shuffle, ListPlus, ListMusic, MicVocal, Music as MusicIcon, ExternalLink } from '@lucide/svelte'
-  import { artistPage, itemDetail, type ArtistPage, type Item } from '../lib/api'
-  import { music, addToPlaylist, trackTime, totalTime, plays } from './actions.svelte'
-  import TrackMenu from './TrackMenu.svelte'
-  import Stars from './Stars.svelte'
+  import { Play, Shuffle, ListPlus, ListStart, ListMusic, MicVocal, ExternalLink, Sparkles } from '@lucide/svelte'
+  import { artistPage, itemTracks, type ArtistPage, type Item } from '../lib/api'
+  import { music, addToPlaylist, totalTime } from './actions.svelte'
+  import { mq, play, playNext, append } from './player/queue.svelte'
+  import TrackList from './TrackList.svelte'
+  import DownloadMenu from './DownloadMenu.svelte'
+  import AlbumGrid from './library/AlbumGrid.svelte'
 
   let { artist }: { artist: Item } = $props()
 
@@ -50,29 +52,29 @@
   const image = $derived(a.poster || fallback)
   const portrait = $derived(!!a.poster)
 
-  // Every track of theirs, album by album, for Play and Shuffle.
-  async function allTracks(): Promise<Item[]> {
-    if (!page) return []
-    const lists = await Promise.all(page.albums.map((al) => itemDetail(al.id).then((d) => d.children.filter((c) => c.kind === 'track'))))
-    return lists.flat()
-  }
+  // Every track of theirs, album by album in release order, in one request.
+  const source = $derived({ kind: 'artist', id: artist.id, title: artist.title })
+  const allTracks = () => itemTracks(artist.id)
+  const fail = (err: unknown) => music().notify('error', err instanceof Error ? err.message : String(err))
   async function playAll(shuffle = false) {
     try {
       const tracks = await allTracks()
-      if (tracks.length) music().play(tracks, shuffle ? Math.floor(Math.random() * tracks.length) : 0, shuffle)
+      if (tracks.length) play(tracks, 0, { shuffle, source })
     } catch (err) {
-      music().notify('error', err instanceof Error ? err.message : String(err))
+      fail(err)
     }
   }
-  async function queueAll() {
+  async function queueAll(next = false) {
     try {
       const tracks = await allTracks()
-      music().queue(tracks)
-      music().notify('info', `Queued ${tracks.length} tracks by ${a.title}.`)
+      if (next) playNext(tracks)
+      else append(tracks)
+      music().notify('info', `${next ? 'Playing next' : 'Queued'}: ${tracks.length} tracks by ${a.title}.`)
     } catch (err) {
-      music().notify('error', err instanceof Error ? err.message : String(err))
+      fail(err)
     }
   }
+  const playing = $derived(mq.active ? mq.items[mq.index]?.id : undefined)
 
   const stats = $derived.by(() => {
     if (!page) return ''
@@ -86,12 +88,11 @@
   })
   async function playAlbum(al: Item) {
     try {
-      music().play((await itemDetail(al.id)).children.filter((c) => c.kind === 'track'), 0)
+      play(await itemTracks(al.id), 0, { source: { kind: 'album', id: al.id, title: al.title } })
     } catch (err) {
-      music().notify('error', err instanceof Error ? err.message : String(err))
+      fail(err)
     }
   }
-  const albumOf = (t: Item) => page?.albums.find((al) => al.id === t.parentId) ?? page?.appearsOn.find((al) => al.id === t.parentId)
 </script>
 
 <div class="artist">
@@ -109,17 +110,13 @@
       <h1>{a.title}</h1>
       {#if stats}<p class="stats">{stats}</p>{/if}
       <div class="acts">
-        <button class="primary" onclick={() => playAll()} disabled={!page?.albums.length}><Play size={16} /> Play</button>
+        <button class="play primary" onclick={() => playAll()} disabled={!page?.albums.length}><Play size={16} /> Play</button>
         <button class="btn" onclick={() => playAll(true)} disabled={!page?.albums.length}><Shuffle size={15} /> Shuffle</button>
-        <button class="btn icon" onclick={queueAll} disabled={!page?.albums.length} title="Add to queue" aria-label="Add to queue"><ListPlus size={16} /></button>
+        <button class="btn" onclick={() => music().mix(a)} disabled={!page?.albums.length} title="A mix from this artist: their best-known songs, then similar artists"><Sparkles size={15} /> Mix</button>
+        <button class="btn icon" onclick={() => queueAll(true)} disabled={!page?.albums.length} title="Play next" aria-label="Play next"><ListStart size={16} /></button>
+        <button class="btn icon" onclick={() => queueAll()} disabled={!page?.albums.length} title="Add to queue" aria-label="Add to queue"><ListPlus size={16} /></button>
         <button class="btn icon" onclick={() => addToPlaylist([a.id], a.title)} disabled={!page?.albums.length} title="Add to playlist" aria-label="Add to playlist"><ListMusic size={16} /></button>
-        <select class="btn dlsel" title="Download (ZIP)" aria-label="Download" onchange={(e) => { const s = e.target as HTMLSelectElement; music().download(a.id, s.value); s.value = '' }}>
-          <option value="">Download…</option>
-          <option value="original">Original (ZIP)</option>
-          <option value="mp3-320">MP3 320 (ZIP)</option>
-          <option value="mp3-192">MP3 192 (ZIP)</option>
-          <option value="ogg-192">OGG 192 (ZIP)</option>
-        </select>
+        <DownloadMenu id={a.id} compact />
       </div>
     </div>
   </header>
@@ -145,25 +142,8 @@
   {#if page && page.topTracks.length > 0}
     <section>
       <h2>Top tracks</h2>
-      <ol class="tracks">
-        {#each page.topTracks as t, i (t.id)}
-          {@const al = albumOf(t)}
-          <li class="trackstars">
-            <button class="trow" onclick={() => page && music().play(page.topTracks, i)}>
-              <span class="rank">{i + 1}</span>
-              {#if t.poster}<img src={t.poster} alt="" loading="lazy" />{:else}<span class="thumb ph"><MusicIcon size={14} /></span>{/if}
-              <span class="tmain">
-                <span class="ttitle">{t.title}</span>
-                <span class="tsub">{al?.title ?? t.artist}</span>
-              </span>
-              <span class="tplays" title="Your plays">{t.playCount ? plays(t.playCount) : ''}</span>
-              <span class="ttime">{trackTime(t.runtimeSecs)}</span>
-            </button>
-            <Stars track={t} />
-            <TrackMenu track={t} artist={false} />
-          </li>
-        {/each}
-      </ol>
+      <TrackList tracks={page.topTracks} mode="list" currentId={playing} menuArtist={false}
+        onplay={(i) => page && play(page.topTracks, i, { source: { kind: 'artist', id: artist.id, title: `${artist.title}: top tracks` } })} />
     </section>
   {/if}
 
@@ -171,40 +151,17 @@
     {#if page.albums.length > 0}
       <section>
         <h2>Albums</h2>
-        <div class="grid">
-          {#each page.albums as al (al.id)}
-            {@render albumCard(al)}
-          {/each}
-        </div>
+        <AlbumGrid items={page.albums} showArtist={false} onopen={(al) => music().openAlbum(al)} onplay={playAlbum} />
       </section>
     {/if}
     {#if page.appearsOn.length > 0}
       <section>
         <h2>Appears on</h2>
-        <div class="grid">
-          {#each page.appearsOn as al (al.id)}
-            {@render albumCard(al, true)}
-          {/each}
-        </div>
+        <AlbumGrid items={page.appearsOn} onopen={(al) => music().openAlbum(al)} onplay={playAlbum} />
       </section>
     {/if}
   {/if}
 </div>
-
-{#snippet albumCard(al: Item, showArtist = false)}
-  <div class="card">
-    <div class="cwrap">
-      <button class="cover" onclick={() => music().openAlbum(al)} aria-label={al.title}>
-        {#if al.poster}<img src={al.poster} alt="" loading="lazy" />{:else}<span class="ph"><MusicIcon size={30} /></span>{/if}
-      </button>
-      <button class="cardplay" title="Play {al.title}" aria-label="Play {al.title}" onclick={() => playAlbum(al)}>
-        <Play size={16} />
-      </button>
-    </div>
-    <button class="cname" onclick={() => music().openAlbum(al)}>{al.title}</button>
-    <span class="csub">{showArtist ? al.artist : ''}{showArtist && al.year ? ' · ' : ''}{al.year || ''}</span>
-  </div>
-{/snippet}
 
 <style>
   .artist { position: relative; }
@@ -240,7 +197,6 @@
   .btn:hover { border-color: var(--accent); }
   .btn.icon { padding: 0.5rem 0.65rem; }
   .primary:disabled, .btn:disabled { opacity: 0.5; cursor: default; }
-  .dlsel { font: inherit; font-size: 0.85rem; padding: 0.45rem 0.8rem; max-width: 9rem; color: var(--muted); }
 
   .note { color: var(--muted); font-size: 0.88rem; text-align: center; margin: 0.5rem 0; }
   .note.err { color: var(--err); }
@@ -254,40 +210,6 @@
   .link { color: var(--accent-2); font-size: 0.85rem; padding: 0; }
 
   h2 { font-size: 1.1rem; color: var(--text); margin: 1.6rem 0 0.7rem; }
-  .tracks { list-style: none; display: grid; gap: 0.1rem 2rem; }
-  .tracks li { display: flex; align-items: center; min-width: 0; border-radius: 8px; }
-  .tracks li:hover { background: var(--panel); }
-  .trow { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0.7rem; padding: 0.35rem 0.4rem; text-align: left; }
-  .rank { width: 1.3rem; text-align: right; color: var(--muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; flex: none; }
-  .trow img, .thumb { width: 2.6rem; height: 2.6rem; border-radius: 5px; object-fit: cover; flex: none; }
-  .thumb.ph { display: grid; place-items: center; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }
-  .tmain { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .ttitle, .tsub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ttitle { font-size: 0.92rem; }
-  .tsub { font-size: 0.78rem; color: var(--muted); }
-  .trow:hover .ttitle { color: var(--accent-2); }
-  .tplays { color: var(--muted); font-size: 0.78rem; white-space: nowrap; flex: none; }
-  .ttime { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; flex: none; width: 2.8rem; text-align: right; }
-
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr)); gap: 1rem 0.9rem; }
-  .card { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
-  .cwrap { position: relative; }
-  .cover { display: block; width: 100%; padding: 0; border-radius: 10px; overflow: hidden; aspect-ratio: 1; border: 1px solid var(--border); background: var(--panel); }
-  .cover img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.15s ease; }
-  .cover .ph { width: 100%; height: 100%; display: grid; place-items: center; color: var(--muted); }
-  .card:hover .cover { border-color: var(--accent); }
-  .card:hover .cover img { transform: scale(1.03); }
-  .cardplay {
-    position: absolute; right: 0.45rem; bottom: 0.45rem; width: 2.4rem; height: 2.4rem;
-    display: grid; place-items: center; border-radius: 50%;
-    background: color-mix(in srgb, var(--accent) 85%, var(--panel)); color: var(--text);
-    opacity: 0; transition: opacity 0.15s ease;
-  }
-  .card:hover .cardplay, .cardplay:focus-visible { opacity: 1; }
-  @media (hover: none) { .cardplay { display: none; } }
-  .cname { text-align: left; padding: 0; font-size: 0.86rem; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
-  .cname:hover { color: var(--accent-2); }
-  .csub { font-size: 0.75rem; color: var(--muted); }
 
   @media (min-width: 48rem) {
     .hero { flex-direction: row; align-items: flex-end; text-align: left; gap: 1.6rem; padding-top: 1rem; }
@@ -296,13 +218,8 @@
     h1 { font-size: 2.6rem; }
     .acts { justify-content: flex-start; }
     .bio { margin-left: 0; }
-    .tracks { grid-template-columns: 1fr 1fr; }
-    .grid { grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); }
   }
   @media (max-width: 767px) {
     .artbg { margin: -1rem -1rem 0; }
-  }
-  @media (max-width: 30rem) {
-    .tplays { display: none; }
   }
 </style>

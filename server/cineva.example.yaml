@@ -66,6 +66,11 @@ transcode:
   # Exceeding it evicts least-recently-used sessions.
   #                                             CINEVA_TRANSCODE_MAX_BYTES
   max_bytes: 8589934592
+  # Cap on cached music transcodes, in MiB. They live beside the database
+  # (<its directory>/cache/audio), not in the scratch above, so a track
+  # encoded once stays encoded across a reboot; the least recently played
+  # go first. 0 removes the cap.             CINEVA_TRANSCODE_AUDIO_CACHE_MB
+  audio_cache_mb: 2048
   # Hardware acceleration: "auto" probes NVENC, QuickSync then VAAPI and uses
   # the first that opens; "none" forces software; "vaapi", "qsv" or "nvenc"
   # pin one backend.                              CINEVA_TRANSCODE_HWACCEL
@@ -97,6 +102,27 @@ metadata:
     # Enrich music from MusicBrainz and Cover Art Archive after embedded
     # tags.                            CINEVA_METADATA_MUSICBRAINZ_ENABLED
     enabled: true
+  listenbrainz:
+    # A ListenBrainz user token (free with an account, under Settings on
+    # listenbrainz.org) for mixes (docs/mix.md): ListenBrainz keeps an
+    # artist's best-known songs behind one, while the similar-artists
+    # graph is open. Without it mixes still work, from similarity and
+    # your own listening.                 CINEVA_METADATA_LISTENBRAINZ_TOKEN
+    token: ""
+
+subsonic:
+  # Serve the Subsonic-compatible API at /rest/, so music apps such as
+  # Symfonium, DSub, play:Sub and Feishin can play the music libraries
+  # (docs/subsonic.md). They sign in with the account password or an API
+  # key.                                            CINEVA_SUBSONIC_ENABLED
+  enabled: true
+
+jellyfin:
+  # Serve the Jellyfin-compatible API at the server's root, so the Jellyfin
+  # apps on televisions and phones (and Infuse, Swiftfin, Findroid, Kodi)
+  # can browse and play the libraries (docs/jellyfin.md). They sign in
+  # with the account password.                      CINEVA_JELLYFIN_ENABLED
+  enabled: true
 
 stats:
   # How often the admin dashboard samples CPU, memory and disk, in seconds.

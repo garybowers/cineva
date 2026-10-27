@@ -282,8 +282,15 @@ paths:
         "409": { description: Setup already completed }
   /auth/login:
     post:
-      summary: Sign in (sets the session cookie)
-      description: The password field also accepts the user's PIN, when they have one.
+      summary: Sign in (sets the session cookie, or returns a bearer token)
+      description: >
+        The password field also accepts the user's PIN, when they have one.
+        A native app sends bearer: true and its device, and gets the session
+        token in the answer instead of cookies (server/docs/offline.md); it
+        then sends `Authorization: Bearer <token>` on every request, and the
+        session slides and can be signed out from the Devices page like any
+        other. The device is the app's own: the same device id is the same
+        device at every sign-in, named as the app says the first time.
       operationId: authLogin
       tags: [Account]
       security: []
@@ -291,9 +298,31 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/Credentials" }
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/Credentials"
+                - type: object
+                  properties:
+                    bearer: { type: boolean, default: false, description: Answer with the token and set no cookies }
+                    device:
+                      type: object
+                      description: The app's device, for a bearer sign-in
+                      properties:
+                        id: { type: string, description: The app's stable id for this install }
+                        name: { type: string, description: '"Pixel 8"' }
+                        client: { type: string, description: '"Cineva Android 0.1"' }
       responses:
-        "200": { description: Signed in, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "200":
+          description: Signed in; with bearer, the user plus the token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/User"
+                  - type: object
+                    properties:
+                      token: { type: string, description: The session token, on a bearer sign-in only }
+                      sessionId: { type: string, description: "The session's id, which is the device's, on a bearer sign-in only" }
         "401": { description: Incorrect username or password (or account disabled) }
   /auth/profiles:
     get:
@@ -518,12 +547,21 @@ paths:
         "200": { description: Keys (never the secret), content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } }
     post:
       summary: Create an API key — the secret is returned exactly once
+      description: >
+        forApps keeps a sealed copy of the key on the server so it can be
+        typed into a music app as the password, salted-token sign-in
+        included (docs/subsonic.md); without it the key is a plain bearer
+        secret, hashed and never read back.
       operationId: createAPIKey
       tags: [Account]
       requestBody:
         content:
           application/json:
-            schema: { type: object, properties: { name: { type: string } } }
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                forApps: { type: boolean, default: false }
       responses:
         "201":
           description: Key created
@@ -628,11 +666,12 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
   /auth/sessions/current/queue:
     put:
-      summary: Record this device's play queue, so another device can take it over
+      summary: Record this device's play queue, so another device can take it over and a reload can carry on
       description: >
-        Positions are not part of it: resume positions are kept per user and
-        item, so whichever device plays next resumes where the last stopped.
-        An empty list clears it.
+        The whole record (see QueueRequest). Film and episode positions are
+        not part of it, since resume positions are kept per user and item;
+        a track's position is, written by the playback heartbeat, because
+        music keeps no resume state. An empty list clears it.
       operationId: saveDeviceQueue
       tags: [Devices]
       requestBody:
@@ -643,6 +682,17 @@ paths:
       responses:
         "204": { description: Saved }
         "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      summary: This device's own saved queue, to carry on after a reload
+      description: >
+        As /auth/sessions/{id}/queue, for the requesting device: its entries
+        resolved to the items the caller may still see, with shuffle, repeat,
+        the position in the current entry and what the queue was made from.
+      operationId: myQueue
+      tags: [Devices]
+      responses:
+        "200": { description: The queue, content: { application/json: { schema: { $ref: "#/components/schemas/HandoffQueue" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
   /auth/sessions/revoke-others:
     post:
       summary: Sign out every device but this one
@@ -1347,6 +1397,110 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Item" }
 
+  /libraries/{id}/ids:
+    get:
+      summary: Every item id in a library
+      description: >
+        For a client keeping a local copy of the library to find what was
+        deleted, since a pruned item leaves no trace for ?since= to report.
+        One indexed column, so cheap even for tens of thousands of items.
+      operationId: libraryIDs
+      tags: [Libraries]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The ids
+          content:
+            application/json:
+              schema: { type: array, items: { type: string, format: uuid } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /downloads:
+    get:
+      summary: Your download jobs
+      operationId: listDownloads
+      tags: [Playback]
+      responses:
+        "200":
+          description: Jobs, oldest first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DownloadJob" } }
+    post:
+      summary: Ask for tracks to be prepared for download
+      description: >
+        One job per track (server/docs/offline.md): itemId or itemIds may
+        name tracks, albums or artists, the last two expanding to their
+        tracks. An original is ready at once; an Opus transcode is prepared
+        in the background through the audio cache and polled until ready. A
+        user may have at most 500 jobs queued or preparing. Video profiles
+        arrive with a later stage and are refused for now.
+      operationId: createDownloads
+      tags: [Playback]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profile]
+              properties:
+                itemId: { type: string, format: uuid }
+                itemIds: { type: array, items: { type: string, format: uuid } }
+                profile: { type: string, enum: [original, opus-128, opus-64] }
+      responses:
+        "201":
+          description: The jobs, in the tracks' order
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/DownloadJob" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { description: Too many jobs still being prepared }
+
+  /downloads/{id}:
+    get:
+      summary: One download job, polled until ready
+      operationId: getDownload
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DownloadJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Forget a download job (the cached file stays for the cache to evict)
+      operationId: deleteDownload
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Forgotten }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /downloads/{id}/file:
+    get:
+      summary: Fetch a prepared download
+      description: >
+        The file, with ranges, so a fetch resumes where it stopped. An
+        original comes from the library; a transcode from the audio cache,
+        waited for if it is still being encoded. A failed job answers 409
+        with why.
+      operationId: downloadFile
+      tags: [Playback]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: The file }
+        "206": { description: Part of the file }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: The job failed }
+
   /libraries/{id}/manage:
     get:
       summary: One page of a library's items for the Manage list (admin)
@@ -1422,6 +1576,37 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ArtistPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/mix:
+    get:
+      summary: One batch of a mix grown from a track, an album or an artist
+      description: >
+        A mix is a playlist that builds itself from a seed (server/docs/mix.md):
+        tracks from the library chosen by which artists are alike (ListenBrainz's
+        similar artists, cached), which of their songs are best known, what the
+        household plays and rates, what it plays beside the seed, genre and era,
+        and never anything the viewer played in the last three hours or already
+        has queued. The top is diversified: no artist twice in a row, at most two
+        in twenty, the seed's artists capped at a quarter. basis names the
+        signals the batch had, so a client can say "Similar artists" or "Based on
+        what you play". A seed whose similarity is not cached yet is looked up in
+        the background: this batch comes from what is known, the next is better.
+      operationId: itemMix
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { name: exclude, in: query, required: false, schema: { type: string }, description: Track ids already queued, comma separated, up to a thousand }
+        - { name: after, in: query, required: false, schema: { type: string, format: uuid }, description: The track the listener reached, so a long mix drifts from where it is }
+        - { name: start, in: query, required: false, schema: { type: boolean, default: false }, description: 'The first batch of a mix started on purpose: a track seed comes first, an album seed opens with a few of its best spread through, an artist seed with its best-known leading' }
+      responses:
+        "200":
+          description: The batch
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Mix" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
@@ -2246,7 +2431,8 @@ paths:
                   type: object
                   properties:
                     genre: { type: string }
-                    count: { type: integer }
+                    count: { type: integer, description: 'Titles carrying the genre: films, series or albums' }
+                    tracks: { type: integer, description: Tracks carrying it, in a music library }
 
   /libraries/{id}/refresh:
     post:
@@ -2384,15 +2570,186 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /libraries/{id}/artists:
+    get:
+      summary: One page of a music library's artists
+      description: >
+        Filtered, sorted and paged on the server (server/docs/music.md), each
+        artist with their album count (childCount) and the requesting user's
+        plays of them. On the name sort the response carries index, how many
+        artists file under each letter (and "#" for the rest) with the letter
+        filter not applied, for drawing a letter strip. q matches every word
+        as a substring of the name, insensitive to case and accents, names
+        starting with the query first.
+      operationId: libraryArtists
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: q, in: query, required: false, schema: { type: string }, description: Words to match in the name }
+        - { name: genre, in: query, required: false, schema: { type: string }, description: Artists with an album in the genre }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [name, added, plays, played, random], default: name } }
+        - { name: letter, in: query, required: false, schema: { type: string }, description: 'A letter, or "#" for names starting with anything else' }
+        - { name: page, in: query, required: false, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 60 } }
+      responses:
+        "200":
+          description: The page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MusicPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/albums:
+    get:
+      summary: One page of a music library's albums
+      description: >
+        As /libraries/{id}/artists, for albums: each with its track count
+        (childCount), the requesting user's plays of it and their rating of
+        it. q matches the title and the artist.
+      operationId: libraryAlbums
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: q, in: query, required: false, schema: { type: string }, description: Words to match in the title or artist }
+        - { name: artist, in: query, required: false, schema: { type: string, format: uuid }, description: Only this artist's own albums }
+        - { name: genre, in: query, required: false, schema: { type: string } }
+        - { name: year, in: query, required: false, schema: { type: integer } }
+        - { name: decade, in: query, required: false, schema: { type: integer }, description: The decade's first year (1990) }
+        - { name: compilations, in: query, required: false, schema: { type: boolean, default: false }, description: Only albums by various artists }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [name, artist, year, added, plays, played, rating, random], default: name } }
+        - { name: letter, in: query, required: false, schema: { type: string } }
+        - { name: page, in: query, required: false, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 60 } }
+      responses:
+        "200":
+          description: The page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MusicPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/tracks:
+    get:
+      summary: One page of a music library's tracks
+      description: >
+        As /libraries/{id}/artists, for tracks, each carrying its album title
+        and album artist, the requesting user's plays and their rating. q
+        matches the title, the artist and the album. The page may be up to a
+        thousand tracks, so a genre, or a random thousand of the library
+        (sort=random), can be queued in one request.
+      operationId: libraryTracks
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: q, in: query, required: false, schema: { type: string } }
+        - { name: genre, in: query, required: false, schema: { type: string } }
+        - { name: year, in: query, required: false, schema: { type: integer } }
+        - { name: decade, in: query, required: false, schema: { type: integer } }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [title, artist, album, added, plays, played, rating, random], default: title } }
+        - { name: letter, in: query, required: false, schema: { type: string } }
+        - { name: page, in: query, required: false, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 60 } }
+      responses:
+        "200":
+          description: The page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MusicPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /libraries/{id}/search:
+    get:
+      summary: Search within a music library
+      description: >
+        What the library's search box shows as the query is typed: the
+        artists and albums (five each) and tracks (twenty) matching every
+        word of it, names starting with the query first. Fewer than two
+        characters finds nothing.
+      operationId: librarySearch
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: q, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The matches, each list possibly empty
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artists, albums, tracks]
+                properties:
+                  artists: { type: array, items: { $ref: "#/components/schemas/Item" } }
+                  albums: { type: array, items: { $ref: "#/components/schemas/Item" } }
+                  tracks: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/tracks:
+    get:
+      summary: Every track under an artist or album, in play order
+      description: >
+        An album's tracks in disc and track order, or an artist's own albums'
+        tracks album by album in release order, each with the requesting
+        user's plays and rating, in one request: what Play, Shuffle and Add
+        to queue put in the queue. shuffle=true returns them shuffled.
+      operationId: itemTracks
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: shuffle, in: query, required: false, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: The tracks
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Item" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /items/{id}/lyrics:
+    get:
+      summary: A track's lyrics
+      description: >
+        From the file's tags or an .lrc file beside it, read when the track
+        was scanned; never looked up online. synced means the lines are
+        timed ("[01:23.45] ...").
+      operationId: itemLyrics
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The lyrics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [synced, text]
+                properties:
+                  synced: { type: boolean }
+                  text: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /playlists:
     get:
       summary: Your playlists
       description: >
         The requesting user's playlists by name, each summarised over the
         tracks they can play now. Playlists are personal: nobody else sees
-        them, admins included.
+        them, admins included. With for=<track id>, the list a picker adds
+        that track from: the playlists most recently added to first, those
+        never added to by name after them, each with holds set where it
+        already has the track (server/docs/mix.md).
       operationId: listPlaylists
       tags: [Music]
+      parameters:
+        - { name: for, in: query, required: false, schema: { type: string, format: uuid }, description: A track the caller is about to add }
       responses:
         "200":
           description: Playlists
@@ -2469,6 +2826,31 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /playlists/{id}/items/last:
+    delete:
+      summary: Undo an append to a manual playlist
+      description: >
+        Takes the last count entries (1 by default) off the end: the undo of
+        an add, whose size the client knows. A smart playlist refuses with
+        400.
+      operationId: removeLastPlaylistItems
+      tags: [Music]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: count, in: query, required: false, schema: { type: integer, minimum: 1, default: 1 } }
+      responses:
+        "200":
+          description: How many entries went
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /playlists/{id}/items:
@@ -3580,10 +3962,20 @@ paths:
         play when capable, else remux with AAC audio); "original" forces
         direct play; "1080p"/"720p"/"480p" force a video re-encode at that
         level. Starting playback replaces any existing session for the item.
-        Music tracks always answer direct play (browsers decode
-        flac/mp3/aac/ogg/opus natively); capabilities/quality are ignored for
-        them. The music hierarchy (artist -> album -> ordered tracks) is
-        served by the same /libraries/{id}/items and /items/{id} endpoints.
+
+        A music track is negotiated too (server/docs/music.md, part 3): the
+        device's music-quality preference, resolved on the server so an
+        administrator's lock holds, decides between the original file and an
+        Opus transcode ("original", "opus-128", "opus-64"; the client's own
+        quality applies when nothing locks it), and a device whose audioCodecs
+        leave out the file's codec is sent a transcode it can play (Opus if
+        listed, else AAC). The answer's url carries any format and quality,
+        mode is always "direct", and source says what will play (codec,
+        bitrate, sampleRate, bitDepth) for a quality badge. The transcode
+        streams while it is encoded, so the first play does not wait for it.
+        A second request for the same track from the same device within 30
+        seconds (a seek to the start) is the same play: the same answer,
+        without another history row.
       operationId: playItem
       tags: [Playback]
       parameters:
@@ -3600,7 +3992,10 @@ paths:
                 audioCodecs: { type: array, items: { type: string } }
                 quality:
                   type: string
-                  enum: [auto, original, 1080p, 720p, 480p]
+                  enum: [auto, original, 1080p, 720p, 480p, opus-128, opus-64]
+                  description: >
+                    Video: the level to send. Track: the music quality, when
+                    the device's preference is not locked.
                 fromStart:
                   type: boolean
                   description: Ignore the stored resume position and play from 00:00
@@ -3635,13 +4030,20 @@ paths:
       tags: [Playback]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
-        - { name: format, in: query, required: false, schema: { type: string, enum: [original, opus, aac, mp3, ogg] }, description: Music only — stream a cached transcode instead of the file (Opus for bandwidth, AAC as the universal browser fallback) }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [original, opus, aac, mp3, ogg] }, description: "Music only — stream a cached transcode instead of the file (Opus for bandwidth, AAC as the universal browser fallback). What the play call negotiated is already in its url." }
         - { name: quality, in: query, required: false, schema: { type: integer, enum: [64, 96, 128, 192, 256, 320] }, description: Bitrate in kbps for transcoded formats (default 192) }
       description: >
         Every read of the file has a deadline: if the storage stops answering
         part-way through a response, the response is cut short rather than
         left hanging, and the next request is refused with 503 once the
         library has been found unreachable.
+
+        A transcode is encoded once per track, format and bitrate into a
+        cache beside the database (transcode.audio_cache_mb bounds it) and
+        served from the first packet while it is still being encoded, as a
+        chunked response without ranges; once it is on disk in full it is
+        served with ranges like the original. Two requests for the same
+        transcode share one encode.
       responses:
         "200": { description: The media file }
         "206": { description: Partial content (range request) }
@@ -4356,15 +4758,64 @@ components:
         online: { type: boolean, description: Has the app open now }
     QueueRequest:
       type: object
-      required: [itemIds]
+      description: >
+        A device's play queue, whole: the entries in play order with each
+        one's place in the unshuffled order (so turning shuffle off puts it
+        back), where in them, shuffle and repeat, where in the current entry
+        (kept up to date by the playback heartbeat for tracks), and what it
+        was made from. itemIds is the shape before migration 0046 and is
+        still accepted in place of entries.
       properties:
-        itemIds: { type: array, maxItems: 500, items: { type: string } }
-        index: { type: integer, minimum: 0, description: The item playing (or to play first) }
+        entries:
+          type: array
+          maxItems: 1000
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: { type: string }
+              ord: { type: integer, description: Its place in the unshuffled order }
+        itemIds: { type: array, maxItems: 1000, items: { type: string }, description: The old shape, entries in order }
+        index: { type: integer, minimum: 0, description: The entry playing (or to play first) }
+        mix: { $ref: "#/components/schemas/QueueMix" }
+        shuffle: { type: boolean }
+        repeat: { type: string, enum: [off, all, one] }
+        positionSecs: { type: number, description: Seconds into the current entry }
+        source: { $ref: "#/components/schemas/QueueSource" }
+    QueueSource:
+      type: object
+      description: What a queue was made from, for "Playing from" and "Save as playlist"
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [album, artist, playlist, genre, library, search, collection, series, season] }
+        id: { type: string }
+        title: { type: string }
     HandoffQueue:
       type: object
+      description: A queue on its way between devices, its entries resolved to items in play order
+      required: [items, index]
       properties:
         items: { type: array, items: { $ref: "#/components/schemas/Item" } }
         index: { type: integer }
+        shuffle: { type: boolean }
+        repeat: { type: string, enum: [off, all, one] }
+        positionSecs: { type: number, description: Seconds into the current entry, as the other device last reported }
+        source: { $ref: "#/components/schemas/QueueSource" }
+        mix: { $ref: "#/components/schemas/QueueMix" }
+    QueueMix:
+      type: object
+      description: >
+        The queue is, or ends in, a mix (server/docs/mix.md): what it grew
+        from and where it has got to, kept as the client sent it so another
+        device carries it on and Up next can name it.
+      required: [seedId]
+      properties:
+        seedId: { type: string, description: The track, album or artist the mix grew from }
+        kind: { type: string, enum: [track, album, artist] }
+        title: { type: string, description: The seed's title, for "Mix · from ..." }
+        after: { type: string, description: The last track the mix was asked to continue from }
+        from: { type: integer, description: "The queue index the mix's entries begin at: 0 for a mix started on purpose" }
+        basis: { type: array, items: { type: string }, description: The signals the last batch had }
     RefreshProgress:
       type: object
       properties:
@@ -4815,6 +5266,7 @@ components:
         name: { type: string }
         createdAt: { type: string }
         lastUsedAt: { type: string }
+        forApps: { type: boolean, description: Usable as a password in music apps }
     MediaType:
       type: string
       enum: [movies, tv, music, audiobooks, podcasts, books]
@@ -4919,6 +5371,16 @@ components:
         discNum: { type: integer }
         trackNum: { type: integer }
         artist: { type: string, description: Display artist (music kinds) }
+        album: { type: string, description: A track's album title }
+        albumArtist: { type: string, description: A track's album artist, the name its album sits under }
+        compilation: { type: boolean, description: An album by various artists }
+        bitrate: { type: integer, description: A track's kbit/s }
+        sampleRate: { type: integer, description: A track's sample rate, Hz }
+        bitDepth: { type: integer, description: A track's bits per sample; absent for lossy codecs }
+        channels: { type: integer }
+        mbid: { type: string, description: The MusicBrainz artist, release or recording id, from tags or a lookup }
+        sortTitle: { type: string, description: 'The title as it sorts: folded, lower-cased, a leading English article dropped' }
+        childCount: { type: integer, description: An artist's albums or an album's tracks, in the music listings }
         path: { type: string }
         sizeBytes: { type: integer, format: int64 }
         runtimeSecs: { type: integer }
@@ -5013,6 +5475,50 @@ components:
             plays: { type: integer, description: The viewer's plays of them }
         bioUrl: { type: string, description: The Wikipedia article the biography (the artist's overview) is from, to credit it }
         lookingUp: { type: boolean, description: A picture and biography are being looked up now }
+    DownloadJob:
+      type: object
+      required: [id, itemId, profile, status, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        itemId: { type: string, format: uuid }
+        deviceId: { type: string, description: The session (device) that asked, absent for an API key }
+        profile: { type: string, enum: [original, opus-128, opus-64] }
+        status: { type: string, enum: [queued, preparing, ready, failed] }
+        bytes: { type: integer, format: int64, description: The file's size once known }
+        error: { type: string, description: Why the job failed }
+        url: { type: string, description: Where to fetch the file, once ready }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    Mix:
+      type: object
+      required: [seed, basis, tracks]
+      properties:
+        seed: { $ref: "#/components/schemas/Item" }
+        basis:
+          type: array
+          items: { type: string, enum: [similar-artists, top-songs, household, co-listening, genre] }
+          description: The signals this batch had, strongest first
+        tracks:
+          type: array
+          items: { $ref: "#/components/schemas/Item" }
+          description: The batch in play order, each with the requesting user's plays and rating
+    MusicPage:
+      type: object
+      required: [items, total, page, size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Item" }
+        total: { type: integer, description: Items matching the filters, across every page }
+        page: { type: integer }
+        size: { type: integer, description: The page size applied after clamping }
+        index:
+          type: object
+          additionalProperties: { type: integer }
+          description: >
+            On the name sort only: how many items file under each letter,
+            "#" for those starting with anything but a letter, with the
+            letter filter not applied.
     SmartRules:
       type: object
       description: >
@@ -5054,6 +5560,8 @@ components:
         covers: { type: array, items: { type: string }, description: Up to four distinct album covers, for a mosaic }
         createdAt: { type: string }
         updatedAt: { type: string }
+        lastAddedAt: { type: string, description: "When a track was last appended; absent when never" }
+        holds: { type: boolean, description: "With ?for=, whether the playlist already has that track" }
     PlaylistDetail:
       type: object
       required: [playlist, tracks]
@@ -5242,6 +5750,9 @@ components:
         outHeight: { type: integer, description: Height being sent; absent when the video is untouched }
         audio: { type: string, enum: [direct, transcode] }
         audioCodec: { type: string, description: Codec being sent }
+        bitrate: { type: integer, description: Audio bit rate being sent, kbit/s (tracks) }
+        sampleRate: { type: integer, description: Audio sample rate being sent, Hz (tracks) }
+        bitDepth: { type: integer, description: Bits per sample of a lossless original (tracks) }
 
     SubtitleTrack:
       type: object
@@ -5308,6 +5819,19 @@ components:
         error: { type: string }
         startedAt: { type: string }
         finishedAt: { type: string }
+        phase:
+          type: string
+          enum: [registering, enriching, done]
+          description: >
+            Where a scan in passes has got to: registering while the files
+            are walked and their rows written (status running; enriched of
+            toEnrich fill in once the metadata job is running alongside),
+            enriching once the pass has ended and the job is still fetching
+            details (status completed; the cancel call stops it), done
+            after. A small scan looks titles up inline and goes straight
+            to done.
+        enriched: { type: integer, description: Titles the enrichment job has looked up }
+        toEnrich: { type: integer, description: Titles the enrichment job has to look up }
 
   responses:
     StorageUnavailable:

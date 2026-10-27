@@ -66,7 +66,12 @@ $(LIB):
 	git -C $(STATIGO) apply --reverse --check $(PATCH) 2>/dev/null || git -C $(STATIGO) apply $(PATCH)
 	cd $(STATIGO) && go run ./internal/builder
 
+# The Android app's debug APK, built in the toolchain container
+# (clients/android/README.md), which must be running.
+android:
+	docker exec -w /work/clients/android -e GRADLE_USER_HOME=/root/.gradle -e ANDROID_USER_HOME=/root/.android cineva-android ./gradlew -q assembleDebug
+
 clean:
 	rm -rf bin
 
-.PHONY: build run test lint ui setup clean
+.PHONY: build run test lint ui setup android clean

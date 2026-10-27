@@ -161,6 +161,11 @@ func (s *Scheduler) sweep(ctx context.Context) {
 	} else if n > 0 {
 		housekeepingLog.Info("unused devices forgotten", "count", n, "unused_for_days", store.DeviceUnusedDays)
 	}
+	if n, err := s.Store.PruneDownloadJobs(ctx, store.FinishedDownloadDays); err != nil {
+		housekeepingLog.Error("download job pruning failed", "err", err)
+	} else if n > 0 {
+		housekeepingLog.Info("finished download jobs removed", "count", n)
+	}
 	if audit, plays, err := s.Store.PruneHistory(ctx, s.Retain); err != nil {
 		housekeepingLog.Error("history retention failed", "err", err)
 	} else if audit > 0 || plays > 0 {

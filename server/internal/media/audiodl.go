@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
 	"github.com/linuxmatters/ffmpeg-statigo/av"
@@ -121,6 +122,12 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 	if err != nil {
 		return fmt.Errorf("audio transcode output: %w", err)
 	}
+	// Fragmented MP4 for AAC, so the file plays while it is still being
+	// written: a plain .m4a keeps its index (the moov atom) for the end,
+	// and a player reading the growing file would wait for all of it.
+	if strings.HasSuffix(strings.ToLower(dst), ".m4a") {
+		setMuxerOption(out.Raw(), "movflags", "frag_keyframe+empty_moov+default_base_moof")
+	}
 	// Closing flushes and closes dst; a failure there leaves it incomplete.
 	defer func() {
 		if err := out.Close(); err != nil && retErr == nil {
@@ -190,4 +197,17 @@ func TranscodeAudio(ctx context.Context, src, dst, encoderName string, bitrateKb
 		return fmt.Errorf("audio transcode flush encoder: %w", err)
 	}
 	return out.WriteTrailer()
+}
+
+// setMuxerOption sets a private option on a muxer before its header is
+// written. An option the muxer does not know is ignored: it is a hint, not
+// a requirement.
+func setMuxerOption(ctx *ffmpeg.AVFormatContext, name, value string) {
+	if ctx == nil || ctx.PrivData() == nil {
+		return
+	}
+	k, v := ffmpeg.ToCStr(name), ffmpeg.ToCStr(value)
+	defer k.Free()
+	defer v.Free()
+	_, _ = ffmpeg.AVOptSet(ctx.PrivData(), k, v, 0)
 }

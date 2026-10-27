@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -94,14 +95,104 @@ type Session struct {
 	DeviceSecretHash string `json:"-"`
 }
 
-// SessionQueue is a device's video play queue, as stored on its session.
-type SessionQueue struct {
-	ItemIDs []string `json:"itemIds"`
-	Index   int      `json:"index"`
+// QueueEntry is one item in a play queue. Ord is its place in the
+// unshuffled order, so turning shuffle off puts the queue back.
+type QueueEntry struct {
+	ID  string `json:"id"`
+	Ord int    `json:"ord"`
 }
 
-// MaxQueueItems bounds a stored queue, matching the client's own cap.
-const MaxQueueItems = 500
+// QueueSource is what a queue was made from (an album, artist, playlist,
+// genre, library or search), for "Playing from" and "Add this to a
+// playlist".
+type QueueSource struct {
+	Kind  string `json:"kind"`
+	ID    string `json:"id,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
+// QueueMix says the queue is, or ends in, a mix (server/docs/mix.md): what
+// it grew from and where it has got to, so another device carries it on
+// and Up next can name it. Kept as the client sends it.
+type QueueMix struct {
+	// SeedID is the track, album or artist the mix grew from; Kind which.
+	SeedID string `json:"seedId"`
+	Kind   string `json:"kind,omitempty"`
+	Title  string `json:"title,omitempty"`
+	// After is the last track the mix was asked to continue from.
+	After string `json:"after,omitempty"`
+	// From is the queue index the mix's entries begin at: 0 for a mix
+	// started on purpose, the end of the queue it carried on from otherwise.
+	From int `json:"from,omitempty"`
+	// Basis is the signals the last batch had, for the sub-line.
+	Basis []string `json:"basis,omitempty"`
+}
+
+// SessionQueue is a device's play queue, video or music, as stored on its
+// session (server/docs/music.md, part 2): the entries in play order, where
+// in them and where in the current one, shuffle and repeat, and what it
+// was made from. Everything a screen needs to carry on exactly as another
+// left off.
+type SessionQueue struct {
+	Entries []QueueEntry `json:"entries"`
+	Index   int          `json:"index"`
+	Shuffle bool         `json:"shuffle,omitempty"`
+	// Repeat is "off", "all" or "one".
+	Repeat       string       `json:"repeat,omitempty"`
+	PositionSecs float64      `json:"positionSecs,omitempty"`
+	Source       *QueueSource `json:"source,omitempty"`
+	Mix          *QueueMix    `json:"mix,omitempty"`
+	UpdatedAt    string       `json:"updatedAt,omitempty"`
+	// ItemIDs is the shape before migration 0046 ({itemIds, index}), still
+	// accepted from clients and converted by Normalise.
+	ItemIDs []string `json:"itemIds,omitempty"`
+}
+
+// Normalise converts the old shape, clamps the index and settles the
+// repeat mode, so every reader sees one form.
+func (q *SessionQueue) Normalise() {
+	if len(q.Entries) == 0 && len(q.ItemIDs) > 0 {
+		q.Entries = make([]QueueEntry, len(q.ItemIDs))
+		for i, id := range q.ItemIDs {
+			q.Entries[i] = QueueEntry{ID: id, Ord: i}
+		}
+	}
+	q.ItemIDs = nil
+	if len(q.Entries) == 0 {
+		q.Index = 0
+	} else {
+		q.Index = max(0, min(q.Index, len(q.Entries)-1))
+	}
+	switch q.Repeat {
+	case "all", "one":
+	default:
+		q.Repeat = "off"
+	}
+	if q.PositionSecs < 0 {
+		q.PositionSecs = 0
+	}
+}
+
+// IDs is the entries' ids in play order.
+func (q SessionQueue) IDs() []string {
+	out := make([]string, len(q.Entries))
+	for i, e := range q.Entries {
+		out[i] = e.ID
+	}
+	return out
+}
+
+// CurrentID is the id of the entry the queue is on, "" when empty.
+func (q SessionQueue) CurrentID() string {
+	if q.Index < 0 || q.Index >= len(q.Entries) {
+		return ""
+	}
+	return q.Entries[q.Index].ID
+}
+
+// MaxQueueItems bounds a stored queue, matching the client's own cap: a
+// whole library is never a queue, a random thousand of it is.
+const MaxQueueItems = 1000
 
 type APIKey struct {
 	ID         string `json:"id"`
@@ -110,6 +201,11 @@ type APIKey struct {
 	KeyHash    string `json:"-"`
 	CreatedAt  string `json:"createdAt"`
 	LastUsedAt string `json:"lastUsedAt,omitempty"`
+	// ForApps says the key can be typed into a music app as the password:
+	// a sealed copy of it is kept (SecretEnc, see migration 0047) so the
+	// app's salted-token sign-in can be checked.
+	ForApps   bool   `json:"forApps"`
+	SecretEnc []byte `json:"-"`
 }
 
 var (
@@ -148,7 +244,7 @@ type UserRepo interface {
 	SetSessionQueue(ctx context.Context, tokenHash string, q SessionQueue) error
 	PruneSessions(ctx context.Context) (int, error)
 
-	CreateAPIKey(ctx context.Context, userID, name, keyHash string) (APIKey, error)
+	CreateAPIKey(ctx context.Context, userID, name, keyHash string, secretEnc []byte) (APIKey, error)
 	APIKeyByHash(ctx context.Context, keyHash string) (APIKey, User, error)
 	APIKeys(ctx context.Context, userID string) ([]APIKey, error)
 	DeleteAPIKey(ctx context.Context, userID, id string) error
@@ -563,12 +659,13 @@ func (s *Store) SetSessionName(ctx context.Context, tokenHash, name string) erro
 
 // SetSessionQueue records the device's play queue. An empty queue clears it.
 func (s *Store) SetSessionQueue(ctx context.Context, tokenHash string, q SessionQueue) error {
-	if len(q.ItemIDs) > MaxQueueItems {
+	q.Normalise()
+	if len(q.Entries) > MaxQueueItems {
 		return fmt.Errorf("a queue holds at most %d items", MaxQueueItems)
 	}
 	raw := ""
-	if len(q.ItemIDs) > 0 {
-		q.Index = max(0, min(q.Index, len(q.ItemIDs)-1))
+	if len(q.Entries) > 0 {
+		q.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		b, err := json.Marshal(q)
 		if err != nil {
 			return fmt.Errorf("encode queue: %w", err)
@@ -582,15 +679,33 @@ func (s *Store) SetSessionQueue(ctx context.Context, tokenHash string, q Session
 	return nil
 }
 
-// ParsedQueue decodes the session's stored queue; empty when it has none.
+// SetSessionQueuePosition records where the device is in the current
+// entry, from a playback heartbeat, when that entry is the item given:
+// what lets another device carry a track on from the same second. A
+// heartbeat for anything else leaves the queue alone.
+func (s *Store) SetSessionQueuePosition(ctx context.Context, tokenHash, itemID string, secs float64) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET queue = json_set(queue, '$.positionSecs', ?)
+		 WHERE token_hash = ? AND queue <> ''
+		   AND json_extract(queue, '$.entries[' || json_extract(queue, '$.index') || '].id') = ?`,
+		secs, tokenHash, itemID); err != nil {
+		return fmt.Errorf("save queue position: %w", err)
+	}
+	return nil
+}
+
+// ParsedQueue decodes the session's stored queue, in the current shape
+// whatever it was saved in; empty when it has none.
 func (sess Session) ParsedQueue() (SessionQueue, error) {
 	var q SessionQueue
 	if sess.Queue == "" {
+		q.Normalise()
 		return q, nil
 	}
 	if err := json.Unmarshal([]byte(sess.Queue), &q); err != nil {
 		return SessionQueue{}, fmt.Errorf("session %s queue: %w", sess.ID, err)
 	}
+	q.Normalise()
 	return q, nil
 }
 
@@ -606,13 +721,20 @@ func (s *Store) PruneSessions(ctx context.Context) (int, error) {
 
 // ---- API keys ----
 
-func (s *Store) CreateAPIKey(ctx context.Context, userID, name, keyHash string) (APIKey, error) {
-	k := APIKey{ID: uuid.NewString(), UserID: userID, Name: strings.TrimSpace(name), KeyHash: keyHash}
+// CreateAPIKey stores a key's hash and, for a key usable in music apps,
+// its sealed copy (nil for a plain bearer key).
+func (s *Store) CreateAPIKey(ctx context.Context, userID, name, keyHash string, secretEnc []byte) (APIKey, error) {
+	k := APIKey{ID: uuid.NewString(), UserID: userID, Name: strings.TrimSpace(name), KeyHash: keyHash,
+		ForApps: len(secretEnc) > 0, SecretEnc: secretEnc}
 	if k.Name == "" {
 		k.Name = "API key"
 	}
-	if err := s.db.QueryRowContext(ctx, `INSERT INTO api_keys (id, user_id, name, key_hash) VALUES (?, ?, ?, ?)
-		RETURNING created_at`, k.ID, k.UserID, k.Name, k.KeyHash).Scan(&k.CreatedAt); err != nil {
+	var enc any
+	if len(secretEnc) > 0 {
+		enc = secretEnc
+	}
+	if err := s.db.QueryRowContext(ctx, `INSERT INTO api_keys (id, user_id, name, key_hash, secret_enc) VALUES (?, ?, ?, ?, ?)
+		RETURNING created_at`, k.ID, k.UserID, k.Name, k.KeyHash, enc).Scan(&k.CreatedAt); err != nil {
 		return APIKey{}, fmt.Errorf("create api key: %w", err)
 	}
 	return k, nil
@@ -621,8 +743,8 @@ func (s *Store) CreateAPIKey(ctx context.Context, userID, name, keyHash string) 
 func (s *Store) APIKeyByHash(ctx context.Context, keyHash string) (APIKey, User, error) {
 	var k APIKey
 	var last sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT id, user_id, name, key_hash, created_at, last_used_at FROM api_keys WHERE key_hash = ?`, keyHash).
-		Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.CreatedAt, &last)
+	err := s.db.QueryRowContext(ctx, `SELECT id, user_id, name, key_hash, created_at, last_used_at, secret_enc FROM api_keys WHERE key_hash = ?`, keyHash).
+		Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.CreatedAt, &last, &k.SecretEnc)
 	if errors.Is(err, sql.ErrNoRows) {
 		return APIKey{}, User{}, ErrNotFound
 	}
@@ -630,13 +752,14 @@ func (s *Store) APIKeyByHash(ctx context.Context, keyHash string) (APIKey, User,
 		return APIKey{}, User{}, fmt.Errorf("api key: %w", err)
 	}
 	k.LastUsedAt = last.String
+	k.ForApps = len(k.SecretEnc) > 0
 	_, _ = s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`, k.ID)
 	u, err := s.UserByID(ctx, k.UserID)
 	return k, u, err
 }
 
 func (s *Store) APIKeys(ctx context.Context, userID string) ([]APIKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, user_id, name, key_hash, created_at, last_used_at FROM api_keys
+	rows, err := s.db.QueryContext(ctx, `SELECT id, user_id, name, key_hash, created_at, last_used_at, secret_enc FROM api_keys
 		WHERE user_id = ? ORDER BY created_at`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("api keys: %w", err)
@@ -646,10 +769,11 @@ func (s *Store) APIKeys(ctx context.Context, userID string) ([]APIKey, error) {
 	for rows.Next() {
 		var k APIKey
 		var last sql.NullString
-		if err := rows.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.CreatedAt, &last); err != nil {
+		if err := rows.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &k.CreatedAt, &last, &k.SecretEnc); err != nil {
 			return nil, err
 		}
 		k.LastUsedAt = last.String
+		k.ForApps = len(k.SecretEnc) > 0
 		out = append(out, k)
 	}
 	return out, rows.Err()

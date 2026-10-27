@@ -3,11 +3,12 @@
   // playlists, and their most played tracks — Plexamp's way in, before the
   // whole catalogue.
   import { Play, Music as MusicIcon, Plus } from '@lucide/svelte'
-  import { libraryListening, listPlaylists, itemDetail, type Listening, type Playlist, type Item } from '../lib/api'
-  import { music, trackTime, plays, playedWhen } from './actions.svelte'
-  import Mosaic from './Mosaic.svelte'
-  import TrackMenu from './TrackMenu.svelte'
-  import Stars from './Stars.svelte'
+  import { libraryListening, listPlaylists, itemTracks, type Listening, type Playlist, type Item } from '../../lib/api'
+  import { music, trackTime, plays, playedWhen } from '../actions.svelte'
+  import { play } from '../player/queue.svelte'
+  import Mosaic from '../Mosaic.svelte'
+  import TrackMenu from '../TrackMenu.svelte'
+  import Stars from '../Stars.svelte'
 
   let { libraryId, onplaylists }: { libraryId: string; onplaylists: () => void } = $props()
 
@@ -27,7 +28,7 @@
 
   async function playAlbum(al: Item) {
     try {
-      music().play((await itemDetail(al.id)).children.filter((c) => c.kind === 'track'), 0)
+      play(await itemTracks(al.id), 0, { source: { kind: 'album', id: al.id, title: al.title } })
     } catch (err) {
       music().notify('error', err instanceof Error ? err.message : String(err))
     }
@@ -36,11 +37,11 @@
 </script>
 
 {#if rows && rows.recentlyPlayed.length > 0}
-  <section class="lrow">
+  <section class="lrow" data-nav-group="recent">
     <h3>Recently played</h3>
     <div class="scroller">
       {#each rows.recentlyPlayed as al (al.id)}
-        <div class="card">
+        <div class="card" data-nav-id={al.id}>
           <div class="cwrap">
             <button class="cover" onclick={() => music().openAlbum(al)} aria-label={al.title}>
               {#if al.poster}<img src={al.poster} alt="" loading="lazy" />{:else}<span class="ph"><MusicIcon size={26} /></span>{/if}
@@ -55,7 +56,7 @@
   </section>
 {/if}
 
-<section class="lrow">
+<section class="lrow" data-nav-group="playlists">
   <div class="lhead">
     <h3>Playlists</h3>
     <button class="see" onclick={onplaylists}>{lists.length ? 'See all' : 'New playlist'}{#if !lists.length}<Plus size={14} />{/if}</button>
@@ -83,7 +84,7 @@
     <ol class="tracks">
       {#each top as t, i (t.id)}
         <li class="trackstars">
-          <button class="trow" onclick={() => music().play(top, i)}>
+          <button class="trow" onclick={() => play(top, i, { source: { kind: 'library', id: libraryId, title: 'Most played' } })}>
             <span class="rank">{i + 1}</span>
             {#if t.poster}<img src={t.poster} alt="" loading="lazy" />{:else}<span class="thumb"><MusicIcon size={14} /></span>{/if}
             <span class="tmain"><span class="ttitle">{t.title}</span><span class="tsub">{t.artist}</span></span>
@@ -123,8 +124,8 @@
     border-radius: 50%; background: color-mix(in srgb, var(--accent) 85%, var(--panel)); color: var(--text);
     opacity: 0; transition: opacity 0.15s ease;
   }
-  .card:hover .cardplay, .cardplay:focus-visible { opacity: 1; }
-  @media (hover: none) { .cardplay { display: none; } }
+  .card:hover .cardplay, .cardplay:focus-visible, .card:focus-within .cardplay { opacity: 1; }
+  @media (hover: none) { .cardplay { opacity: 1; width: 2rem; height: 2rem; } }
   .cname { text-align: left; padding: 0; font-size: 0.85rem; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
   .cname:hover { color: var(--accent-2); }
   .csub { font-size: 0.74rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

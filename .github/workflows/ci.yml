@@ -201,11 +201,17 @@ jobs:
           flavor: |
             latest=auto
 
+      # The binaries were built and cached above, so the image packages
+      # them (SOURCE=prebuilt) rather than building from source, which the
+      # Dockerfile also does for a plain `docker build`.
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            SOURCE=prebuilt
+            VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
